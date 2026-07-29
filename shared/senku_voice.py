@@ -106,10 +106,10 @@ def channel_scope_prompt(title: str) -> str:
         f"Setting up the distribution channel for <b>{esc(title)}</b>. Two ways:\n\n"
         "👤 <b>You create it</b> — you make the channel and add our bots as admins. "
         "I'll hand you the title, description and username to paste.\n\n"
-        "🤖 <b>The bot creates it</b> — a pooled account makes it, sets the title, "
-        "description and username itself. You only add the profile photo.\n\n"
-        "<blockquote>⚠️ Prefer creating it yourself. Only let the bot do it once your "
-        "own account has hit its channel-creation limit — bot accounts have a hard "
+        "🤖 <b>A user-bot creates it</b> — a pooled user-bot account makes it, sets the "
+        "title, description and username itself. You only add the profile photo.\n\n"
+        "<blockquote>⚠️ Prefer creating it yourself. Only let a user-bot do it once your "
+        "own account has hit its channel-creation limit — user-bot accounts have a hard "
         "cap too, so we save them for when you're out of room.</blockquote>"
     )
 
@@ -238,7 +238,15 @@ def channel_verified(handle: str) -> str:
     )
 
 
-def channel_verify_failed(handle: str) -> str:
+def channel_verify_failed(handle: str, missing: list[str] | None = None) -> str:
+    if missing:
+        who = " and ".join(missing)
+        return (
+            f"{ICON} <b>Almost — {esc(handle)} still needs {esc(who)} as admin.</b>\n\n"
+            "Both <b>Senku</b> (me) and <b>Gojo</b> must be administrators: I post the "
+            "info card + watch guide, Gojo runs publishing. Add the missing bot with "
+            "full permissions, then send the @username again."
+        )
     return (
         f"{ICON} <b>Can't reach {esc(handle)}.</b> Either the handle's wrong or I'm not an "
         "admin there yet. Add me as admin, double-check the username, and send it again."
@@ -401,7 +409,7 @@ BTN_TMDB_POSTER = "🖼 Open TMDB Poster Page"
 
 # Two-scope channel creation (feature #41).
 BTN_SCOPE_OWN = "👤 I'll create it"
-BTN_SCOPE_USERBOT = "🤖 Let the bot create it"
+BTN_SCOPE_USERBOT = "🤖 Let a user-bot create it"
 BTN_USERBOT_JOIN = "🔗 Join the channel"
 BTN_USERBOT_JOINED = "✅ I've joined"
 BTN_USERBOT_DONE = "✅ Done — I added the photo"

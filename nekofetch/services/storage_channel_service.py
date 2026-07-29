@@ -12,8 +12,9 @@ Three responsibilities:
   • upload_pack  — automated ingestion: post header, upload files in order, post sticker
   • deliver      — copy a pack's messages to a user (protect / temp / auto-delete aware)
 
-All operations use the admin bot client (``container.admin_client``), which must be an
-administrator of the database channel.
+All operations use Levi (the downloader bot, ``container.pipeline_manager.levi``),
+which must be an administrator of the database channel. Falls back to
+``container.admin_client`` when the pipeline isn't wired.
 """
 
 from __future__ import annotations
@@ -59,7 +60,11 @@ class StorageChannelService:
 
     @property
     def _client(self):
-        client = getattr(self._c, "admin_client", None)
+        # Levi (downloader bot) owns the database channel and must be an admin
+        # there. Fall back to the global admin_client when the pipeline isn't
+        # wired (e.g. tests, or NekoFetch's single-bot BotManager).
+        pm = getattr(self._c, "pipeline_manager", None)
+        client = (getattr(pm, "levi", None) if pm else None) or getattr(self._c, "admin_client", None)
         if not self.cfg.enabled or self.cfg.channel_id == 0 or client is None:
             raise FeatureDisabled("storage_channel")
         return client

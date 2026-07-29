@@ -232,24 +232,52 @@ class NyaaSource(AnimeSource):
         """Download the .torrent, parse its file list, order EP1..EPN."""
         r = json.loads(source_ref)
         try:
-            resp = await self.http.get(r["torrent_url"])
-            resp.raise_for_status()
-            _name, files = torrent_files(resp.content)
+            if r.get("torrent_path"):
+                raw = Path(r["torrent_path"]).read_bytes()
+            elif r.get("magnet"):
+                raw = await self._resolve_magnet(r["magnet"])
+            else:
+                resp = await self.http.get(r["torrent_url"])
+                resp.raise_for_status()
+                raw = resp.content
+            _name, files = torrent_files(raw)
         except Exception as exc:  # noqa: BLE001
             log.warning("nyaa.torrent.parse_failed", error=str(exc))
             return []
 
-        ordered = order_episodes(files)
+        ordered = order_episodes(files, prefer_resolution=1080)
         episodes: list[Episode] = []
+        ep_ref_base = {}
+        if r.get("torrent_url"):
+            ep_ref_base["torrent_url"] = r["torrent_url"]
+        if r.get("magnet"):
+            ep_ref_base["magnet"] = r["magnet"]
+        if r.get("torrent_path"):
+            ep_ref_base["torrent_path"] = r["torrent_path"]
+        ep_ref_base["info_hash"] = r.get("info_hash", "")
+
+        # Robustly derive audio. The incoming ``r["dual_audio"]`` is only set when
+        # the release came through search() (which runs is_dual_audio on the RSS
+        # title). When the admin pastes a nyaa link directly, ``r`` never ran
+        # classification, so it defaults to single/Sub even for a dual-audio pack.
+        # Re-classify from the torrent's OWN internal name + the release title +
+        # the per-file names — whichever signals dual/multi audio wins, so the
+        # pack is stamped Dual, not Sub.
+        file_blob = " ".join(f.get("name", "") for f in files[:40])
+        cls = classify_audio(f"{r.get('title', '')} {_name} {file_blob}")
+        audio_kind = cls["audio"]  # 'dual' | 'multi' | 'single'
+        if r.get("dual_audio") and audio_kind == "single":
+            audio_kind = "dual"  # trust an explicit upstream flag over a miss
+        ep_ref_base["dual_audio"] = audio_kind in ("dual", "multi")
+        ep_ref_base["audio_kind"] = audio_kind
+
         for e in ordered:
             label = {"movie": "Movie", "ova": "OVA", "special": "Special",
                      "extra": "Extra"}.get(e["kind"], f"Ep. {e.get('episode') or e['seq']}")
             episodes.append(
                 Episode(
                     source_ref=json.dumps({
-                        "torrent_url": r["torrent_url"],
-                        "info_hash": r.get("info_hash", ""),
-                        "dual_audio": r.get("dual_audio", False),
+                        **ep_ref_base,
                         "file_index": e["index"],
                         "path": e["path"],
                         "name": e["name"],
@@ -268,11 +296,21 @@ class NyaaSource(AnimeSource):
     async def get_variants(self, episode_ref: str) -> list[VideoVariant]:
         """One variant: the torrent file itself (transcodes happen post-download)."""
         e = json.loads(episode_ref)
+        # Map the derived audio kind to the domain enum. ``audio_kind`` is set by
+        # get_episodes (multi/dual/single); fall back to the legacy dual_audio
+        # flag for refs built before that field existed.
+        kind = e.get("audio_kind")
+        if kind == "multi":
+            audio = AudioType.MULTI
+        elif kind == "dual" or e.get("dual_audio"):
+            audio = AudioType.DUAL_AUDIO
+        else:
+            audio = AudioType.SUBBED
         return [
             VideoVariant(
                 source_ref=episode_ref,
                 resolution=e.get("resolution") or "1080p",
-                audio=AudioType.DUAL_AUDIO if e.get("dual_audio") else AudioType.SUBBED,
+                audio=audio,
                 container=Path(e["name"]).suffix.lstrip("."),
                 size_bytes=e.get("length"),
             )
@@ -292,3 +330,41 @@ class NyaaSource(AnimeSource):
         return await download_torrent_file(
             info, dest, on_progress=on_progress,
         )
+
+    async def _resolve_magnet(self, magnet_uri: str) -> bytes:
+        """Resolve a magnet URI to .torrent metadata bytes via aria2c."""
+        import asyncio
+        import shutil
+        import tempfile
+
+        from nekofetch.sources._torrentdl import find_aria2
+
+        aria2 = find_aria2()
+        if not aria2:
+            raise RuntimeError("aria2c not found")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd = [
+                aria2, "--dir", tmp,
+                "--bt-metadata-only=true", "--bt-save-metadata=true",
+                "--bt-stop-timeout=60", "--seed-time=0",
+                "--enable-dht=true",
+                "--dht-listen-port=6881-6999",
+                "--listen-port=6881-6999",
+                "--console-log-level=warn",
+                magnet_uri,
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=120)
+            except TimeoutError:
+                proc.kill()
+                raise RuntimeError("magnet metadata resolution timed out") from None
+
+            torrents = list(Path(tmp).glob("*.torrent"))
+            if not torrents:
+                raise RuntimeError("aria2c did not produce a .torrent from the magnet")
+            return torrents[0].read_bytes()

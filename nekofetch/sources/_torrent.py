@@ -11,6 +11,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from nekofetch.core.logging import get_logger
+
+log = get_logger(__name__)
+
 VIDEO_EXT = (".mkv", ".mp4", ".avi", ".ts", ".m4v", ".mov")
 
 
@@ -86,13 +90,15 @@ def parse_release_meta(name: str) -> dict:
     low = base.lower()
 
     kind = "episode"
-    if re.search(r"\b(ncop|nced|opening|ending|preview|menu|pv)\b", low):
+    _B = r"(?:^|[\s_\-\.\[\(])"
+    _E = r"(?:[\s_\-\.\]\)]|$)"
+    if re.search(_B + r"(ncop|nced|opening|ending|preview|menu|pv)" + _E, low):
         kind = "extra"
-    elif re.search(r"\bova\b", low):
+    elif re.search(_B + r"ova" + _E, low):
         kind = "ova"
-    elif re.search(r"\b(special|specials|sp\d+|extra|oad)\b", low):
+    elif re.search(_B + r"(special|specials|sp\d+|extra|oad)" + _E, low):
         kind = "special"
-    elif re.search(r"\bmovie\b", low):
+    elif re.search(_B + r"movie" + _E, low):
         kind = "movie"
 
     # season — try the most explicit forms first; default 1 if only episodes given
@@ -108,14 +114,14 @@ def parse_release_meta(name: str) -> dict:
     # rather than any audio/quality keyword (Dual/Sub/Multi vary, these don't).
     episode = None
     for pat in (
-        r"\bs\d{1,2}\s*e\s*(\d{1,3})\b",                  # S1 E12 / S01E01 / S1 E 12
+        r"\bs\d{1,2}\s*e\s*(\d{1,3})(?:v\d+)?\b",            # S1E12v3 / S01E01 / S1 E 12
         r"\bseason\s*\d{1,2}\s*episode\s*(\d{1,3})\b",    # Season 1 Episode 1
         r"\bepisode\s*(\d{1,3})\b",                       # Episode 12
         r"\bep\s*[._-]?\s*(\d{1,3})\b",                   # EP01 / Ep.1
         r"(?:^|[\s\-_])e(\d{1,3})\b",                     # - E17 / E17 / _E001
-        r"-\s*(\d{1,3})(?:v\d)?\s*[\(\[]",                # - 24 [Dual]
-        r"-\s*(\d{1,3})(?:v\d)?(?=\s|$)",                 # - 24
-        r"\s(\d{1,3})\s*[\(\[]",                          #  24 (1080p)
+        r"[\s_]-[\s_]*(\d{1,3})(?:v\d+)?[\s_]*[\(\[]",    # - 24 [Dual] / _-_01_(
+        r"[\s_]-[\s_]*(\d{1,3})(?:v\d+)?(?=[\s_]|$)",     # - 24 / _-_01_
+        r"[\s_](\d{1,3})[\s_]*[\(\[]",                    #  24 (1080p) / _01_(
         r"#(\d{1,3})\b",                                  # #01
     ):
         m = re.search(pat, low)
@@ -231,13 +237,60 @@ def validate_order(names: list[str]) -> dict:
     }
 
 
-def order_episodes(files: list[dict]) -> list[dict]:
+def _resolution_rank(res: str | None) -> int:
+    """Numeric height for a resolution token ("1080p" → 1080). 0 when unknown."""
+    if not res:
+        return 0
+    digits = "".join(c for c in str(res) if c.isdigit())
+    return int(digits) if digits else 0
+
+
+def _collapse_resolution(main: list[dict], prefer: int) -> tuple[list[dict], list[dict]]:
+    """Collapse multi-resolution duplicates of the same (season, episode).
+
+    A multi-quality torrent ships e.g. both a 1080p and a 720p file for episode 1.
+    We download ONE quality per episode and derive the rest by encoding, so keep
+    a single file per (season, episode): the ``prefer`` height when present, else
+    the highest available. Returns ``(kept, low_only)`` where ``low_only`` lists
+    the kept files for episodes that had NO ``prefer``-height option (so the
+    caller can flag the "only 720p — download anyway?" case). Only numbered
+    episodes are collapsed; callers must pass main episodes only.
+    """
+    from collections import OrderedDict
+
+    groups: "OrderedDict[tuple, list[dict]]" = OrderedDict()
+    for e in main:
+        groups.setdefault((e["season"], e["episode"]), []).append(e)
+
+    kept: list[dict] = []
+    low_only: list[dict] = []
+    for _key, files in groups.items():
+        if len(files) == 1:
+            kept.append(files[0])
+            continue
+        exact = [f for f in files if _resolution_rank(f.get("resolution")) == prefer]
+        if exact:
+            chosen = exact[0]
+        else:
+            chosen = max(files, key=lambda f: _resolution_rank(f.get("resolution")))
+            low_only.append(chosen)
+        kept.append(chosen)
+    return kept, low_only
+
+
+def order_episodes(files: list[dict], *, prefer_resolution: int | None = None) -> list[dict]:
     """Order a release's video files into an EP1..EPN sequence.
 
     Returns each kept file augmented with ``seq`` (1-based), ``season``,
     ``episode``, ``kind``, ``resolution`` and the original ``name``/``path``.
     Movies/specials/OVAs/extras are ordered after the main episodes. Original
     filenames are preserved; only the sequence index is synthesised.
+
+    ``prefer_resolution`` (e.g. ``1080``), when set, collapses multi-resolution
+    duplicates of the same numbered episode down to a single file — the preferred
+    height when present, else the highest available — so a multi-quality torrent
+    downloads ONE file per episode (the lower tiers are derived by encoding).
+    Movies/extras (no episode number) are never collapsed.
     """
     vids = [f for f in files if f["name"].lower().endswith(VIDEO_EXT)]
     if not vids:
@@ -256,6 +309,25 @@ def order_episodes(files: list[dict]) -> list[dict]:
     main = [e for e in enriched if e["kind"] == "episode"]
     movies = [e for e in enriched if e["kind"] == "movie"]
     extras = [e for e in enriched if e["kind"] in ("special", "ova", "extra")]
+
+    # Collapse multi-resolution duplicates for numbered episodes only. Episodes
+    # with no detected number (episode is None) are left alone — they'd all share
+    # the same (season, None) key and must not be merged into one.
+    if prefer_resolution is not None and main:
+        numbered = [e for e in main if e["episode"] is not None]
+        unnumbered = [e for e in main if e["episode"] is None]
+        if numbered:
+            kept, low_only = _collapse_resolution(numbered, prefer_resolution)
+            if low_only:
+                log.warning(
+                    "torrent.resolution.no_preferred",
+                    prefer=prefer_resolution,
+                    episodes=[e.get("episode") for e in low_only],
+                    got=[e.get("resolution") for e in low_only],
+                    hint="episodes lacking the preferred height — admin confirm "
+                         "before downloading a lower tier",
+                )
+            main = kept + unnumbered
 
     # If episode numbers were detected for the main set, sort by (season, ep);
     # otherwise fall back to a natural filename sort (stable per release).

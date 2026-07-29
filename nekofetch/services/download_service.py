@@ -14,6 +14,7 @@ Byte-moving itself is delegated to the source's ``download`` (e.g. ``LocalFileSo
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import shutil
 import time
@@ -24,7 +25,12 @@ from sqlalchemy import select
 from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
 from nekofetch.core.parsing import clean_anilist_id
-from nekofetch.core.redis_safe import safe_redis_delete, safe_redis_get, safe_redis_set
+from nekofetch.core.redis_safe import (
+    safe_redis_delete,
+    safe_redis_get,
+    safe_redis_mget,
+    safe_redis_set,
+)
 from nekofetch.domain.enums import AudioType, JobStatus, RequestStatus
 from nekofetch.infrastructure.database.postgres.models import DownloadJob, MediaFile
 from nekofetch.infrastructure.database.postgres.session import session_scope
@@ -90,9 +96,20 @@ class DownloadWorker:
             task.add_done_callback(self._tasks.discard)
 
     async def stop(self) -> None:
+        """Stop the poll loop and cancel all in-flight download tasks.
+
+        Awaits each cancelled task so that by the time this returns the worker
+        has fully wound down — no background task is still writing to the DB or
+        downloading a file. This is the guarantee :class:`DatabaseClearService`
+        needs before truncating tables, and that ``PipelineManager.stop`` needs
+        for a clean shutdown.
+        """
         self._running = False
         for task in list(self._tasks):
             task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
 
     async def _claim_next(self) -> int | None:
         async with session_scope(self._c.pg_sessionmaker) as session:
@@ -173,6 +190,52 @@ class DownloadWorker:
             episodes = [e for e in episodes if e.season == req.season]
         if req.episodes:
             episodes = [e for e in episodes if e.number in set(req.episodes)]
+
+        # Strip extras (NCOP, NCED, etc.) when the franchise data tells us how
+        # many main episodes to expect and no explicit episode list was given.
+        # Extras are only downloaded when the user specifically selected them.
+        if not req.episodes:
+            expected = int((req.franchise_data or {}).get("franchise_episodes") or 0)
+            if expected > 0:
+                main = []
+                for ep in episodes:
+                    try:
+                        kind = json.loads(ep.source_ref).get("kind", "episode")
+                    except Exception:
+                        kind = "episode"
+                    if kind == "episode":
+                        main.append(ep)
+                if len(main) >= expected:
+                    episodes = main[:expected]
+                elif main:
+                    episodes = main
+
+        # Apply torrent mapping: filter to included files and override season/episode numbers.
+        torrent_mapping_dict = (req.franchise_data or {}).get("_torrent_mapping")
+        if torrent_mapping_dict:
+            from nekofetch.services.torrent_mapping import TorrentMapping
+            from nekofetch.sources.base import Episode
+            tm = TorrentMapping.from_dict(torrent_mapping_dict)
+            ep_override: dict[int, tuple[int, int]] = {}
+            for tme in tm.included_entries:
+                fe = tme.franchise_entry
+                for fa in tme.files:
+                    if fa.episode_number is not None:
+                        ep_override[fa.file_index] = (fe.season_number, fa.episode_number)
+            if ep_override:
+                remapped = []
+                for ep in episodes:
+                    try:
+                        fidx = json.loads(ep.source_ref).get("file_index")
+                    except Exception:
+                        fidx = None
+                    if fidx is not None and fidx in ep_override:
+                        s, n = ep_override[fidx]
+                        remapped.append(Episode(
+                            source_ref=ep.source_ref, season=s, number=n, title=ep.title,
+                        ))
+                if remapped:
+                    episodes = remapped
 
         audios = self._target_audios(req)
         folder = _safe_folder(req)
@@ -458,9 +521,7 @@ class DownloadWorker:
             on_retry=on_retry,
         ))
         while True:
-            cancel = await self._cancel_requested(job_id)
-            abort_source = await self._source_abort_requested(job_id)
-            skip = await self._skip_requested(job_id)
+            cancel, abort_source, skip = await self._control_flags(job_id)
             if cancel or abort_source or skip:
                 task.cancel()
                 if skip:
@@ -617,7 +678,7 @@ class DownloadWorker:
                 .order_by(DownloadJob.id.desc())
             )).scalars().first()
             job_id = job.id if job else None
-            anime_doc_id = req.anime_doc_id or clean_anilist_id(req.source_ref)
+            anime_doc_id = _safe_anime_doc_id(req)
             audio = req.audio or AudioType.SUBBED
             season = req.season or 1
             folder = _safe_folder(req)
@@ -649,6 +710,23 @@ class DownloadWorker:
     @staticmethod
     def _skip_key(job_id: int) -> str:
         return f"nf:job:{job_id}:skip"
+
+    async def _control_flags(self, job_id: int) -> tuple[bool, bool, bool]:
+        """Read cancel / source-abort / skip in ONE Redis round-trip.
+
+        The hot poll loop (``_download_watched``, ~1s) previously issued three
+        separate GETs, each with its own timeout — on a high-latency/remote
+        Redis (e.g. Upstash from a home connection) those stacked into repeated
+        ``redis.timeout`` warnings and starved the poll. One MGET is a single
+        timed call instead of three. Returns ``(cancel, abort_source, skip)``;
+        any blip yields all-``False`` so the download simply keeps going.
+        """
+        vals = await safe_redis_mget(
+            self._c.redis,
+            [self._cancel_key(job_id), self._source_abort_key(job_id), self._skip_key(job_id)],
+            label="download.control_flags",
+        )
+        return bool(vals[0]), bool(vals[1]), bool(vals[2])
 
     async def _skip_requested(self, job_id: int) -> bool:
         # Hot path polled every ~1s by ``_download_watched``. A bare ``get``
@@ -828,9 +906,13 @@ class DownloadWorker:
             return None
 
     async def _already_have(self, job_id, ep, resolution, audio) -> bool:
-        """True if this exact unit was already downloaded in a prior run and the file
-        still exists — the basis of resume (eps 1-9 done → skip straight to ep 10)."""
+        """True if this exact unit was already downloaded in a prior run.
 
+        A DB record is sufficient — the file may have been uploaded and cleaned
+        up by a prior _process_and_upload_quality pass, which is correct behaviour
+        (not a reason to re-download). Only re-download when there is no DB record
+        at all (genuinely missing from this job).
+        """
         try:
             async with session_scope(self._c.pg_sessionmaker) as session:
                 row = (await session.execute(
@@ -840,9 +922,7 @@ class DownloadWorker:
                         MediaFile.audio == audio,
                     )
                 )).scalars().first()
-            if not (row and row.local_path):
-                return False
-            return await asyncio.to_thread(Path(row.local_path).exists)
+            return row is not None
         except Exception:  # noqa: BLE001 - on error, just re-download (safe) not fail
             return False
 
@@ -1105,17 +1185,18 @@ class DownloadWorker:
         return {}
 
     async def _record_file(self, job_id, req, ep, variant, dest, result) -> None:
+        actual_path = result.get("path") or str(dest)
         async with session_scope(self._c.pg_sessionmaker) as session:
             session.add(
                 MediaFile(
                     job_id=job_id,
-                    anime_doc_id=req.anime_doc_id or req.source_ref,
+                    anime_doc_id=_safe_anime_doc_id(req),
                     season=ep.season,
                     episode=ep.number,
                     resolution=variant.resolution,
                     audio=variant.audio,
                     original_name=ep.title,
-                    local_path=str(dest),
+                    local_path=actual_path,
                     size_bytes=int(result.get("bytes", 0)),
                     checksum=result.get("checksum"),
                     container=variant.container,
@@ -1415,11 +1496,31 @@ def _alternate_source(source: str) -> str | None:
     return next((w for w in _WEBSITE_SOURCES if w != primary), None)
 
 
+def _safe_anime_doc_id(req) -> str:
+    """A short identifier safe for the VARCHAR(48) ``anime_doc_id`` column.
+
+    Priority: ``req.anime_doc_id`` (if already set and short enough) → a cleaned
+    AniList id extracted from ``source_ref`` → the request code. We NEVER fall
+    back to the raw ``source_ref`` because nyaa/torrent sources store a full
+    JSON metadata blob there that overflows the column.
+    """
+    _MAX_DOC_ID_LEN = 48
+    doc = getattr(req, "anime_doc_id", None)
+    if doc and len(str(doc)) <= _MAX_DOC_ID_LEN:
+        return str(doc)
+    # Extract ``anilist:<id>`` → ``<id>`` when source_ref is that form.
+    cleaned = clean_anilist_id(getattr(req, "source_ref", None))
+    if cleaned and len(cleaned) <= _MAX_DOC_ID_LEN:
+        return cleaned
+    # Last resort: the request code (always short, always unique).
+    return getattr(req, "code", None) or "unknown"
+
+
 def _safe_folder(req) -> str:
     """A filesystem-safe work folder name for a request (no colons/slashes)."""
     import re
 
-    base = req.anime_doc_id or req.code or clean_anilist_id(req.source_ref) or "work"
+    base = _safe_anime_doc_id(req) or "work"
     return re.sub(r"[^\w.\-]+", "_", str(base)).strip("_") or "work"
 
 

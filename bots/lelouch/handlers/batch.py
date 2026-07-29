@@ -52,7 +52,7 @@ STATE_BATCH_PROMPT = "lelouch_batch:await_titles"
 STATE_BATCH_REVIEW = "lelouch_batch:review"
 
 # Commands the batch text handler must never swallow.
-_RESERVED = ["start", "help", "myrequests", "admin", "settings", "batch"]
+_RESERVED = ["start", "help", "myrequests", "admin", "settings", "batch", "cleardatabase"]
 
 BOT = "lelouch"
 

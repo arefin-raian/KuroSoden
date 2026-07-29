@@ -35,10 +35,17 @@ class DatabaseClearService:
         self._c = container
 
     async def clear_operational_state(self) -> DatabaseClearResult:
-        """Wipe request/content/runtime state and keep identity/profile rows."""
+        """Wipe request/content/runtime state and keep identity/profile rows.
+
+        Stops the download worker **before** truncating so that no in-flight
+        download task is mid-write when the rows vanish, then restarts it
+        afterwards so the pipeline resumes from the (now empty) queue.
+        """
+        await self._stop_download_worker()
         postgres_truncated, missing = await self._clear_postgres()
         mongo_cleared = await self._clear_mongo()
         redis_flushed = await self._clear_redis()
+        await self._restart_download_worker()
         result = DatabaseClearResult(
             postgres_truncated=postgres_truncated,
             postgres_kept=tuple(sorted(KEEP_TABLES)),
@@ -89,3 +96,21 @@ class DatabaseClearService:
             return False
         await self._c.redis.flushdb()
         return True
+
+    async def _stop_download_worker(self) -> None:
+        """Stop the download worker before clearing, if a PipelineManager is wired."""
+        pm = getattr(self._c, "pipeline_manager", None)
+        if pm is not None:
+            try:
+                await pm.stop_download_worker()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("database.clear.worker_stop_failed", error=str(exc))
+
+    async def _restart_download_worker(self) -> None:
+        """Restart the download worker after clearing, if a PipelineManager is wired."""
+        pm = getattr(self._c, "pipeline_manager", None)
+        if pm is not None:
+            try:
+                await pm.restart_download_worker()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("database.clear.worker_restart_failed", error=str(exc))

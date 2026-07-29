@@ -17,12 +17,14 @@ So the flow the user sees is:
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 from urllib.parse import quote
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import CallbackQuery, Message
 
 from kurosoden.shared import levi_voice as V
@@ -190,6 +192,8 @@ def _report_recommendation(report, torrent_rows: list[dict], expected: int | Non
 
 def register(client: Client, container: Container) -> None:
     """Register Levi's task list — the entry point into the shared download flow."""
+
+    _active_reports: dict[str, asyncio.Task] = {}
 
     async def _render_tasks(chat_id: int, admin_id: int,
                             old_msg: Message | None = None) -> None:
@@ -547,16 +551,78 @@ def register(client: Client, container: Container) -> None:
         if req is None:
             await q.answer("Request not found.", show_alert=True)
             return
-        await q.answer("Reading sources.")
+        await q.answer()
+
+        cancel_key = f"{q.message.chat.id}:{code}"
+        old_task = _active_reports.pop(cancel_key, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
+        back_kb = keyboard([(V.BTN_BACK, cb("levi", "reportcancel", code))])
+
+        async def _do_report():
+            return (
+                await _build_report_caption(req),
+                await _anime_image(req),
+            )
+
+        task = asyncio.create_task(_do_report())
+        _active_reports[cancel_key] = task
+
+        _ANIM_FRAMES = [
+            f"{V.ICON} <b>Scanning sources.</b>",
+            f"{V.ICON} <b>Scanning sources..</b>",
+            f"{V.ICON} <b>Scanning sources...</b>",
+        ]
+
+        frame = 0
+        try:
+            while not task.done():
+                caption = _ANIM_FRAMES[frame % len(_ANIM_FRAMES)]
+                try:
+                    await client.edit_message_caption(
+                        q.message.chat.id, q.message.id,
+                        caption=caption, parse_mode=ParseMode.HTML,
+                        reply_markup=back_kb,
+                    )
+                except MessageNotModified:
+                    pass
+                except Exception:
+                    pass
+                frame += 1
+                await asyncio.sleep(0.8)
+
+            caption_text, image = await task
+        except asyncio.CancelledError:
+            return
+        finally:
+            _active_reports.pop(cancel_key, None)
+
         screen = Screen(
-            caption=await _build_report_caption(req),
-            image=await _anime_image(req),
+            caption=caption_text,
+            image=image,
             keyboard=keyboard(
                 [("Pick Source", cb("levi", "sources", code))],
                 [(V.BTN_BACK, cb("levi", "task", code))],
             ),
         )
         await send_screen(client, q.message.chat.id, screen, old_msg=q.message)
+
+    @client.on_callback_query(filters.regex(r"^levi\|reportcancel\|"))
+    async def _report_cancel_cb(_: Client, q: CallbackQuery) -> None:
+        if q.message is None:
+            await q.answer()
+            return
+        code = (q.data or "").split("|", 2)[2]
+        await q.answer()
+
+        cancel_key = f"{q.message.chat.id}:{code}"
+        task = _active_reports.pop(cancel_key, None)
+        if task and not task.done():
+            task.cancel()
+
+        offered = await _has_pending_offer(q.from_user.id, code) if q.from_user else False
+        await _render_detail(q.message.chat.id, code, old_msg=q.message, offered=offered)
 
     @client.on_callback_query(filters.regex(r"^levi\|sources\|"))
     async def _sources_cb(_: Client, q: CallbackQuery) -> None:

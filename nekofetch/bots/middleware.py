@@ -8,7 +8,7 @@ in an early group that resolves the user and enforces limits before feature hand
 from __future__ import annotations
 
 from pyrogram import Client
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ChatType, ParseMode
 from pyrogram.types import CallbackQuery, Message
 
 from nekofetch.core.constants import REDIS_RATELIMIT
@@ -84,7 +84,13 @@ def install_auth_middleware(
             )
             await message.stop_propagation()
         message.nf_user = await _resolve(message.from_user)  # type: ignore[attr-defined]
-        if staff_only_bot and not _is_staff(message.nf_user):
+        # Gate ONLY real humans in a private chat. Channel posts, service
+        # messages, and anonymous-admin posts have no ``from_user`` — gating
+        # them would send the "Staff Access Only" card straight into the channel
+        # the bot administers (Senku/Gojo spamming every distribution channel).
+        is_private = bool(message.chat and message.chat.type == ChatType.PRIVATE)
+        if (staff_only_bot and is_private and message.from_user
+                and not _is_staff(message.nf_user)):
             await _show_gate_msg(message)
             await message.stop_propagation()
 
@@ -95,7 +101,16 @@ def install_auth_middleware(
             await query.stop_propagation()
         query.nf_user = await _resolve(query.from_user)  # type: ignore[attr-defined]
         if staff_only_bot and not _is_staff(query.nf_user):
-            await _show_gate_cb(query)
+            # Only render the full gate card in a private chat; never edit a
+            # channel/group message into it. Elsewhere a private alert to the
+            # tapping user preserves the restriction without posting publicly.
+            msg = query.message
+            is_private = bool(msg and msg.chat and msg.chat.type == ChatType.PRIVATE)
+            if is_private:
+                await _show_gate_cb(query)
+            else:
+                await query.answer("🔒 This bot is for authorized staff only.",
+                                   show_alert=True)
             await query.stop_propagation()
 
     async def _show_gate_msg(message: Message) -> None:

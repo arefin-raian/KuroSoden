@@ -143,7 +143,53 @@ class PipelineManager:
         # ── Connection watchdog ───────────────────────────────────────────────
         self._conn_watchdog_task = asyncio.create_task(self._connection_watchdog())
 
+        # Global admin_client fallback — Gojo is the primary publisher/index actor.
+        self._c.admin_client = self.gojo or next(iter(self._clients.values()), None)  # type: ignore[attr-defined]
+
+        await self._preflight_channels()
+
         log.info("kuro-soden.pipeline.started", bots=list(self._clients.keys()))
+
+    async def _preflight_channels(self) -> None:
+        """Resolve each configured channel with its owning bot and log the result."""
+        cfg = self._c.config
+        tracker = getattr(self._c, "startup_tracker", None)
+
+        # channel-name → (config_section, owning_client)
+        # KuroSoden is a pure bot pipeline — no log/thumbnail "management" channels
+        # (those are NekoFetch concepts). Only the content channels matter:
+        # database/storage (Levi uploads files), main + index (Gojo publishes).
+        channel_map = [
+            ("storage", cfg.storage_channel, self.levi or self._c.admin_client),
+            ("main",    cfg.main_channel,    self.gojo or self._c.admin_client),
+            ("index",   cfg.index_channel,   self.gojo or self._c.admin_client),
+        ]
+
+        for name, ch_cfg, client in channel_map:
+            enabled = getattr(ch_cfg, "enabled", False)
+            cid = getattr(ch_cfg, "channel_id", 0)
+            if not enabled or not cid:
+                log.info("kuro-soden.channel.disabled", channel=name, id=cid)
+                if tracker:
+                    tracker.channel_disabled(name, cid or 0)
+                continue
+            if client is None:
+                log.warning("kuro-soden.channel.unreachable", channel=name, id=cid,
+                            reason="no_client")
+                if tracker:
+                    tracker.channel_fail(name, cid)
+                continue
+            try:
+                chat = await client.get_chat(cid)
+                title = getattr(chat, "title", str(cid))
+                log.info("kuro-soden.channel.ok", channel=name, id=cid, title=title)
+                if tracker:
+                    tracker.channel_ok(name, cid, title)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("kuro-soden.channel.unreachable", channel=name, id=cid,
+                            error=str(exc))
+                if tracker:
+                    tracker.channel_fail(name, cid)
 
     async def _start_bot(self, name: str, env_var: str) -> None:
         """Start a single pipeline bot by name."""
@@ -217,6 +263,45 @@ class PipelineManager:
         """Return the Gojo (Publisher Bot) Pyrogram client."""
         return self._clients.get("gojo")
 
+    # ── download worker lifecycle (used by DatabaseClearService) ──────────────
+
+    async def stop_download_worker(self) -> None:
+        """Stop the download worker and await its in-flight tasks.
+
+        Called by :class:`DatabaseClearService` **before** truncating tables so
+        that no background download task is mid-write when the rows vanish.
+        Without this, an in-flight download finishes after the clear and tries
+        to INSERT a :class:`MediaFile` row — producing a foreign-key or
+        orphaned-row error (or worse, a partial row against an empty DB).
+        """
+        if self._worker is not None:
+            await self._worker.stop()
+        if self._worker_task is not None and not self._worker_task.done():
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._worker = None
+        self._worker_task = None
+        log.info("kuro-soden.download_worker.stopped")
+
+    async def restart_download_worker(self) -> None:
+        """Re-create and re-start the download worker after a DB clear.
+
+        ``recover_on_startup`` re-queues any orphaned jobs — but after a clear
+        there are none, so the loop simply idles until new requests arrive.
+        """
+        if self._worker_task is not None and not self._worker_task.done():
+            return  # already running
+        if not self._c.config.features.download_queue or self.levi is None:
+            return
+        from nekofetch.services.download_service import DownloadWorker
+
+        self._worker = DownloadWorker(self._c)
+        self._worker_task = asyncio.create_task(self._worker.run_forever())
+        log.info("kuro-soden.download_worker.restarted")
+
     # ── connection watchdog ──────────────────────────────────────────────────
 
     async def _connection_watchdog(self) -> None:
@@ -261,12 +346,7 @@ class PipelineManager:
 
     async def stop(self) -> None:
         """Gracefully stop all bots."""
-        if self._worker_task is not None and not self._worker_task.done():
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+        await self.stop_download_worker()
         if self._scheduler is not None:
             self._scheduler.shutdown()
         if self._conn_watchdog_task is not None and not self._conn_watchdog_task.done():

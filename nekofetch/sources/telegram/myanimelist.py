@@ -620,3 +620,43 @@ class MyAnimeListClient:
                 seen.add(t.lower())
                 out.append(t)
         return out
+
+    # ── episode titles ───────────────────────────────────────────────────────
+
+    async def episode_titles(
+        self, mal_id: int, *, max_pages: int = 5
+    ) -> list[dict]:
+        """Fetch episode list with titles from Jikan.
+
+        Returns a list of ``{number: int, title: str}`` sorted by number.
+        Jikan paginates at 100 per page; ``max_pages`` caps the fetch.
+        """
+        episodes: list[dict] = []
+        for page in range(1, max_pages + 1):
+            data = await self._get(
+                f"anime/{mal_id}/episodes", {"page": page}
+            )
+            if not data:
+                break
+            items = data if isinstance(data, list) else data.get("data", [])
+            if not items:
+                break
+            for ep in items:
+                num = ep.get("mal_id") or ep.get("episode_id")
+                title = (ep.get("title") or "").strip()
+                if num is not None:
+                    episodes.append({"number": int(num), "title": title})
+            pagination = (
+                data.get("pagination") if isinstance(data, dict) else None
+            )
+            if pagination and not pagination.get("has_next_page"):
+                break
+        episodes.sort(key=lambda e: e["number"])
+        return episodes
+
+    async def episode_titles_by_query(self, query: str) -> list[dict]:
+        """Search for an anime by title and return its episode titles."""
+        mal_id = await self._best_id(query)
+        if mal_id is None:
+            return []
+        return await self.episode_titles(mal_id)

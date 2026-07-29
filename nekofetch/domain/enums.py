@@ -75,6 +75,7 @@ class ProcessingStage(StrEnum):
     METADATA = "metadata"
     BRANDING = "branding"
     THUMBNAIL = "thumbnail"
+    ENCODE = "encode"
     STORE = "store"
     PUBLISH = "publish"
 

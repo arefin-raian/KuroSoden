@@ -17,7 +17,23 @@ from nekofetch.domain.enums import RequestStatus
 from nekofetch.infrastructure.database.postgres.models import DownloadJob, MediaFile, Request
 from nekofetch.infrastructure.database.postgres.session import session_scope
 from nekofetch.infrastructure.repositories.request_repo import RequestRepository
-from nekofetch.core.parsing import clean_anilist_id
+
+
+def _as_int(value) -> int | None:
+    """Coerce a possibly-string id to ``int``; ``None`` when absent/non-numeric.
+
+    ``franchise_data["anilist_id"]`` is stored as ``str(media.id)`` at the
+    request-creation sites, but ``StoragePack.entry_id`` is an INTEGER column.
+    Feeding the raw string into the pack lookup raises
+    ``operator does not exist: integer = character varying`` and aborts the whole
+    storage upload — so every id that reaches a pack query goes through here.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(slots=True)
@@ -98,12 +114,20 @@ class PublishingService:
                 if f.local_path and Path(f.local_path).exists()
                 and (f.verified or not verify_on)
             ]
-            anime_doc_id = req.anime_doc_id or clean_anilist_id(req.source_ref)
+            from nekofetch.services.download_service import _safe_anime_doc_id
+            anime_doc_id = _safe_anime_doc_id(req)
             title = req.anime_title
             # Extract the AniList entry ID from franchise_data so storage packs
             # track which specific entry (season/movie/OVA) the files belong to.
+            # ``anilist_id`` is stored as a STRING at the request-creation sites
+            # (``str(media.id)``), but ``StoragePack.entry_id`` is an INTEGER
+            # column. Passing the raw string into the pack lookup query produces
+            # ``operator does not exist: integer = character varying`` and the
+            # ENTIRE storage upload fails (uploaded=0). Coerce to ``int | None``.
             fd = req.franchise_data or {}
-            req_entry_id: int | None = fd.get("anilist_id") or fd.get("season_anilist_id")
+            req_entry_id: int | None = _as_int(
+                fd.get("anilist_id") or fd.get("season_anilist_id")
+            )
             snapshot = [
                 {"season": f.season, "season_part": f.season_part,
                  "episode": f.episode, "resolution": f.resolution,
@@ -113,19 +137,34 @@ class PublishingService:
                 for f in files
             ]
 
-        await self._upload_packs(anime_doc_id, title, snapshot, on_progress=on_progress)
+        uploaded_paths = await self._upload_packs(
+            anime_doc_id, title, snapshot, on_progress=on_progress,
+        )
 
-        # Uploaded to the storage channel — delivery serves from Telegram file_ids,
-        # not local disk, so every local file is now redundant. Delete them all so
-        # nothing accumulates. Best-effort: cleanup must never fail the pipeline.
-        self._cleanup_local_files(snapshot, code=code, title=title)
+        # Only delete local files that were CONFIRMED uploaded to the storage
+        # channel. If the channel is disabled, unreachable, or any pack failed,
+        # the affected files are kept so the operator can fix config and
+        # reprocess — losing the only local copy of un-uploaded content is far
+        # worse than leaving some files behind.
+        all_paths = {s["path"] for s in snapshot if s.get("path")}
+        if all_paths and uploaded_paths >= all_paths:
+            self._cleanup_local_files(snapshot, code=code, title=title)
+        else:
+            from nekofetch.core.logging import get_logger
+            get_logger(__name__).warning(
+                "publish.storage.incomplete_keeping_files",
+                code=code, title=title,
+                uploaded=len(uploaded_paths), total=len(all_paths),
+                storage_enabled=self._c.config.storage_channel.enabled,
+            )
 
         from nekofetch.services.log_channel_service import LogChannelService
 
+        uploaded_count = len([s for s in snapshot if s.get("path") in uploaded_paths])
         await LogChannelService(self._c).event(
-            "download", "stored", code=code, anime=title, files=len(snapshot),
+            "download", "stored", code=code, anime=title, files=uploaded_count,
         )
-        return len(snapshot)
+        return uploaded_count
 
     def _cleanup_local_files(self, snapshot: list[dict], *, code: str, title: str) -> None:
         """Delete every local file for a request after a successful storage upload.
@@ -205,7 +244,8 @@ class PublishingService:
                 f.published = True
             req.status = RequestStatus.PUBLISHED
             count = len(files)
-            anime_doc_id = req.anime_doc_id or clean_anilist_id(req.source_ref)
+            from nekofetch.services.download_service import _safe_anime_doc_id
+            anime_doc_id = _safe_anime_doc_id(req)
             title = req.anime_title
             first = next((f for f in files if f.local_path), None)
             res = first.resolution if first else None
@@ -390,10 +430,25 @@ class PublishingService:
         )
 
     async def _upload_packs(self, anime_doc_id: str, title: str, files: list[dict],
-                            *, on_progress=None) -> None:
-        """Group published files by (season, resolution, audio, entry_id) and upload each as a pack."""
-        if not self._c.config.storage_channel.enabled or not files:
-            return
+                            *, on_progress=None) -> set[str]:
+        """Group published files by (season, resolution, audio, entry_id) and upload each as a pack.
+
+        Returns the set of local file paths that were CONFIRMED uploaded to the
+        storage channel, so the caller only cleans up what actually shipped.
+        """
+        from nekofetch.core.logging import get_logger
+        _log = get_logger(__name__)
+
+        if not self._c.config.storage_channel.enabled:
+            # Loud, not silent: a disabled storage channel means NOTHING reaches
+            # the database channel — the operator must know why, and files must
+            # NOT be cleaned up (the caller checks the returned set).
+            _log.warning("publish.storage_channel_disabled",
+                         anime=anime_doc_id, title=title, files=len(files),
+                         hint="set storage_channel.enabled + channel_id to upload packs")
+            return set()
+        if not files:
+            return set()
         from pathlib import Path
 
         from nekofetch.core.exceptions import FeatureDisabled
@@ -409,7 +464,25 @@ class PublishingService:
             _content_type_label,
         )
 
-        for (season, season_part, resolution, audio, entry_id), items in groups.items():
+        # Post packs smallest-resolution-first (480p → 720p → 1080p) within each
+        # season, so the database channel reads in ascending quality order. A
+        # missing/garbage resolution token sorts last. Season/part lead the key
+        # so a multi-season upload still groups each season's tiers together.
+        def _res_rank(res: str) -> int:
+            digits = "".join(ch for ch in (res or "") if ch.isdigit())
+            return int(digits) if digits else 10_000
+
+        ordered_groups = sorted(
+            groups.items(),
+            key=lambda kv: (
+                kv[0][0] if kv[0][0] is not None else -1,   # season
+                kv[0][1] if kv[0][1] is not None else -1,   # season_part
+                _res_rank(kv[0][2]),                          # resolution asc
+            ),
+        )
+
+        uploaded_paths: set[str] = set()
+        for (season, season_part, resolution, audio, entry_id), items in ordered_groups:
             if not resolution or audio is None:
                 continue
             items.sort(key=lambda x: (x["episode"] or 0))
@@ -440,13 +513,16 @@ class PublishingService:
                     thumb=poster,
                     on_progress=on_progress,
                 )
+                # Pack persisted → these files are safely in the channel.
+                uploaded_paths.update(i["path"] for i in items if i.get("path"))
             except FeatureDisabled:
-                return
+                _log.warning("publish.storage_channel_disabled_midway",
+                             anime=anime_doc_id, season=season, resolution=resolution)
+                return uploaded_paths
             except Exception as exc:  # noqa: BLE001 - one pack failing shouldn't abort publish
-                from nekofetch.core.logging import get_logger
-
-                get_logger(__name__).warning("publish.upload_pack.failed",
-                                             season=season, resolution=resolution, error=str(exc))
+                _log.warning("publish.upload_pack.failed",
+                             season=season, resolution=resolution, error=str(exc))
+        return uploaded_paths
 
     async def reprocess(self, code: str) -> None:
         async with session_scope(self._c.pg_sessionmaker) as session:

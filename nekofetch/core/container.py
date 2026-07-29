@@ -37,6 +37,13 @@ class Container:
         self.config = config
         self.cipher = TokenCipher(env.secret_key)
 
+        # Secret lives in .env: let ``TELEGRAPH_ACCESS_TOKEN`` override the
+        # (optional) config.yaml ``thumbnail_channel.telegraph_access_token`` so
+        # every reader (image_backup, senku_thumbnail_adapter, thumbnail_channel_
+        # service, publishing_service gate, bot_content) sees one resolved value.
+        if getattr(env, "telegraph_access_token", ""):
+            self.config.thumbnail_channel.telegraph_access_token = env.telegraph_access_token
+
         # Stateless singletons available immediately. Reuse the one shared catalog
         # (absolute path, CWD-independent) so t() and container.localizer.get()
         # read the same en.json and edits propagate on restart.
@@ -150,16 +157,30 @@ class Container:
         from redis.backoff import ExponentialBackoff
         from redis.retry import Retry
 
-        self.redis = Redis.from_url(
-            self.env.redis_url,
-            decode_responses=True,
-            health_check_interval=30,
-            socket_keepalive=True,
-            socket_connect_timeout=10,
-            socket_timeout=10,
-            retry_on_timeout=True,
-            retry=Retry(ExponentialBackoff(cap=10, base=0.5), retries=3),
-        )
+        try:
+            self.redis = Redis.from_url(
+                self.env.redis_url,
+                decode_responses=True,
+                health_check_interval=30,
+                socket_keepalive=True,
+                socket_connect_timeout=15,
+                socket_timeout=15,
+                retry_on_timeout=True,
+                retry=Retry(ExponentialBackoff(cap=10, base=0.5), retries=3),
+            )
+            await self.redis.ping()
+            log.info("redis.connected", url=self.env.redis_url.split("@")[-1])
+        except Exception as exc:
+            log.error(
+                "redis.connect.failed",
+                url=self.env.redis_url.split("@")[-1],
+                error=str(exc),
+                hint=(
+                    "TLS on port 6379 may be blocked by your firewall/antivirus. "
+                    "Try a local Redis (redis://localhost:6379) or check your network."
+                ),
+            )
+            raise
         self.progress = ProgressStore(self.redis)
 
         # Apply persisted runtime overrides (admin settings panel) over config.yaml.

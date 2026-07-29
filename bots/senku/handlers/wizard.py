@@ -361,7 +361,13 @@ def register(client: Client, container: Container) -> None:
         )
 
     async def _verify_and_store(chat_id: int, user_id: int, code: str, raw: str) -> None:
-        """Resolve the channel, confirm Senku is an admin there, store it, advance."""
+        """Resolve the channel, confirm BOTH Senku and Gojo are admins, store, advance.
+
+        Senku posts the info card / watch guide; Gojo runs the publishing side —
+        so both bots must be admins before we proceed. We resolve the channel with
+        Senku (which becomes the cached peer), then check Gojo's membership through
+        Senku's peer by Gojo's user id, so Gojo needn't have seen the channel yet.
+        """
         handle = raw.strip()
         target: str | int = handle
         if not handle.startswith("@") and not handle.lstrip("-").isdigit():
@@ -369,23 +375,46 @@ def register(client: Client, container: Container) -> None:
         elif handle.lstrip("-").isdigit():
             target = int(handle)
 
+        def _is_admin_status(member) -> bool:
+            status = getattr(getattr(member, "status", None), "value",
+                             str(getattr(member, "status", "")))
+            return status in ("administrator", "creator")
+
         chat = None
-        is_admin = False
+        senku_ok = False
+        missing: list[str] = []
         try:
             chat = await client.get_chat(target)
             me = await client.get_chat_member(chat.id, "me")
-            status = getattr(getattr(me, "status", None), "value", str(getattr(me, "status", "")))
-            is_admin = status in ("administrator", "creator")
+            senku_ok = _is_admin_status(me)
         except Exception as exc:  # noqa: BLE001 — bad handle / not a member / not admin
             log.info("senku.wiz.verify_failed", code=code, handle=handle, error=str(exc))
+
+        # Verify Gojo (the publisher bot) is also an admin. Best-effort: in a
+        # single-bot/test container with no pipeline manager we don't block.
+        gojo = getattr(getattr(container, "pipeline_manager", None), "gojo", None)
+        gojo_ok = True
+        if chat is not None and gojo is not None:
+            gojo_ok = False
+            try:
+                gojo_me = await gojo.get_me()
+                gm = await client.get_chat_member(chat.id, gojo_me.id)
+                gojo_ok = _is_admin_status(gm)
+            except Exception as exc:  # noqa: BLE001 — not a member ⇒ not admin
+                log.info("senku.wiz.gojo_verify_failed", code=code, error=str(exc))
 
         display = f"@{chat.username}" if chat and chat.username else (
             chat.title if chat else handle
         )
-        if chat is None or not is_admin:
+        if not senku_ok:
+            missing.append("Senku (me)")
+        if not gojo_ok:
+            missing.append("Gojo")
+        if chat is None or missing:
             await send_screen(
                 client, chat_id,
-                card(V.channel_verify_failed(display), image=pick_artwork(BOT), bot_name=BOT,
+                card(V.channel_verify_failed(display, missing or None),
+                     image=pick_artwork(BOT), bot_name=BOT,
                      buttons=[
                          [(V.BTN_CHANNEL_DONE, cb(BOT, "wiz", "chandone", code))],
                          [(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))],
@@ -642,8 +671,12 @@ def register(client: Client, container: Container) -> None:
         chat_id = q.message.chat.id
 
         if action == "open":
+            # One click from the handoff: land directly on "who creates the
+            # channel?" instead of an intermediate franchise-map + Begin card
+            # (Levi already showed the map at download time). _scope_step seeds
+            # the cache via _channel_ctx, so nothing is skipped.
             await q.answer()
-            await _open(chat_id, code, old_msg=q.message)
+            await _scope_step(chat_id, code, old_msg=q.message)
         elif action == "scope":
             await q.answer()
             await _scope_step(chat_id, code, old_msg=q.message)

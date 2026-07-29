@@ -272,12 +272,17 @@ class MiruroSource(AnimeSource):
                 "/search",
                 params={"query": query, "page": 1, "per_page": 20},
             )
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            log.warning("miruro.search.failed", query=query, error=str(exc))
             return []
         rows = data.get("results") if isinstance(data, dict) else data
         if not isinstance(rows, list):
+            log.warning("miruro.search.bad_response", query=query, data_type=type(data).__name__)
             return []
-        return [self._stub(row) for row in rows if row.get("id")]
+        stubs = [self._stub(row) for row in rows if row.get("id")]
+        if not stubs:
+            log.info("miruro.search.no_results", query=query, raw_count=len(rows))
+        return stubs
 
     async def get_details(self, source_ref: str) -> AnimeDetails:
         aid = _anilist_ref(source_ref)
@@ -538,18 +543,25 @@ class MiruroSource(AnimeSource):
         }
 
     async def coverage(self, *titles: str) -> SourceCoverage | None:
-        query = next((t for t in titles if t), "")
-        if not query:
+        candidates = [t for t in titles if t]
+        if not candidates:
             return SourceCoverage(
                 source=self.name, matched_title="", source_ref="", available=False,
             )
-        hits = await self.search(query)
-        if not hits:
+        stub = None
+        searched = ""
+        for query in candidates:
+            searched = query
+            hits = await self.search(query)
+            if hits:
+                stub = hits[0]
+                break
+        if not stub:
+            log.warning("miruro.coverage.no_match", candidates=candidates)
             return SourceCoverage(
-                source=self.name, matched_title=query, source_ref="", available=False,
-                note="no confident match",
+                source=self.name, matched_title=searched, source_ref="",
+                available=False, note="no confident match",
             )
-        stub = hits[0]
         try:
             data = await self._get_json(f"/episodes/{stub.source_ref}")
             total, subbed, dubbed, dual = _count_audio_coverage(data)

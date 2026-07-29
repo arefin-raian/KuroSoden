@@ -127,13 +127,23 @@ class DistributionCache:
         if not franchise:
             # Intake stored no franchise data (e.g. Telegram-source or a provider
             # miss) — fall back to a live resolve so the wizard still has a map.
-            try:
-                from kurosoden.shared.franchise_resolver import resolve_franchise
+            # NEVER resolve with the request CODE (``REQ-1058``): it isn't a
+            # searchable title and would leak straight into the @acutebot /anime
+            # query (and then surface as the channel/AcuteBot "title"). Only
+            # resolve when we have a real anime title.
+            title = getattr(req, "anime_title", None)
+            if title:
+                try:
+                    from kurosoden.shared.franchise_resolver import resolve_franchise
 
-                title = getattr(req, "anime_title", None) or code
-                franchise = await resolve_franchise(self._c, title) or {}
-            except Exception as exc:  # noqa: BLE001
-                log.debug("dist_cache.resolve.live_failed", code=code, error=str(exc))
+                    franchise = await resolve_franchise(self._c, title) or {}
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("dist_cache.resolve.live_failed", code=code, error=str(exc))
+                    franchise = {}
+            else:
+                log.warning("dist_cache.resolve.no_title", code=code,
+                            hint="request has no anime_title; skipping live resolve "
+                                 "so the code is never sent to metadata providers")
                 franchise = {}
 
         if franchise:

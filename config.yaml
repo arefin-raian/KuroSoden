@@ -15,7 +15,10 @@
 features:
   request_system: true          # Lelouch: accept user requests
   download_queue: true          # Levi: run the download queue
-  distribution_bots: true       # Senku/Gojo: auto-create & run delivery bots
+  # KuroSoden delivers through admin-built distribution CHANNELS (Senku), NOT
+  # auto-created delivery bots. Leave this OFF so the NekoFetch bot-orchestrator
+  # path (BotOrchestratorService.ensure_bot_for_anime) never fires on publish.
+  distribution_bots: false      # was true — no auto-created delivery bots
   metadata_editing: true        # rewrite container metadata during processing
   thumbnail_generation: true    # generate/attach video thumbnails
   temporary_links: true         # expiring delivery deep-links
@@ -36,10 +39,21 @@ downloads:
 processing:
   verify_files: true              # integrity-check each file after download
   branding: true                  # apply branding (metadata author/comment/footer)
+  # Torrents deliver one (1080p) file per episode; derive the lower tiers
+  # ourselves so every release ships 3 qualities. Streaming sources acquire
+  # their own qualities and skip encoding. encode_heights upload smallest-first
+  # (packs post as 480p → 720p → 1080p).
+  encode: true
+  encode_heights: [720, 480]
   # false (default): auto-publish to main + index channels and bring up the
   # distribution bot right after storage upload — no admin click.
   # true: gate publishing behind an admin approval card.
-  require_approval_before_publish: false
+  #
+  # KuroSoden gates publishing on the admin: when a download completes, the
+  # handoff assigns Senku and posts an "Open Distribution" card. The admin then
+  # decides to build a distribution CHANNEL. Auto-publish (which would fire the
+  # NekoFetch bot-orchestrator) must therefore stay OFF.
+  require_approval_before_publish: true
 
 # File naming. Movies/specials have no meaningful S/E pair, so they get their
 # own templates instead of being forced into "S90E01".
@@ -123,7 +137,7 @@ storage_channel:
 # edited-in-place section messages (dashboard, pending, active, completed,
 # notices, catalog) plus a divider sticker and a cover image.
 log_channel:
-  enabled: true
+  enabled: false                  # KuroSoden is a pure bot pipeline — no log channel
   channel_id: -1004429939823
   sections: true                  # full sectioned control center
   reserved_slots: 2               # reserved msgs per growth-prone section
@@ -200,7 +214,7 @@ index_channel:
 # Telegraph galleries) before the Playwright renderer builds each thumbnail.
 # Requires a Telegraph token (https://api.telegra.ph/createAccount).
 thumbnail_channel:
-  enabled: true
+  enabled: false                  # KuroSoden is a pure bot pipeline — no thumbnail channel
   channel_id: -1004417091364
   cover_image: "https://im.gurl.eu.org/file/AgACAgEAAxkDAAEBkp9qTTIfT1ycV-GJUUR48oXqo338wgAC2A1rGyYwaEaxdNmL5swENAEAAwIAA3cAAzwE.png"
   divider_sticker_id: "CAACAgUAAxkBAAI0vGpAOaZ7gJ6Yk9MtJ63jm0sYmDysAAIYAANDc8kSzixbXL29lfc8BA"
@@ -225,7 +239,10 @@ localization:
 
 # Distribution-bot creation & profile.
 bot:
-  auto_create_on_publish: true
+  # KuroSoden does NOT auto-create delivery bots — distribution runs through
+  # admin-built channels (Senku). Kept false as a second guard alongside
+  # features.distribution_bots.
+  auto_create_on_publish: false
   health_check_interval_minutes: 60
   delivery_retention_days: 7
   avatar_source: tmdb             # tmdb | anilist

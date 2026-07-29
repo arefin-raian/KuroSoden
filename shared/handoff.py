@@ -135,8 +135,8 @@ def _stage_caption(
         who = ""
         if requester_id is not None:
             who = (
-                f"\n👤 <b>By:</b> {html.escape(requester or 'user')} "
-                f"(<code>{requester_id}</code>)\n"
+                f"\n👤 <b>By</b> : {html.escape(requester or 'user')} "
+                f"(<code>{requester_id}</code>)"
             )
         header = "⚔️ Levi Offer" if is_offer else "⚔️ New Download Task"
         body = (
@@ -146,10 +146,11 @@ def _stage_caption(
             "Assigned to download. Open Levi, pick the source, and cut the queue clean."
         )
         return (
-            f"<b>{header}</b>\n\n"
+            f"<blockquote><b>{header}</b>\n\n"
             f"<b>{escaped_title}</b>\n"
-            f"<code>{code}</code> · {_franchise_bits(franchise_json or {})}{who}\n"
-            f"<i>{body}</i>"
+            f"<code>{code}</code> · {_franchise_bits(franchise_json or {})}"
+            f"{who}</blockquote>\n\n"
+            f"<blockquote><i>{body}</i></blockquote>"
         )
     if stage == "senku":
         header = "🧪 Senku Offer" if is_offer else "🧪 Ready for Distribution"

@@ -41,6 +41,10 @@ class AnalyticsService:
                      anime_doc_id: str | None = None, data: dict | None = None) -> None:
         if not self._c.config.features.analytics:
             return
+        # anime_doc_id is varchar(48) — clamp defensively so a torrent source_ref
+        # blob (or any other oversized value) never crashes the analytics insert.
+        if anime_doc_id and len(anime_doc_id) > 48:
+            anime_doc_id = anime_doc_id[:48]
         async with session_scope(self._c.pg_sessionmaker) as session:
             session.add(
                 AnalyticsEvent(

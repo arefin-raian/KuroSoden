@@ -66,10 +66,14 @@ log = get_logger(__name__)
 
 
 # Default Redis-call timeout. Upstash's free tier can stall up to 3-5s on a
-# blip; this cap leaves headroom so a single slow read can't starve every
-# other apscheduler job in the same tick. Tests ``patch`` this constant to
-# drive ``asyncio.wait_for`` under a sub-second budget.
-_REDIS_READ_TIMEOUT_S = 2.0
+# blip, and a remote Redis reached from a home connection (e.g. Windows →
+# Upstash) adds real round-trip latency on top. 2s was too tight for that
+# path and produced a stream of spurious ``redis.timeout`` warnings; 5s leaves
+# headroom for a slow blip while still capping well under the 15s socket
+# timeout so a single slow read can't starve every other apscheduler job in
+# the same tick. Tests ``patch`` this constant to drive ``asyncio.wait_for``
+# under a sub-second budget.
+_REDIS_READ_TIMEOUT_S = 5.0
 
 
 async def safe_redis_get(redis, key: str, *, timeout: float | None = None,

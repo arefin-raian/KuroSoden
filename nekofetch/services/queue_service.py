@@ -140,7 +140,14 @@ class QueueService:
 
     async def cancel_all_active(self) -> int:
         """Cancel EVERY active/queued/orphaned job and clear their live progress —
-        the 'wipe the download state' button. Returns how many were cancelled."""
+        the 'wipe the download state' button. Returns how many were cancelled.
+
+        Also **deletes** the job rows from the DB and wipes the on-disk work
+        directory so no stale files remain after a full clear.
+        """
+        import shutil
+        from pathlib import Path
+
         async with session_scope(self._c.pg_sessionmaker) as session:
             jobs = await QueueRepository(session).by_status(
                 JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.PAUSED,
@@ -148,6 +155,10 @@ class QueueService:
             ids = [j.id for j in jobs]
             for job in jobs:
                 job.status = JobStatus.CANCELLED
+            # Also collect ALL non-active jobs so we can fully purge the table.
+            all_jobs = await QueueRepository(session).list(limit=100_000)
+            for job in all_jobs:
+                await session.delete(job)
         for jid in ids:
             if self._c.progress:
                 await self._c.progress.delete(jid)
@@ -158,6 +169,11 @@ class QueueService:
                 await safe_redis_set(self._c.redis, f"nf:job:{jid}:cancel",
                                       "1", label="queue.cancel_all.signal",
                                       ex=600)
+        # Wipe the on-disk work directory to reclaim storage from partial/stale
+        # downloads. The directory is recreated on demand by the download service.
+        work_dir = Path(self._c.env.storage_path) / "work"
+        if work_dir.is_dir():
+            shutil.rmtree(work_dir, ignore_errors=True)
         return len(ids)
 
     async def counts(self) -> dict[str, int]:

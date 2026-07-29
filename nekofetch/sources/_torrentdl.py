@@ -53,7 +53,7 @@ async def download_torrent_file(
     max_seconds: int = 1800,
     stop_idle: int = 180,
 ) -> dict:
-    """Download a single file from a torrent, preserving its original name.
+    """Download a single file from a torrent and place it at ``dest``.
 
     ``info`` carries ``torrent_url``, ``file_index`` (1-based, bencode order),
     ``path`` and ``name``. Returns the downloaded file path + stats. Raises on
@@ -66,25 +66,34 @@ async def download_torrent_file(
     work = dest.parent
     work.mkdir(parents=True, exist_ok=True)
 
-    # Fetch the .torrent (small) ourselves so aria2 starts immediately.
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True,
-                                 headers={"User-Agent": "Mozilla/5.0"}) as c:
-        tr = await c.get(info["torrent_url"])
-        tr.raise_for_status()
+    # Acquire the .torrent file — from a local path, a remote URL, or a magnet.
     torrent_path = work / ".release.torrent"
-    torrent_path.write_bytes(tr.content)
+    magnet_uri = info.get("magnet")
 
-    # Flatten the selected file to <dir>/<name>, dropping the (often very long)
-    # release folder — avoids Windows MAX_PATH (260) failures on batch releases
-    # while still preserving the original filename.
+    if info.get("torrent_path"):
+        src = Path(info["torrent_path"])
+        if src.exists():
+            shutil.copy2(str(src), str(torrent_path))
+        else:
+            raise RuntimeError(f"provided .torrent not found: {src}")
+    elif magnet_uri:
+        pass  # magnet URIs are passed directly to aria2c (no .torrent file)
+    else:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True,
+                                     headers={"User-Agent": "Mozilla/5.0"}) as c:
+            tr = await c.get(info["torrent_url"])
+            tr.raise_for_status()
+        torrent_path.write_bytes(tr.content)
+
+    # aria2c downloads to a temp name; we rename to `dest` after completion.
     out_name = info["name"]
     cmd = [
         aria2,
         "--dir", str(work),
         "--select-file", str(info["file_index"]),
         f"--index-out={info['file_index']}={out_name}",
-        "--seed-time=0",                       # stop seeding the moment it's done
-        f"--bt-stop-timeout={stop_idle}",      # give up if no progress for a while
+        "--seed-time=0",
+        f"--bt-stop-timeout={stop_idle}",
         "--max-connection-per-server=16",
         "--split=16",
         "--bt-max-peers=200",
@@ -97,7 +106,7 @@ async def download_torrent_file(
         "--console-log-level=warn",
         "--bt-save-metadata=false",
         "--allow-overwrite=true",
-        str(torrent_path),
+        magnet_uri if magnet_uri else str(torrent_path),
     ]
 
     proc = await asyncio.create_subprocess_exec(
@@ -105,6 +114,7 @@ async def download_torrent_file(
     )
 
     last_pct = -1
+    file_length = int(info.get("length") or 0)
 
     async def pump() -> None:
         nonlocal last_pct
@@ -116,7 +126,10 @@ async def download_torrent_file(
                 pct = int(m.group(1))
                 if pct != last_pct:
                     last_pct = pct
-                    await on_progress(pct, 100)
+                    if file_length:
+                        await on_progress(pct * file_length // 100, file_length)
+                    else:
+                        await on_progress(pct, 100)
 
     try:
         await asyncio.wait_for(asyncio.gather(pump(), proc.wait()), timeout=max_seconds)
@@ -127,7 +140,9 @@ async def download_torrent_file(
     if proc.returncode != 0:
         raise RuntimeError(f"aria2c exited {proc.returncode}")
 
-    # With --index-out the file lands flat at work/<name>.
+    # Locate the downloaded file — --index-out flattens to work/<name>, but
+    # fall back to a recursive search if aria2c placed it in the torrent's
+    # original directory structure instead.
     out = work / out_name
     if not out.exists():
         matches = list(work.rglob(info["name"]))
@@ -135,19 +150,40 @@ async def download_torrent_file(
             raise RuntimeError(f"downloaded file not found: {info['name']}")
         out = matches[0]
 
+    # Move the file to the structured `dest` path that the download service
+    # expects (e.g. S01E001_1080p_dual_audio.mkv).  This ensures the
+    # MediaFile.local_path stored in the DB points to an existing file so the
+    # processing pipeline can find it.
+    if out != dest:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(out), str(dest))
+        out = dest
+
+    # Clean up aria2c artifacts.
     torrent_path.unlink(missing_ok=True)
-    aria_ctrl = out.with_name(out.name + ".aria2")
+    aria_ctrl = dest.with_name(dest.name + ".aria2")
     aria_ctrl.unlink(missing_ok=True)
 
-    size = out.stat().st_size
+    # Remove the torrent's original directory structure — aria2c creates it as
+    # a side effect of piece-boundary alignment even with --select-file.  Walk
+    # top-level subdirectories of the work folder; only remove dirs (never the
+    # flat files that belong to other episodes).
+    for child in work.iterdir():
+        if child.is_dir() and child.name != ".":
+            try:
+                shutil.rmtree(child, ignore_errors=True)
+            except Exception:
+                pass
+
+    size = dest.stat().st_size
     if on_progress:
-        await on_progress(100, 100)
+        await on_progress(size, size)
     import hashlib
     sha = hashlib.sha256()
-    sha.update(out.read_bytes())
+    sha.update(dest.read_bytes())
     return {
-        "path": str(out),
-        "name": out.name,
+        "path": str(dest),
+        "name": dest.name,
         "bytes": size,
         "checksum": sha.hexdigest(),
         "complete": True,

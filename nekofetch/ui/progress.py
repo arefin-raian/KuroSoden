@@ -122,16 +122,31 @@ def queue_block_html(
     )
 
 
-def human_bytes(num: float) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(num) < 1024.0:
+def human_bytes(num: float, *, floor_unit: str = "MB") -> str:
+    """Format byte count with a minimum display unit.
+
+    By default the smallest unit shown is MB — raw B/KB values are promoted to
+    ``0.0 MB`` so progress cards never read "16.0 B" when the actual figure is
+    negligible or the value hasn't populated yet.
+    """
+    _UNITS = ("B", "KB", "MB", "GB", "TB")
+    floor_idx = _UNITS.index(floor_unit) if floor_unit in _UNITS else 2
+    for i, unit in enumerate(_UNITS):
+        if abs(num) < 1024.0 or i == len(_UNITS) - 1:
+            if i < floor_idx:
+                # Value is below the floor unit — convert to the floor unit.
+                while i < floor_idx:
+                    num /= 1024.0
+                    i += 1
+                return f"{num:.1f} {_UNITS[floor_idx]}"
             return f"{num:.1f} {unit}"
         num /= 1024.0
     return f"{num:.1f} PB"
 
 
 def human_speed(bps: float) -> str:
-    return f"{human_bytes(bps)}/s"
+    """Format speed with a minimum display unit of MB/s."""
+    return f"{human_bytes(bps, floor_unit='MB')}/s"
 
 
 def human_eta(seconds: int | None) -> str:
@@ -140,8 +155,8 @@ def human_eta(seconds: int | None) -> str:
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     if h:
-        return f"{h:02d}h {m:02d}m"
-    return f"{m:02d}m {s:02d}s"
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 def human_elapsed(seconds: int | None) -> str:
@@ -182,13 +197,21 @@ def download_card_html(
     retry_reason: str | None = None,
     low_disk: bool = False,
 ) -> str:
-    """Live Levi transfer card for download, retry, processing, and upload stages."""
+    """Live Levi transfer card for download, retry, processing, and upload stages.
+
+    Adapts the detail block based on the current stage:
+    - **Download / Upload / Encoding**: full Transfer panel (speed, size, ETA, elapsed)
+    - **Processing stages** (branding, watermarking, metadata, etc.): compact
+      Progress panel (just progress bar + elapsed)
+    """
     title_bits = [_esc(title)]
     if current_episode is not None:
         title_bits.append(f"[S{(season or 1):02d}E{int(current_episode):02d}]")
-    variant_bits = [b for b in (resolution, (audio or "").upper() or None) if b]
-    if variant_bits:
-        title_bits.append(f"[{_esc(' · '.join(variant_bits))}]")
+    if resolution:
+        title_bits.append(f"[{_esc(resolution)}]")
+    if audio:
+        # Normalize underscores → spaces for display (e.g. DUAL_AUDIO → DUAL AUDIO)
+        title_bits.append(f"[{_esc(audio.upper().replace('_', ' '))}]")
 
     if retry_attempt and retry_max:
         reason = f" · {_esc(retry_reason)}" if retry_reason else ""
@@ -198,28 +221,60 @@ def download_card_html(
     else:
         stage_label = "Downloading"
 
-    if total_bytes > 0:
-        size = f"{human_bytes(downloaded_bytes)} / {human_bytes(total_bytes)}"
-    elif downloaded_bytes > 0:
-        size = human_bytes(downloaded_bytes)
-    else:
-        size = "—"
-    speed = human_speed(speed_bps) if speed_bps > 0 else "—"
-    eta = human_eta(eta_seconds) if eta_seconds is not None else "—"
     elapsed = human_elapsed(elapsed_seconds)
     percent = int(max(0.0, min(100.0, progress)))
-    filled = round(percent / 100 * 10)
-    cells = "■" * filled + "□" * (10 - filled)
+    filled = round(percent / 100 * 16)
+    cells = "■" * filled + "□" * (16 - filled)
     warning = f"\n\n<blockquote>{t(M.DL_CARD_LOW_DISK)}</blockquote>" if low_disk else ""
 
-    return (
-        f"<blockquote><b>{' '.join(title_bits)}</b> <b>@AniXWeebs</b></blockquote>\n"
+    header = (
+        f"<blockquote><b>📺 {' '.join(title_bits)} @AniXWeebs</b></blockquote>\n"
         f"<blockquote><b><u>‣ Status : </u></b><i><u>{stage_label}</u></i>\n"
         f"<b>[{cells}] {percent}%</b></blockquote>\n"
-        f"<blockquote><b><u>Transfer</u>\n"
-        f"├─ ⚡ Speed             </b> {speed}\n"
-        f"<b>├─ Downloaded        </b> {size}\n"
-        f"<b>├─ ⌛ ETA               </b> {eta}\n"
-        f"<b>└─ ⏱️ Elapsed          </b> {elapsed}</blockquote>"
-        f"{warning}"
     )
+
+    # Stages that have meaningful transfer stats (speed, size, ETA).
+    _TRANSFER_STAGES = {
+        "downloading", "download", "uploading", "upload",
+        "encoding", "transcoding", "transcode", "compressing",
+    }
+    stage_key = (stage or "downloading").strip().lower()
+
+    if stage_key in _TRANSFER_STAGES:
+        # Full transfer panel
+        if total_bytes > 0:
+            total_str = human_bytes(total_bytes)
+            total_val, total_unit = total_str.rsplit(" ", 1)
+            dl_in_total_unit = downloaded_bytes
+            for u in ("B", "KB", "MB", "GB", "TB"):
+                if u == total_unit:
+                    break
+                dl_in_total_unit /= 1024.0
+            size = f"{dl_in_total_unit:.1f} / {total_val} {total_unit}"
+        elif downloaded_bytes > 0:
+            size = human_bytes(downloaded_bytes)
+        else:
+            size = "—"
+        speed = human_speed(speed_bps) if speed_bps > 0 else "—"
+        eta = human_eta(eta_seconds) if eta_seconds is not None else "—"
+
+        detail = (
+            f"<blockquote><b><u>Transfer</u>\n"
+            f"├─ ⚡ Speed             </b> {speed}\n"
+            f"<b>├─ 📂 Downloaded  </b> {size}\n"
+            f"<b>├─ ⌛ ETA                 </b> {eta}\n"
+            f"<b>└─ ⏱️ Elapsed          </b> {elapsed}</blockquote>"
+        )
+    else:
+        # Compact panel for processing stages (branding, watermarking, metadata,
+        # verifying, thumbnail, rename, store, etc.)
+        ep_info = ""
+        if episode_index is not None and total_episodes is not None:
+            ep_info = f"<b>├─ 📁 File                  </b> {episode_index} / {total_episodes}\n"
+        detail = (
+            f"<blockquote><b><u>Progress</u>\n"
+            f"{ep_info}"
+            f"<b>└─ ⏱️ Elapsed          </b> {elapsed}</blockquote>"
+        )
+
+    return f"{header}{detail}{warning}"

@@ -223,9 +223,60 @@ class IndexChannelService:
         self._c = container
         self.cfg = container.config.index_channel
 
+    # ── Client selection: Gojo (Publisher) is the PRIMARY actor for the index
+    # channel — it edits letter cards, reserved posts, inline buttons, and the
+    # poster grid. But the legacy index posts were authored by the NekoFetch
+    # admin bot, and Telegram only lets a bot edit its OWN messages, so any Gojo
+    # edit that lands on one of those fails with MESSAGE_AUTHOR_REQUIRED. When it
+    # does, we transparently fall back to the admin client (NekoFetch), which
+    # authored them and thus can edit them — NekoFetch acts as Gojo's substitute
+    # for anything Gojo lacks permission to touch. A userbot is deliberately NOT
+    # used: user accounts cannot attach inline keyboards, which the index needs.
+    _FALLBACK_ERRORS = (
+        "MESSAGE_AUTHOR_REQUIRED",
+        "CHAT_ADMIN_REQUIRED",
+        "CHAT_WRITE_FORBIDDEN",
+        "MESSAGE_ID_INVALID",
+        "FORBIDDEN",
+    )
+
+    def _primary_client(self):
+        """Gojo (Publisher) client if running, else the admin client as substitute."""
+        pm = getattr(self._c, "pipeline_manager", None)
+        gojo = getattr(pm, "gojo", None) if pm else None
+        return gojo or getattr(self._c, "admin_client", None)
+
+    def _admin_client(self):
+        return getattr(self._c, "admin_client", None)
+
+    async def _client_call(self, method: str, *args, **kwargs):
+        """Invoke a Pyrogram method on Gojo, falling back to NekoFetch when Gojo
+        lacks permission to act on the target message (e.g. a legacy admin-authored
+        post → MESSAGE_AUTHOR_REQUIRED).
+
+        MESSAGE_NOT_MODIFIED is re-raised unchanged so callers keep their idempotent
+        handling; only permission/authorship failures trigger the single fallback.
+        """
+        primary = self._primary_client()
+        admin = self._admin_client()
+        try:
+            return await getattr(primary, method)(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            text = str(exc).upper()
+            if "MESSAGE_NOT_MODIFIED" in text:
+                raise
+            if admin is None or admin is primary:
+                raise
+            if not any(code in text for code in self._FALLBACK_ERRORS):
+                raise
+            log.info("index.client.fallback", method=method, reason=str(exc)[:80])
+            return await getattr(admin, method)(*args, **kwargs)
+
     def _active(self) -> bool:
-        client = getattr(self._c, "admin_client", None)
-        return bool(self.cfg.enabled and self.cfg.channel_id != 0 and client is not None)
+        return bool(
+            self.cfg.enabled and self.cfg.channel_id != 0
+            and self._primary_client() is not None
+        )
 
     # ── config-driven channel identity (was hardcoded to AniXWeebs_Index) ───────
     # These let the index survive a move to a fresh channel: on restore we rewrite
@@ -349,7 +400,7 @@ class IndexChannelService:
 
         Returns the number of slots newly flagged. Cheap enough to run at the
         top of a shift (only reserved, unflagged rows are fetched)."""
-        client = getattr(self._c, "admin_client", None)
+        client = self._primary_client()
         if client is None:
             return 0
         async with session_scope(self._c.pg_sessionmaker) as session:
@@ -420,7 +471,6 @@ class IndexChannelService:
 
         chunks = _chunk_titles(titles, base_letter)
         links = await self._links_for_titles(titles)
-        client = self._c.admin_client
         first_mid: int | None = None
 
         async with session_scope(self._c.pg_sessionmaker) as session:
@@ -494,7 +544,8 @@ class IndexChannelService:
                         if needs_image:
                             img_path = _IMG_DIR / f"{base_letter}.jpg"
                             if img_path.exists():
-                                await client.edit_message_media(
+                                await self._client_call(
+                                    "edit_message_media",
                                     self.cfg.channel_id, cast(int, section.message_id),
                                     media=InputMediaPhoto(
                                         media=str(img_path), caption=caption,
@@ -503,7 +554,8 @@ class IndexChannelService:
                                     reply_markup=self._letter_buttons(),
                                 )
                                 continue
-                        await client.edit_message_caption(
+                        await self._client_call(
+                            "edit_message_caption",
                             self.cfg.channel_id, cast(int, section.message_id),
                             caption=caption, parse_mode=ParseMode.HTML,
                             reply_markup=self._letter_buttons(),
@@ -518,7 +570,8 @@ class IndexChannelService:
                     section = existing[idx]
                     empty_cap = _letter_caption(section.label or "?", [])
                     try:
-                        await client.edit_message_caption(
+                        await self._client_call(
+                            "edit_message_caption",
                             self.cfg.channel_id, cast(int, section.message_id),
                             caption=empty_cap, parse_mode=ParseMode.HTML,
                             reply_markup=self._letter_buttons(),
@@ -604,12 +657,12 @@ class IndexChannelService:
 
         # Change image for rebranded section
         if first_msg_id:
-            client = self._c.admin_client
             img_path = _IMG_DIR / f"{prev_base}.jpg"
             if img_path.exists():
                 try:
                     temp_cap = _letter_caption(new_first_label, [])
-                    await client.edit_message_media(
+                    await self._client_call(
+                        "edit_message_media",
                         self.cfg.channel_id, first_msg_id,
                         media=InputMediaPhoto(
                             media=str(img_path), caption=temp_cap,
@@ -630,7 +683,6 @@ class IndexChannelService:
         if not self._active():
             return False
 
-        client = self._c.admin_client
         async with session_scope(self._c.pg_sessionmaker) as session:
             # Find max sort_order
             result = await session.execute(
@@ -642,13 +694,14 @@ class IndexChannelService:
             for i in range(_RESERVED_BATCH):
                 # Divider sticker
                 try:
-                    await client.send_sticker(self.cfg.channel_id, _DIVIDER)
+                    await self._client_call("send_sticker", self.cfg.channel_id, _DIVIDER)
                 except Exception as exc:
                     log.warning("index.reserved.divider_failed", error=str(exc))
 
                 # Reserved post with image
                 try:
-                    sent = await client.send_photo(
+                    sent = await self._client_call(
+                        "send_photo",
                         self.cfg.channel_id, _RESERVED_IMG,
                         caption=(f"{_RESERVED_CAP}\n\n"
                                  f"<i>Slot {i + 1}/{_RESERVED_BATCH}</i>"),
@@ -680,7 +733,6 @@ class IndexChannelService:
         if not sections:
             return
 
-        client = self._c.admin_client
         poster_id = await self._get_poster_id()
         username = self._username()
 
@@ -698,7 +750,8 @@ class IndexChannelService:
             rows.append(row)
 
         try:
-            await client.edit_message_caption(
+            await self._client_call(
+                "edit_message_caption",
                 self.cfg.channel_id, poster_id,
                 caption=_POSTER_CAP, parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(rows),
@@ -807,7 +860,8 @@ class IndexChannelService:
         if slot is None or not slot.message_id:
             return False
         try:
-            await self._c.admin_client.edit_message_caption(
+            await self._client_call(
+                "edit_message_caption",
                 self.cfg.channel_id, cast(int, slot.message_id),
                 caption=caption_html, parse_mode=ParseMode.HTML,
                 reply_markup=self._letter_buttons(),
@@ -835,7 +889,8 @@ class IndexChannelService:
                                 parse_mode=ParseMode.HTML) if caption_html \
             else InputMediaPhoto(media=image)
         try:
-            await self._c.admin_client.edit_message_media(
+            await self._client_call(
+                "edit_message_media",
                 self.cfg.channel_id, cast(int, slot.message_id), media=media,
                 reply_markup=self._letter_buttons(),
             )
@@ -860,7 +915,8 @@ class IndexChannelService:
             [[InlineKeyboardButton(text, url=url)] for text, url in buttons]
         ) if buttons else None
         try:
-            await self._c.admin_client.edit_message_reply_markup(
+            await self._client_call(
+                "edit_message_reply_markup",
                 self.cfg.channel_id, cast(int, slot.message_id),
                 reply_markup=markup,
             )

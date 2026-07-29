@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html as _html
+import json
 import re
 from urllib.parse import quote
 
@@ -41,6 +42,8 @@ STATE_MANUAL_CONFIRM = "staff:manual:confirm"
 STATE_MANUAL_INTAKE = "staff:manual:intake"
 STATE_MANUAL = STATE_MANUAL_COMP  # legacy alias for the entry-point transition
 STATE_TORRENT = "staff:torrent_pick"
+STATE_TORRENT_PROVIDE = "staff:torrent_provide"
+STATE_TORRENT_MAP = "staff:torrent_map"
 STATE_PROVIDE = "staff:await_provide"   # admin is sending a file for a stuck episode
 
 # Franchise flow states
@@ -519,8 +522,8 @@ def register(client: Client, container: Container) -> None:
         )
         kb = keyboard(
             [(L(M.ADMIN_BTN_TELEGRAM), cb("staff", "rsource", code, "telegram")),
-             (L(M.ADMIN_BTN_WEBSITE), cb("staff", "rsource", code, "website")),
-             (L(M.ADMIN_BTN_TORRENT), cb("staff", "rsource", code, "torrent"))],
+             (L(M.ADMIN_BTN_WEBSITE), cb("staff", "rsource", code, "website"))],
+            [(L(M.ADMIN_BTN_TORRENT), cb("staff", "rsource", code, "torrent"))],
             [(L(M.ADMIN_BTN_REJECT), cb("staff", "rreject", code))],
             [(L(M.BTN_BACK), cb("staff", "requests", 0))],
         )
@@ -643,21 +646,15 @@ def register(client: Client, container: Container) -> None:
             await send_screen(client, q.message.chat.id, screen, old_msg=q.message)
             return
 
-        # Torrent: present a seeders-ranked, dual-audio-first picker (with auto-pick).
+        # Torrent: present a mode choice — search Nyaa or provide a magnet/.torrent.
         await q.answer()
         title = (req.franchise_data or {}).get("title") or req.anime_title
-        back = keyboard([(L(M.BTN_BACK), cb("staff", "rdetail", code))])
-        loading = await show(client, q.message, L(M.TORRENT_LOADING, title=title), back)
-        try:
-            stubs = (await container.sources.get("nyaa").search(title))[:24]
-        except Exception:
-            stubs = []
-        if not stubs:
-            await show(client, loading, L(M.TORRENT_EMPTY, title=title), back)
-            return
-        cands = [{"ref": s.source_ref, "label": s.title} for s in stubs]
-        await fsm.set(q.from_user.id, STATE_TORRENT, code=code, title=title, cands=cands)
-        await _render_torrent_page(loading, code, cands, 0, title)
+        kb = keyboard(
+            [(L(M.TORRENT_BTN_SEARCH), cb("staff", "rtmode", code, "search")),
+             (L(M.TORRENT_BTN_PROVIDE), cb("staff", "rtmode", code, "provide"))],
+            [(L(M.BTN_BACK), cb("staff", "rdetail", code))],
+        )
+        await show(client, q.message, L(M.TORRENT_MODE_PROMPT, title=title), kb)
 
     _TPAGE = 6
 
@@ -675,44 +672,86 @@ def register(client: Client, container: Container) -> None:
             nav.append((L(M.BTN_NEXT), cb("staff", "rtpage", code, page + 1)))
         if nav:
             rows.append(nav)
-        rows.append([(L(M.BTN_BACK), cb("staff", "rdetail", code))])
-        caption = f"{L(M.TORRENT_TITLE, title=title)}\n\n{L(M.TORRENT_INTRO, n=len(cands))}"
+        rows.append([(L(M.BTN_BACK), cb("staff", "rsource", code, "torrent"))])
         await show(client, msg, caption, keyboard(*rows))
 
-    async def _torrent_queue(q: CallbackQuery, idx: int) -> None:
-        from nekofetch.services.queue_service import QueueService
+    @client.on_callback_query(filters.regex(r"^staff\|rtmode"))
+    async def _torrent_mode(_: Client, q: CallbackQuery) -> None:
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        parts = q.data.split("|")
+        code, mode = parts[2], parts[3]
         from nekofetch.services.request_service import RequestService
 
+        req = await RequestService(container).get(code)
+        title = (req.franchise_data or {}).get("title") or req.anime_title
+        await q.answer()
+
+        if mode == "search":
+            back = keyboard([(L(M.BTN_BACK), cb("staff", "rdetail", code))])
+            loading = await show(client, q.message,
+                                 L(M.TORRENT_LOADING, title=title), back)
+            try:
+                stubs = (await container.sources.get("nyaa").search(title))[:24]
+            except Exception:
+                stubs = []
+            if not stubs:
+                await show(client, loading, L(M.TORRENT_EMPTY, title=title), back)
+                return
+            cands = [{"ref": s.source_ref, "label": s.title} for s in stubs]
+            await fsm.set(q.from_user.id, STATE_TORRENT,
+                          code=code, title=title, cands=cands)
+            await _render_torrent_page(loading, code, cands, 0, title)
+        else:
+            kb = keyboard([(L(M.BTN_BACK), cb("staff", "rdetail", code))])
+            card = await show(client, q.message,
+                              L(M.TORRENT_PROVIDE_PROMPT, title=title), kb)
+            # Remember the prompt card so the reply handlers can edit it in place
+            # (rotating artwork + caption swap) instead of spawning a new message.
+            await fsm.set(q.from_user.id, STATE_TORRENT_PROVIDE,
+                          code=code, title=title,
+                          prompt_chat_id=card.chat.id, prompt_message_id=card.id)
+            await _arm_reply(container.redis, card.chat.id,
+                             STATE_TORRENT_PROVIDE, code=code, title=title,
+                             prompt_chat_id=card.chat.id, prompt_message_id=card.id)
+
+    async def _torrent_queue(q: CallbackQuery, idx: int) -> None:
         _, data = await fsm.get(q.from_user.id)
         cands = data.get("cands", [])
         code = data.get("code")
+        title = data.get("title", "")
         if not code or idx >= len(cands):
             await q.answer(L(M.ERR_GENERIC), show_alert=True)
             return
         chosen = cands[idx]
-        try:
-            await RequestService(container).update_source_ref(code, "nyaa", chosen["ref"])
-            job_id = await QueueService(container).enqueue(code)
-        except NekoFetchError as exc:
-            await q.answer(getattr(exc, "detail", None) or L(M.ERR_GENERIC), show_alert=True)
-            return
-        except Exception:
-            # Anything non-domain (DB errors, redis, network) must NOT become a
-            # silent no-op — that's exactly what made torrent picks look dead.
-            # Surface it to the admin and log the full traceback.
-            from nekofetch.core.logging import get_logger
-            get_logger(__name__).exception(
-                "torrent enqueue failed for code=%s idx=%s", code, idx
-            )
-            await q.answer(L(M.ERR_GENERIC), show_alert=True)
-            return
-        await fsm.clear(q.from_user.id)
-        await _spawn_progress_card(job_id, q.from_user.id)
-        await q.answer(L(M.TORRENT_QUEUED, title=f"job #{job_id}"), show_alert=True)
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
+        await q.answer()
+
+        ref = chosen["ref"]
+        ref_data = json.loads(ref)
+        torrent_url = ref_data.get("torrent_url")
+
+        if torrent_url:
+            from nekofetch.sources._torrent import order_episodes, torrent_files
+
+            try:
+                import httpx as _httpx
+
+                async with _httpx.AsyncClient(
+                    timeout=30, follow_redirects=True,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                ) as hc:
+                    resp = await hc.get(torrent_url)
+                    resp.raise_for_status()
+                _name, files = torrent_files(resp.content)
+                ordered = order_episodes(files)
+                await _show_torrent_mapping(
+                    q.message, q.from_user.id, code, ref, ordered, title,
+                )
+                return
+            except Exception:
+                log.debug("torrent_queue.parse_failed", code=code)
+
+        await _torrent_enqueue(q.message, q.from_user.id, code, ref, title)
 
     @client.on_callback_query(filters.regex(r"^staff\|rtpage"))
     async def _torrent_page(_: Client, q: CallbackQuery) -> None:
@@ -737,6 +776,454 @@ def register(client: Client, container: Container) -> None:
             return
         await _torrent_queue(q, 0)  # candidates are already ranked best-first
 
+    # ── torrent provide: magnet link handler ──────────────────────────────
+    # group 12 so it doesn't shadow the channel guard in group 9.
+
+    @client.on_message(filters.text & ~filters.command(["start"]), group=12)
+    async def _torrent_magnet_reply(client: Client, message: Message) -> None:
+        """Receive a magnet link from the admin in STATE_TORRENT_PROVIDE."""
+        text = (message.text or "").strip()
+        if not text.startswith("magnet:"):
+            return  # not a magnet link — let other handlers try
+
+        state, data, via_channel = await _resolve_reply_flow(
+            message, STATE_TORRENT_PROVIDE,
+        )
+        if state is None:
+            return
+
+        code = data.get("code")
+        title = data.get("title", "")
+        if not code:
+            return
+
+        # Delete the admin's message (magnet links are ugly / sensitive).
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        import re as _re
+        hash_m = _re.search(r"btih:([0-9a-fA-F]{40}|[0-9a-zA-Z]{32})", text)
+        info_hash = hash_m.group(1) if hash_m else ""
+
+        from nekofetch.sources.nyaa import classify_audio as _classify_audio
+        _audio_cls = _classify_audio(title)
+        magnet_ref = json.dumps({
+            "magnet": text, "info_hash": info_hash, "title": title,
+            "dual_audio": _audio_cls["dual_audio"],
+            "audio": _audio_cls["audio"],
+        })
+
+        if via_channel:
+            await _finish_channel_reply(message, data)
+        else:
+            await fsm.clear(message.from_user.id)
+
+        user_id = message.from_user.id if message.from_user else 0
+
+        # Retrieve the stored prompt card to edit it in place.
+        prompt_chat_id = data.get("prompt_chat_id", message.chat.id)
+        prompt_message_id = data.get("prompt_message_id")
+        try:
+            prompt_msg = await client.get_messages(prompt_chat_id, prompt_message_id) if prompt_message_id else None
+        except Exception:
+            prompt_msg = None
+
+        async def _ack(text: str) -> Message:
+            if prompt_msg:
+                return await show(client, prompt_msg, text)
+            return await client.send_message(message.chat.id, text, parse_mode=ParseMode.HTML)
+
+        # Try to resolve magnet metadata for mapping.
+        from nekofetch.sources._torrent import order_episodes, torrent_files
+
+        try:
+            from nekofetch.sources.nyaa import NyaaSource
+
+            ns = NyaaSource()
+            raw = await ns._resolve_magnet(text)
+            await ns.close()
+            _name, files = torrent_files(raw)
+            ordered = order_episodes(files)
+
+            ack = await _ack(L(M.TORRENT_MAGNET_ACK))
+            await _show_torrent_mapping(
+                ack, user_id, code, magnet_ref, ordered, title,
+            )
+            return
+        except Exception:
+            log.debug("torrent_magnet.metadata_resolve_failed", code=code)
+
+        # Fallback: enqueue without mapping.
+        ack = await _ack(L(M.TORRENT_MAGNET_ACK))
+        await _torrent_enqueue(ack, user_id, code, magnet_ref, title)
+
+    # ── torrent provide: .torrent file handler ────────────────────────────
+
+    @client.on_message(filters.document, group=12)
+    async def _torrent_file_reply(client: Client, message: Message) -> None:
+        """Receive a .torrent file from the admin in STATE_TORRENT_PROVIDE."""
+        doc = message.document
+        if not doc:
+            return
+        fname = getattr(doc, "file_name", "") or ""
+        mime = getattr(doc, "mime_type", "") or ""
+        if not (fname.endswith(".torrent") or "bittorrent" in mime):
+            return  # not a torrent file
+
+        state, data, via_channel = await _resolve_reply_flow(
+            message, STATE_TORRENT_PROVIDE,
+        )
+        if state is None:
+            return
+
+        code = data.get("code")
+        title = data.get("title", "")
+        if not code:
+            return
+
+        from nekofetch.sources._torrent import torrent_files, order_episodes
+        from nekofetch.ui.torrent_screens import format_torrent_summary
+
+        raw = await message.download(in_memory=True)
+        raw_bytes = bytes(raw.getbuffer()) if hasattr(raw, "getbuffer") else raw
+
+        try:
+            torrent_name, files = torrent_files(raw_bytes)
+            ordered = order_episodes(files)
+        except Exception:
+            await message.reply("Failed to parse torrent file.",
+                                parse_mode=ParseMode.HTML)
+            return
+
+        summary = format_torrent_summary(torrent_name, ordered)
+
+        # Store the raw .torrent bytes in a temp file for later download use.
+        from pathlib import Path
+        work = Path(container.env.storage_path) / "work" / code
+        work.mkdir(parents=True, exist_ok=True)
+        torrent_path = work / ".provided.torrent"
+        torrent_path.write_bytes(raw_bytes)
+
+        # Build source_ref that points to the local .torrent file. Classify the
+        # audio from the torrent's own name (the release name carries "Dual Audio"
+        # etc. even when the request title doesn't).
+        from nekofetch.sources.nyaa import classify_audio as _classify_audio
+        _audio_cls = _classify_audio(torrent_name or title)
+        ref = json.dumps({
+            "torrent_path": str(torrent_path),
+            "torrent_name": torrent_name,
+            "title": title,
+            "dual_audio": _audio_cls["dual_audio"],
+            "audio": _audio_cls["audio"],
+        })
+
+        # Store ref + candidates in FSM for confirm step.
+        await fsm.set(
+            message.from_user.id if message.from_user else 0,
+            STATE_TORRENT_PROVIDE,
+            code=code, title=title, ref=ref,
+            torrent_name=torrent_name,
+        )
+
+        # Delete the admin's file message.
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        # Retrieve the stored prompt card to edit it in place.
+        prompt_chat_id = data.get("prompt_chat_id", message.chat.id)
+        prompt_message_id = data.get("prompt_message_id")
+        try:
+            prompt_msg = await client.get_messages(prompt_chat_id, prompt_message_id) if prompt_message_id else None
+        except Exception:
+            prompt_msg = None
+
+        kb = keyboard(
+            [(L(M.TORRENT_BTN_CONFIRM), cb("staff", "rtfileok", code))],
+            [(L(M.BTN_BACK), cb("staff", "rdetail", code))],
+        )
+        text = L(M.TORRENT_FILE_ACK, name=torrent_name, summary=summary)
+        if prompt_msg:
+            await show(client, prompt_msg, text, kb)
+        else:
+            await client.send_message(
+                message.chat.id, text, parse_mode=ParseMode.HTML, reply_markup=kb,
+            )
+
+    @client.on_callback_query(filters.regex(r"^staff\|rtfileok"))
+    async def _torrent_file_confirm(_: Client, q: CallbackQuery) -> None:
+        """Confirm a provided .torrent file — show mapping before enqueue."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        _, data = await fsm.get(q.from_user.id)
+        code = data.get("code")
+        ref = data.get("ref")
+        if not code or not ref:
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+        await q.answer()
+
+        from nekofetch.sources._torrent import order_episodes, torrent_files
+
+        ref_data = json.loads(ref)
+        torrent_path = ref_data.get("torrent_path")
+        if not torrent_path:
+            await _torrent_enqueue(
+                q.message, q.from_user.id, code, ref, data.get("title", ""),
+            )
+            return
+
+        from pathlib import Path
+
+        try:
+            raw = Path(torrent_path).read_bytes()
+            _name, files = torrent_files(raw)
+            ordered = order_episodes(files)
+        except Exception:
+            await _torrent_enqueue(
+                q.message, q.from_user.id, code, ref, data.get("title", ""),
+            )
+            return
+
+        await _show_torrent_mapping(
+            q.message, q.from_user.id, code, ref, ordered,
+            data.get("title", ""),
+        )
+
+    # ── torrent mapping: build + show mapping before enqueue ──────────────
+
+    async def _show_torrent_mapping(
+        msg: Message,
+        user_id: int,
+        code: str,
+        source_ref: str,
+        ordered_files: list[dict],
+        title: str,
+    ) -> None:
+        """Build a franchise->torrent mapping and present it for confirmation.
+
+        Fetches episode titles from Jikan for gap detection. If the request
+        has no franchise data (single season, no parts), skips the mapping
+        and queues directly.
+        """
+        from nekofetch.services.franchise_flow import FranchiseFlowService
+        from nekofetch.services.request_service import RequestService
+        from nekofetch.services.torrent_mapping import (
+            build_torrent_mapping,
+            fetch_episode_titles_for_franchise,
+        )
+        from nekofetch.ui.torrent_screens import format_torrent_mapping
+
+        req = await RequestService(container).get(code)
+        franchise = req.franchise_data or {}
+
+        ff = FranchiseFlowService(container)
+        franchise_entries = await _walk_franchise_for_mapping(
+            container, franchise, req.anime_doc_id or ""
+        )
+        mapping = ff.build_mapping(
+            franchise, req.anime_doc_id or "",
+            franchise_entries=franchise_entries,
+        )
+
+        if len(mapping.entries) <= 1 and not any(
+            e.season_part for e in mapping.entries
+        ):
+            await _torrent_enqueue(msg, user_id, code, source_ref, title)
+            return
+
+        # Fetch episode titles from Jikan (best-effort — never blocks the flow).
+        ep_titles: dict[int, list[dict]] = {}
+        try:
+            ep_titles = await fetch_episode_titles_for_franchise(mapping)
+        except Exception:
+            log.debug("torrent_mapping.jikan_titles_failed", code=code)
+
+        tmapping = build_torrent_mapping(
+            ordered_files, mapping, episode_titles=ep_titles,
+        )
+        summary = format_torrent_mapping(tmapping)
+
+        await fsm.set(
+            user_id, STATE_TORRENT_MAP,
+            code=code, ref=source_ref, title=title,
+            torrent_mapping=tmapping.to_dict(),
+        )
+
+        text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
+                 mapping=summary)
+        kb = keyboard(
+            [(L(M.TORRENT_MAP_BTN_CONFIRM), cb("staff", "rtmapok", code)),
+             (L(M.TORRENT_MAP_BTN_DETAIL), cb("staff", "rtmapdet", code, 0))],
+            [(L(M.TORRENT_MAP_BTN_TOGGLE), cb("staff", "rtmaptgl", code, 0))],
+            [(L(M.BTN_BACK), cb("staff", "rdetail", code))],
+        )
+        await show(client, msg, text, kb)
+
+    async def _torrent_enqueue(
+        msg: Message,
+        user_id: int,
+        code: str,
+        source_ref: str,
+        title: str,
+        torrent_mapping_dict: dict | None = None,
+    ) -> None:
+        """Common enqueue path for all torrent flows."""
+        from nekofetch.services.queue_service import QueueService
+        from nekofetch.services.request_service import RequestService
+
+        try:
+            await RequestService(container).update_source_ref(
+                code, "nyaa", source_ref,
+            )
+            if torrent_mapping_dict:
+                req = await RequestService(container).get(code)
+                fr_dict = dict(req.franchise_data or {})
+                fr_dict["_torrent_mapping"] = torrent_mapping_dict
+                await RequestService(container).update_franchise_data(
+                    code, fr_dict,
+                )
+            job_id = await QueueService(container).enqueue(code)
+        except Exception:
+            log.exception("torrent enqueue failed code=%s", code)
+            await msg.reply(L(M.ERR_GENERIC), parse_mode=ParseMode.HTML)
+            return
+        await fsm.clear(user_id)
+        await _spawn_progress_card(job_id, user_id)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    @client.on_callback_query(filters.regex(r"^staff\|rtmapok"))
+    async def _torrent_map_confirm(_: Client, q: CallbackQuery) -> None:
+        """Confirm the torrent mapping and queue the download."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        _, data = await fsm.get(q.from_user.id)
+        code = data.get("code")
+        ref = data.get("ref")
+        if not code or not ref:
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+        await q.answer()
+        await _torrent_enqueue(
+            q.message, q.from_user.id, code, ref,
+            data.get("title", ""),
+            torrent_mapping_dict=data.get("torrent_mapping"),
+        )
+
+    @client.on_callback_query(filters.regex(r"^staff\|rtmapdet"))
+    async def _torrent_map_detail(_: Client, q: CallbackQuery) -> None:
+        """Show detailed per-entry file assignments."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        from nekofetch.services.torrent_mapping import TorrentMapping
+        from nekofetch.ui.torrent_screens import format_mapping_detail
+
+        parts = q.data.split("|")
+        code, page = parts[2], int(parts[3])
+        _, data = await fsm.get(q.from_user.id)
+        td = data.get("torrent_mapping")
+        if not td:
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+        await q.answer()
+        tmapping = TorrentMapping.from_dict(td)
+        detail = format_mapping_detail(tmapping, page=page)
+        total_pages = len(tmapping.entries) or 1
+
+        nav = []
+        if page > 0:
+            nav.append((L(M.BTN_PREV), cb("staff", "rtmapdet", code, page - 1)))
+        if page + 1 < total_pages:
+            nav.append((L(M.BTN_NEXT), cb("staff", "rtmapdet", code, page + 1)))
+        rows = []
+        if nav:
+            rows.append(nav)
+        rows.append([
+            (L(M.BTN_BACK), cb("staff", "rtmapov", code)),
+        ])
+        await show(client, q.message, detail, keyboard(*rows))
+
+    @client.on_callback_query(filters.regex(r"^staff\|rtmapov"))
+    async def _torrent_map_overview(_: Client, q: CallbackQuery) -> None:
+        """Return to the mapping overview from detail view."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        from nekofetch.services.torrent_mapping import TorrentMapping
+        from nekofetch.ui.torrent_screens import format_torrent_mapping
+
+        parts = q.data.split("|")
+        code = parts[2]
+        _, data = await fsm.get(q.from_user.id)
+        td = data.get("torrent_mapping")
+        if not td:
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+        await q.answer()
+        tmapping = TorrentMapping.from_dict(td)
+        summary = format_torrent_mapping(tmapping)
+
+        text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
+                 mapping=summary)
+        kb = keyboard(
+            [(L(M.TORRENT_MAP_BTN_CONFIRM), cb("staff", "rtmapok", code)),
+             (L(M.TORRENT_MAP_BTN_DETAIL), cb("staff", "rtmapdet", code, 0))],
+            [(L(M.TORRENT_MAP_BTN_TOGGLE), cb("staff", "rtmaptgl", code, 0))],
+            [(L(M.BTN_BACK), cb("staff", "rdetail", code))],
+        )
+        await show(client, q.message, text, kb)
+
+    @client.on_callback_query(filters.regex(r"^staff\|rtmaptgl"))
+    async def _torrent_map_toggle(_: Client, q: CallbackQuery) -> None:
+        """Toggle inclusion of a franchise entry in the torrent mapping."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        from nekofetch.services.torrent_mapping import TorrentMapping
+        from nekofetch.ui.torrent_screens import format_torrent_mapping
+
+        parts = q.data.split("|")
+        code, idx = parts[2], int(parts[3])
+        _, data = await fsm.get(q.from_user.id)
+        td = data.get("torrent_mapping")
+        if not td:
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+
+        tmapping = TorrentMapping.from_dict(td)
+        if 0 <= idx < len(tmapping.entries):
+            entry = tmapping.entries[idx]
+            entry.franchise_entry.included = not entry.franchise_entry.included
+            td = tmapping.to_dict()
+            data["torrent_mapping"] = td
+            await fsm.set(q.from_user.id, STATE_TORRENT_MAP, **data)
+
+        await q.answer()
+
+        # Show entry selection list for toggling.
+        rows = []
+        for i, me in enumerate(tmapping.entries):
+            fe = me.franchise_entry
+            icon = "✅" if fe.included else "❌"
+            label = f"{icon} "
+            if fe.kind.value == "season":
+                label += f"S{fe.season_number:02d}"
+                if fe.season_part:
+                    label += f"P{fe.season_part}"
+                label += f" ({me.actual} ep)"
+            else:
+                label += f"{fe.kind.value.title()} ({me.actual} files)"
+            rows.append([(label, cb("staff", "rtmaptgl", code, i))])
+        rows.append([(L(M.BTN_BACK), cb("staff", "rtmapov", code))])
+
+        summary = format_torrent_mapping(tmapping)
+        text = f"<b>Toggle entries</b>\n\n{summary}"
+        await show(client, q.message, text, keyboard(*rows))
+
     @client.on_callback_query(filters.regex(r"^staff\|rsiteprio"))
     async def _site_priority(_: Client, q: CallbackQuery) -> None:
         """Confirm website provider priority list and queue the request."""
@@ -753,14 +1240,16 @@ def register(client: Client, container: Container) -> None:
             return
         primary = priority[0]
         priority_str = ">".join(priority)
+        # Ack before the slow enqueue/progress-card work — see _torrent_queue for
+        # why: answering after the TTL expires raises QueryIdInvalid.
+        await q.answer()
         try:
             await RequestService(container).update_source(code, priority_str)
             job_id = await QueueService(container).enqueue(code)
         except NekoFetchError as exc:
-            await q.answer(getattr(exc, "detail", None) or L(M.ERR_GENERIC), show_alert=True)
+            await q.message.reply(getattr(exc, "detail", None) or L(M.ERR_GENERIC))
             return
         await _spawn_progress_card(job_id, q.from_user.id)
-        await q.answer(L(M.TOAST_QUEUED, source=primary, job=job_id), show_alert=True)
         try:
             await q.message.delete()
         except Exception:
@@ -1631,8 +2120,8 @@ def register(client: Client, container: Container) -> None:
                         keyboard([
                             (L(M.ADMIN_BTN_TELEGRAM), cb("staff", "rsource", code, "telegram")),
                             (L(M.ADMIN_BTN_WEBSITE), cb("staff", "rsource", code, "website")),
-                            (L(M.ADMIN_BTN_TORRENT), cb("staff", "rsource", code, "torrent")),
                         ],
+                        [(L(M.ADMIN_BTN_TORRENT), cb("staff", "rsource", code, "torrent"))],
                         [(L(M.ADMIN_BTN_REJECT), cb("staff", "rreject", code))],
                         ))
         await q.answer()

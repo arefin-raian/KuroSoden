@@ -19,6 +19,7 @@ AniList can't find still resolves through the same fallbacks in both paths.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from nekofetch.bots.admin.handlers.requests import (
@@ -173,6 +174,15 @@ async def resolve_franchise(
     """
     query = (query or "").strip()
     if not query:
+        return None
+
+    # Guard: an internal request code (``REQ-1058``) is NOT a searchable title.
+    # If one ever reaches here it would be sent verbatim as the @acutebot
+    # ``/anime`` query and surface as a bogus "title" (the REQ-1058 bug). Reject
+    # it loudly so the caller is fixed rather than silently shipping garbage.
+    if re.fullmatch(r"REQ-\d+", query, flags=re.IGNORECASE):
+        log.warning("resolve.rejected_request_code", query=query,
+                    hint="pass the anime title, not the request code")
         return None
 
     for name, probe in (

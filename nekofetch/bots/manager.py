@@ -471,9 +471,17 @@ class BotManager:
             ("thumbnail", cfg.thumbnail_channel),
         ]
         for name, section in sections:
-            if not getattr(section, "enabled", False) or not getattr(section, "channel_id", 0):
+            enabled = getattr(section, "enabled", False)
+            cid = getattr(section, "channel_id", 0)
+            if not enabled or not cid:
+                # Report the channel as explicitly disabled instead of silently
+                # omitting it — the startup dashboard then shows main, storage
+                # (database), index, log and thumbnail every time, so an operator
+                # can see at a glance which are wired up and which aren't.
+                tracker = getattr(self._c, "startup_tracker", None)
+                if tracker:
+                    tracker.channel_disabled(name, cid)
                 continue
-            cid = section.channel_id
             if await self._try_resolve(name, cid):
                 continue
             asyncio.create_task(self._retry_resolve(name, cid))

@@ -60,6 +60,12 @@ class StartupTracker:
         if name not in self.channels:
             self.channels[name] = {"id": cid, "title": "?", "ok": False}
 
+    def channel_disabled(self, name: str, cid: int = 0) -> None:
+        """Record a configured-but-inactive channel (disabled or no id) so the
+        dashboard reports it explicitly instead of silently omitting it."""
+        if name not in self.channels:
+            self.channels[name] = {"id": cid, "title": "—", "ok": None}
+
     def service_ok(self, name: str) -> None:
         self.services[name] = True
 
@@ -117,6 +123,16 @@ def _render_channels(tracker: StartupTracker) -> None:
     if not tracker.channels:
         return
 
+    # Friendly labels so the operator recognizes each channel's role — notably
+    # "storage" is the database channel where packs are archived.
+    labels = {
+        "storage": "database",
+        "main": "main",
+        "index": "index",
+        "log": "log",
+        "thumbnail": "thumbnail",
+    }
+
     table = Table(
         title="channels",
         title_style=f"{CYAN} bold",
@@ -131,14 +147,21 @@ def _render_channels(tracker: StartupTracker) -> None:
     table.add_column("id", style=DIM)
 
     for name, info in tracker.channels.items():
-        if info["ok"]:
+        ok = info.get("ok")
+        display = labels.get(name, name)
+        if ok is True:
             status = f"[{GREEN}]●[/{GREEN}]"
-        else:
+            title = str(info.get("title", "?"))
+        elif ok is False:
             status = f"[{RED}]✖[/{RED}]"
+            title = str(info.get("title", "?"))
+        else:
+            status = f"[{DIM}]○[/{DIM}]"
+            title = f"[{DIM}]disabled[/{DIM}]"
         table.add_row(
             status,
-            f"[bold]{name}[/bold]",
-            str(info.get("title", "?")),
+            f"[bold]{display}[/bold]",
+            title,
             str(info.get("id", "?")),
         )
 
@@ -284,6 +307,10 @@ _HUMAN_EVENTS: dict[str, str] = {
     "bot.branding.applied": "bot branding applied",
     "bot.content.generated": "bot content generated",
     "channel.registered": "channel registered",
+    # --- kuro-soden pipeline ---
+    "kuro-soden.channel.ok": "channel connected",
+    "kuro-soden.channel.unreachable": "channel unreachable",
+    "kuro-soden.channel.disabled": "channel disabled",
     # --- index ---
     "index.sections.seeded": "index channel seeded",
     # --- userbot ---
@@ -299,11 +326,14 @@ def _humanize_event(event: str, kv: dict) -> str:
     base = _HUMAN_EVENTS.get(event, event.replace("_", " ").replace(".", " › "))
 
     # Embellish with key context fields
-    if event == "bots.channel.ok":
+    if event in ("bots.channel.ok", "kuro-soden.channel.ok"):
         title = kv.get("title", "")
         name = kv.get("channel", "")
         return f"{base} · {name} [{title}]"
-    if event == "bots.channel.unreachable":
+    if event in ("bots.channel.unreachable", "kuro-soden.channel.unreachable"):
+        name = kv.get("channel", "")
+        return f"{base} · {name}"
+    if event == "kuro-soden.channel.disabled":
         name = kv.get("channel", "")
         return f"{base} · {name}"
     if event == "bots.distribution.started":

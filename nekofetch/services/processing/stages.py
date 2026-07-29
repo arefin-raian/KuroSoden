@@ -203,7 +203,10 @@ def _content_type_label(season: int | None, episode_count: int,
     return KIND_SPECIAL
 
 
-async def _push_stage_progress(c, ctx: StageContext, stage_name: str, progress: float) -> None:
+async def _push_stage_progress(
+    c, ctx: StageContext, stage_name: str, progress: float,
+    *, file_index: int | None = None, file_total: int | None = None,
+) -> None:
     """Push a ProgressSnapshot for the current processing stage so the log channel
     shows bars even during compression/watermarking. Falls back silently if Redis
     is unavailable — cosmetic telemetry must never break the actual job."""
@@ -217,6 +220,8 @@ async def _push_stage_progress(c, ctx: StageContext, stage_name: str, progress: 
             status="RUNNING",
             progress=progress,
             stage=stage_name,
+            episode_index=file_index,
+            total_episodes=file_total,
         )
         await store.set(snap, ttl=600)
     except Exception:  # noqa: BLE001
@@ -266,6 +271,103 @@ async def _ffprobe_ok(ffprobe: str, path: Path) -> tuple[bool, str]:
     return True, "ok"
 
 
+async def _audio_track_langs(ffprobe: str, path: Path) -> list[str]:
+    """Return the language tag of each audio track in order (``""`` when unset).
+
+    Used by :class:`BrandingStage` to name each audio track. An empty list means
+    "couldn't probe" — the caller then falls back to a single-track guess.
+    """
+    return await _track_langs(ffprobe, path, "a")
+
+
+async def _track_langs(ffprobe: str, path: Path, select: str) -> list[str]:
+    """Return the language tag of each track of a stream type, in order.
+
+    ``select`` is an ffmpeg stream selector: ``"a"`` for audio, ``"s"`` for
+    subtitles. ``""`` fills a track whose language tag is unset. An empty list
+    means the probe failed (or there are no such tracks).
+    """
+    import json
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe, "-v", "error", "-select_streams", select,
+            "-show_entries", "stream=index:stream_tags=language",
+            "-of", "json", str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except Exception:  # noqa: BLE001
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(out or b"{}")
+    except ValueError:
+        return []
+    langs: list[str] = []
+    for s in data.get("streams", []):
+        langs.append((s.get("tags", {}) or {}).get("language", "") or "")
+    return langs
+
+
+async def _sub_tracks(ffprobe: str, path: Path) -> list[dict]:
+    """Probe every subtitle track: ``{index, codec, lang, title}`` in order.
+
+    ``index`` is the subtitle-relative index (0-based, i.e. the ``s:N`` selector),
+    ``codec`` the codec_name (``ass``/``subrip``/``hdmv_pgs_subtitle``…), ``lang``
+    the ISO tag, and ``title`` the original track title tag (``""`` when unset).
+    Used by torrent subtitle branding, which keeps the ORIGINAL title (e.g.
+    "Signs & Songs") rather than the language, and needs the codec to know which
+    tracks are text (brandable) vs image (PGS/VobSub — title-only).
+    """
+    import json
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe, "-v", "error", "-select_streams", "s",
+            "-show_entries", "stream=index,codec_name:stream_tags=language,title",
+            "-of", "json", str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except Exception:  # noqa: BLE001
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(out or b"{}")
+    except ValueError:
+        return []
+    tracks: list[dict] = []
+    for rel, s in enumerate(data.get("streams", [])):
+        tags = s.get("tags", {}) or {}
+        tracks.append({
+            "index": rel,
+            "codec": (s.get("codec_name") or "").lower(),
+            "lang": tags.get("language", "") or "",
+            "title": tags.get("title", "") or "",
+        })
+    return tracks
+
+
+async def _probe_duration_ms(ffprobe: str, path: Path) -> int | None:
+    """Media duration in ms (for subtitle branding-window placement), or None."""
+    import json
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe, "-v", "error", "-show_entries", "format=duration",
+            "-of", "json", str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        data = json.loads(out or b"{}")
+        return int(float(data.get("format", {}).get("duration") or 0) * 1000) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class VerifyStage(Stage):
     stage = ProcessingStage.VERIFY
 
@@ -278,7 +380,8 @@ class VerifyStage(Stage):
 
         ffprobe = find_ffprobe()
         corrupt: list[str] = []
-        await _push_stage_progress(self.c, ctx, "Verifying", 0.0)
+        n = len(ctx.files)
+        await _push_stage_progress(self.c, ctx, "Verifying", 0.0, file_index=0, file_total=n)
         for i, f in enumerate(ctx.files):
             path = Path(f.local_path) if f.local_path else None
             if not (path and path.exists() and path.stat().st_size > 0):
@@ -295,8 +398,8 @@ class VerifyStage(Stage):
             f.verified = ok
             if not ok:
                 corrupt.append(f"{path.name}: {reason}")
-            pct = ((i + 1) / len(ctx.files)) * 100
-            await _push_stage_progress(self.c, ctx, "Verifying", pct)
+            pct = ((i + 1) / n) * 100
+            await _push_stage_progress(self.c, ctx, "Verifying", pct, file_index=i + 1, file_total=n)
         # Corrupt files must never reach the database channel — fail the whole job
         # so it's surfaced and can be retried, rather than silently shipping garbage.
         if corrupt:
@@ -322,6 +425,8 @@ class RenameStage(Stage):
     async def process(self, ctx: StageContext) -> None:
         branding = BrandingService(self.c)
         cfg = self.c.config.rename
+        n = len(ctx.files)
+        await _push_stage_progress(self.c, ctx, "Renaming", 0.0, file_index=0, file_total=n)
 
         # Pre-compute short title from AniList synonyms or acronym fallback
         anime_title = ctx.request.anime_title
@@ -335,18 +440,18 @@ class RenameStage(Stage):
             s = f.season or 0
             season_totals[s] = season_totals.get(s, 0) + 1
 
-        for f in ctx.files:
+        for i, f in enumerate(ctx.files):
             raw = (f.audio.value if f.audio else "").lower()
             audio_short = _AUDIO_TAG.get(raw, raw)
             season_part = f.season_part
             part_str = f"P{season_part:02d}" if season_part else ""
 
-            # Dynamic episode padding based on total episodes in this season
+            # Dynamic episode padding based on total episodes in this season.
+            # Minimum is ALWAYS two digits — never ``E1``/``S1``. Even a 6-episode
+            # season is ``E01``..``E06``; scale to ``E001`` only past 99 episodes.
             s = f.season or 0
             total_for_season = season_totals.get(s, 0)
-            if total_for_season <= 9:
-                ep_str = f"{f.episode or 0}"
-            elif total_for_season <= 99:
+            if total_for_season <= 99:
                 ep_str = f"{f.episode or 0:02d}"
             else:
                 ep_str = f"{f.episode or 0:03d}"
@@ -385,6 +490,8 @@ class RenameStage(Stage):
                     f.local_path = str(dest)
                 except OSError as exc:
                     ctx.notes.append(f"rename skipped: {exc}")
+            pct = (i + 1) / n * 100
+            await _push_stage_progress(self.c, ctx, "Renaming", pct, file_index=i + 1, file_total=n)
 
 
 class MetadataStage(Stage):
@@ -396,7 +503,8 @@ class MetadataStage(Stage):
     async def process(self, ctx: StageContext) -> None:
         meta = self.c.config.metadata
         branding = BrandingService(self.c).metadata_fields()
-        await _push_stage_progress(self.c, ctx, "Metadata", 0.0)
+        n = len(ctx.files)
+        await _push_stage_progress(self.c, ctx, "Metadata", 0.0, file_index=0, file_total=n)
         for i, f in enumerate(ctx.files):
             if not f.local_path:
                 continue
@@ -454,8 +562,51 @@ class MetadataStage(Stage):
                 else:
                     applied = sum(1 for t in tags if t == "--set")
                     ctx.notes.append(f"metadata: {applied} mkvpropedit field(s) applied")
-            pct = ((i + 1) / len(ctx.files)) * 100
-            await _push_stage_progress(self.c, ctx, "Metadata", pct)
+            pct = ((i + 1) / n) * 100
+            await _push_stage_progress(self.c, ctx, "Metadata", pct, file_index=i + 1, file_total=n)
+
+
+# Language code → human display name for track branding. Torrents arrive already
+# muxed, so we read the embedded track's ISO-639 language tag (e.g. "jpn") and
+# turn it into the same display name the streaming mux path uses ("Japanese"),
+# so both paths produce identical chrome-bracket labels. Unknown/blank tags fall
+# back to the "Anime Weebs #N" form inside ``brand_track_title``.
+_LANG_DISPLAY = {
+    "jpn": "Japanese", "ja": "Japanese", "jp": "Japanese",
+    "eng": "English", "en": "English",
+    "spa": "Spanish", "es": "Spanish",
+    "por": "Portuguese", "pt": "Portuguese",
+    "fra": "French", "fre": "French", "fr": "French",
+    "deu": "German", "ger": "German", "de": "German",
+    "ita": "Italian", "it": "Italian",
+    "rus": "Russian", "ru": "Russian",
+    "ara": "Arabic", "ar": "Arabic",
+    "hin": "Hindi", "hi": "Hindi",
+    "kor": "Korean", "ko": "Korean",
+    "zho": "Chinese", "chi": "Chinese", "zh": "Chinese",
+    "tha": "Thai", "th": "Thai",
+    "vie": "Vietnamese", "vi": "Vietnamese",
+    "ind": "Indonesian", "id": "Indonesian",
+}
+
+
+def _lang_display(lang: str) -> str:
+    """Map an ISO-639 language tag to a human display name ("jpn" → "Japanese").
+
+    Returns "" for unknown/untagged languages so ``brand_track_title`` uses its
+    "Anime Weebs #N" fallback instead of an ugly raw code.
+    """
+    c = (lang or "").lower().split("-")[0].strip()
+    if c in ("", "und", "unk", "mis", "zxx"):
+        return ""
+    return _LANG_DISPLAY.get(c, "")
+
+
+# Sources whose files arrive as a single high-quality torrent download. These
+# need us to (a) derive the lower resolution tiers (EncodeStage), and (b) brand
+# subtitle CONTENT + keep original-title track names (BrandingStage). Streaming
+# sources acquire each quality natively and are mux-branded at assembly time.
+_TORRENT_SOURCES = frozenset({"nyaa"})
 
 
 _CORNER_OVERLAY = {
@@ -479,9 +630,151 @@ class BrandingStage(Stage):
         return self.c.config.processing.branding and self.c.config.branding.enabled
 
     async def process(self, ctx: StageContext) -> None:
-        # Branding here is metadata/caption-level (see BrandingService). Video watermarking
-        # is a separate, opt-in stage below.
-        return None
+        """Brand a torrent's already-muxed MKV with the canonical chrome-bracket
+        style — matching the labels the streaming mux path writes via
+        ``_branding.py`` — with a torrent-specific subtitle rule.
+
+          * Container title → ``"AnimeName〢@AniXWeebs"``
+          * Audio track     → ``"Japanese〘 @AniXWeebs 〙"`` (language-based)
+          * Subtitle track  → torrent-specific: keep the ORIGINAL track title
+            (e.g. "Signs & Songs") + ``〘 @AniXWeebs 〙`` (fansub subs carry
+            meaningful names — Full / Signs&Songs / Dialogue — that we preserve),
+            and INJECT a ``Telegram: @AniXWeebs`` cue into the subtitle content of
+            every episode. Streaming sources instead name subs by language and are
+            already content-branded at mux time by ``_subs``.
+
+        Streaming sources arrive branded (mux path), so this stage only re-affirms
+        their metadata cheaply via ``mkvpropedit`` (no content remux). Torrents get
+        the full extract → inject-cue → remux pass for their subtitle CONTENT, then
+        the original-title track names. MKV-only, best-effort: a missing binary /
+        unsupported container records a note and moves on rather than failing.
+        """
+        from nekofetch.sources._branding import (
+            brand_container_title,
+            brand_track_title,
+        )
+        from nekofetch.sources._hls import find_ffprobe
+
+        if not self.c.config.branding.enabled:
+            return
+        is_torrent = (ctx.request.source or "").lower() in _TORRENT_SOURCES
+        ffprobe = find_ffprobe()
+        anime_title = (ctx.request.anime_title or "").strip()
+        branded_title = brand_container_title(anime_title) if anime_title else ""
+        n = len(ctx.files)
+        await _push_stage_progress(self.c, ctx, "Branding", 0.0, file_index=0, file_total=n)
+        for i, f in enumerate(ctx.files):
+            if not f.local_path or (f.container or "").lower() != "mkv":
+                if f.local_path and (f.container or "").lower() != "mkv":
+                    ctx.notes.append(f"branding: skipped non-mkv {f.container}")
+                continue
+            path = Path(f.local_path)
+
+            # ── Torrent path: inject the Telegram cue into subtitle CONTENT and
+            #    keep original-title track names via a single remux. ──
+            if is_torrent and ffprobe:
+                did = await self._brand_torrent_file(
+                    ctx, path, branded_title, brand_track_title,
+                )
+                if did:
+                    pct = ((i + 1) / n) * 100
+                    await _push_stage_progress(
+                        self.c, ctx, "Branding", pct, file_index=i + 1, file_total=n)
+                    continue
+                # Remux unavailable/failed → fall through to metadata-only branding
+                # so the file is at least title/track branded.
+
+            audio_langs = await _track_langs(ffprobe, path, "a") if ffprobe else []
+            sub_langs = await _track_langs(ffprobe, path, "s") if ffprobe else []
+
+            tags: list[str] = []
+            # Container title — branded + idempotent (the helper no-ops if already
+            # branded), so re-running the stage never double-appends the handle.
+            if branded_title:
+                tags += ["--edit", "info", "--set", f"title={branded_title}"]
+            # Audio: fall back to a single track when the probe found none (so a
+            # container ffprobe can't read still gets a branded track name).
+            audio_count = len(audio_langs) or 1
+            for t in range(1, audio_count + 1):
+                lang = audio_langs[t - 1] if t - 1 < len(audio_langs) else ""
+                name = brand_track_title(_lang_display(lang), t)
+                tags += ["--edit", f"track:a{t}", "--set", f"name={name}"]
+            # Subtitles: only name tracks we actually detected — never invent a
+            # phantom subtitle track on a file that has none.
+            for t in range(1, len(sub_langs) + 1):
+                name = brand_track_title(_lang_display(sub_langs[t - 1]), t)
+                tags += ["--edit", f"track:s{t}", "--set", f"name={name}"]
+
+            rc, err = await _run("mkvpropedit", f.local_path, *tags)
+            if rc != 0:
+                ctx.notes.append(f"branding: {err.strip() or 'mkvpropedit unavailable'}")
+            else:
+                ctx.notes.append(
+                    f"branding: title + {audio_count} audio + {len(sub_langs)} "
+                    "subtitle track(s) branded"
+                )
+            pct = ((i + 1) / n) * 100
+            await _push_stage_progress(self.c, ctx, "Branding", pct, file_index=i + 1, file_total=n)
+
+    async def _brand_torrent_file(
+        self, ctx: StageContext, path: Path, branded_title: str, brand_track_title,
+    ) -> bool:
+        """Torrent subtitle branding for one file: inject the Telegram cue into
+        subtitle content + keep original-title track names, via one remux.
+
+        Returns True when the remux replaced the file, False when there's nothing
+        to do or the remux couldn't run (caller falls back to metadata-only).
+        Audio-track names + container title are applied afterwards via mkvpropedit
+        (fast, no second remux) so this method owns ONLY the subtitle work.
+        """
+        from nekofetch.sources._hls import find_ffprobe
+        from nekofetch.sources._torrent_subs import brand_torrent_subtitles
+
+        ffprobe = find_ffprobe()
+        sub_tracks = await _sub_tracks(ffprobe, path) if ffprobe else []
+        if not sub_tracks:
+            return False  # no subs → nothing torrent-specific to do here
+
+        video_ms = await _probe_duration_ms(ffprobe, path)
+        tmp_out = path.with_name(path.stem + ".brand.mkv")
+        try:
+            manifest = await brand_torrent_subtitles(
+                path, tmp_out, sub_tracks=sub_tracks, video_ms=video_ms,
+                container_title=branded_title or None,
+                brand_track_title=brand_track_title,
+            )
+        except Exception as exc:  # noqa: BLE001 — remux failure is recoverable
+            ctx.notes.append(f"branding(torrent): remux error {exc}")
+            tmp_out.unlink(missing_ok=True)
+            return False
+        if not manifest.get("ok"):
+            tmp_out.unlink(missing_ok=True)
+            return False
+
+        try:
+            tmp_out.replace(path)  # swap the branded remux in
+        except OSError as exc:
+            ctx.notes.append(f"branding(torrent): swap failed {exc}")
+            tmp_out.unlink(missing_ok=True)
+            return False
+
+        # Audio track names + container title (subtitle titles were set in the
+        # remux). Cheap metadata-only mkvpropedit pass, no second transcode.
+        audio_langs = await _track_langs(ffprobe, path, "a")
+        tags: list[str] = []
+        if branded_title:
+            tags += ["--edit", "info", "--set", f"title={branded_title}"]
+        audio_count = len(audio_langs) or 1
+        for t in range(1, audio_count + 1):
+            lang = audio_langs[t - 1] if t - 1 < len(audio_langs) else ""
+            tags += ["--edit", f"track:a{t}", "--set",
+                     f"name={brand_track_title(_lang_display(lang), t)}"]
+        await _run("mkvpropedit", str(path), *tags)
+        ctx.notes.append(
+            f"branding(torrent): {manifest['branded_tracks']} sub track(s) content-branded "
+            f"({manifest['total_cues']} cues) + {audio_count} audio named"
+        )
+        return True
 
 
 class WatermarkStage(Stage):
@@ -518,7 +811,8 @@ class WatermarkStage(Stage):
 
     async def process(self, ctx: StageContext) -> None:
         w = self.c.config.watermark
-        await _push_stage_progress(self.c, ctx, "Watermarking", 0.0)
+        n = len(ctx.files)
+        await _push_stage_progress(self.c, ctx, "Watermarking", 0.0, file_index=0, file_total=n)
         for i, f in enumerate(ctx.files):
             if not f.local_path:
                 continue
@@ -536,8 +830,8 @@ class WatermarkStage(Stage):
                 out.replace(src)  # swap in the watermarked file
             except OSError as exc:
                 ctx.notes.append(f"watermark swap failed: {exc}")
-            pct = ((i + 1) / len(ctx.files)) * 100
-            await _push_stage_progress(self.c, ctx, "Watermarking", pct)
+            pct = ((i + 1) / n) * 100
+            await _push_stage_progress(self.c, ctx, "Watermarking", pct, file_index=i + 1, file_total=n)
 
 
 # Name of the shared poster thumbnail dropped in a request's work folder. The
@@ -595,6 +889,134 @@ class ThumbnailStage(Stage):
         return rc == 0 and dest.exists() and dest.stat().st_size > 0
 
 
+class EncodeStage(Stage):
+    """Derive lower-resolution renditions (720p / 480p) from each torrent file.
+
+    Torrents deliver one file per episode (we download only the 1080p variant),
+    so to ship the standard three-quality packs we transcode the lower tiers
+    ourselves. Runs AFTER rename/brand/metadata/watermark so every rendition
+    inherits the final name and branding, and BEFORE store so the new files are
+    marked processed and uploaded alongside the source. Video is re-encoded
+    (x264 CRF); all audio tracks, subtitles and metadata are copied, so
+    dual-audio and branding survive. Streaming sources are skipped entirely.
+    """
+
+    stage = ProcessingStage.ENCODE
+
+    def enabled(self) -> bool:
+        return self.c.config.processing.encode
+
+    async def process(self, ctx: StageContext) -> None:
+        if (ctx.request.source or "").lower() not in _TORRENT_SOURCES:
+            ctx.notes.append(f"encode: skipped (source {ctx.request.source})")
+            return
+
+        from sqlalchemy import inspect as _sa_inspect
+
+        from nekofetch.infrastructure.database.postgres.models import MediaFile
+        from nekofetch.sources._transcode import _encode
+
+        heights = [h for h in self.c.config.processing.encode_heights if h > 0]
+        if not heights:
+            return
+
+        # Only encode files that are actually present on disk this pass. To stay
+        # safe across reprocess passes (where rows are reloaded from the DB and
+        # the in-memory ``_is_rendition`` marker is gone), encode ONLY the
+        # highest-resolution files on disk — derived lower tiers are never a
+        # source, so we can't re-encode our own outputs.
+        on_disk = [
+            f for f in list(ctx.files)
+            if f.local_path and Path(f.local_path).exists()
+        ]
+        if not on_disk:
+            return
+
+        def _res_h(f) -> int:
+            r = (f.resolution or "").rstrip("p")
+            return int(r) if r.isdigit() else 0
+
+        max_h = max((_res_h(f) for f in on_disk), default=0)
+        sources = [f for f in on_disk if _res_h(f) == max_h and max_h > 0]
+        if not sources:
+            return
+
+        session = None
+        try:
+            session = _sa_inspect(sources[0]).session
+        except Exception:  # noqa: BLE001
+            session = None
+
+        n = len(sources)
+        await _push_stage_progress(self.c, ctx, "Encoding", 0.0, file_index=0, file_total=n)
+        new_rows: list = []
+        for i, f in enumerate(sources):
+            src = Path(f.local_path)
+            src_res = f.resolution or "1080p"
+            # Rename put the resolution token in the stem (e.g.
+            # "... [1080p] ..."); we swap it per rendition so names stay correct.
+            stem = src.stem
+            for height in heights:
+                label = f"{height}p"
+                if label == src_res:
+                    continue  # never "downscale" to the same tier
+                await _push_stage_progress(
+                    self.c, ctx, f"Encoding {label}",
+                    (i / n) * 100, file_index=i, file_total=n,
+                )
+                out_stem = _swap_resolution(stem, src_res, label)
+                out_path = src.with_name(f"{out_stem}{src.suffix}")
+                try:
+                    await _encode(src, out_path, height, _ENCODE_CRF.get(height, 22))
+                except Exception as exc:  # noqa: BLE001 - a failed tier is a note, not a job failure
+                    ctx.notes.append(f"encode {label}: {exc}")
+                    continue
+                if not (out_path.exists() and out_path.stat().st_size > 0):
+                    ctx.notes.append(f"encode {label}: empty output")
+                    continue
+                row = MediaFile(
+                    job_id=f.job_id, anime_doc_id=f.anime_doc_id,
+                    season=f.season, season_part=f.season_part, episode=f.episode,
+                    resolution=label, audio=f.audio,
+                    original_name=f.original_name,
+                    final_name=out_path.name, local_path=str(out_path),
+                    size_bytes=out_path.stat().st_size, container=f.container,
+                    verified=True, processed=False, published=False,
+                )
+                new_rows.append(row)
+                if session is not None:
+                    session.add(row)
+            pct = ((i + 1) / n) * 100
+            await _push_stage_progress(self.c, ctx, "Encoding", pct, file_index=i + 1, file_total=n)
+
+        # Make the renditions visible to STORE (and the storage uploader, which
+        # reads MediaFile rows for the job) in this same pass.
+        ctx.files.extend(new_rows)
+        if new_rows:
+            ctx.notes.append(f"encode: {len(new_rows)} rendition(s) created")
+
+
+# Derived-rendition CRFs (mirrors _transcode._CRF; kept local so the stage owns
+# its quality knobs).
+_ENCODE_CRF = {1080: 21, 720: 21, 480: 22}
+
+
+def _swap_resolution(stem: str, old_res: str, new_res: str) -> str:
+    """Replace the resolution token in a filename stem, tolerating case/format.
+
+    "Takopi S01E01 [1080p] [Dual] - Anime Weebs" → "... [720p] ..." . Falls back
+    to appending the new resolution when the old token isn't found, so the two
+    renditions never collide on the same name.
+    """
+    if old_res and old_res in stem:
+        return stem.replace(old_res, new_res)
+    low = stem.lower()
+    if old_res and old_res.lower() in low:
+        idx = low.index(old_res.lower())
+        return stem[:idx] + new_res + stem[idx + len(old_res):]
+    return f"{stem} [{new_res}]"
+
+
 class StoreStage(Stage):
     stage = ProcessingStage.STORE
 
@@ -602,8 +1024,12 @@ class StoreStage(Stage):
         return True
 
     async def process(self, ctx: StageContext) -> None:
-        for f in ctx.files:
+        n = len(ctx.files)
+        await _push_stage_progress(self.c, ctx, "Storing", 0.0, file_index=0, file_total=n)
+        for i, f in enumerate(ctx.files):
             f.processed = True
+            pct = (i + 1) / n * 100
+            await _push_stage_progress(self.c, ctx, "Storing", pct, file_index=i + 1, file_total=n)
 
 
 def default_stages(container) -> list[Stage]:
@@ -614,5 +1040,6 @@ def default_stages(container) -> list[Stage]:
         BrandingStage(container),
         WatermarkStage(container),
         ThumbnailStage(container),
+        EncodeStage(container),
         StoreStage(container),
     ]

@@ -61,37 +61,65 @@ _IMGBB_ENDPOINT = "https://api.imgbb.com/1/upload"
 async def _upload_imgbb(container: Container, blob: bytes) -> str | None:
     """Push bytes to ImgBB (needs ``IMGBB_API_KEY``). Returns the URL or None.
 
-    ImgBB takes a base64 ``image`` field with the API key as a query param and
-    replies with JSON. We return **only** ``data.url`` (the full-resolution
-    original) — never ``data.thumb.url`` / ``data.medium.url``, which are
-    downscaled and would degrade a restored post. Best-effort — any hiccup
-    (missing key, network, malformed body) returns None.
+    ImgBB accepts the image either as a base64 ``image`` form field or as a
+    multipart binary upload. We try base64 first (its documented default) and,
+    on any rejection, retry as multipart binary — some keys/edge payloads 400 on
+    one form but succeed on the other. We return **only** ``data.url`` (the full-
+    resolution original) — never ``data.thumb.url`` / ``data.medium.url``, which
+    are downscaled and would degrade a restored post.
+
+    Crucially, we do NOT ``raise_for_status()`` blindly: on a non-2xx we read the
+    response body and log ImgBB's actual ``error.message`` (e.g. "Invalid API v1
+    key", "Can't get target upload source info") so failures are diagnosable
+    instead of a bare ``400 Bad Request``. Best-effort — always returns a URL or
+    None, never raises.
     """
     key = getattr(getattr(container, "env", None), "imgbb_api_key", "") or ""
     if not key:
         log.warning("imgbackup.imgbb.no_key",
                     hint="Set IMGBB_API_KEY in .env to enable the ImgBB mirror")
         return None
-    try:
-        payload = base64.b64encode(blob).decode("ascii")
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as cli:
-            r = await cli.post(
-                _IMGBB_ENDPOINT,
-                params={"key": key},
-                data={"image": payload},
-            )
-            r.raise_for_status()
-            body = r.json()
-    except Exception as exc:  # noqa: BLE001 — last-resort host, never raises
-        log.warning("imgbackup.imgbb.failed", error=str(exc))
+    if not blob:
+        log.warning("imgbackup.imgbb.empty_blob")
         return None
-    # Only the full-resolution URL — deliberately NOT thumb/medium/display_url.
-    url = ((body or {}).get("data") or {}).get("url")
-    if isinstance(url, str) and url.startswith("http"):
-        log.info("imgbackup.imgbb.ok", url=url, bytes=len(blob))
-        return url
-    log.warning("imgbackup.imgbb.bad_body",
-                success=(body or {}).get("success"), status=(body or {}).get("status"))
+
+    async def _post(cli: httpx.AsyncClient, *, use_multipart: bool):
+        if use_multipart:
+            return await cli.post(_IMGBB_ENDPOINT, params={"key": key},
+                                  files={"image": ("image", blob)})
+        payload = base64.b64encode(blob).decode("ascii")
+        return await cli.post(_IMGBB_ENDPOINT, params={"key": key},
+                              data={"image": payload})
+
+    async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as cli:
+        for use_multipart in (False, True):
+            mode = "multipart" if use_multipart else "base64"
+            try:
+                r = await _post(cli, use_multipart=use_multipart)
+            except Exception as exc:  # noqa: BLE001 — transport hiccup, try next mode
+                log.warning("imgbackup.imgbb.transport", mode=mode, error=str(exc))
+                continue
+            if r.status_code >= 400:
+                # Surface ImgBB's real error message, not a bare status code.
+                try:
+                    err = (r.json().get("error") or {}).get("message")
+                except Exception:  # noqa: BLE001
+                    err = (r.text or "")[:200]
+                log.warning("imgbackup.imgbb.http_error", mode=mode,
+                            status=r.status_code, imgbb_error=err)
+                continue
+            try:
+                body = r.json()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("imgbackup.imgbb.bad_json", mode=mode, error=str(exc))
+                continue
+            url = ((body or {}).get("data") or {}).get("url")
+            if isinstance(url, str) and url.startswith("http"):
+                log.info("imgbackup.imgbb.ok", mode=mode, url=url, bytes=len(blob))
+                return url
+            log.warning("imgbackup.imgbb.bad_body", mode=mode,
+                        success=(body or {}).get("success"),
+                        status=(body or {}).get("status"))
     return None
 
 

@@ -334,30 +334,39 @@ def request_received(user_name: str, title: str, queue_pos: int | None = None,
     code, who asked (name + id), when, a summarized franchise breakdown, episode
     count, and queue position.
     """
-    rows = [t(M.REQ_RECEIVED, name=_esc(user_name) or "there"), "",
-            _field(M.F_ANIME, title)]
+    header_lines = [f"♟️ <b>Request Accepted</b>\n"]
+    header_lines.append(f"<b>{_esc(title)}</b>")
     if code:
-        rows.append(_field(M.F_REQUEST, code))
+        header_lines.append(f"<code>{_esc(code)}</code>")
 
-    # Who + when — the "by which user, their name and ID, when they did it" detail.
+    detail_parts: list[str] = []
     if requester_id is not None:
-        rows.append(f"<b>{t(M.F_REQUESTED_BY)}</b> : {_esc(user_name) or 'user'} "
-                    f"(<code>{requester_id}</code>)")
+        detail_parts.append(f"<b>By</b> : {_esc(user_name) or 'user'} "
+                            f"(<code>{requester_id}</code>)")
     if requested_at:
-        rows.append(_field(M.F_REQUESTED_AT, requested_at))
-
-    # Summarized franchise report — episodes + the season/movie/OVA breakdown.
+        detail_parts.append(f"<b>Requested</b> : {_esc(requested_at)}")
     breakdown = _franchise_breakdown(franchise)
     if breakdown:
-        rows.append(_field(M.F_BREAKDOWN, breakdown))
+        detail_parts.append(f"<b>Contents</b> : {_esc(breakdown)}")
     if franchise and franchise.get("franchise_episodes"):
-        rows.append(_field(M.F_EPISODES, str(franchise["franchise_episodes"])))
+        detail_parts.append(f"<b>Episodes</b> : {_esc(str(franchise['franchise_episodes']))}")
 
-    rows.append(_field(M.F_STATUS, t(M.VALUE_QUEUED)))
+    if detail_parts:
+        header_lines.append("")
+        header_lines.extend(detail_parts)
+
+    top_block = "<blockquote>" + "\n".join(header_lines) + "</blockquote>"
+
+    status_text = t(M.VALUE_QUEUED)
     if queue_pos is not None:
-        rows.append(_field(M.F_QUEUE, f"#{queue_pos}"))
-    rows += ["", t(M.REQ_RECEIVED_BODY)]
-    return Screen(caption="\n".join(rows),
+        status_text += f" · Position #{queue_pos}"
+    bottom_block = (
+        f"<blockquote>{status_text}\n\n"
+        f"{t(M.REQ_RECEIVED_BODY)}</blockquote>"
+    )
+
+    caption = f"{top_block}\n\n{bottom_block}"
+    return Screen(caption=caption,
                   image=image if image is not None else pick_artwork(bot_name),
                   keyboard=_kb([[(t(M.BTN_MY_REQUESTS), cb("req", "mine", 0))]]))
 

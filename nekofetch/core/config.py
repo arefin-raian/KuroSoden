@@ -129,6 +129,14 @@ class EnvSettings(BaseSettings):
     # is skipped (catbox / telegraph still run).
     imgbb_api_key: str = Field("", alias="IMGBB_API_KEY")
 
+    # Telegraph — access token for creating galleries and (legacy) file uploads.
+    # Generate one with: curl "https://api.telegra.ph/createAccount?short_name=kuro&author_name=Kuro"
+    # and copy the ``result.access_token`` from the JSON. When set, it overrides
+    # the (optional) config.yaml ``thumbnail_channel.telegraph_access_token`` so
+    # the secret lives in .env with the other credentials. Empty = fall back to
+    # config.yaml, then skip the telegraph host.
+    telegraph_access_token: str = Field("", alias="TELEGRAPH_ACCESS_TOKEN")
+
     # Logging
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     log_json: bool = Field(False, alias="LOG_JSON")
@@ -197,6 +205,14 @@ class ProcessingConfig(BaseModel):
     metadata: bool = True
     branding: bool = True
     thumbnail: bool = True
+    # Torrent sources deliver a single (1080p) file per episode; derive the
+    # lower quality tiers (720p / 480p) ourselves via ffmpeg so every release
+    # ships the standard three resolutions. Streaming sources acquire their own
+    # qualities natively and skip this stage.
+    encode: bool = True
+    # Target rendition heights produced from the source file. Uploaded smallest
+    # first, so packs post as 480p → 720p → 1080p.
+    encode_heights: list[int] = Field(default_factory=lambda: [720, 480])
     # When False, the pipeline automatically publishes to the main channel +
     # index channel and brings up the distribution bot right after the storage
     # upload finishes — no admin click required. When True, the existing
