@@ -53,6 +53,24 @@ if not exist "%READY_MARKER%" (
     echo ready>"%READY_MARKER%"
 )
 
+REM --- ensure the Playwright Chromium browser is installed -----
+REM Thumbnail rendering (Senku) needs a headless Chromium; the pip package alone
+REM doesn't ship the browser binary. "playwright install" is idempotent, so this
+REM is a fast no-op once installed. Non-fatal: the bots still start if it fails
+REM (thumbnails just won't render until it succeeds). Windows needs no separate
+REM system-deps step.
+set "PW_MARKER=%VENV_DIR%\.playwright-ready"
+if not exist "%PW_MARKER%" (
+    echo [Kuro Soden] Ensuring Playwright Chromium is installed ...
+    "%VENV_PY%" -m playwright install chromium
+    if errorlevel 1 (
+        echo [Kuro Soden] WARNING: 'playwright install chromium' failed - thumbnail
+        echo [Kuro Soden]          rendering may not work until it succeeds.
+    ) else (
+        echo ready>"%PW_MARKER%"
+    )
+)
+
 REM --- sanity: secrets file -----------------------------------
 if not exist ".env" (
     echo [Kuro Soden] WARNING: .env not found.

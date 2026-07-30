@@ -31,6 +31,24 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# --- ensure the Playwright Chromium browser is installed ----
+# Thumbnail rendering (Senku) needs a headless Chromium; the pip package alone
+# doesn't ship the browser binary. `playwright install` is idempotent — a fast
+# no-op once the browser exists, downloading only on first run. Non-fatal so the
+# bots still start (thumbnails just won't render until it succeeds).
+echo "[Kuro Sōden] Ensuring Playwright Chromium is installed ..."
+if ! "$VENV_PY" -m playwright install chromium; then
+    echo "[Kuro Sōden] WARNING: 'playwright install chromium' failed — thumbnail"
+    echo "[Kuro Sōden]          rendering may not work until it succeeds."
+fi
+# System libraries Chromium needs (Linux only). Needs root, so best-effort:
+# skip silently when it can't run (e.g. macOS, or no sudo).
+if [ "$(uname -s)" = "Linux" ]; then
+    "$VENV_PY" -m playwright install-deps chromium >/dev/null 2>&1 \
+        || sudo "$VENV_PY" -m playwright install-deps chromium >/dev/null 2>&1 \
+        || echo "[Kuro Sōden] NOTE: couldn't install Chromium system deps (need root). If thumbnails fail: sudo $VENV_PY -m playwright install-deps chromium"
+fi
+
 # --- sanity: secrets file -----------------------------------
 if [ ! -f ".env" ]; then
     echo "[Kuro Sōden] WARNING: .env not found."
