@@ -50,11 +50,22 @@ def is_oversized_1080(size_bytes: int, duration_s: float) -> bool:
     return size_bytes > budget * OVERSIZE_FACTOR
 
 
-async def _run_ffmpeg(cmd: list[str]) -> None:
+async def _run_ffmpeg(cmd: list[str], *, timeout: float = 3600.0) -> None:
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
     )
-    _, err = await proc.communicate()
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, TimeoutError):
+        # A wedged ffmpeg (stalled I/O, waiting on a broken pipe) would otherwise
+        # dam the whole pipeline forever. Kill it and surface a real error so the
+        # tier is skipped (a note) rather than hanging the job indefinitely.
+        proc.kill()
+        try:
+            await proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(f"ffmpeg encode timed out after {int(timeout)}s") from None
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg transcode failed: {err.decode(errors='replace')[-300:]}")
 

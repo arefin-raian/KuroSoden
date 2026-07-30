@@ -38,6 +38,12 @@ from nekofetch.ui.progress import download_card_html, human_elapsed
 log = get_logger(__name__)
 
 _ACTIVE = {JobStatus.QUEUED.value, JobStatus.RUNNING.value, JobStatus.PAUSED.value}
+# Only these definitively end the job. Anything else (an unknown/transient
+# status, or a snapshot gap) is treated as "still working" so the card can never
+# flip to the terminal "handed to distribution" frame while processing/encoding/
+# uploading is genuinely still in flight.
+_TERMINAL = {JobStatus.COMPLETED.value, JobStatus.FAILED.value,
+             JobStatus.CANCELLED.value}
 _REFRESH_CADENCE = 4.0          # seconds between edits; slow enough to dodge flood limits
 _MAX_LIFETIME = 6 * 60 * 60     # hard stop so a wedged job can't leak a task forever
 
@@ -205,24 +211,28 @@ async def _refresh_loop(client: Client, container: Container, job_id: int,
             return
         status = view["status"]
 
-        if status in _ACTIVE:
-            text = _render_live(job_id, view)
-            if text != last_text:
-                try:
-                    await client.edit_message_text(
-                        chat_id, msg_id, text, parse_mode=ParseMode.HTML,
-                        reply_markup=_live_keyboard(job_id, view),
-                    )
-                    last_text = text
-                except MessageNotModified:
-                    pass
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("levi.progress.edit_blip", job_id=job_id, error=str(exc))
-            continue
+        if status in _TERMINAL:
+            # Definitively done/failed/cancelled — paint the final card once, stop.
+            await _paint_terminal(client, container, job_id, chat_id, msg_id, view)
+            return
 
-        # Terminal — paint the final card once, then stop.
-        await _paint_terminal(client, container, job_id, chat_id, msg_id, view)
-        return
+        # Active OR any transient/unknown status (snapshot gap between the
+        # download loop and processing, etc.) → keep the live card refreshing.
+        # This is what stops a premature "handed to distribution" while encoding
+        # or uploading is still running.
+        text = _render_live(job_id, view)
+        if text != last_text:
+            try:
+                await client.edit_message_text(
+                    chat_id, msg_id, text, parse_mode=ParseMode.HTML,
+                    reply_markup=_live_keyboard(job_id, view),
+                )
+                last_text = text
+            except MessageNotModified:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                log.debug("levi.progress.edit_blip", job_id=job_id, error=str(exc))
+        continue
     log.info("levi.progress.monitor_expired", job_id=job_id)
 
 

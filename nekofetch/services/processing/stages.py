@@ -948,6 +948,17 @@ class EncodeStage(Stage):
             session = None
 
         n = len(sources)
+        # Resolve encode tuning from config (fast preset + per-tier CRF), with
+        # safe fallbacks so an older config without these keys still works.
+        preset = getattr(self.c.config.processing, "encode_preset", "veryfast")
+        crf_map = getattr(self.c.config.processing, "encode_crf", None) or _ENCODE_CRF
+        # Every (file, height) pair is one encode — count them all so the bar
+        # advances per rendition, not per file (a single file with 2 tiers used
+        # to jump 0→50→100 with a long silent gap between).
+        total_units = sum(
+            1 for f in sources for h in heights if f"{h}p" != (f.resolution or "1080p")
+        ) or 1
+        done_units = 0
         await _push_stage_progress(self.c, ctx, "Encoding", 0.0, file_index=0, file_total=n)
         new_rows: list = []
         for i, f in enumerate(sources):
@@ -962,15 +973,19 @@ class EncodeStage(Stage):
                     continue  # never "downscale" to the same tier
                 await _push_stage_progress(
                     self.c, ctx, f"Encoding {label}",
-                    (i / n) * 100, file_index=i, file_total=n,
+                    (done_units / total_units) * 100,
+                    file_index=i + 1, file_total=n,
                 )
                 out_stem = _swap_resolution(stem, src_res, label)
                 out_path = src.with_name(f"{out_stem}{src.suffix}")
                 try:
-                    await _encode(src, out_path, height, _ENCODE_CRF.get(height, 22))
+                    await _encode(src, out_path, height,
+                                  crf_map.get(height, 23), preset=preset)
                 except Exception as exc:  # noqa: BLE001 - a failed tier is a note, not a job failure
                     ctx.notes.append(f"encode {label}: {exc}")
+                    done_units += 1
                     continue
+                done_units += 1
                 if not (out_path.exists() and out_path.stat().st_size > 0):
                     ctx.notes.append(f"encode {label}: empty output")
                     continue
@@ -986,8 +1001,10 @@ class EncodeStage(Stage):
                 new_rows.append(row)
                 if session is not None:
                     session.add(row)
-            pct = ((i + 1) / n) * 100
-            await _push_stage_progress(self.c, ctx, "Encoding", pct, file_index=i + 1, file_total=n)
+            await _push_stage_progress(
+                self.c, ctx, "Encoding", (done_units / total_units) * 100,
+                file_index=i + 1, file_total=n,
+            )
 
         # Make the renditions visible to STORE (and the storage uploader, which
         # reads MediaFile rows for the job) in this same pass.

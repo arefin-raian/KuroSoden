@@ -213,6 +213,16 @@ class ProcessingConfig(BaseModel):
     # Target rendition heights produced from the source file. Uploaded smallest
     # first, so packs post as 480p → 720p → 1080p.
     encode_heights: list[int] = Field(default_factory=lambda: [720, 480])
+    # x264 speed/efficiency preset for the derived tiers. "medium" is far too
+    # slow for a multi-episode batch (each rendition is a full re-encode), so the
+    # default is a fast preset that keeps quality high at the CRF below while
+    # cutting encode time several-fold. Valid: ultrafast…veryslow.
+    encode_preset: str = "veryfast"
+    # Constant Rate Factor per tier (lower = better quality/larger). Tuned to
+    # pair with the fast preset — visually clean for downscaled 720p/480p.
+    encode_crf: dict[int, int] = Field(
+        default_factory=lambda: {1080: 21, 720: 22, 480: 23}
+    )
     # When False, the pipeline automatically publishes to the main channel +
     # index channel and brings up the distribution bot right after the storage
     # upload finishes — no admin click required. When True, the existing

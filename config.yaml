@@ -45,6 +45,11 @@ processing:
   # (packs post as 480p → 720p → 1080p).
   encode: true
   encode_heights: [720, 480]
+  # x264 speed preset for the derived tiers. "medium" is far too slow for a
+  # multi-episode batch (each rendition is a full re-encode); "veryfast" cuts
+  # encode time several-fold with negligible quality loss at the CRFs used.
+  # Options (slow→fast): veryslow slower slow medium fast faster veryfast superfast ultrafast
+  encode_preset: veryfast
   # false (default): auto-publish to main + index channels and bring up the
   # distribution bot right after storage upload — no admin click.
   # true: gate publishing behind an admin approval card.
