@@ -336,6 +336,14 @@ THUMB_GALLERY_FAIL = (
     "tap the button again and it'll come through."
 )
 
+THUMB_RENDER_FAIL = (
+    f"{ICON} <b>Couldn't render the card.</b> The picks are saved — this is the "
+    "renderer, not your choices. If this is a fresh box, the headless browser "
+    "isn't installed yet: run <code>playwright install chromium</code> "
+    "(and <code>playwright install-deps chromium</code> on Linux), then tap "
+    "Generate again."
+)
+
 
 # ── Watch-order confirm / edit ──────────────────────────────────────────────────
 

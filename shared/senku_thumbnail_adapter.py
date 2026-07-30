@@ -63,6 +63,10 @@ class SenkuThumbnailAdapter:
         self.cache = DistributionCache(container)
         self._telegraph: TelegraphClient | None = None
         self._render = None  # lazy ThumbnailRenderService
+        # Set by render_entry on failure: "browser" (playwright not installed /
+        # launch failed) vs "render" (everything else) — the wizard picks the
+        # right operator-facing message from this.
+        self.last_render_error: str | None = None
 
     # ── shared machinery (lazy) ─────────────────────────────────────────────
 
@@ -260,8 +264,11 @@ class SenkuThumbnailAdapter:
         sel = await self.cache.get_selection(code, entry.index)
         if not (sel.logo_url and sel.poster_url and sel.backdrop_url):
             return None
+        self.last_render_error = None
         renderer = self._renderer()
         if renderer is None:
+            # Renderer couldn't even initialise → almost always a missing browser.
+            self.last_render_error = "browser"
             return None
         franchise = await self.cache.get_franchise(code) or {}
         anime_doc_id = franchise.get("anime_doc_id")
@@ -277,6 +284,17 @@ class SenkuThumbnailAdapter:
                 **fields,
             )
         except Exception as exc:  # noqa: BLE001
+            # Flag a missing/broken headless browser distinctly so the wizard can
+            # tell the operator to run `playwright install` instead of blaming the
+            # network. Playwright surfaces this as an Error mentioning the missing
+            # executable or as an ImportError when the package isn't installed.
+            msg = str(exc).lower()
+            self.last_render_error = (
+                "browser"
+                if ("playwright" in msg or "executable doesn't exist" in msg
+                    or "browsertype.launch" in msg or "install" in msg)
+                else "render"
+            )
             log.warning("senku.thumb.render_failed", code=code, entry=entry.index,
                         error=str(exc))
             return None

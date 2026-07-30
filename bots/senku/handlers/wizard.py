@@ -548,9 +548,15 @@ def register(client: Client, container: Container) -> None:
         await q.answer("Rendering…")
         path = await thumbs.render_entry(code, entry)
         if path is None:
+            # Accurate failure copy: a missing headless browser is not a network
+            # blip, so don't tell the operator to "tap again" — tell them to
+            # install playwright.
+            fail_msg = (V.THUMB_RENDER_FAIL
+                        if getattr(thumbs, "last_render_error", None) == "browser"
+                        else V.THUMB_GALLERY_FAIL)
             await send_screen(
                 client, q.message.chat.id,
-                card(V.THUMB_GALLERY_FAIL, image=pick_artwork(BOT), bot_name=BOT,
+                card(fail_msg, image=pick_artwork(BOT), bot_name=BOT,
                      buttons=[[(V.BTN_GENERATE, cb(BOT, "wiz", "gen", code, str(index)))],
                               [(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))]]),
                 old_msg=q.message,
