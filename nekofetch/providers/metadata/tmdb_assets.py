@@ -53,11 +53,16 @@ async def fetch_logos(client: "TmdbClient", tmdb_id: int, media_type: str) -> li
     if not logos:
         return []
 
-    # Sort: English first, then neutral, then others; within each tier by quality
+    # Logos are ENGLISH-ONLY by spec (the title art overlaid on the thumbnail
+    # must read in English). Fall back to language-neutral art only when TMDB
+    # has no English logo at all, so the picker is never empty.
+    english = [l for l in logos if (l.get("iso_639_1") or "") == "en"]
+    logos = english or [l for l in logos if not l.get("iso_639_1")]
+    if not logos:
+        return []
+
     def sort_key(l: dict) -> tuple:
-        lang = l.get("iso_639_1") or ""
-        tier = 0 if lang == "en" else (1 if lang == "" else 2)
-        return (tier, -l.get("vote_count", 0), -_quality_key(l)[2])
+        return (-l.get("vote_count", 0), -_quality_key(l)[2])
 
     logos.sort(key=sort_key)
 
@@ -95,9 +100,17 @@ async def fetch_posters_ranked(
     if not posters:
         return []
 
+    # Posters by spec: English first, then language-neutral. Drop any other
+    # language so the picker only offers EN + textless art.
+    posters = [
+        p for p in posters if (p.get("iso_639_1") or "") in ("en", "")
+    ]
+    if not posters:
+        return []
+
     def sort_key(p: dict) -> tuple:
         lang = p.get("iso_639_1") or ""
-        tier = 0 if lang == "en" else (1 if lang == "" else 2)
+        tier = 0 if lang == "en" else 1  # English first, then neutral
         return (tier, -p.get("vote_count", 0), -_quality_key(p)[2])
 
     posters.sort(key=sort_key)
@@ -119,33 +132,35 @@ async def fetch_posters_ranked(
 async def fetch_backdrops_ranked(
     client: "TmdbClient", tmdb_id: int, media_type: str,
 ) -> list[dict]:
-    """Fetch **textless** backdrop images for the thumbnail-generator picker.
+    """Fetch backdrop images for the thumbnail-generator picker.
 
-    The thumbnail bot overlays the user's chosen logo on top, so the backdrop
-    options offered MUST be textless — the ``?image_language=xx`` (no-language)
-    gallery, art with no title baked in. We request only ``null`` from TMDB and
-    additionally guard in-code against any language-tagged art slipping through.
-    This is the opposite of the confirmation card, which wants English-tagged
-    art (see ``TmdbClient._confirm_backdrop``).
+    By spec the picker leads with **language-neutral / textless** backdrops
+    (the thumbnail bot overlays the chosen logo, so clean art is preferred),
+    and lists **English-tagged** backdrops LAST as a fallback. Any other
+    language is dropped. We request ``en,null`` from TMDB and order in-code.
 
     Returns same format as ``fetch_logos`` but with ``w1280`` sized URLs.
     """
     try:
         imgs = await client._get(
             f"/{media_type}/{tmdb_id}/images",
-            include_image_language="null",
+            include_image_language="en,null",
         )
     except Exception as exc:
         log.warning("tmdb.backdrops.failed", id=tmdb_id, error=str(exc))
         return []
 
-    # Textless only: drop anything carrying a language tag (baked-in title text).
-    backdrops = [b for b in imgs.get("backdrops", []) if not b.get("iso_639_1")]
+    # Keep neutral + English only; neutral first, English last.
+    backdrops = [
+        b for b in imgs.get("backdrops", []) if (b.get("iso_639_1") or "") in ("", "en")
+    ]
     if not backdrops:
         return []
 
     def sort_key(b: dict) -> tuple:
-        return (-b.get("vote_count", 0), -_quality_key(b)[2])
+        lang = b.get("iso_639_1") or ""
+        tier = 0 if lang == "" else 1  # neutral/textless first, English last
+        return (tier, -b.get("vote_count", 0), -_quality_key(b)[2])
 
     backdrops.sort(key=sort_key)
 

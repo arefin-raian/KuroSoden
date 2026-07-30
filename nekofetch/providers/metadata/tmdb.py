@@ -100,14 +100,22 @@ class TmdbClient:
             raise last_exc
         return {}
 
-    async def search(self, title: str) -> TmdbResult | None:
-        """Best match for ``title`` — prefers TV, then movie, by popularity."""
+    async def search(self, title: str, *, prefer_media: str | None = None,
+                     anime: bool = True) -> TmdbResult | None:
+        """Best match for ``title``.
+
+        ``anime=True`` (the default for this pipeline) biases results toward
+        Japanese-origin animation so a generically-named anime doesn't lose to a
+        more popular live-action show that happens to share the title (the
+        "K-drama backdrops" bug). ``prefer_media`` ("tv"/"movie") nudges the
+        media type when the caller already knows it (e.g. a movie entry).
+        """
         candidates: list[dict] = []
         try:
             for media in ("tv", "movie"):
                 data = await self._get(f"/search/{media}", query=title,
                                        include_adult="false", language="en-US")
-                for item in data.get("results", [])[:5]:
+                for item in data.get("results", [])[:8]:
                     item["_media"] = media
                     candidates.append(item)
         except (httpx.HTTPError, ValueError) as exc:
@@ -115,9 +123,32 @@ class TmdbClient:
             return None
         if not candidates:
             return None
-        # prefer TV, then higher popularity
-        candidates.sort(key=lambda c: (c["_media"] == "tv", c.get("popularity", 0)),
-                        reverse=True)
+
+        _ANIMATION_GENRE_ID = 16  # TMDB "Animation"
+
+        def _is_jp(c: dict) -> bool:
+            oc = c.get("origin_country") or []
+            return "JP" in oc or (c.get("original_language") == "ja")
+
+        def _is_anime(c: dict) -> bool:
+            return _is_jp(c) and _ANIMATION_GENRE_ID in (c.get("genre_ids") or [])
+
+        def rank(c: dict) -> tuple:
+            # Highest priority first: true anime (JP + animation), then JP-origin,
+            # then animation anywhere, then the media-type preference, then TV,
+            # then popularity. When anime=False the anime tiers collapse to 0 so
+            # behaviour matches the old popularity-first ordering.
+            if anime:
+                a_anime = _is_anime(c)
+                a_jp = _is_jp(c)
+                a_anim = _ANIMATION_GENRE_ID in (c.get("genre_ids") or [])
+            else:
+                a_anime = a_jp = a_anim = False
+            pref = prefer_media is not None and c["_media"] == prefer_media
+            return (a_anime, a_jp, a_anim, pref, c["_media"] == "tv",
+                    c.get("popularity", 0))
+
+        candidates.sort(key=rank, reverse=True)
         top = candidates[0]
         return await self.details(top["id"], top["_media"])
 

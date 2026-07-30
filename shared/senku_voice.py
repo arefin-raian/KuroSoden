@@ -266,9 +266,15 @@ def thumb_intro(title: str, total: int) -> str:
 
 
 def thumb_entry_header(label: str, index: int, total: int) -> str:
+    # Single entry → the label alone is enough (no redundant "Entry 1 / 1").
+    # Multiple → keep the counter but put the label INLINE in brackets, not on a
+    # separate line, so it reads "Entry 2 / 5 · (Season 2)" instead of stacking.
+    if total <= 1:
+        head = f"{ICON} <b>{esc(label)}</b>"
+    else:
+        head = f"{ICON} <b>Entry {index} / {total}</b>  ·  <b>{esc(label)}</b>"
     return (
-        f"{ICON} <b>Entry {index} / {total}</b>\n"
-        f"<b>{esc(label)}</b>\n\n"
+        f"{head}\n\n"
         "Pick the assets below. Tap to open the gallery, then tap the number you want."
     )
 

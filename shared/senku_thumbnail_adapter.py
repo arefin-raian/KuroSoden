@@ -102,7 +102,12 @@ class SenkuThumbnailAdapter:
         if not query:
             return None, entry.media_type
         try:
-            result = await self._c.tmdb.search(query)
+            # Bias to anime (JP + animation) and hint the known media type so a
+            # generically-named title doesn't resolve to a popular live-action
+            # show (the wrong-images / "K-drama backdrops" bug).
+            result = await self._c.tmdb.search(
+                query, prefer_media=entry.media_type, anime=True,
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("senku.thumb.tmdb_search_failed", query=query, error=str(exc))
             return None, entry.media_type

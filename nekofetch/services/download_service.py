@@ -924,12 +924,17 @@ class DownloadWorker:
             return None
 
     async def _already_have(self, job_id, ep, resolution, audio) -> bool:
-        """True if this exact unit was already downloaded in a prior run.
+        """True if this exact unit is safely accounted for and needn't re-download.
 
-        A DB record is sufficient — the file may have been uploaded and cleaned
-        up by a prior _process_and_upload_quality pass, which is correct behaviour
-        (not a reason to re-download). Only re-download when there is no DB record
-        at all (genuinely missing from this job).
+        "Accounted for" means one of:
+          * the file was already uploaded to storage (``published=True``), or
+          * a DB row exists AND its file is still on disk.
+
+        A DB row whose file is GONE from disk and was never uploaded is an
+        orphan (e.g. a power-loss mid-encode wiped the working set before upload)
+        — returning True there is what caused a resumed job to skip the
+        re-download, find no files, and silently "complete" without uploading.
+        In that case we return False so the unit is fetched again.
         """
         try:
             async with session_scope(self._c.pg_sessionmaker) as session:
@@ -940,7 +945,15 @@ class DownloadWorker:
                         MediaFile.audio == audio,
                     )
                 )).scalars().first()
-            return row is not None
+                if row is None:
+                    return False
+                if row.published:
+                    return True  # already in storage — never re-download
+                local = row.local_path
+            # Row exists but not uploaded → only trust it if the file survives.
+            if local and await asyncio.to_thread(Path(local).exists):
+                return True
+            return False
         except Exception:  # noqa: BLE001 - on error, just re-download (safe) not fail
             return False
 
@@ -1212,6 +1225,22 @@ class DownloadWorker:
     async def _record_file(self, job_id, req, ep, variant, dest, result) -> None:
         actual_path = result.get("path") or str(dest)
         async with session_scope(self._c.pg_sessionmaker) as session:
+            # Drop any stale orphan row for this exact unit before inserting — a
+            # re-download on resume (file was gone from disk, never uploaded)
+            # must not leave a duplicate MediaFile behind. Only un-published rows
+            # are cleared; a published row means it's already in storage and
+            # _already_have would have skipped the re-download entirely.
+            stale = (await session.execute(
+                select(MediaFile).where(
+                    MediaFile.job_id == job_id, MediaFile.season == ep.season,
+                    MediaFile.episode == ep.number,
+                    MediaFile.resolution == variant.resolution,
+                    MediaFile.audio == variant.audio,
+                    MediaFile.published.is_(False),
+                )
+            )).scalars().all()
+            for row in stale:
+                await session.delete(row)
             session.add(
                 MediaFile(
                     job_id=job_id,
