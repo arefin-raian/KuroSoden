@@ -376,6 +376,7 @@ class VerifyStage(Stage):
 
     async def process(self, ctx: StageContext) -> None:
         from nekofetch.core.exceptions import ProcessingError
+        from nekofetch.domain.enums import AudioType
         from nekofetch.sources._hls import find_ffprobe
 
         ffprobe = find_ffprobe()
@@ -398,12 +399,46 @@ class VerifyStage(Stage):
             f.verified = ok
             if not ok:
                 corrupt.append(f"{path.name}: {reason}")
+            # ── Ground-truth audio: the file's OWN tracks, not the title guess ──
+            # Title/magnet-name parsing lies (a bare request title has no "Dual
+            # Audio" in it → SUBBED). The container never lies: 2 audio tracks =
+            # Dual, 3+ = Multi. Correct the recorded audio here so naming, packs
+            # and the channel title all reflect reality.
+            if ok and ffprobe:
+                await self._correct_audio_from_tracks(ctx, f, ffprobe, path, AudioType)
             pct = ((i + 1) / n) * 100
             await _push_stage_progress(self.c, ctx, "Verifying", pct, file_index=i + 1, file_total=n)
         # Corrupt files must never reach the database channel — fail the whole job
         # so it's surfaced and can be retried, rather than silently shipping garbage.
         if corrupt:
             raise ProcessingError("corrupt file(s): " + "; ".join(corrupt[:5]))
+
+    async def _correct_audio_from_tracks(
+        self, ctx: StageContext, f, ffprobe: str, path: Path, AudioType,
+    ) -> None:
+        """Set ``f.audio`` from the actual audio-track count in the file.
+
+        Only ever UPGRADES toward dual/multi — a genuine single-track sub/dub
+        release keeps its label. Distinct language tags decide multi (3+ langs)
+        vs dual (2 langs / 2 tracks); an untagged 2-track file is still dual.
+        """
+        langs = await _track_langs(ffprobe, path, "a")
+        n_tracks = len(langs)
+        if n_tracks < 2:
+            return  # single audio → trust the existing label
+        distinct = {l.lower() for l in langs if l}
+        new_audio = AudioType.MULTI if len(distinct) >= 3 else AudioType.DUAL_AUDIO
+        if f.audio != new_audio:
+            old = getattr(f.audio, "value", f.audio)
+            f.audio = new_audio
+            ctx.notes.append(
+                f"audio: {path.name} has {n_tracks} audio track(s) "
+                f"({','.join(sorted(distinct)) or 'untagged'}) → "
+                f"{new_audio.value} (was {old})"
+            )
+            log.info("verify.audio_corrected", file=path.name,
+                     tracks=n_tracks, langs=sorted(distinct),
+                     audio=new_audio.value, was=str(old))
 
 
 # Canonical short audio tags used in file names — the AudioType enum values
