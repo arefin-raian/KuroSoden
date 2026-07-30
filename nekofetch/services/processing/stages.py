@@ -913,6 +913,7 @@ class EncodeStage(Stage):
 
         from sqlalchemy import inspect as _sa_inspect
 
+        from nekofetch.core.exceptions import ProcessingError
         from nekofetch.infrastructure.database.postgres.models import MediaFile
         from nekofetch.sources._transcode import _encode
 
@@ -978,13 +979,32 @@ class EncodeStage(Stage):
                 )
                 out_stem = _swap_resolution(stem, src_res, label)
                 out_path = src.with_name(f"{out_stem}{src.suffix}")
-                try:
-                    await _encode(src, out_path, height,
-                                  crf_map.get(height, 23), preset=preset)
-                except Exception as exc:  # noqa: BLE001 - a failed tier is a note, not a job failure
-                    ctx.notes.append(f"encode {label}: {exc}")
-                    done_units += 1
-                    continue
+                # Retry a failing encode a few times (transient ffmpeg/disk
+                # hiccups happen). If it STILL fails after _ENCODE_MAX_ATTEMPTS,
+                # raise so the whole job goes to the recovery card — the operator
+                # can then switch to a different torrent rather than shipping an
+                # incomplete quality set.
+                last_exc: Exception | None = None
+                for attempt in range(1, _ENCODE_MAX_ATTEMPTS + 1):
+                    try:
+                        await _encode(src, out_path, height,
+                                      crf_map.get(height, 23), preset=preset)
+                        last_exc = None
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        last_exc = exc
+                        out_path.unlink(missing_ok=True)  # drop any partial file
+                        ctx.notes.append(
+                            f"encode {label}: attempt {attempt}/"
+                            f"{_ENCODE_MAX_ATTEMPTS} failed ({exc})"
+                        )
+                        log.warning("encode.retry", label=label, attempt=attempt,
+                                    error=str(exc))
+                if last_exc is not None:
+                    raise ProcessingError(
+                        f"encode {label} failed after {_ENCODE_MAX_ATTEMPTS} "
+                        f"attempts: {last_exc}"
+                    )
                 done_units += 1
                 if not (out_path.exists() and out_path.stat().st_size > 0):
                     ctx.notes.append(f"encode {label}: empty output")
@@ -1016,6 +1036,10 @@ class EncodeStage(Stage):
 # Derived-rendition CRFs (mirrors _transcode._CRF; kept local so the stage owns
 # its quality knobs).
 _ENCODE_CRF = {1080: 21, 720: 21, 480: 22}
+
+# How many times to retry a single failing tier encode before failing the whole
+# job (which routes to the recovery card so the operator can switch torrents).
+_ENCODE_MAX_ATTEMPTS = 3
 
 
 def _swap_resolution(stem: str, old_res: str, new_res: str) -> str:
