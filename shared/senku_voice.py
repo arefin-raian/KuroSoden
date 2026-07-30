@@ -174,61 +174,81 @@ CHANNEL_USERBOT_FAILED = (
 )
 
 
-def channel_title_block(title_text: str) -> str:
-    return (
-        "🏷 <b>Channel title</b> — tap to copy:\n"
-        f"<code>{esc(title_text)}</code>\n\n"
-        "That's the exact name, built from the pack's audio, languages and qualities. "
-        "Paste it as the channel title verbatim."
+def channel_create_card(name: str, candidates: list[str]) -> str:
+    """Step 1 — everything the admin needs to CREATE the channel in one card:
+    a name suggestion + a menu of valid @username options to pick from."""
+    lines = [
+        f"{ICON} <b>Create the channel</b>\n",
+        "① <b>Name</b> — tap to copy:",
+        f"<code>{esc(name)}</code>",
+        "<i>(I'll set the final decorated title myself later — this is just so the "
+        "channel exists.)</i>\n",
+        "② <b>Public link</b> — Telegram won't hand out an exact @handle, so pick "
+        "one of these (they're built from the title + <code>axw</code>):",
+    ]
+    for i, c in enumerate(candidates, start=1):
+        lines.append(f"  <b>{i}.</b> <code>{c}</code>")
+    lines.append(
+        "\nCreate a <b>public channel</b> with one of those usernames, then tap "
+        "<b>Next</b>."
     )
-
-
-def channel_username_block(username: str) -> str:
-    return (
-        "🔗 <b>Channel username</b> — tap to copy:\n"
-        f"<code>{esc(username)}</code>\n\n"
-        "Set this as the channel's public link (<code>t.me/…</code>). It's the same "
-        "handle the automated build would've picked, so deep-links stay consistent."
-    )
+    return "\n".join(lines)
 
 
 def channel_pfp_line() -> str:
     return (
-        "🖼 <b>Profile picture</b>\n"
+        "🖼 <b>Add the profile picture</b>\n"
         "Open the TMDB poster page below, download a clean poster, and set it as the "
-        "channel photo. Pick one you did <b>not</b> already use as the file thumbnail — "
-        "variety reads as effort."
-    )
-
-
-def channel_description_block(description_text: str) -> str:
-    return (
-        "📝 <b>Channel description</b> — tap to copy:\n"
-        f"<code>{esc(description_text)}</code>\n\n"
-        "Same description on every channel. Paste it into the channel bio exactly."
+        "channel photo.\n\n"
+        "<i>Tip: after setting it, delete Telegram's \"channel photo updated\" service "
+        "message so the channel stays clean.</i>\n\n"
+        "Tap <b>Next</b> once the photo's on."
     )
 
 
 CHANNEL_ADMINS_LINE = (
-    "👥 <b>Add the bots as admins</b>\n"
-    "Add <b>Senku</b> (me) and <b>Gojo</b> as administrators on the new channel. "
-    "I post the info card and watch guide; Gojo handles the publishing side. "
-    "Without admin rights, neither of us can touch it."
+    "👥 <b>Add both bots as admins</b>\n"
+    "Add <b>Senku</b> (me) and <b>Gojo</b> as administrators with <b>all rights</b>. "
+    "I post the info card, watch guide and set the title/description; Gojo handles "
+    "publishing. Without admin rights, neither of us can touch it.\n\n"
+    "Tap <b>Next</b> when we're both admins."
 )
 
 
 def channel_missing(what: str) -> str:
     return (
         f"{ICON} <b>Not so fast.</b> I still need: {esc(what)}. "
-        "Finish that and tap <b>I've created it</b> again — I don't publish half-built experiments."
+        "Fix that and send the link again — I don't publish half-built experiments."
     )
 
 
-CHANNEL_ASK_USERNAME = (
-    f"{ICON} <b>Channel ready?</b>\n\n"
-    "Send me the channel <b>@username</b> or its numeric ID so I can verify my access "
-    "and start forging thumbnails. Reply /cancel to abort."
+CHANNEL_ASK_LINK = (
+    f"{ICON} <b>Send the channel link</b>\n\n"
+    "Paste the channel's <b>link</b> (<code>t.me/yourchannel</code>), its "
+    "<b>@username</b>, or numeric ID. I'll confirm both bots are admins, then set "
+    "the title and description myself. Reply /cancel to abort."
 )
+
+
+def channel_setup_progress(steps: list[tuple[str, str]]) -> str:
+    """A small progress card for the bot-driven finalisation (title, desc, etc.).
+
+    ``steps`` is a list of ``(label, state)`` where state ∈ {"done","active",
+    "todo"} — rendered like the download bar's stage list."""
+    icon = {"done": "✅", "active": "⏳", "todo": "▫️"}
+    lines = [f"{ICON} <b>Setting up the channel…</b>\n"]
+    for label, state in steps:
+        lines.append(f"{icon.get(state, '▫️')} {esc(label)}")
+    return "\n".join(lines)
+
+
+def channel_setup_done(handle: str, title_text: str) -> str:
+    return (
+        f"{ICON} <b>Channel is ready.</b>\n\n"
+        f"<b>{esc(handle)}</b>\n"
+        f"Title set to:\n<code>{esc(title_text)}</code>\n\n"
+        "Now let's forge the thumbnails."
+    )
 
 
 def channel_verified(handle: str) -> str:
@@ -420,6 +440,8 @@ BTN_CANCEL = "✗ Cancel"
 
 BTN_CHANNEL_DONE = "✅ I've created it"
 BTN_TMDB_POSTER = "🖼 Open TMDB Poster Page"
+BTN_NEXT = "➡️ Next"
+BTN_SEND_LINK = "🔗 I've added both — send link"
 
 # Two-scope channel creation (feature #41).
 BTN_SCOPE_OWN = "👤 I'll create it"

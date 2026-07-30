@@ -23,6 +23,7 @@ to the Phase 3 handler once it lands.
 from __future__ import annotations
 
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import CallbackQuery, Message
 
 from nekofetch.bots.fsm import FSM
@@ -288,54 +289,46 @@ def register(client: Client, container: Container) -> None:
         )
 
     async def _channel_step(chat_id: int, code: str, *, old_msg: Message | None) -> None:
-        """Channel-creation step 1 — title + suggested username (both tap-to-copy).
+        """Step 1 — CREATE: channel name + a menu of valid @username candidates.
 
-        The channel essentials overflow a single 1000-char caption, so the flow is
-        a three-card stepper (title/username → poster/description → admins) with no
-        silent truncation: 1) title & username, 2) poster & description, 3) admins.
+        The admin creates a public channel with one of the suggested usernames.
+        The bot sets the DECORATED title itself later (once it's an admin), so
+        this card only needs a plain name + username options.
         """
         ctx = await _channel_ctx(code)
         if ctx is None:
             await _no_task(chat_id, old_msg=old_msg)
             return
         franchise, title, ess = ctx
-        body = "\n\n".join([
-            V.channel_intro(title),
-            V.channel_title_block(ess.title),
-            V.channel_username_block(ess.username),
-        ])
+        body = V.channel_create_card(ess.channel_name, ess.username_candidates)
         screen = card(
             body, image=await _art(franchise, title), bot_name=BOT,
             buttons=[
-                [(V.BTN_CONTINUE, cb(BOT, "wiz", "chan2", code))],
+                [(V.BTN_NEXT, cb(BOT, "wiz", "chan2", code))],
                 [(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))],
             ],
         )
         await send_screen(client, chat_id, screen, old_msg=old_msg)
 
     async def _channel_step2(chat_id: int, code: str, *, old_msg: Message | None) -> None:
-        """Channel-creation step 2 — profile picture (TMDB link) + description."""
+        """Step 2 — PFP: add the TMDB poster as the channel photo."""
         ctx = await _channel_ctx(code)
         if ctx is None:
             await _no_task(chat_id, old_msg=old_msg)
             return
         franchise, title, ess = ctx
-        body = "\n\n".join([
-            V.channel_pfp_line(),
-            V.channel_description_block(ess.description),
-        ])
         screen = card(
-            body, image=await _art(franchise, title), bot_name=BOT,
+            V.channel_pfp_line(), image=await _art(franchise, title), bot_name=BOT,
             url_buttons=[[(V.BTN_TMDB_POSTER, ess.poster_search_url)]],
             buttons=[
-                [(V.BTN_CONTINUE, cb(BOT, "wiz", "chan3", code))],
+                [(V.BTN_NEXT, cb(BOT, "wiz", "chan3", code))],
                 [(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))],
             ],
         )
         await send_screen(client, chat_id, screen, old_msg=old_msg)
 
     async def _channel_step3(chat_id: int, code: str, *, old_msg: Message | None) -> None:
-        """Channel-creation step 3 — add Senku + Gojo as admins, then confirm done."""
+        """Step 3 — ADMINS: add Senku + Gojo as admins, then ask for the link."""
         ctx = await _channel_ctx(code)
         if ctx is None:
             await _no_task(chat_id, old_msg=old_msg)
@@ -344,7 +337,7 @@ def register(client: Client, container: Container) -> None:
         screen = card(
             V.CHANNEL_ADMINS_LINE, image=await _art(franchise, title), bot_name=BOT,
             buttons=[
-                [(V.BTN_CHANNEL_DONE, cb(BOT, "wiz", "chandone", code))],
+                [(V.BTN_SEND_LINK, cb(BOT, "wiz", "chandone", code))],
                 [(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))],
             ],
         )
@@ -352,10 +345,11 @@ def register(client: Client, container: Container) -> None:
 
     async def _ask_channel(chat_id: int, user_id: int, code: str,
                            *, old_msg: Message | None) -> None:
+        """Step 4 — LINK: arm the reply flow to receive the channel link."""
         await fsm.set(user_id, STATE_AWAIT_CHANNEL, code=code)
         await send_screen(
             client, chat_id,
-            card(V.CHANNEL_ASK_USERNAME, image=pick_artwork(BOT), bot_name=BOT,
+            card(V.CHANNEL_ASK_LINK, image=pick_artwork(BOT), bot_name=BOT,
                  buttons=[[(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))]]),
             old_msg=old_msg,
         )
@@ -424,10 +418,61 @@ def register(client: Client, container: Container) -> None:
 
         await fsm.clear(user_id)
         await cache.set_channel(code, handle=display, chat_id=chat.id)
+
+        # ── Bot-driven finalisation ─────────────────────────────────────────
+        # Both bots are admins now, so Senku sets the decorated title + the
+        # description ITSELF (the admin shouldn't type these). A small progress
+        # card, edited in place, mirrors the download bar's stage list.
+        steps = [("Set channel title", "active"),
+                 ("Set channel description", "todo")]
+        prog = await send_screen(
+            client, chat_id,
+            card(V.channel_setup_progress(steps), image=pick_artwork(BOT),
+                 bot_name=BOT),
+        )
+        ctx = await _channel_ctx(code)
+        ess = ctx[2] if ctx else None
+        final_title = ess.title if ess else (chat.title or display)
+
+        async def _edit_progress() -> None:
+            try:
+                await client.edit_message_caption(
+                    prog.chat.id, prog.id,
+                    caption=V.channel_setup_progress(steps),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:  # noqa: BLE001 — progress is cosmetic
+                pass
+
+        # 1) Title
+        try:
+            await client.set_chat_title(chat.id, final_title[:128])
+            steps[0] = ("Set channel title", "done")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("senku.wiz.set_title_failed", code=code, error=str(exc))
+            steps[0] = ("Set channel title (skipped — check my rights)", "done")
+        steps[1] = ("Set channel description", "active")
+        await _edit_progress()
+
+        # 2) Description
+        if ess and ess.description:
+            try:
+                await client.set_chat_description(chat.id, ess.description[:255])
+                steps[1] = ("Set channel description", "done")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("senku.wiz.set_desc_failed", code=code, error=str(exc))
+                steps[1] = ("Set channel description (skipped — check my rights)",
+                            "done")
+        else:
+            steps[1] = ("Set channel description", "done")
+        await _edit_progress()
+
         await send_screen(
             client, chat_id,
-            card(V.channel_verified(display), image=pick_artwork(BOT), bot_name=BOT,
+            card(V.channel_setup_done(display, final_title),
+                 image=pick_artwork(BOT), bot_name=BOT,
                  buttons=[[(V.BTN_CONTINUE, cb(BOT, "wiz", "thumbs", code))]]),
+            old_msg=prog,
         )
 
     async def _enter_thumbnails(chat_id: int, code: str, *, old_msg: Message | None) -> None:

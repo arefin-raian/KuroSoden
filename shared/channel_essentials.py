@@ -30,8 +30,10 @@ _TMDB_SEARCH = "https://www.themoviedb.org/search?query={q}"
 class ChannelEssentials:
     """The paste-ready pieces for creating one distribution channel."""
 
-    title: str                 # display name — paste as the channel title
-    username: str              # suggested @username (no leading @)
+    title: str                 # FINAL channel title the bot sets itself (EN + JP + tags)
+    channel_name: str          # plain name suggestion for the admin to create with
+    username: str              # best @username candidate (no leading @)
+    username_candidates: list[str]  # menu of valid @username options to pick from
     description: str           # channel bio / description block
     poster_search_url: str     # TMDB poster page to open (never auto-copied)
 
@@ -49,11 +51,17 @@ async def build_channel_essentials(
     the built-in AniXWeebs network block).
     """
     from nekofetch.services.bot_factory import BotFactory
-    from nekofetch.services.bot_naming import format_bot_name, format_bot_username
+    from nekofetch.services.bot_naming import (
+        format_channel_title,
+        format_channel_username_candidates,
+        format_bot_username,
+    )
 
     franchise = franchise or {}
     english = (franchise.get("english") or franchise.get("title") or "").strip()
     romaji = (franchise.get("romaji") or "").strip()
+    native = (franchise.get("native") or franchise.get("title_native") or "").strip()
+    synonyms = [s for s in (franchise.get("synonyms") or []) if isinstance(s, str)]
 
     meta: dict = {}
     if anime_doc_id:
@@ -67,21 +75,35 @@ async def build_channel_essentials(
     # Prefer the franchise's titles when _gather couldn't resolve them.
     english = (meta.get("english") or "").strip() or english
     romaji = (meta.get("romaji") or "").strip() or romaji
+    native = (meta.get("native") or "").strip() or native
     base_title = english or romaji or (anime_doc_id or "Anime")
 
-    title = format_bot_name(
-        english or base_title, romaji,
+    # The FINAL title the bot sets itself once it's an admin (EN + JP + tags).
+    title = format_channel_title(
+        english or base_title, native,
         audios=meta.get("audios") or set(),
         languages=meta.get("languages"),
         qualities=meta.get("qualities"),
     )
-    username = format_bot_username(base_title, anime_doc_id or "", is_channel=True)
+    # A menu of valid @username options built from the title's own names; the
+    # admin picks whichever Telegram lets them claim (exact handles rarely free).
+    candidates = format_channel_username_candidates(
+        english=english or base_title, romaji=romaji, synonyms=synonyms,
+    )
+    if not candidates:
+        candidates = [format_bot_username(base_title, anime_doc_id or "",
+                                          is_channel=True)]
+    username = candidates[0]
     description = _description(container)
     poster_url = _TMDB_SEARCH.format(q=quote_plus(base_title))
 
     return ChannelEssentials(
-        title=title, username=username,
-        description=description, poster_search_url=poster_url,
+        title=title,
+        channel_name=english or base_title,
+        username=username,
+        username_candidates=candidates,
+        description=description,
+        poster_search_url=poster_url,
     )
 
 

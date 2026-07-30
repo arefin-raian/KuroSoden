@@ -135,3 +135,88 @@ def format_bot_username(
     slug = slug[: max(1, 32 - len(tail))].strip("_") or "anime"
     name = f"{slug}{tail}"
     return name[:32]
+
+
+def format_channel_username_candidates(
+    *, english: str | None = None, romaji: str | None = None,
+    synonyms: list[str] | None = None, suffix: str | None = None,
+) -> list[str]:
+    """Several valid @username candidates (5–32 chars) for a channel.
+
+    Telegram won't let you claim an arbitrary exact handle (length + uniqueness),
+    so Senku offers a short menu built from the title's own names — English,
+    Romaji, then any synonyms — each slugified with the ``_<suffix>`` (``_axw``)
+    tail and de-duplicated in priority order. The admin picks whichever is free.
+    """
+    import re
+
+    if suffix is None:
+        from nekofetch.core.config import get_app_config
+        suffix = get_app_config().bot.channel_username_suffix
+
+    tail = f"_{suffix}"
+    seen: set[str] = set()
+    out: list[str] = []
+    sources = [english, romaji, *(synonyms or [])]
+    for src in sources:
+        base = (src or "").strip()
+        if not base:
+            continue
+        slug = re.sub(r"[^a-z0-9]+", "_", base.lower()).strip("_")
+        slug = slug[: max(1, 32 - len(tail))].strip("_")
+        if not slug:
+            continue
+        cand = f"{slug}{tail}"[:32]
+        # Telegram floor is 5 chars; skip anything that came out too short.
+        if len(cand) < 5 or cand in seen:
+            continue
+        seen.add(cand)
+        out.append(cand)
+    return out
+
+
+def format_channel_title(
+    english: str | None, native: str | None, *,
+    audios: set | None = None, languages: set | None = None,
+    qualities: list[str] | None = None, limit: int = 128,
+) -> str:
+    """Channel title with BOTH names + the decorative audio/language/quality tags.
+
+    Distribution *channels* allow a 128-char title (vs a bot's 64), so we can
+    show the English name, the native (Japanese) name in guillemets, then the
+    same ``『 audio 』« languages » qualities`` suffix used for bot names:
+
+        "<English> «<Native>» 『 Dual Audio 』« Japanese & English » 1080p 720p 480p"
+
+    The native half is dropped first when space is tight; the audio/quality
+    suffix is always preserved (it's what users scan for).
+    """
+    english = (english or "").strip()
+    native = (native or "").strip()
+    title = english or native or "Anime"
+
+    tag = audio_tag(audios or set())
+    langs = language_label(languages)
+    quals = " ".join(qualities) if qualities else ""
+
+    suffix_parts = []
+    if tag:
+        suffix_parts.append(f"『 {tag} 』")
+    if langs:
+        suffix_parts.append(f"« {langs} »")
+    if quals:
+        suffix_parts.append(quals)
+    suffix = " ".join(suffix_parts)
+
+    # Try full "English «Native» suffix", then drop native, then just English.
+    for head in ([f"{english} «{native}»" if native and native != english else english,
+                  english] if english else [native]):
+        candidate = f"{head} {suffix}".strip() if suffix else head
+        if len(candidate) <= limit:
+            return candidate
+    # Last resort: preserve the suffix, truncate the head.
+    if suffix:
+        room = limit - len(suffix) - 1
+        if room > 3:
+            return f"{title[:room - 1].rstrip()}… {suffix}"[:limit]
+    return title[:limit]
