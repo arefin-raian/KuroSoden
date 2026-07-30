@@ -272,7 +272,7 @@ def download_card_html(
         if episode_index is not None and total_episodes is not None:
             ep_info = f"<b>├─ 📁 File                  </b> {episode_index} / {total_episodes}\n"
         detail = (
-            f"<blockquote><b><u>Progress</u>\n"
+            f"<blockquote><b><u>Progress</u></b>\n"
             f"{ep_info}"
             f"<b>└─ ⏱️ Elapsed          </b> {elapsed}</blockquote>"
         )
