@@ -56,6 +56,8 @@ class EntryData:
     season_number: int = 1
     season_part: int | None = None
     title: str = ""                  # the AniList/TMDB English title
+    romaji: str = ""                 # AniList Romaji title (for the EN+JP channel name)
+    native: str = ""                 # AniList native (Japanese) title
     episodes: int | None = None
     anilist_id: int | None = None
     tmdb_id: int | None = None
@@ -170,17 +172,29 @@ class DistributionCache:
             log.warning("dist_cache.expand.failed", code=code, error=str(exc))
             return self._entries_from_relations(franchise)
 
-        entries = self._mapping_to_entries(mapping)
+        entries = self._mapping_to_entries(mapping, franchise)
         if entries:
             return entries
         return self._entries_from_relations(franchise)
 
-    def _mapping_to_entries(self, mapping: Any) -> list[EntryData]:
+    def _mapping_to_entries(self, mapping: Any,
+                            franchise: dict | None = None) -> list[EntryData]:
         """Convert a :class:`FranchiseMapping`'s included entries to ``EntryData``.
 
         Shared by the first expansion and the watch-order edit path so both
         produce identically-shaped entries (index, label, kind, ids).
+
+        ``franchise`` supplies the fallback title trio. Mapping entries usually
+        carry only season/kind/anilist_id and NO title string, so without this
+        ``entry.title`` was empty and the thumbnail TMDB search fell back to the
+        entry LABEL ("Season 1") — which resolves to a random popular show (the
+        "K-drama backdrops" bug). Falling back to the franchise's real English/
+        Romaji/native title keeps every TMDB lookup on the right anime.
         """
+        franchise = franchise or {}
+        f_english = franchise.get("english") or franchise.get("title") or ""
+        f_romaji = franchise.get("romaji") or franchise.get("title_romaji") or ""
+        f_native = franchise.get("native") or franchise.get("title_native") or ""
         entries: list[EntryData] = []
         for i, e in enumerate(mapping.included_entries, start=1):
             kind = getattr(e.kind, "value", None) or str(getattr(e, "kind", "season"))
@@ -190,7 +204,9 @@ class DistributionCache:
                 kind=str(kind).lower(),
                 season_number=getattr(e, "season_number", 1),
                 season_part=getattr(e, "season_part", None),
-                title=getattr(e, "title", "") or "",
+                title=(getattr(e, "title", "") or "").strip() or f_english or f_romaji,
+                romaji=(getattr(e, "romaji", "") or "").strip() or f_romaji,
+                native=(getattr(e, "native", "") or "").strip() or f_native,
                 episodes=getattr(e, "episodes", None),
                 anilist_id=getattr(e, "anilist_id", None),
                 media_type="movie" if str(kind).lower() == "movie" else "tv",
@@ -222,7 +238,7 @@ class DistributionCache:
             return None
         if corrected is None:
             return None
-        entries = self._mapping_to_entries(corrected)
+        entries = self._mapping_to_entries(corrected, franchise)
         if not entries:
             return None
         await self.set_entries(code, entries)
@@ -251,7 +267,10 @@ class DistributionCache:
         title = franchise.get("english") or franchise.get("title") or "Anime"
         return [EntryData(
             index=1, label="Season 1", kind="season", season_number=1,
-            title=title, anilist_id=franchise.get("anilist_id"),
+            title=title,
+            romaji=franchise.get("romaji") or franchise.get("title_romaji") or "",
+            native=franchise.get("native") or franchise.get("title_native") or "",
+            anilist_id=franchise.get("anilist_id"),
         )]
 
     # ── Reads ───────────────────────────────────────────────────────────────
