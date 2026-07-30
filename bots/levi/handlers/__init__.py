@@ -38,6 +38,16 @@ def register_all(client: Client, container: Container) -> None:
     # ── The full download/source machinery (mounted from admin.review) ─────
     from nekofetch.bots.admin.handlers import review
 
+    # The shared torrent/source flow's "Back" button defaults to the admin
+    # review detail card (staff|rdetail) — but on Levi the admin arrived via
+    # Levi's own route picker (Telegram / Website / Torrent), NOT the review
+    # card. Point Back back at Levi's route picker so it doesn't dump the admin
+    # onto the review card with its stray Reject button.
+    def _levi_source_back(code: str) -> str:
+        return f"levi|sources|{code}"
+
+    container.source_back_cb = _levi_source_back  # type: ignore[attr-defined]
+
     review.register(client, container)
 
     # ── Levi's settings panel (levi|set|…) — the shared human-friendly engine ──

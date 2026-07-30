@@ -54,6 +54,24 @@ _ESTIMATED_BYTES_PER_RES: dict[str, int] = {
 _DISK_BUFFER_BYTES = 1_000_000_000  # 1 GB safety margin
 
 
+def _is_torrent_ref(ref: str) -> bool:
+    """True when a ``source_ref`` is a nyaa/torrent descriptor (magnet, torrent
+    URL/path, or info-hash) rather than a website native id. Such refs are only
+    meaningful to the nyaa source — never pass them to a website source."""
+    if not ref:
+        return False
+    if ref.startswith("magnet:"):
+        return True
+    try:
+        obj = json.loads(ref)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(obj, dict):
+        return False
+    return any(k in obj for k in
+               ("magnet", "torrent_url", "torrent_path", "info_hash", "file_index"))
+
+
 class _SkipEpisode(Exception):
     """Raised internally when an admin Stops the currently-downloading episode."""
 
@@ -1002,6 +1020,13 @@ class DownloadWorker:
                 continue
             try:
                 ref = req.source_ref
+                # A torrent/magnet source_ref is nyaa-specific — it must NEVER be
+                # handed to a website source (kickassanime/anikoto/miruro), which
+                # would try to fetch a garbage `https://…/{"magnet":…}` URL and
+                # dead-end the whole chain. For any non-nyaa source, discard the
+                # pinned ref and fall back to a verified title match.
+                if ref and name != "nyaa" and _is_torrent_ref(ref):
+                    ref = None
                 if not ref or ref.startswith("anilist:"):
                     stub = await find_verified_match(src, match_titles)
                     if not stub:

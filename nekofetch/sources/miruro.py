@@ -231,13 +231,29 @@ class MiruroSource(AnimeSource):
         if isinstance(provider_order, str):
             provider_order = [p.strip() for p in provider_order.split(",") if p.strip()]
 
+        # Resolution order: an explicit env override ALWAYS wins, then the value
+        # passed from config.yaml, then the built-in localhost default. Miruro
+        # has no public hosted instance (the upstream repo explicitly warns
+        # against Vercel/Render), so an operator points ``MIRURO_API_BASE_URL``
+        # at their own VPS deployment — that override must beat the config
+        # default, which previously silently shadowed the env var and pinned the
+        # source to a dead ``localhost:8000``.
+        env_base = os.getenv("MIRURO_API_BASE_URL")
         self.base_url = (
-            base_url or os.getenv("MIRURO_API_BASE_URL") or DEFAULT_BASE_URL
+            env_base or base_url or DEFAULT_BASE_URL
         ).rstrip("/")
+        env_ref = os.getenv("MIRURO_STREAM_REFERER")
         self.stream_referer = (
-            stream_referer or os.getenv("MIRURO_STREAM_REFERER") or self.base_url
+            env_ref or stream_referer or self.base_url
         ).rstrip("/") + "/"
         self.provider_order = provider_order or ["kiwi", "arc", "zoro", "hop", "pahe"]
+        # A source still pointed at the localhost default is effectively
+        # unconfigured — flag it so the resolver skips it fast (and we log a
+        # clear "set MIRURO_API_BASE_URL" hint) instead of hammering a dead
+        # localhost endpoint on every request.
+        self.configured = self.base_url not in (
+            "http://localhost:8000", "http://127.0.0.1:8000",
+        )
         self._http: httpx.AsyncClient | None = None
 
     @property
@@ -257,6 +273,14 @@ class MiruroSource(AnimeSource):
             self._http = None
 
     async def search(self, query: str) -> list[AnimeStub]:
+        if not self.configured:
+            log.warning(
+                "miruro.unconfigured",
+                hint="set MIRURO_API_BASE_URL to your self-hosted Miruro-API "
+                     "instance (no public endpoint exists) — skipping miruro",
+                base_url=self.base_url,
+            )
+            return []
         if query.startswith("anilist:"):
             aid = _anilist_ref(query)
             if aid is None:
@@ -328,6 +352,10 @@ class MiruroSource(AnimeSource):
         )
 
     async def get_episodes(self, source_ref: str) -> list[Episode]:
+        if not self.configured:
+            log.warning("miruro.unconfigured", op="get_episodes",
+                        base_url=self.base_url)
+            return []
         aid = _anilist_ref(source_ref)
         if aid is None:
             raise ValueError(f"invalid Miruro source_ref: {source_ref!r}")

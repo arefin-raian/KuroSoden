@@ -224,12 +224,17 @@ thumbnail_channel:
   wipe_max_history: 200
 
 # Content sources. Only authorized sources are enabled; pirate-site plugins are
-# not shipped. Miruro talks to a self-hosted Miruro-API instance.
+# not shipped. Miruro talks to a self-hosted Miruro-API instance
+# (https://github.com/walterwhite-69/Miruro-API). There is NO public hosted
+# endpoint — deploy the API on your own VPS and point api_base_url at it, or set
+# the MIRURO_API_BASE_URL env var (the env var overrides this file). While it
+# stays on localhost:8000 the miruro source is treated as unconfigured and is
+# skipped, so kickassanime/anikoto carry the website chain on their own.
 sources:
   enabled: [local, telegram, anikoto, kickassanime, anizone, miruro, nyaa]
   default: telegram
   miruro:
-    api_base_url: http://localhost:8000     # self-hosted Miruro-API endpoint (the API, not the UI site)
+    api_base_url: http://localhost:8000     # self-hosted Miruro-API endpoint (the API, not the UI site); override via MIRURO_API_BASE_URL
     stream_referer: http://localhost:8000   # Referer sent while probing/downloading HLS streams
     provider_order: [kiwi, arc, zoro, hop, pahe]   # server priority; first available wins
 

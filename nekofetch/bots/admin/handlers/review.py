@@ -344,6 +344,23 @@ def register(client: Client, container: Container) -> None:
     fsm = FSM(container.redis, bot="admin")
     L = container.localizer.get
 
+    def _source_back_cb(code: str) -> str:
+        """Callback for the "Back" button on the torrent/source sub-screens.
+
+        On the standalone admin bot this returns to the review detail card
+        (``staff|rdetail``). On Kuro Sōden's Levi, the review card is *not* the
+        screen the admin came from — they arrived via Levi's route picker
+        (Telegram / Website / Torrent), so Back must return there instead of
+        dumping them onto the admin review card with its stray Reject button.
+        A host sets ``container.source_back_cb`` to override the target."""
+        hook = getattr(container, "source_back_cb", None)
+        if hook is not None:
+            try:
+                return hook(code)
+            except Exception:  # noqa: BLE001 — never break a keyboard build
+                pass
+        return cb("staff", "rdetail", code)
+
     async def _spawn_progress_card(job_id: int, chat_id: int | None) -> None:
         """Raise a live download card for a freshly-queued job, if the host wired
         one up (Kuro Sōden / Levi does; the standalone admin bot leaves it unset).
@@ -413,6 +430,43 @@ def register(client: Client, container: Container) -> None:
         """
         del data
         await _disarm_reply(container.redis, message.chat.id)
+
+    async def _claim_torrent_provide(code: str) -> bool:
+        """Atomically claim the torrent-provide slot for ``code``.
+
+        Returns ``True`` for the FIRST magnet/.torrent submitted for a request
+        and ``False`` for any re-send while the claim is still held. Backed by a
+        redis ``SET NX`` with a TTL long enough to cover the slowest magnet
+        metadata resolve (~180s) plus mapping. When redis is unavailable the
+        claim is granted (fail-open) so the single-submission happy path never
+        breaks — the guard only exists to swallow accidental duplicates.
+        """
+        redis = getattr(container, "redis", None)
+        if redis is None:
+            return True
+        key = f"kuro:torrent_provide:{code}"
+        try:
+            # SET key val NX EX=300 — only sets when absent; auto-expires.
+            ok = await asyncio.wait_for(
+                redis.set(key, "1", nx=True, ex=300), timeout=5.0,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-open on any redis blip
+            log.warning("torrent_provide.claim_failed", code=code, error=str(exc)[:160])
+            return True
+        return bool(ok)
+
+    async def _release_torrent_provide(code: str) -> None:
+        """Release the torrent-provide claim (e.g. after an enqueue failure) so
+        the admin can immediately retry without waiting out the TTL."""
+        redis = getattr(container, "redis", None)
+        if redis is None:
+            return
+        try:
+            await asyncio.wait_for(
+                redis.delete(f"kuro:torrent_provide:{code}"), timeout=5.0,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _allowed(q: CallbackQuery, permission: Permission) -> bool:
         user = getattr(q, "nf_user", None)
@@ -652,7 +706,7 @@ def register(client: Client, container: Container) -> None:
         kb = keyboard(
             [(L(M.TORRENT_BTN_SEARCH), cb("staff", "rtmode", code, "search")),
              (L(M.TORRENT_BTN_PROVIDE), cb("staff", "rtmode", code, "provide"))],
-            [(L(M.BTN_BACK), cb("staff", "rdetail", code))],
+            [(L(M.BTN_BACK), _source_back_cb(code))],
         )
         await show(client, q.message, L(M.TORRENT_MODE_PROMPT, title=title), kb)
 
@@ -673,6 +727,10 @@ def register(client: Client, container: Container) -> None:
         if nav:
             rows.append(nav)
         rows.append([(L(M.BTN_BACK), cb("staff", "rsource", code, "torrent"))])
+        caption = (
+            f"{L(M.TORRENT_TITLE, title=title)}\n\n"
+            f"{L(M.TORRENT_INTRO, n=len(cands))}"
+        )
         await show(client, msg, caption, keyboard(*rows))
 
     @client.on_callback_query(filters.regex(r"^staff\|rtmode"))
@@ -688,7 +746,7 @@ def register(client: Client, container: Container) -> None:
         await q.answer()
 
         if mode == "search":
-            back = keyboard([(L(M.BTN_BACK), cb("staff", "rdetail", code))])
+            back = keyboard([(L(M.BTN_BACK), cb("staff", "rsource", code, "torrent"))])
             loading = await show(client, q.message,
                                  L(M.TORRENT_LOADING, title=title), back)
             try:
@@ -703,9 +761,14 @@ def register(client: Client, container: Container) -> None:
                           code=code, title=title, cands=cands)
             await _render_torrent_page(loading, code, cands, 0, title)
         else:
-            kb = keyboard([(L(M.BTN_BACK), cb("staff", "rdetail", code))])
+            kb = keyboard([(L(M.BTN_BACK), cb("staff", "rsource", code, "torrent"))])
             card = await show(client, q.message,
                               L(M.TORRENT_PROVIDE_PROMPT, title=title), kb)
+            # Entering (or re-entering) the provide screen is an explicit
+            # "start over" — clear any stale duplicate-guard claim so a fresh
+            # magnet/.torrent is accepted immediately instead of waiting out the
+            # previous claim's TTL.
+            await _release_torrent_provide(code)
             # Remember the prompt card so the reply handlers can edit it in place
             # (rotating artwork + caption swap) instead of spawning a new message.
             await fsm.set(q.from_user.id, STATE_TORRENT_PROVIDE,
@@ -797,6 +860,23 @@ def register(client: Client, container: Container) -> None:
         if not code:
             return
 
+        # ── Double-submission guard ────────────────────────────────────────
+        # Magnet metadata resolution can take up to ~180s. If the ack card
+        # doesn't visibly update (e.g. a connection blip), the admin naturally
+        # re-sends the same magnet — which previously spawned a SECOND download
+        # job. We take a short-lived redis lock keyed by request code: the FIRST
+        # magnet claims it; any re-send while the first is still in-flight (or
+        # for a few minutes after) finds the lock held, so we just delete the
+        # duplicate message and drop it. The awaited-reply flow is consumed at
+        # the very end, once the work has actually completed.
+        if not await _claim_torrent_provide(code):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            log.info("torrent_magnet.duplicate_dropped", code=code)
+            return
+
         # Delete the admin's message (magnet links are ugly / sensitive).
         try:
             await message.delete()
@@ -815,9 +895,13 @@ def register(client: Client, container: Container) -> None:
             "audio": _audio_cls["audio"],
         })
 
+        # Consume the awaited-reply flow now that the duplicate guard has let
+        # this magnet through — clears the per-user FSM and disarms the
+        # chat-scoped channel marker so nothing else treats a later message as
+        # this reply.
         if via_channel:
             await _finish_channel_reply(message, data)
-        else:
+        elif message.from_user:
             await fsm.clear(message.from_user.id)
 
         user_id = message.from_user.id if message.from_user else 0
@@ -883,6 +967,12 @@ def register(client: Client, container: Container) -> None:
         if not code:
             return
 
+        # Double-submission guard (see _torrent_magnet_reply): the first
+        # .torrent claims the slot; re-sends while it's held are dropped.
+        if not await _claim_torrent_provide(code):
+            log.info("torrent_file.duplicate_dropped", code=code)
+            return
+
         from nekofetch.sources._torrent import torrent_files, order_episodes
         from nekofetch.ui.torrent_screens import format_torrent_summary
 
@@ -893,6 +983,7 @@ def register(client: Client, container: Container) -> None:
             torrent_name, files = torrent_files(raw_bytes)
             ordered = order_episodes(files)
         except Exception:
+            await _release_torrent_provide(code)  # parse failed — allow retry
             await message.reply("Failed to parse torrent file.",
                                 parse_mode=ParseMode.HTML)
             return
@@ -943,7 +1034,7 @@ def register(client: Client, container: Container) -> None:
 
         kb = keyboard(
             [(L(M.TORRENT_BTN_CONFIRM), cb("staff", "rtfileok", code))],
-            [(L(M.BTN_BACK), cb("staff", "rdetail", code))],
+            [(L(M.BTN_BACK), cb("staff", "rsource", code, "torrent"))],
         )
         text = L(M.TORRENT_FILE_ACK, name=torrent_name, summary=summary)
         if prompt_msg:
@@ -1089,6 +1180,7 @@ def register(client: Client, container: Container) -> None:
             job_id = await QueueService(container).enqueue(code)
         except Exception:
             log.exception("torrent enqueue failed code=%s", code)
+            await _release_torrent_provide(code)  # let the admin retry
             await msg.reply(L(M.ERR_GENERIC), parse_mode=ParseMode.HTML)
             return
         await fsm.clear(user_id)

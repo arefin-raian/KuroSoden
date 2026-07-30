@@ -379,8 +379,8 @@ def register(client: Client, container: Container) -> None:
             "or AniZone. Torrent opens the Nyaa release board."
         )
         kb = keyboard(
-            [(V.BTN_SRC_TELEGRAM, cb("levi", "telegram", code))],
-            [("🌐 Website", cb("levi", "website", code))],
+            [(V.BTN_SRC_TELEGRAM, cb("levi", "telegram", code)),
+             ("🌐 Website", cb("levi", "website", code))],
             [(V.BTN_SRC_TORRENT, cb("staff", "rsource", code, "torrent"))],
         )
         await send_screen(

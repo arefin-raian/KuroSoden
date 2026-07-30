@@ -26,8 +26,17 @@ from nekofetch.core.logging import get_logger
 log = get_logger(__name__)
 
 # Connection watchdog intervals (mirrors BotManager's approach).
-_CONN_CHECK_INTERVAL = 30
-_CONN_PROBE_TIMEOUT = 20
+#
+# The probe is a light ``get_me()`` against the MAIN DC. It must NOT be
+# aggressive: a full ``client.restart()`` tears down every session including
+# in-flight media-DC transfers (a running download/upload), so a single
+# transient probe timeout under heavy transfer load must never trigger one.
+# We therefore only restart after several CONSECUTIVE failures — a genuinely
+# dead link fails every probe, while a momentary blip recovers on the next
+# tick with the transfer left untouched.
+_CONN_CHECK_INTERVAL = 60          # was 30 — media-DC churn is normal; probe less often
+_CONN_PROBE_TIMEOUT = 25
+_CONN_FAILURES_BEFORE_RESTART = 3  # consecutive misses before a heavy restart
 _CONN_RECONNECT_ATTEMPTS = 3
 _CONN_RECONNECT_TIMEOUT = 60
 _CONN_RECONNECT_BACKOFF = 5
@@ -305,7 +314,15 @@ class PipelineManager:
     # ── connection watchdog ──────────────────────────────────────────────────
 
     async def _connection_watchdog(self) -> None:
-        """Detect dead Telegram links and force clean reconnects."""
+        """Detect dead Telegram links and force clean reconnects.
+
+        A restart is heavy (it kills in-flight media transfers), so we only
+        trigger one after ``_CONN_FAILURES_BEFORE_RESTART`` CONSECUTIVE probe
+        failures for the same bot. A single transient timeout — common while a
+        big download/upload saturates the socket — is tolerated and the counter
+        resets the moment a probe succeeds again.
+        """
+        misses: dict[str, int] = {}
         while True:
             try:
                 await asyncio.sleep(_CONN_CHECK_INTERVAL)
@@ -314,11 +331,19 @@ class PipelineManager:
                         continue
                     try:
                         await asyncio.wait_for(client.get_me(), timeout=_CONN_PROBE_TIMEOUT)
+                        if misses.get(name):
+                            log.info("kuro-soden.conn.recovered", bot=name,
+                                     after_misses=misses[name])
+                        misses[name] = 0  # healthy — reset the streak
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
-                        log.warning("kuro-soden.conn.probe_failed", bot=name, error=str(exc))
-                        await self._reconnect_client(name, client)
+                        misses[name] = misses.get(name, 0) + 1
+                        log.warning("kuro-soden.conn.probe_failed", bot=name,
+                                    error=str(exc), streak=misses[name])
+                        if misses[name] >= _CONN_FAILURES_BEFORE_RESTART:
+                            if await self._reconnect_client(name, client):
+                                misses[name] = 0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

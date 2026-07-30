@@ -147,14 +147,25 @@ def next_anime_art(key: str, *, fallback_bot: str | None = None):
 
 
 def _urls_from_franchise(franchise: dict | None) -> list[str]:
-    """Pull any already-known artwork URLs out of a franchise dict, best-first."""
+    """Pull any already-known **backdrop** URLs out of a franchise dict.
+
+    Recurring card artwork must be 16:9 backdrops only — NEVER posters. So we
+    deliberately skip ``cover_url``/``poster_url`` (portrait key art) and only
+    take the pre-fetched backdrop list plus the single backdrop/banner fields.
+    The TMDB gallery seeded alongside these (see ``ensure_anime_art``) is
+    already English-backdrop-first then language-neutral, so posters never
+    enter the rotation from any path.
+    """
     fr = franchise or {}
     urls: list[str] = []
-    # A pre-fetched list wins; then the single card backdrop, then AniList assets.
+    # A pre-fetched backdrop list wins; then the single card backdrop / banner.
+    # ``banner_url`` on AniList is the wide 16:9 banner (a backdrop), NOT the
+    # portrait cover — safe to include. ``cover_url``/``poster_url`` are posters
+    # and are intentionally excluded.
     for u in (fr.get("backdrops") or []):
         if u:
             urls.append(u)
-    for k in ("backdrop_url", "_backdrop_url", "banner_url", "cover_url"):
+    for k in ("backdrop_url", "_backdrop_url", "banner_url"):
         v = fr.get(k)
         if v:
             urls.append(v)

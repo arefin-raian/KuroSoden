@@ -332,12 +332,19 @@ class NyaaSource(AnimeSource):
         )
 
     async def _resolve_magnet(self, magnet_uri: str) -> bytes:
-        """Resolve a magnet URI to .torrent metadata bytes via aria2c."""
+        """Resolve a magnet URI to .torrent metadata bytes via aria2c.
+
+        Uses the same well-seeded public trackers + DHT config as the downloader
+        so a magnet with no baked-in trackers can still find peers. aria2c writes
+        the fetched metadata as ``<info-hash>.torrent`` in ``--dir``; we return
+        its bytes. On failure the real aria2c output is surfaced in the error so
+        the admin sees *why* (no peers, DHT blocked, bad magnet) instead of a
+        generic "did not produce a .torrent".
+        """
         import asyncio
-        import shutil
         import tempfile
 
-        from nekofetch.sources._torrentdl import find_aria2
+        from nekofetch.sources._torrentdl import _EXTRA_TRACKERS, find_aria2
 
         aria2 = find_aria2()
         if not aria2:
@@ -347,24 +354,35 @@ class NyaaSource(AnimeSource):
             cmd = [
                 aria2, "--dir", tmp,
                 "--bt-metadata-only=true", "--bt-save-metadata=true",
-                "--bt-stop-timeout=60", "--seed-time=0",
+                "--bt-stop-timeout=90", "--seed-time=0",
                 "--enable-dht=true",
                 "--dht-listen-port=6881-6999",
                 "--listen-port=6881-6999",
+                "--bt-max-peers=200",
+                f"--bt-tracker={_EXTRA_TRACKERS}",
                 "--console-log-level=warn",
+                "--summary-interval=0",
                 magnet_uri,
             ]
             proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                *cmd, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             )
             try:
-                await asyncio.wait_for(proc.wait(), timeout=120)
-            except TimeoutError:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
+            except (TimeoutError, asyncio.TimeoutError):
                 proc.kill()
-                raise RuntimeError("magnet metadata resolution timed out") from None
+                await proc.wait()
+                raise RuntimeError(
+                    "magnet metadata resolution timed out after 180s "
+                    "(no peers found — the magnet may be dead or DHT is blocked)"
+                ) from None
 
             torrents = list(Path(tmp).glob("*.torrent"))
             if not torrents:
-                raise RuntimeError("aria2c did not produce a .torrent from the magnet")
+                tail = (out or b"").decode(errors="replace").strip()
+                tail = tail[-400:] if tail else "(no output)"
+                raise RuntimeError(
+                    f"aria2c did not produce a .torrent from the magnet — {tail}"
+                )
             return torrents[0].read_bytes()
