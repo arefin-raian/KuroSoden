@@ -884,11 +884,20 @@ def register(client: Client, container: Container) -> None:
             pass
 
         import re as _re
+        from urllib.parse import parse_qs, unquote, urlparse
         hash_m = _re.search(r"btih:([0-9a-fA-F]{40}|[0-9a-zA-Z]{32})", text)
         info_hash = hash_m.group(1) if hash_m else ""
 
+        # Classify audio from the magnet's own display name (dn=…) — the release
+        # name carries "Dual Audio"/"Multi" even when the request title doesn't.
+        # Fall back to the request title if the magnet has no dn.
+        try:
+            _dn = (parse_qs(urlparse(text).query).get("dn") or [""])[0]
+            _release_name = unquote(_dn).strip()
+        except Exception:
+            _release_name = ""
         from nekofetch.sources.nyaa import classify_audio as _classify_audio
-        _audio_cls = _classify_audio(title)
+        _audio_cls = _classify_audio(_release_name or title)
         magnet_ref = json.dumps({
             "magnet": text, "info_hash": info_hash, "title": title,
             "dual_audio": _audio_cls["dual_audio"],
@@ -914,10 +923,22 @@ def register(client: Client, container: Container) -> None:
         except Exception:
             prompt_msg = None
 
-        async def _ack(text: str) -> Message:
+        _back_kb = keyboard(
+            [(L(M.BTN_BACK), cb("staff", "rsource", code, "torrent"))],
+        )
+
+        async def _ack(text: str, kb: InlineKeyboardMarkup | None = None) -> Message:
             if prompt_msg:
-                return await show(client, prompt_msg, text)
-            return await client.send_message(message.chat.id, text, parse_mode=ParseMode.HTML)
+                return await show(client, prompt_msg, text, kb)
+            return await client.send_message(
+                message.chat.id, text, reply_markup=kb, parse_mode=ParseMode.HTML,
+            )
+
+        # Update the card IMMEDIATELY — before the (potentially ~180s) metadata
+        # resolve — so the admin sees "Resolving metadata…" the instant their
+        # magnet is accepted, plus a Back button to bail out. We then edit this
+        # same card in place once resolution finishes.
+        ack = await _ack(L(M.TORRENT_MAGNET_ACK), _back_kb)
 
         # Try to resolve magnet metadata for mapping.
         from nekofetch.sources._torrent import order_episodes, torrent_files
@@ -931,7 +952,20 @@ def register(client: Client, container: Container) -> None:
             _name, files = torrent_files(raw)
             ordered = order_episodes(files)
 
-            ack = await _ack(L(M.TORRENT_MAGNET_ACK))
+            # The resolved torrent name + its file names are the most reliable
+            # audio signal (they carry "Dual Audio" even when dn=/title don't).
+            # Re-classify and rebuild the ref so mapping/enqueue stamps the right
+            # audio type instead of a stale "subbed".
+            _blob = " ".join(
+                [_name or ""] + [str(f.get("path") or f.get("name") or "") for f in files]
+            )
+            _rc = _classify_audio(_blob or _release_name or title)
+            if _rc["dual_audio"] or _rc["audio"] != _audio_cls["audio"]:
+                magnet_ref = json.dumps({
+                    "magnet": text, "info_hash": info_hash, "title": title,
+                    "dual_audio": _rc["dual_audio"], "audio": _rc["audio"],
+                })
+
             await _show_torrent_mapping(
                 ack, user_id, code, magnet_ref, ordered, title,
             )
@@ -939,8 +973,7 @@ def register(client: Client, container: Container) -> None:
         except Exception:
             log.debug("torrent_magnet.metadata_resolve_failed", code=code)
 
-        # Fallback: enqueue without mapping.
-        ack = await _ack(L(M.TORRENT_MAGNET_ACK))
+        # Fallback: enqueue without mapping (reuse the ack card in place).
         await _torrent_enqueue(ack, user_id, code, magnet_ref, title)
 
     # ── torrent provide: .torrent file handler ────────────────────────────

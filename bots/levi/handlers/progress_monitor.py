@@ -33,7 +33,7 @@ from nekofetch.domain.enums import JobStatus, Permission
 from nekofetch.localization.messages import M, t
 from nekofetch.services.auth_service import AuthService
 from nekofetch.ui.components import cb
-from nekofetch.ui.progress import download_card_html
+from nekofetch.ui.progress import download_card_html, human_elapsed
 
 log = get_logger(__name__)
 
@@ -226,6 +226,44 @@ async def _refresh_loop(client: Client, container: Container, job_id: int,
     log.info("levi.progress.monitor_expired", job_id=job_id)
 
 
+async def _completion_art(container: Container, code: str) -> str | None:
+    """Rotating backdrop for the finished anime, for the terminal completion card.
+
+    Mirrors review.py's ``_anime_backdrop`` — reuse the per-anime art pool seeded
+    at request time so the completion card shows this title's own backdrop (never
+    a poster). Returns a URL, or ``None`` when no art is available (caller then
+    falls back to a plain text card)."""
+    if not code:
+        return None
+    try:
+        from nekofetch.infrastructure.database.postgres.models import Request
+        from nekofetch.infrastructure.database.postgres.session import session_scope
+        from nekofetch.ui.artwork import (
+            ensure_anime_art,
+            key_for_franchise,
+            next_anime_art,
+        )
+
+        async with session_scope(container.pg_sessionmaker) as session:
+            from sqlalchemy import select
+            req = (
+                await session.execute(select(Request).where(Request.code == code))
+            ).scalar_one_or_none()
+            if req is None:
+                return None
+            franchise = req.franchise_data or {}
+            title = franchise.get("title") or req.anime_title
+
+        key = key_for_franchise(franchise, title=title)
+        await ensure_anime_art(key, tmdb=container.tmdb, title=title,
+                               franchise=franchise)
+        art = next_anime_art(key)
+        return art if isinstance(art, str) else None
+    except Exception as exc:  # noqa: BLE001 - art is cosmetic, never fail the card
+        log.debug("levi.progress.completion_art_blip", code=code, error=str(exc))
+        return None
+
+
 async def _paint_terminal(client: Client, container: Container, job_id: int,
                           chat_id: int, msg_id: int, view: dict) -> None:
     title, code, status = view["title"], view.get("code", ""), view["status"]
@@ -238,8 +276,34 @@ async def _paint_terminal(client: Client, container: Container, job_id: int,
         text = t(M.DL_CARD_FAILED, title=title, job=job_id)
         kb = await _recovery_keyboard(container, code)
     else:
-        text = t(M.DL_CARD_DONE, title=title, job=job_id)
-        kb = None
+        # Success — paint a proper completion card with a cover backdrop, not a
+        # one-liner. Delete the live text message and send a photo card so the
+        # admin sees the anime's own art on "handed to distribution".
+        started = view.get("started_ts")
+        elapsed = human_elapsed(int(time.time() - started)) if started else "—"
+        text = t(M.DL_CARD_DONE, title=title, job=job_id, elapsed=elapsed)
+        art = await _completion_art(container, code)
+        if art:
+            try:
+                await client.send_photo(
+                    chat_id, art, caption=text, parse_mode=ParseMode.HTML,
+                )
+                try:
+                    await client.delete_messages(chat_id, msg_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            except Exception as exc:  # noqa: BLE001 - fall back to text edit below
+                log.debug("levi.progress.done_photo_blip", job_id=job_id, error=str(exc))
+        # No art (or photo send failed) → edit the existing card in place.
+        try:
+            await client.edit_message_text(chat_id, msg_id, text,
+                                           parse_mode=ParseMode.HTML)
+        except MessageNotModified:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.debug("levi.progress.terminal_blip", job_id=job_id, error=str(exc))
+        return
     try:
         await client.edit_message_text(chat_id, msg_id, text, parse_mode=ParseMode.HTML,
                                         reply_markup=kb)
