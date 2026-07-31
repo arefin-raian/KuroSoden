@@ -256,20 +256,36 @@ class NyaaSource(AnimeSource):
             ep_ref_base["torrent_path"] = r["torrent_path"]
         ep_ref_base["info_hash"] = r.get("info_hash", "")
 
-        # Robustly derive audio. The incoming ``r["dual_audio"]`` is only set when
-        # the release came through search() (which runs is_dual_audio on the RSS
-        # title). When the admin pastes a nyaa link directly, ``r`` never ran
-        # classification, so it defaults to single/Sub even for a dual-audio pack.
-        # Re-classify from the torrent's OWN internal name + the release title +
-        # the per-file names — whichever signals dual/multi audio wins, so the
-        # pack is stamped Dual, not Sub.
+        # Robustly derive audio. Signals, most-authoritative first:
+        #   1. An explicit upstream kind the caller already resolved and stored on
+        #      the ref (``audio_kind`` / ``audio`` = 'dual'|'multi', or the legacy
+        #      ``dual_audio`` bool). The admin magnet/paste handlers run
+        #      classify_audio on the magnet's OWN dn= release name — which carries
+        #      "Dual Audio" even when the request title and the torrent's internal
+        #      name don't — and stash the verdict here. It must WIN.
+        #   2. Fresh classification of every name we can see: the release title,
+        #      the magnet dn (``release_name``), the torrent's internal name, and
+        #      the per-file names.
+        # Previously step 2 ran on the REQUEST title only and step 1 checked just
+        # ``dual_audio`` — so a BDRip whose internal name says only "x265" (not
+        # "Dual Audio") was stamped Sub despite the dn clearly saying Dual Audio.
+        upstream = (r.get("audio_kind") or r.get("audio") or "").lower()
+        release_name = r.get("release_name") or r.get("dn") or ""
         file_blob = " ".join(f.get("name", "") for f in files[:40])
-        cls = classify_audio(f"{r.get('title', '')} {_name} {file_blob}")
+        cls = classify_audio(
+            f"{r.get('title', '')} {release_name} {_name} {file_blob}")
         audio_kind = cls["audio"]  # 'dual' | 'multi' | 'single'
-        if r.get("dual_audio") and audio_kind == "single":
-            audio_kind = "dual"  # trust an explicit upstream flag over a miss
+        # Upstream verdict overrides a fresh 'single' miss (never downgrades a
+        # freshly-detected multi/dual).
+        if upstream in ("dual", "multi") and audio_kind == "single":
+            audio_kind = upstream
+        elif r.get("dual_audio") and audio_kind == "single":
+            audio_kind = "dual"  # legacy explicit flag
         ep_ref_base["dual_audio"] = audio_kind in ("dual", "multi")
         ep_ref_base["audio_kind"] = audio_kind
+        # Preserve the release name so any downstream re-parse keeps the signal.
+        if release_name:
+            ep_ref_base["release_name"] = release_name
 
         for e in ordered:
             label = {"movie": "Movie", "ova": "OVA", "special": "Special",

@@ -900,6 +900,7 @@ def register(client: Client, container: Container) -> None:
         _audio_cls = _classify_audio(_release_name or title)
         magnet_ref = json.dumps({
             "magnet": text, "info_hash": info_hash, "title": title,
+            "release_name": _release_name,
             "dual_audio": _audio_cls["dual_audio"],
             "audio": _audio_cls["audio"],
         })
@@ -952,19 +953,24 @@ def register(client: Client, container: Container) -> None:
             _name, files = torrent_files(raw)
             ordered = order_episodes(files)
 
-            # The resolved torrent name + its file names are the most reliable
-            # audio signal (they carry "Dual Audio" even when dn=/title don't).
-            # Re-classify and rebuild the ref so mapping/enqueue stamps the right
-            # audio type instead of a stale "subbed".
+            # The resolved torrent name + its file names are an ADDITIONAL audio
+            # signal (they carry "Dual Audio" even when dn=/title don't). Combine
+            # them with the dn= verdict and keep the STRONGEST — multi > dual >
+            # single — so a "Dual Audio" dn is never downgraded by a BDRip whose
+            # internal files only mention the codec, and vice-versa.
             _blob = " ".join(
                 [_name or ""] + [str(f.get("path") or f.get("name") or "") for f in files]
             )
             _rc = _classify_audio(_blob or _release_name or title)
-            if _rc["dual_audio"] or _rc["audio"] != _audio_cls["audio"]:
-                magnet_ref = json.dumps({
-                    "magnet": text, "info_hash": info_hash, "title": title,
-                    "dual_audio": _rc["dual_audio"], "audio": _rc["audio"],
-                })
+            _rank = {"single": 0, "dual": 1, "multi": 2}
+            _best = max(_audio_cls["audio"], _rc["audio"],
+                        key=lambda a: _rank.get(a, 0))
+            magnet_ref = json.dumps({
+                "magnet": text, "info_hash": info_hash, "title": title,
+                "release_name": _release_name,
+                "dual_audio": _best in ("dual", "multi"),
+                "audio": _best, "audio_kind": _best,
+            })
 
             await _show_torrent_mapping(
                 ack, user_id, code, magnet_ref, ordered, title,
