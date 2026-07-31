@@ -302,12 +302,12 @@ class MetadataPrefetchService:
             mirror = await backup_bytes(self._c, blob, mime=mime or "image/jpeg",
                                         source_url=url)
             host = None
-            if mirror.catbox_url:
+            if mirror.imgbb_url:
+                host = "imgbb"
+            elif mirror.catbox_url:
                 host = "catbox"
             elif mirror.telegraph_url:
                 host = "telegraph"
-            elif mirror.imgbb_url:
-                host = "imgbb"
             entries.append({
                 "kind": kind, "source_url": url,
                 "local": str(local_path),

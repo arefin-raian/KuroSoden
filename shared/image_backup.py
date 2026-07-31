@@ -50,8 +50,12 @@ class BackupImage:
 
     @property
     def primary(self) -> str | None:
-        """The best URL to rebuild from: mirrors first, then original source."""
-        return (self.catbox_url or self.telegraph_url or self.imgbb_url
+        """The best URL to rebuild from: most-reliable mirror first, then source.
+
+        Order matches ``_DEFAULT_HOST_ORDER`` — ImgBB leads (it's the host that
+        actually sticks), then catbox, then the telegraph/graph.org mirror, then
+        finally the original source CDN."""
+        return (self.imgbb_url or self.catbox_url or self.telegraph_url
                 or self.source_url or None)
 
 
@@ -171,8 +175,11 @@ async def _upload_telegraph(
 
 
 # Default host order when config doesn't specify one. Each host is independent so
-# a single operator outage can't strand every mirror.
-_DEFAULT_HOST_ORDER = ("catbox", "telegraph", "imgbb")
+# a single operator outage can't strand every mirror. ImgBB leads because it's
+# the most reliable in practice (catbox frequently IP-blocks datacenter ranges;
+# telegra.ph disabled its upload endpoint entirely — we now try the graph.org
+# mirror but it's flaky), so the authoritative URL should be one that sticks.
+_DEFAULT_HOST_ORDER = ("imgbb", "catbox", "telegraph")
 
 
 def _host_order(container: Container) -> tuple[str, ...]:
