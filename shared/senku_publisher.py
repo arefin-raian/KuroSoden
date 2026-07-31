@@ -726,9 +726,13 @@ class SenkuPublisher:
                         reply_markup=markup, parse_mode=ParseMode.HTML,
                     )
                 else:
+                    # Text posts (notably the watch guide) carry quality
+                    # hyperlinks — suppress the link preview so a t.me thumbnail
+                    # card never appears under the guide.
                     msg = await client.send_message(
                         chat_id, caption,
                         reply_markup=markup, parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
                     )
                 posted += 1
             except Exception as exc:  # noqa: BLE001 — a partial channel still ships
