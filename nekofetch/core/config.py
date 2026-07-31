@@ -213,11 +213,13 @@ class ProcessingConfig(BaseModel):
     # Target rendition heights produced from the source file. Uploaded smallest
     # first, so packs post as 480p → 720p → 1080p.
     encode_heights: list[int] = Field(default_factory=lambda: [720, 480])
-    # x264 speed/efficiency preset for the derived tiers. "medium" is far too
-    # slow for a multi-episode batch (each rendition is a full re-encode), so the
-    # default is a fast preset that keeps quality high at the CRF below while
-    # cutting encode time several-fold. Valid: ultrafast…veryslow.
-    encode_preset: str = "veryfast"
+    # x264 speed/efficiency preset for the derived tiers. NOT "veryfast" — that
+    # disables trellis/adaptive-B-frames/motion-search, so a lean source can come
+    # out LARGER after downscale. "fast" is the size/speed sweet spot: ~2x quicker
+    # than "medium" but compresses far better than veryfast. Paired with
+    # -tune animation + explicit psy-rd (set in _transcode._encode) for anime.
+    # Valid: ultrafast…veryslow.
+    encode_preset: str = "fast"
     # Constant Rate Factor per tier (lower = better quality/larger). Tuned to
     # pair with the fast preset — visually clean for downscaled 720p/480p.
     encode_crf: dict[int, int] = Field(

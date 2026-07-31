@@ -141,12 +141,15 @@ class PublishingService:
             anime_doc_id, title, snapshot, on_progress=on_progress,
         )
 
-        # Only delete local files that were CONFIRMED uploaded to the storage
-        # channel. If the channel is disabled, unreachable, or any pack failed,
-        # the affected files are kept so the operator can fix config and
-        # reprocess — losing the only local copy of un-uploaded content is far
-        # worse than leaving some files behind.
+        # Delete every file that was CONFIRMED uploaded — individually, so a
+        # partial failure still frees the disk of everything that made it up
+        # (only the genuinely-failed files are kept for reprocessing). When ALL
+        # files uploaded we additionally sweep the now-empty work/manual/library
+        # dirs so nothing (stray temp files, empty trees) is left behind.
         all_paths = {s["path"] for s in snapshot if s.get("path")}
+        confirmed = [s for s in snapshot if s.get("path") in uploaded_paths]
+        if confirmed:
+            self._delete_uploaded_files(confirmed)
         if all_paths and uploaded_paths >= all_paths:
             self._cleanup_local_files(snapshot, code=code, title=title)
         else:
@@ -155,6 +158,7 @@ class PublishingService:
                 "publish.storage.incomplete_keeping_files",
                 code=code, title=title,
                 uploaded=len(uploaded_paths), total=len(all_paths),
+                kept=len(all_paths - uploaded_paths),
                 storage_enabled=self._c.config.storage_channel.enabled,
             )
 
@@ -165,6 +169,30 @@ class PublishingService:
             "download", "stored", code=code, anime=title, files=uploaded_count,
         )
         return uploaded_count
+
+    def _delete_uploaded_files(self, confirmed: list[dict]) -> None:
+        """Delete each individually-confirmed uploaded file from disk.
+
+        Runs even on a PARTIAL upload, so every tier that made it to the storage
+        channel is freed immediately (only genuinely-failed files linger). Empty
+        parent trees are swept separately by :meth:`_cleanup_local_files` on a
+        full success."""
+        from pathlib import Path
+
+        from nekofetch.core.logging import get_logger
+
+        log = get_logger(__name__)
+        removed = 0
+        for item in confirmed:
+            p = item.get("path")
+            if not p:
+                continue
+            try:
+                Path(p).unlink(missing_ok=True)
+                removed += 1
+            except OSError as exc:
+                log.debug("storage.cleanup.unlink_failed", path=p, error=str(exc))
+        log.info("storage.cleanup.uploaded_removed", removed=removed)
 
     def _cleanup_local_files(self, snapshot: list[dict], *, code: str, title: str) -> None:
         """Delete every local file for a request after a successful storage upload.

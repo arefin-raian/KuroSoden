@@ -45,11 +45,12 @@ processing:
   # (packs post as 480p → 720p → 1080p).
   encode: true
   encode_heights: [720, 480]
-  # x264 speed preset for the derived tiers. "medium" is far too slow for a
-  # multi-episode batch (each rendition is a full re-encode); "veryfast" cuts
-  # encode time several-fold with negligible quality loss at the CRFs used.
+  # x264/x265 speed preset for the derived tiers. NOT "veryfast" — it disables
+  # the compression features that keep files small, so a lean source can come out
+  # LARGER after downscale. "fast" is the sweet spot: ~2x quicker than medium but
+  # compresses far better than veryfast. Paired with -tune animation + psy-rd.
   # Options (slow→fast): veryslow slower slow medium fast faster veryfast superfast ultrafast
-  encode_preset: veryfast
+  encode_preset: fast
   # false (default): auto-publish to main + index channels and bring up the
   # distribution bot right after storage upload — no admin click.
   # true: gate publishing behind an admin approval card.

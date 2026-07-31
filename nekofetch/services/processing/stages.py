@@ -845,7 +845,16 @@ class WatermarkStage(Stage):
         return flt, []
 
     async def process(self, ctx: StageContext) -> None:
+        from nekofetch.sources._hls import find_ffmpeg
+        from nekofetch.sources._transcode import (
+            _ENCODER_PIXFMT, _svtav1_preset, select_encoder,
+        )
+
         w = self.c.config.watermark
+        ffmpeg = find_ffmpeg()
+        preset = getattr(self.c.config.processing, "encode_preset", "fast")
+        crf = (getattr(self.c.config.processing, "encode_crf", None)
+               or {}).get(1080, 21)
         n = len(ctx.files)
         await _push_stage_progress(self.c, ctx, "Watermarking", 0.0, file_index=0, file_total=n)
         for i, f in enumerate(ctx.files):
@@ -854,9 +863,25 @@ class WatermarkStage(Stage):
             src = Path(f.local_path)
             out = src.with_name(src.stem + ".wm" + src.suffix)
             flt, extra_inputs = self._filter(w)
+            # Burning a watermark forces a video re-encode (including the 1080p
+            # source tier). Do it with the SAME codec-aware, tuned settings as
+            # EncodeStage so the watermarked file stays small + high quality
+            # instead of ffmpeg's bloated defaults. Preserve the source codec.
+            encoder = (await select_encoder(src, ffmpeg)) if ffmpeg else "libx264"
+            pix_fmt = _ENCODER_PIXFMT.get(encoder, "yuv420p")
+            venc: list[str] = ["-c:v", encoder]
+            if encoder == "libsvtav1":
+                venc += ["-crf", str(crf), "-preset", str(_svtav1_preset(preset)),
+                         "-svtav1-params", "tune=0:film-grain=0"]
+            else:
+                venc += ["-crf", str(crf), "-preset", preset,
+                         "-tune", "animation",
+                         ("-x265-params" if encoder == "libx265" else "-x264-params"),
+                         "psy-rd=1.0:0.15"]
+            venc += ["-pix_fmt", pix_fmt]
             args = ["ffmpeg", "-y", "-i", str(src), *extra_inputs,
                     "-filter_complex" if extra_inputs else "-vf", flt,
-                    "-c:a", "copy", str(out)]
+                    *venc, "-c:a", "copy", str(out)]
             rc, err = await _run(*args)
             if rc != 0:
                 ctx.notes.append(f"watermark: {err.strip() or 'ffmpeg unavailable'}")
@@ -950,7 +975,8 @@ class EncodeStage(Stage):
 
         from nekofetch.core.exceptions import ProcessingError
         from nekofetch.infrastructure.database.postgres.models import MediaFile
-        from nekofetch.sources._transcode import _encode
+        from nekofetch.sources._hls import find_ffmpeg
+        from nekofetch.sources._transcode import _encode, select_encoder
 
         heights = [h for h in self.c.config.processing.encode_heights if h > 0]
         if not heights:
@@ -1010,6 +1036,11 @@ class EncodeStage(Stage):
         for i, f in enumerate(sources):
             src = Path(f.local_path)
             src_res = f.resolution or "1080p"
+            # Pick the encoder from the SOURCE codec once per file so derived
+            # tiers never downgrade efficiency (HEVC→HEVC, AV1→AV1, h264→h264),
+            # which is what caused a downscaled tier to come out larger.
+            ffmpeg = find_ffmpeg()
+            encoder = await select_encoder(src, ffmpeg) if ffmpeg else "libx264"
             # Rename put the resolution token in the stem (e.g.
             # "... [1080p] ..."); we swap it per rendition so names stay correct.
             stem = src.stem
@@ -1034,7 +1065,7 @@ class EncodeStage(Stage):
                     try:
                         await _encode(src, out_path, height,
                                       crf_map.get(height, 23), preset=preset,
-                                      threads=enc_threads)
+                                      threads=enc_threads, encoder=encoder)
                         last_exc = None
                         break
                     except Exception as exc:  # noqa: BLE001
