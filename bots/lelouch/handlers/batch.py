@@ -27,6 +27,7 @@ paging never re-hits the providers.
 
 from __future__ import annotations
 
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import CallbackQuery, Message
@@ -340,6 +341,22 @@ def register(client: Client, container: Container) -> None:
             old_msg=q.message,
         )
         await q.answer()
+
+        # Prefetch metadata for every accepted batch entry (same policy as the
+        # single-request flow): cache AniList/Jikan/TMDB + mirrored artwork to
+        # each request folder now, so later stages read from disk. Fire-and-
+        # forget; the service swallows its own errors.
+        try:
+            from nekofetch.services.metadata_prefetch import MetadataPrefetchService
+
+            svc = MetadataPrefetchService(container)
+            for i, w in enumerate(created):
+                fr = keep[i]["franchise_data"] if i < len(keep) else {}
+                aid = (fr or {}).get("anilist_id")
+                _doc = f"{aid}" if aid else None
+                asyncio.create_task(svc.prefetch(w.code, _doc, fr or {}))
+        except Exception as exc:  # noqa: BLE001 — prefetch never blocks the batch
+            log.warning("lelouch.batch.prefetch_spawn_failed", error=str(exc)[:200])
 
         # DM every admin the new orders through the downloader (Levi), falling
         # back to this client — same delivery path as single-request pings.

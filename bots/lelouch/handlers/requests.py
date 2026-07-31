@@ -16,6 +16,7 @@ picker, and submission logic is ALL reused from the existing codebase.
 from __future__ import annotations
 
 import html
+import asyncio
 from datetime import UTC
 
 from pyrogram import Client, filters
@@ -485,7 +486,26 @@ def register(client: Client, container: Container) -> None:
 
         await fsm.clear(user_id)
 
-        # ── Show the requester their accepted screen immediately ──────────
+        # ── Prefetch ALL metadata NOW (accepted → cache once, read forever) ──
+        # The request passed every criterion, so pay the AniList/Jikan/TMDB cost
+        # a single time here, off the requester's critical path, and write it to
+        # the request folder. Levi/Senku/Gojo then read the cached JSON instead
+        # of re-hitting the shared public APIs (which is what rate-limited us).
+        # Fire-and-forget: acceptance never waits on it, and it never fails the
+        # request (the service swallows every error internally).
+        try:
+            from nekofetch.services.metadata_prefetch import MetadataPrefetchService
+
+            _doc_id = (f"{anilist_id}" if anilist_id else None)
+            asyncio.create_task(
+                MetadataPrefetchService(container).prefetch(
+                    receipt.code, _doc_id, franchise_json,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — prefetch must never block acceptance
+            log.warning("lelouch.prefetch.spawn_failed",
+                        code=receipt.code, error=str(exc))
+
         # (Assignment + admin notification happen after; the user never waits
         # on them.) The card image swaps to a fresh recurring artwork. The
         # receipt now carries the full detail: code, who + id, when, and a

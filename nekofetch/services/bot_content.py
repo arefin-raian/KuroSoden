@@ -490,38 +490,83 @@ class BotContentService:
                         doc_id=anime_doc_id, query=search_query)
 
         # ── Fallback 1: AniList (or MAL when AniList is down) ──
+        # Prefer the prefetched cache written at acceptance time — it avoids a
+        # live AniList call (and thus the shared-key rate limit) on every
+        # publish/update. Falls through to a live search when absent.
+        cached_search = None
         try:
-            search = await self._c.anilist.search(search_query)
-            if search is not None:
-                meta["title"] = search.english or search.romaji or search.titles[0] if search.titles else search_query
-                meta["romaji"] = search.romaji
-                meta["english"] = search.english
-                meta["format"] = search.format
-                meta["status"] = search.status
-                meta["score"] = str(search.score) if search.score else None
-                meta["genres"] = search.genres or []
-                meta["synopsis"] = search.synopsis
-                # Entry-level episode count (matches what acutebot shows on its card).
-                meta["episode_count"] = search.episodes
-                meta["season_count"] = search.franchise_seasons or 1
-                # Format first_aired from start_date dict (e.g. "Apr 7, 2013").
-                if search.start_date:
-                    yr = search.start_date.get("year")
-                    mo = search.start_date.get("month")
-                    dy = search.start_date.get("day")
-                    if yr and mo and dy:
-                        meta["first_aired"] = f"{calendar.month_abbr[mo]} {dy}, {yr}"
-                # Duration per episode (acutebot shows "24 min/ep").
-                if search.duration:
-                    meta["runtime"] = f"{search.duration} min/ep"
-                # Poster from the metadata provider's cover image.
-                if search.cover_url:
-                    meta["poster_url"] = search.cover_url
-                meta["_source"] = "anilist"
-                log.info("bot.content.metadata.fallback",
-                         anime=search_query, source=meta["_source"])
-        except Exception as exc:
-            log.warning("bot.content.anilist.failed", anime=search_query, error=str(exc))
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            blob = await load_cached(self._c, anime_doc_id, "anilist",
+                                     anime_doc_id=anime_doc_id)
+            if blob:
+                cached_search = blob.get("search")
+        except Exception as exc:  # noqa: BLE001 — cache is best-effort
+            log.debug("bot.content.cache.read_failed", error=str(exc))
+
+        if cached_search:
+            try:
+                s = cached_search
+                titles = s.get("titles") or []
+                meta["title"] = (s.get("english") or s.get("romaji")
+                                 or (titles[0] if titles else search_query))
+                meta["romaji"] = s.get("romaji")
+                meta["english"] = s.get("english")
+                meta["format"] = s.get("format")
+                meta["status"] = s.get("status")
+                meta["score"] = str(s["score"]) if s.get("score") else None
+                meta["genres"] = s.get("genres") or []
+                meta["synopsis"] = s.get("synopsis")
+                meta["episode_count"] = s.get("episodes")
+                meta["season_count"] = s.get("franchise_seasons") or 1
+                sd = s.get("start_date") or {}
+                if sd.get("year") and sd.get("month") and sd.get("day"):
+                    meta["first_aired"] = (
+                        f"{calendar.month_abbr[sd['month']]} {sd['day']}, {sd['year']}"
+                    )
+                if s.get("duration"):
+                    meta["runtime"] = f"{s['duration']} min/ep"
+                if s.get("cover_url"):
+                    meta["poster_url"] = s["cover_url"]
+                meta["_source"] = "anilist_cache"
+                log.info("bot.content.metadata.cache_hit", anime=search_query)
+            except Exception as exc:  # noqa: BLE001 — bad cache → live fetch below
+                log.debug("bot.content.cache.parse_failed", error=str(exc))
+                cached_search = None
+
+        if not cached_search:
+            try:
+                search = await self._c.anilist.search(search_query)
+                if search is not None:
+                    meta["title"] = search.english or search.romaji or search.titles[0] if search.titles else search_query
+                    meta["romaji"] = search.romaji
+                    meta["english"] = search.english
+                    meta["format"] = search.format
+                    meta["status"] = search.status
+                    meta["score"] = str(search.score) if search.score else None
+                    meta["genres"] = search.genres or []
+                    meta["synopsis"] = search.synopsis
+                    # Entry-level episode count (matches what acutebot shows on its card).
+                    meta["episode_count"] = search.episodes
+                    meta["season_count"] = search.franchise_seasons or 1
+                    # Format first_aired from start_date dict (e.g. "Apr 7, 2013").
+                    if search.start_date:
+                        yr = search.start_date.get("year")
+                        mo = search.start_date.get("month")
+                        dy = search.start_date.get("day")
+                        if yr and mo and dy:
+                            meta["first_aired"] = f"{calendar.month_abbr[mo]} {dy}, {yr}"
+                    # Duration per episode (acutebot shows "24 min/ep").
+                    if search.duration:
+                        meta["runtime"] = f"{search.duration} min/ep"
+                    # Poster from the metadata provider's cover image.
+                    if search.cover_url:
+                        meta["poster_url"] = search.cover_url
+                    meta["_source"] = "anilist"
+                    log.info("bot.content.metadata.fallback",
+                             anime=search_query, source=meta["_source"])
+            except Exception as exc:
+                log.warning("bot.content.anilist.failed", anime=search_query, error=str(exc))
 
         # ── Fallback 2: TMDB for poster + backdrop ──
         if not meta.get("poster_url"):

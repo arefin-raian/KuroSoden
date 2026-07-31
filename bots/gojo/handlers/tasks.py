@@ -913,6 +913,27 @@ async def _execute_publish(
         engine = AdminAssignmentEngine(container.pg_sessionmaker)
         await engine.complete_task(request_code, "gojo")
 
+        # Everything is live (main channel + distribution) — the prefetched
+        # artwork on disk is no longer needed. Delete the local image bytes; the
+        # hosted links stay in assets.json / the DB for any later rebuild.
+        try:
+            from nekofetch.services.metadata_prefetch import cleanup_local_assets
+
+            _doc = None
+            try:
+                from nekofetch.infrastructure.database.postgres.session import session_scope
+                from nekofetch.infrastructure.repositories.request_repo import RequestRepository
+                async with session_scope(container.pg_sessionmaker) as session:
+                    req = await RequestRepository(session).get_by_code(request_code)
+                    if req:
+                        _doc = req.anime_doc_id
+            except Exception:  # noqa: BLE001
+                pass
+            await cleanup_local_assets(container, request_code, anime_doc_id=_doc)
+        except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
+            log.debug("gojo.publish.asset_cleanup_failed",
+                      code=request_code, error=str(exc))
+
     except Exception as exc:
         log.warning("gojo.publish.failed", code=request_code, error=str(exc))
         # ``message`` may be a Message (has .reply) or a bare Chat (scheduled
