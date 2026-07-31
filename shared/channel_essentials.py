@@ -94,7 +94,7 @@ async def build_channel_essentials(
         candidates = [format_bot_username(base_title, anime_doc_id or "",
                                           is_channel=True)]
     username = candidates[0]
-    description = _description(container)
+    description = _description(container, title=english or base_title)
     poster_url = _TMDB_SEARCH.format(q=quote_plus(base_title))
 
     return ChannelEssentials(
@@ -107,20 +107,93 @@ async def build_channel_essentials(
     )
 
 
-def _description(container: Container) -> str:
-    """The channel description — operator override or NekoFetch's branding block.
+# Telegram counts a channel description in UTF-16 code units and hard-caps it at
+# 255 (setChatDescription rejects anything longer rather than truncating). The
+# 𝗯𝗼𝗹𝗱 sans-serif glyphs and emojis in the template are each 2 UTF-16 units, so
+# the block is measured in UTF-16 — not len() — and links are dropped in a fixed
+# priority order until it fits.
+_DESC_LIMIT = 255
 
-    Mirrors ``BotFactory._build_description`` but WITHOUT prepending a per-title
-    line: a channel bio is the same network block on every channel (the admin's
-    instruction is 'paste it exactly, same for every title'). Falls back to the
-    literal branding block if config can't be read.
+
+def _utf16_len(text: str) -> int:
+    """Length in UTF-16 code units — how Telegram measures a description."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+# The network link block, in REMOVAL order (last entry dropped first when the
+# description overflows). Main channel + the closing community line always stay;
+# only these four are droppable, in this exact order: Index → Movies → Ongoing →
+# Network. Each tuple is (fancy-bold label, @handle).
+_DESC_LINKS = [
+    ("𝗠𝗮𝗶𝗻 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", "@AniXWeebs"),      # never removed (index 0)
+    ("𝗜𝗻𝗱𝗲𝘅", "@AniXWeebs_Index"),
+    ("𝗠𝗼𝘃𝗶𝗲𝘀", "@AniMovieXWeebs"),
+    ("𝗢𝗻𝗴𝗼𝗶𝗻𝗴", "@Ongoing_AniXWeebs"),
+    ("𝗡𝗲𝘁𝘄𝗼𝗿𝗸", "@WeebsXServer"),
+]
+# Removal sequence by index: Network(4) → Ongoing(3) → Movies(2) → Index(1).
+_DESC_DROP_ORDER = [4, 3, 2, 1]
+
+_DESC_HEADER = "𝗪𝗮𝘁𝗰𝗵/𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 {title} 🎐"
+_DESC_FOOTER = "ᴊᴏɪɴ ᴏᴜʀ ᴄᴏᴍᴍᴜɴɪᴛʏ ꜰᴏʀ ᴍᴏʀᴇ ᴄᴏɴᴛᴇɴᴛ 💌"
+
+
+def _render_description(title: str, drop: set[int]) -> str:
+    """Assemble the description with the links whose index isn't in ``drop``."""
+    lines = [_DESC_HEADER.format(title=title.strip()), ""]
+    for i, (label, handle) in enumerate(_DESC_LINKS):
+        if i in drop:
+            continue
+        lines.append(f"➥ {label}: {handle}")
+    lines += ["", _DESC_FOOTER]
+    return "\n".join(lines)
+
+
+def _description(container: Container, *, title: str = "") -> str:
+    """The per-channel description: the AniXWeebs template with this title baked in.
+
+    An operator override (``bot.description_text``) still wins verbatim. Otherwise
+    we build the network-links block from the template and, if the result exceeds
+    Telegram's 255-UTF-16-unit cap, drop links in the fixed priority order
+    (Index → Movies → Ongoing → Network) until it fits — the anime title and the
+    main-channel link are never sacrificed.
     """
-    from nekofetch.services.bot_factory import BotFactory
-
     try:
         override = (getattr(container.config.bot, "description_text", "") or "").strip()
     except Exception:  # noqa: BLE001 — config shape guard
         override = ""
     if override:
-        return override[:512]
-    return BotFactory._BRANDING_DESCRIPTION[:512]
+        # Honour an explicit override but still respect Telegram's hard cap.
+        return _fit_utf16(override.format(title=title.strip()) if "{title}" in override
+                          else override)
+
+    drop: set[int] = set()
+    desc = _render_description(title, drop)
+    if _utf16_len(desc) <= _DESC_LIMIT:
+        return desc
+    # Overflow — drop links one at a time in priority order until it fits.
+    for idx in _DESC_DROP_ORDER:
+        drop.add(idx)
+        desc = _render_description(title, drop)
+        if _utf16_len(desc) <= _DESC_LIMIT:
+            log.info("channel_essentials.desc_trimmed", dropped=sorted(drop))
+            return desc
+    # Even with every droppable link gone it's still too long (a very long title).
+    # Truncate the title itself as the last resort so the call never gets rejected.
+    log.warning("channel_essentials.desc_title_truncated", title=title)
+    return _fit_utf16(desc)
+
+
+def _fit_utf16(text: str) -> str:
+    """Hard-trim ``text`` to ``_DESC_LIMIT`` UTF-16 units without splitting a
+    surrogate pair (which would corrupt an emoji / fancy-bold glyph)."""
+    if _utf16_len(text) <= _DESC_LIMIT:
+        return text
+    units = text.encode("utf-16-le")
+    clipped = units[: _DESC_LIMIT * 2]
+    # Never end on a lone high surrogate (0xD800–0xDBFF) — drop it if we did.
+    if len(clipped) >= 2:
+        last = int.from_bytes(clipped[-2:], "little")
+        if 0xD800 <= last <= 0xDBFF:
+            clipped = clipped[:-2]
+    return clipped.decode("utf-16-le", errors="ignore")

@@ -509,6 +509,12 @@ class PublishingService:
             ),
         )
 
+        # Per-entry AniList poster map, resolved once from the prefetched
+        # franchise walk. Each pack (S1/S2/S3/OVA) gets ITS OWN cover — AniList
+        # has per-installment covers TMDB frequently lacks, and it matches the
+        # franchise structure exactly. Falls back to the shared TMDB poster.jpg.
+        entry_posters = await self._anilist_entry_posters(anime_doc_id, files)
+
         uploaded_paths: set[str] = set()
         for (season, season_part, resolution, audio, entry_id), items in ordered_groups:
             if not resolution or audio is None:
@@ -521,14 +527,20 @@ class PublishingService:
             # lock-step (both go through processing.stages).
             name_hint = items[0].get("original_name") or items[0].get("path") or ""
             ct = _content_type_label(season, len(items), name_hint)
-            # Find the poster the thumbnail stage wrote — it's a sibling of the media
-            # files. Search each item's folder so EVERY pack gets the thumbnail even
-            # if the first item happens to live elsewhere.
-            poster = next(
-                (p for i in items
-                 if (p := Path(i["path"]).with_name(POSTER_THUMB_NAME)).exists()),
-                None,
+            # This pack's OWN AniList poster (keyed by entry_id, else season), fit
+            # to a Telegram thumbnail beside the media files. Falls back to the
+            # shared TMDB poster.jpg the thumbnail stage wrote when AniList had
+            # nothing for this entry.
+            dest_dir = Path(items[0]["path"]).parent
+            poster = await self._pack_poster(
+                entry_posters, entry_id, season, dest_dir,
             )
+            if poster is None:
+                poster = next(
+                    (p for i in items
+                     if (p := Path(i["path"]).with_name(POSTER_THUMB_NAME)).exists()),
+                    None,
+                )
             try:
                 await storage.upload_pack(
                     storage.key_from(anime_doc_id, season, resolution, audio,
@@ -551,6 +563,97 @@ class PublishingService:
                 _log.warning("publish.upload_pack.failed",
                              season=season, resolution=resolution, error=str(exc))
         return uploaded_paths
+
+    async def _anilist_entry_posters(
+        self, anime_doc_id: str, files: list[dict],
+    ) -> dict:
+        """Map each franchise installment to its AniList cover URL.
+
+        Reads the prefetched ``anilist.json`` (written at acceptance) so no live
+        AniList call happens here. Returns two lookups merged into one dict::
+
+            {("id", anilist_id): cover_url, ("season", n): cover_url}
+
+        keyed by BOTH the entry's AniList id (matches a pack's ``entry_id``) and
+        its chronological season index (fallback when a pack has no entry_id).
+        Empty dict when the cache is absent — the caller then uses the shared
+        TMDB poster."""
+        from nekofetch.core.logging import get_logger
+        _log = get_logger(__name__)
+        out: dict = {}
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            blob = await load_cached(self._c, anime_doc_id, "anilist",
+                                     anime_doc_id=anime_doc_id)
+            if not blob:
+                return out
+            walk = blob.get("franchise") or {}
+            # walk_franchise_full serializes to {id: FranchiseEntry-dict}; the
+            # values carry anilist_id + cover_url + start_date (for ordering).
+            entries = list(walk.values()) if isinstance(walk, dict) else list(walk or [])
+            # TV entries in chronological order → season index (1-based).
+            def _sk(e):
+                sd = (e or {}).get("start_date") or {}
+                return (sd.get("year") or 9999, sd.get("month") or 99,
+                        sd.get("day") or 99)
+            tv = sorted(
+                [e for e in entries
+                 if (e or {}).get("format") in ("TV", "TV_SHORT")],
+                key=_sk,
+            )
+            for e in entries:
+                aid = (e or {}).get("anilist_id")
+                cov = (e or {}).get("cover_url")
+                if aid is not None and cov:
+                    out[("id", int(aid))] = cov
+            for idx, e in enumerate(tv, start=1):
+                cov = (e or {}).get("cover_url")
+                if cov:
+                    out[("season", idx)] = cov
+        except Exception as exc:  # noqa: BLE001 — cache/parse issue → TMDB fallback
+            _log.debug("publish.anilist_posters.failed",
+                       anime=anime_doc_id, error=str(exc))
+        return out
+
+    async def _pack_poster(
+        self, entry_posters: dict, entry_id, season, dest_dir,
+    ):
+        """Resolve + fit this pack's AniList poster; return a Path or ``None``.
+
+        Prefers a match by the pack's ``entry_id`` (AniList id), then by season
+        index. Downloads the cover and fits it to Telegram's 320×320 thumbnail
+        box next to the media files (a per-entry filename so packs don't clobber
+        each other). ``None`` when there's no AniList cover for this pack — the
+        caller then falls back to the shared TMDB poster."""
+        from pathlib import Path
+
+        from nekofetch.core.logging import get_logger
+        _log = get_logger(__name__)
+
+        url = None
+        eid = _as_int(entry_id)
+        if eid is not None:
+            url = entry_posters.get(("id", eid))
+        if url is None and season is not None:
+            url = entry_posters.get(("season", int(season)))
+        if not url:
+            return None
+
+        # A stable, per-entry filename so S1/S2/OVA posters never overwrite each
+        # other in a shared work dir.
+        tag = eid if eid is not None else (f"s{season}" if season is not None else "x")
+        dest = Path(dest_dir) / f"poster_anilist_{tag}.jpg"
+        if dest.exists() and dest.stat().st_size > 0:
+            return dest
+        try:
+            from nekofetch.services.processing.stages import ThumbnailStage
+
+            if await ThumbnailStage._fit_thumb(url, dest):
+                return dest
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("publish.pack_poster.fit_failed", url=url, error=str(exc))
+        return None
 
     async def reprocess(self, code: str) -> None:
         async with session_scope(self._c.pg_sessionmaker) as session:
