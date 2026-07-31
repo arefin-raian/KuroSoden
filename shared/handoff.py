@@ -234,6 +234,10 @@ async def _stage_art(
                 tmdb=container.tmdb,
                 title=art_title,
                 franchise=franchise_json,
+                container=container,
+                anime_doc_id=franchise_json.get("anime_doc_id")
+                or (f"{franchise_json.get('anilist_id')}"
+                    if franchise_json.get("anilist_id") else None),
             )
             return next_anime_art(key, fallback_bot=stage)
         except Exception as exc:  # noqa: BLE001
@@ -253,8 +257,12 @@ async def _handoff_art(
         franchise = req.franchise_data or {}
         art_title = franchise.get("title") or req.anime_title or title
         key = key_for_franchise(franchise, title=art_title)
+        doc_id = (franchise.get("anime_doc_id")
+                  or (f"{franchise.get('anilist_id')}"
+                      if franchise.get("anilist_id") else None))
         await ensure_anime_art(key, tmdb=container.tmdb, title=art_title,
-                               franchise=franchise)
+                               franchise=franchise, container=container,
+                               anime_doc_id=doc_id)
         return next_anime_art(key, fallback_bot=stage)
     except Exception as exc:  # noqa: BLE001
         log.warning("handoff.art.failed", code=code, error=str(exc))

@@ -179,19 +179,39 @@ async def ensure_anime_art(
     title: str | None = None,
     franchise: dict | None = None,
     limit: int = 8,
+    container=None,
+    anime_doc_id: str | None = None,
 ) -> None:
-    """Seed an anime's artwork pool once — from known franchise URLs and, when a
-    TMDB client is supplied, that anime's full backdrop gallery.
+    """Seed an anime's artwork pool once — from known franchise URLs, the
+    prefetch cache, and (only as a last resort) a live TMDB backdrop gallery.
 
-    Safe to call repeatedly: it no-ops once the pool already holds art, so the
-    (network) TMDB fetch happens at most once per anime per run.
+    Safe to call repeatedly: it no-ops once the pool already holds art. When
+    ``container`` + ``anime_doc_id`` are given, the prefetched ``tmdb.json``
+    backdrops are used FIRST so the recurring card art never triggers a live
+    TMDB call for artwork already downloaded at acceptance. The live
+    ``tmdb.backdrops`` fetch only runs when neither the franchise URLs nor the
+    cache yielded anything.
     """
     pool = _anime_pools.get(key)
     if pool is not None and pool.seeded:
         return
 
     urls = _urls_from_franchise(franchise)
-    if tmdb is not None and title:
+
+    # Prefetch cache: the ranked TMDB backdrops saved at acceptance.
+    if not urls and container is not None and anime_doc_id:
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached_tmdb_assets
+
+            cached = await load_cached_tmdb_assets(
+                container, anime_doc_id, "backdrop", anime_doc_id=anime_doc_id)
+            if cached:
+                urls += [a["url"] for a in cached if a.get("url")][:limit]
+        except Exception:  # noqa: BLE001 — artwork is decorative
+            pass
+
+    # Live TMDB only when nothing was cached/known.
+    if not urls and tmdb is not None and title:
         try:
             urls += await tmdb.backdrops(title, limit=limit)
         except Exception:  # noqa: BLE001 — artwork is decorative; never fail a flow
