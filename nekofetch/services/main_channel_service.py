@@ -174,21 +174,54 @@ class MainChannelService:
             log.debug("mainchannel.thumbnail_lookup.failed",
                       anime=anime_doc_id, error=str(exc))
 
-        # 2. Fetch TMDB metadata for the post photo + overview (best-effort).
+        # 2. TMDB metadata for the post photo + overview (best-effort).
         # TMDB descriptions cover the entire franchise, not a single season.
-        # Used as the SECOND fallback when no generated thumbnail is available.
+        # Prefer the prefetched tmdb.json (backdrop/overview cached at
+        # acceptance) before a live TMDB search. Used as the SECOND fallback
+        # when no generated thumbnail is available.
         try:
-            tmdb = getattr(self._c, "tmdb", None)
-            if tmdb is not None:
-                result = await tmdb.search(facts.title)
-                if result is not None:
-                    if not facts.backdrop_url and result.backdrop_url:
-                        facts.backdrop_url = result.backdrop_url
-                    # TMDB overview covers the whole franchise — better for main channel
-                    if result.overview and result.overview != "—":
-                        facts.overview = result.overview
-        except Exception as exc:  # noqa: BLE001
-            log.debug("mainchannel.tmdb.failed", title=facts.title, error=str(exc))
+            from nekofetch.services.metadata_prefetch import (
+                load_cached,
+                resolve_cached_cover,
+            )
+
+            tblob = await load_cached(self._c, anime_doc_id, "tmdb",
+                                      anime_doc_id=anime_doc_id)
+            if tblob:
+                res = tblob.get("result") or {}
+                if not facts.backdrop_url:
+                    bd = res.get("backdrop_url")
+                    if not bd:
+                        bds = tblob.get("backdrops") or []
+                        if bds and isinstance(bds[0], dict):
+                            bd = bds[0].get("url")
+                    # Prefer a locally-mirrored / host-backed backdrop when present.
+                    cached_bd = await resolve_cached_cover(
+                        self._c, anime_doc_id, kind="backdrop",
+                        anime_doc_id=anime_doc_id)
+                    facts.backdrop_url = cached_bd or bd or facts.backdrop_url
+                ov = res.get("overview")
+                if ov and ov != "—":
+                    facts.overview = ov
+        except Exception as exc:  # noqa: BLE001 — cache miss → live below
+            log.debug("mainchannel.tmdb_cache.failed",
+                      anime=anime_doc_id, error=str(exc))
+
+        if not facts.backdrop_url or not facts.overview or facts.overview == "—":
+            try:
+                tmdb = getattr(self._c, "tmdb", None)
+                if tmdb is not None:
+                    result = await tmdb.search(facts.title)
+                    if result is not None:
+                        if not facts.backdrop_url and result.backdrop_url:
+                            facts.backdrop_url = result.backdrop_url
+                        # TMDB overview covers the whole franchise — better for main channel
+                        if result.overview and result.overview != "—" and (
+                            not facts.overview or facts.overview == "—"
+                        ):
+                            facts.overview = result.overview
+            except Exception as exc:  # noqa: BLE001
+                log.debug("mainchannel.tmdb.failed", title=facts.title, error=str(exc))
 
         # Collapse hard line breaks so the overview reads as one clean paragraph
         # (TMDB/AniList synopses arrive with ragged newlines that look broken in
@@ -201,11 +234,41 @@ class MainChannelService:
         self, anime_doc_id: str, facts: PublicationFacts,
     ) -> None:
         """Fill ``facts.episodes`` (TV-season sum) and ``facts.rating`` (franchise
-        average AniList score) by walking the AniList franchise graph.
+        average AniList score).
 
-        Best-effort: any failure leaves the pack-derived episode count and a "—"
-        rating in place rather than aborting the whole post.
-        """
+        Prefers the prefetched franchise walk (``anilist.json["franchise"]``,
+        written at acceptance) so no live AniList call fires on publish; only a
+        cache miss falls back to a live ``franchise_totals`` + ``walk_franchise_
+        full``. Best-effort: any failure leaves the pack-derived episode count
+        and a "—" rating in place rather than aborting the whole post."""
+        # ── Cache first: derive both facts from the cached walk ──
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            blob = await load_cached(self._c, anime_doc_id, "anilist",
+                                     anime_doc_id=anime_doc_id)
+            walk = (blob or {}).get("franchise")
+            if walk:
+                vals = list(walk.values()) if isinstance(walk, dict) else list(walk)
+                # Episodes = Σ TV/TV_SHORT-season episodes (matches franchise_totals).
+                tv_eps = sum(
+                    (e.get("episodes") or 0)
+                    for e in vals
+                    if isinstance(e, dict) and e.get("format") in ("TV", "TV_SHORT")
+                )
+                if tv_eps:
+                    facts.episodes = str(tv_eps)
+                scores = [e.get("score") for e in vals
+                          if isinstance(e, dict) and e.get("score") is not None]
+                if scores:
+                    facts.rating = f"{sum(scores) / len(scores):.1f}"
+                if tv_eps or scores:
+                    return
+        except Exception as exc:  # noqa: BLE001 — cache miss → live below
+            log.debug("mainchannel.franchise_cache.failed",
+                      anime=anime_doc_id, error=str(exc))
+
+        # ── Live fallback (only on cache miss) ──
         anilist = getattr(self._c, "anilist", None)
         if anilist is None:
             return
