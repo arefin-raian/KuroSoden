@@ -142,39 +142,81 @@ async def gather_thumbnail_fields(container: Any, title: str,
     tmdb_rating = anilist_score = None
     country = None
 
+    # ── TMDB: prefetch cache first, live search only on a miss ──
+    # The tmdb.json ``result`` saved at acceptance carries the same fields; read
+    # it (keyed by the root ``anime_doc_id``) before ever hitting TMDB live.
     tmdb_result = None
-    try:
-        tmdb_result = await container.tmdb.search(title)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("thumbfields.tmdb.failed", error=str(exc))
-    if tmdb_result:
-        synopsis = tmdb_result.overview or synopsis
-        native_title = tmdb_result.native_title or ""
-        studio = tmdb_result.studio or ""
-        tmdb_rating = tmdb_result.rating
-        country = tmdb_result.origin_country
-        genres = list(tmdb_result.genres or [])
+    tmdb_cached: dict | None = None
+    if anime_doc_id:
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            tblob = await load_cached(container, anime_doc_id, "tmdb",
+                                      anime_doc_id=anime_doc_id)
+            if tblob:
+                tmdb_cached = tblob.get("result") or None
+        except Exception as exc:  # noqa: BLE001 — cache miss → live below
+            log.debug("thumbfields.tmdb_cache.failed", error=str(exc))
+    if tmdb_cached is None:
+        try:
+            tmdb_result = await container.tmdb.search(title)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("thumbfields.tmdb.failed", error=str(exc))
+
+    def _t(key: str, default: Any = None) -> Any:
+        if tmdb_cached is not None:
+            return tmdb_cached.get(key, default)
+        return getattr(tmdb_result, key, default) if tmdb_result else default
+
+    if tmdb_cached is not None or tmdb_result:
+        synopsis = _t("overview") or synopsis
+        native_title = _t("native_title") or ""
+        studio = _t("studio") or ""
+        tmdb_rating = _t("rating")
+        country = _t("origin_country")
+        genres = list(_t("genres") or [])
         meta_bits = [b for b in (
-            tmdb_result.year, tmdb_result.certification, tmdb_result.runtime
+            _t("year"), _t("certification"), _t("runtime")
         ) if b]
 
+    # ── AniList: prefetch cache first, live search only on a miss ──
     anilist_media = None
-    try:
-        anilist_media = await container.anilist.search(title)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("thumbfields.anilist.failed", error=str(exc))
-    if anilist_media:
-        romaji_title = anilist_media.romaji or ""
-        if not native_title and len(anilist_media.titles) >= 3:
-            native_title = anilist_media.titles[2] or ""
-        if anilist_media.genres:
-            genres = list(anilist_media.genres)
-        if anilist_media.studio:
-            studio = anilist_media.studio
-        if anilist_media.score is not None:
+    anilist_cached: dict | None = None
+    if anime_doc_id:
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            ablob = await load_cached(container, anime_doc_id, "anilist",
+                                      anime_doc_id=anime_doc_id)
+            if ablob:
+                anilist_cached = ablob.get("search") or None
+        except Exception as exc:  # noqa: BLE001 — cache miss → live below
+            log.debug("thumbfields.anilist_cache.failed", error=str(exc))
+    if anilist_cached is None:
+        try:
+            anilist_media = await container.anilist.search(title)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("thumbfields.anilist.failed", error=str(exc))
+
+    def _a(key: str, default: Any = None) -> Any:
+        if anilist_cached is not None:
+            return anilist_cached.get(key, default)
+        return getattr(anilist_media, key, default) if anilist_media else default
+
+    if anilist_cached is not None or anilist_media:
+        romaji_title = _a("romaji") or ""
+        _titles = _a("titles") or []
+        if not native_title and len(_titles) >= 3:
+            native_title = _titles[2] or ""
+        if _a("genres"):
+            genres = list(_a("genres"))
+        if _a("studio"):
+            studio = _a("studio")
+        _score = _a("score")
+        if _score is not None:
             # AnilistMedia.score is 0-10; the ring wants 0-100.
-            anilist_score = round(anilist_media.score * 10)
-        synopsis = synopsis or (anilist_media.synopsis or "")
+            anilist_score = round(_score * 10)
+        synopsis = synopsis or (_a("synopsis") or "")
 
     # Language label from what the title actually carries (see bot_factory):
     #   sub→Japanese, dub→English, dual→Japanese & English,
