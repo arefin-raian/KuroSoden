@@ -66,6 +66,24 @@ async def _run() -> None:
     configure_logging(level=env.log_level, json=env.log_json)
     log = get_logger("kurosoden")
 
+    # Upload/download-speed diagnostics: confirm the fast paths are actually
+    # active. If fast_crypto is False, Pyrogram is doing pure-Python AES — the
+    # single biggest upload bottleneck — so the tgcrypto extension isn't being
+    # picked up and should be reinstalled.
+    def _fast_crypto() -> bool:
+        for mod in ("tgcrypto", "tgcrypto_pyrofork"):
+            try:
+                __import__(mod)
+                return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    _uvloop_active = "uvloop" in str(type(asyncio.get_event_loop_policy())).lower()
+    log.info("kurosoden.speedups", fast_crypto=_fast_crypto(),
+             uvloop=_uvloop_active,
+             upload_concurrency=int(getattr(env, "upload_concurrency", 0) or 8))
+
     container = Container.create()
     await container.startup()
 
@@ -119,6 +137,16 @@ async def _run() -> None:
 
 
 def main() -> None:
+    # uvloop is a drop-in asyncio replacement (libuv/Cython) that makes the loop
+    # 2–4× faster — a direct win for Pyrogram's parallel upload/download chunking,
+    # which is loop-bound. Best-effort: absent (e.g. on Windows) → stock asyncio.
+    # MUST run before asyncio.run()/Client creation.
+    try:
+        import uvloop  # type: ignore
+
+        uvloop.install()
+    except Exception:  # noqa: BLE001 — no uvloop (Windows/unsupported) → stock loop
+        pass
     asyncio.run(_run())
 
 

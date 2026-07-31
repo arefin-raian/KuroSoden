@@ -51,6 +51,7 @@ def build_senku(container: Container, token: str) -> Client:
         api_hash=container.env.telegram_api_hash,
         bot_token=token,
         workdir=str(container.env.session_path),
+        max_concurrent_transmissions=4,  # parallel image/card sends
     )
     client.container = container
 

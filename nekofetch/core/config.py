@@ -101,6 +101,10 @@ class EnvSettings(BaseSettings):
     # without root or manual path edits; override in .env (Docker uses /data/...).
     storage_path: Path = Field(Path("data/storage"), alias="STORAGE_PATH")
     session_path: Path = Field(Path("data/sessions"), alias="SESSION_PATH")
+    # Pyrogram parallel file-chunk streams for Levi's uploads (0 = use the
+    # built-in default of 8). Raise for a fat uplink, lower if the host throws
+    # FLOOD_WAIT / connection resets under many parallel streams.
+    upload_concurrency: int = Field(0, alias="UPLOAD_CONCURRENCY")
 
     @field_validator("storage_path", mode="before")
     @classmethod

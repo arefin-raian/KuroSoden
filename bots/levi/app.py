@@ -50,6 +50,15 @@ def build_levi(container: Container, token: str) -> Client:
         api_hash=container.env.telegram_api_hash,
         bot_token=token,
         workdir=str(container.env.session_path),
+        # Levi uploads every processed video to the DB channel — the pipeline's
+        # heaviest transfer. Pyrogram moves file chunks in parallel up to this
+        # cap (default 1 = fully serialized). 8 parallel chunk streams saturates
+        # a VPS uplink far better; paired with TgCryptoX (fast AES) + uvloop the
+        # upload throughput is several times higher. Tune down if the host's
+        # network throws FLOOD_WAIT/connection resets.
+        max_concurrent_transmissions=int(
+            getattr(container.env, "upload_concurrency", 0) or 8
+        ),
     )
     client.container = container
 
