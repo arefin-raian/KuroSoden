@@ -184,20 +184,54 @@ class MetadataPrefetchService:
 
         Jikan is public and unauthenticated; it rate-limits at ~3 req/s /
         60 req/min, so we make ONE search call and cache the top hit's full
-        payload. Best-effort — a miss just leaves jikan.json absent."""
-        import httpx
+        payload. Best-effort — a miss just leaves jikan.json absent.
 
+        Jikan sits behind Cloudflare, which serves Python's stock TLS
+        fingerprint (httpx/urllib) a synthetic 504 on every request. We use
+        curl_cffi with Chrome impersonation (falling back to httpx only if
+        curl_cffi is unavailable) so the call actually reaches MAL.
+        """
         url = "https://api.jikan.moe/v4/anime"
-        try:
+        params = {"q": title, "limit": 1}
+
+        async def _fetch() -> dict | None:
+            try:
+                from curl_cffi import requests as cf_requests
+            except ImportError:
+                cf_requests = None
+            if cf_requests is not None:
+                sess = cf_requests.AsyncSession(
+                    impersonate="chrome", timeout=30.0, allow_redirects=True)
+                try:
+                    for attempt in range(3):
+                        r = await sess.get(url, params=params)
+                        if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
+                            await asyncio.sleep(1.5 * (attempt + 1))
+                            continue
+                        if r.status_code >= 400:
+                            return None
+                        return r.json()
+                    return None
+                finally:
+                    try:
+                        await sess.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            # Fallback: plain httpx (may 504 behind Cloudflare).
+            import httpx
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as cli:
-                r = await cli.get(url, params={"q": title, "limit": 1})
-                if r.status_code == 429:
-                    log.warning("prefetch.jikan.ratelimited", title=title)
-                    await asyncio.sleep(2.0)
-                    r = await cli.get(url, params={"q": title, "limit": 1})
-                r.raise_for_status()
-                body = r.json()
-        except Exception as exc:  # noqa: BLE001
+                for attempt in range(3):
+                    r = await cli.get(url, params=params)
+                    if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    r.raise_for_status()
+                    return r.json()
+                return None
+
+        try:
+            body = await _fetch()
+        except Exception as exc:  # noqa: BLE001 - transport-agnostic
             log.warning("prefetch.jikan.failed", title=title, error=str(exc))
             return False
         data = (body or {}).get("data") or []

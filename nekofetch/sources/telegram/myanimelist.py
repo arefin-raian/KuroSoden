@@ -23,6 +23,11 @@ from datetime import datetime
 
 import httpx
 
+try:  # Chrome-TLS transport — the actual fix for Cloudflare's 504 wall.
+    from curl_cffi import requests as cf_requests
+except ImportError:  # pragma: no cover - curl_cffi is a hard dep, but be safe
+    cf_requests = None  # type: ignore[assignment]
+
 from nekofetch.core.logging import get_logger
 from nekofetch.sources.telegram.anilist import (
     ANILIST_SITE,
@@ -162,6 +167,7 @@ class MyAnimeListClient:
 
     def __init__(self) -> None:
         self._http: httpx.AsyncClient | None = None
+        self._cf = None  # curl_cffi.AsyncSession — Chrome-impersonating transport
         self._last_request: float = 0.0
 
     @property
@@ -170,10 +176,44 @@ class MyAnimeListClient:
             self._http = httpx.AsyncClient(timeout=20.0)
         return self._http
 
+    @property
+    def _session(self):
+        """The transport used for Jikan calls.
+
+        Prefers ``curl_cffi`` with Chrome impersonation — Jikan's Cloudflare edge
+        serves a synthetic 504 to Python's stock TLS fingerprint (httpx/urllib),
+        so a plain httpx client fails *every* request. curl_cffi's browser-like
+        handshake gets 200s. Falls back to httpx only if curl_cffi is missing.
+        """
+        if cf_requests is None:
+            return self.http
+        if self._cf is None:
+            self._cf = cf_requests.AsyncSession(
+                impersonate="chrome",
+                timeout=30.0,
+                allow_redirects=True,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "application/json",
+                },
+            )
+        return self._cf
+
     async def close(self) -> None:
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+        if self._cf is not None:
+            # curl_cffi's AsyncSession.close() is an async coroutine in 0.15+.
+            try:
+                await self._cf.close()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            self._cf = None
 
     # ── rate limiter ──────────────────────────────────────────────────────────
 
@@ -195,6 +235,13 @@ class MyAnimeListClient:
         retry, so we treat them like a rate-limit rather than a hard failure.
         Up to 3 attempts with exponential backoff. Returns the parsed JSON
         ``data`` dict (without the wrapper key), or ``None`` on hard failure.
+
+        Uses the curl_cffi (Chrome-TLS) session so Cloudflare doesn't 504 us on
+        fingerprint; both curl_cffi and httpx responses expose the same
+        ``.status_code`` / ``.headers`` / ``.json()`` surface, so the handling
+        below is transport-agnostic. Network/transport exceptions are caught
+        broadly (``Exception``) because curl_cffi raises its own error types,
+        not ``httpx.*``.
         """
         url = f"{JIKAN_URL}/{endpoint.lstrip('/')}"
         max_attempts = 3
@@ -202,40 +249,30 @@ class MyAnimeListClient:
             await self._throttle()
             last = attempt == max_attempts
             try:
-                resp = await self.http.get(url, params=params)
-                # Handle retryable status codes BEFORE raise_for_status so a 504
-                # gateway timeout backs off instead of bailing after one try.
-                if resp.status_code == 429 and not last:
+                resp = await self._session.get(url, params=params)
+                status = resp.status_code
+                # Handle retryable status codes BEFORE parsing so a 504 gateway
+                # timeout backs off instead of bailing after one try.
+                if status == 429 and not last:
                     retry_after = float(resp.headers.get("Retry-After") or 2)
                     log.warning("jikan.ratelimit", retry_after=retry_after)
                     await asyncio.sleep(min(retry_after, 10.0))
                     continue
-                if resp.status_code in (500, 502, 503, 504) and not last:
+                if status in (500, 502, 503, 504) and not last:
                     backoff = 1.5 * attempt
                     log.warning("jikan.http_error", url=url,
-                                status=resp.status_code, retry_in=backoff)
+                                status=status, retry_in=backoff)
                     await asyncio.sleep(backoff)
                     continue
-                if resp.status_code == 404:
+                if status == 404:
                     return None  # entry not found — not an error
-                resp.raise_for_status()
+                if status >= 400:
+                    log.warning("jikan.http_error.final", url=url, status=status)
+                    return None
                 payload = resp.json()
-            except httpx.TimeoutException:
-                log.warning("jikan.timeout", url=url)
-                if not last:
-                    await asyncio.sleep(1.5 * attempt)
-                    continue
-                return None
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404:
-                    return None  # entry not found — not an error
-                log.warning("jikan.http_error", url=url, status=exc.response.status_code)
-                if not last:
-                    await asyncio.sleep(1.5 * attempt)
-                    continue
-                return None
-            except (httpx.HTTPError, ValueError) as exc:
-                log.warning("jikan.request.failed", url=url, error=str(exc))
+            except Exception as exc:  # noqa: BLE001 - transport-agnostic (curl_cffi/httpx)
+                log.warning("jikan.request.failed", url=url,
+                            error=str(exc), attempt=attempt)
                 if not last:
                     await asyncio.sleep(1.5 * attempt)
                     continue
