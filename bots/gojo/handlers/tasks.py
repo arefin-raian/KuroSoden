@@ -138,28 +138,32 @@ def _index_slot_actions_markup(order: int):
 def register(client: Client, container: Container) -> None:
     fsm = FSM(container.redis, bot="gojo")
 
-    # ── /tasks — View assigned publishing tasks ───────────────────────────────
-    @client.on_message(filters.command("tasks"))
-    async def _tasks(_: Client, message: Message) -> None:
-        if not message.from_user:
-            return
+    async def _render_tasks(chat_id: int, user_id: int,
+                            *, old_msg: Message | None = None) -> None:
+        """Render the real, actionable task list (offers + assigned).
+
+        Shared by the ``/tasks`` command AND the ``gojo|tasks`` / ``gojo|publish``
+        inline buttons (from /start and the Senku→Gojo handoff card). Before this
+        existed, those buttons fell through to app.py's catch-all which showed
+        static help text with only a Back button — the "publishing shows nothing
+        to post" bug."""
         from kurosoden.shared.admin_assignment import AdminAssignmentEngine
         from nekofetch.infrastructure.database.postgres.session import session_scope
         from nekofetch.infrastructure.repositories.request_repo import RequestRepository
 
         engine = AdminAssignmentEngine(container.pg_sessionmaker)
-        active = await engine.get_active_tasks(message.from_user.id)
-        offers = await engine.get_pending_offers(message.from_user.id)
+        active = await engine.get_active_tasks(user_id)
+        offers = await engine.get_pending_offers(user_id)
 
         if not active and not offers:
             await send_screen(
-                client,
-                message.chat.id,
+                client, chat_id,
                 Screen(
                     caption=V.TASKS_EMPTY,
                     image=pick_artwork("gojo"),
                     keyboard=keyboard([(V.BTN_HOME, cb("gojo", "home"))]),
                 ),
+                old_msg=old_msg,
             )
             return
 
@@ -200,14 +204,41 @@ def register(client: Client, container: Container) -> None:
             ])
         rows.append([(V.BTN_HOME, cb("gojo", "home"))])
         await send_screen(
-            client,
-            message.chat.id,
+            client, chat_id,
             Screen(
                 caption="\n".join(lines),
                 image=pick_artwork("gojo"),
                 keyboard=keyboard(*rows),
             ),
+            old_msg=old_msg,
         )
+
+    # ── /tasks — View assigned publishing tasks ───────────────────────────────
+    @client.on_message(filters.command("tasks"))
+    async def _tasks(_: Client, message: Message) -> None:
+        if not message.from_user:
+            return
+        await _render_tasks(message.chat.id, message.from_user.id)
+
+    # ── gojo|tasks / gojo|publish inline buttons → the SAME actionable list ────
+    # These MUST be registered before app.py's `^gojo\|` catch-all (register_all
+    # runs first), so a tap on Tasks/Publish shows real tasks, not static help.
+    @client.on_callback_query(filters.regex(r"^gojo\|tasks$"))
+    async def _cb_tasks(_: Client, q: CallbackQuery) -> None:
+        if q.from_user is None or q.message is None:
+            await q.answer()
+            return
+        await q.answer()
+        await _render_tasks(q.message.chat.id, q.from_user.id, old_msg=q.message)
+
+    @client.on_callback_query(filters.regex(r"^gojo\|publish$"))
+    async def _cb_publish_list(_: Client, q: CallbackQuery) -> None:
+        if q.from_user is None or q.message is None:
+            await q.answer()
+            return
+        await q.answer()
+        await _render_tasks(q.message.chat.id, q.from_user.id, old_msg=q.message)
+
 
     # ── Callback handlers (registered ONCE, not dynamically) ────────────────
     @client.on_callback_query(filters.regex(r"^gojo\|offer\|"))
