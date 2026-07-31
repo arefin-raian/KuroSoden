@@ -258,10 +258,19 @@ def download_card_html(
         speed = human_speed(speed_bps) if speed_bps > 0 else "—"
         eta = human_eta(eta_seconds) if eta_seconds is not None else "—"
 
+        # During upload the transferred bytes are *sent*, not *downloaded* — flip
+        # the label (and icon) accordingly. The pad is widened so the value column
+        # stays aligned with the other rows ("Uploaded" is 2 chars shorter than
+        # "Downloaded", so it gets 2 extra trailing spaces).
+        if stage_key in ("uploading", "upload"):
+            xfer_row = f"<b>├─ 📤 Uploaded    </b> {size}\n"
+        else:
+            xfer_row = f"<b>├─ 📂 Downloaded  </b> {size}\n"
+
         detail = (
             f"<blockquote><b><u>Transfer</u>\n"
             f"├─ ⚡ Speed             </b> {speed}\n"
-            f"<b>├─ 📂 Downloaded  </b> {size}\n"
+            f"{xfer_row}"
             f"<b>├─ ⌛ ETA                 </b> {eta}\n"
             f"<b>└─ ⏱️ Elapsed          </b> {elapsed}</blockquote>"
         )

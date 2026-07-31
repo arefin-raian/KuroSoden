@@ -191,6 +191,7 @@ class DistributionCache:
         "K-drama backdrops" bug). Falling back to the franchise's real English/
         Romaji/native title keeps every TMDB lookup on the right anime.
         """
+        import re
         franchise = franchise or {}
         f_english = franchise.get("english") or franchise.get("title") or ""
         f_romaji = franchise.get("romaji") or franchise.get("title_romaji") or ""
@@ -198,13 +199,20 @@ class DistributionCache:
         entries: list[EntryData] = []
         for i, e in enumerate(mapping.included_entries, start=1):
             kind = getattr(e.kind, "value", None) or str(getattr(e, "kind", "season"))
+            raw_title = (getattr(e, "title", "") or "").strip()
+            # Detect placeholder season/part labels from _build_from_aggregated
+            # (e.g. "Season 01", "Season 3 Part 2") and treat them as empty so
+            # the franchise fallback fires. A real entry title like "Attack on
+            # Titan Season 3" contains context beyond the bare label and is kept.
+            if raw_title and re.fullmatch(r"Season \d+( Part \d+)?", raw_title):
+                raw_title = ""
             entries.append(EntryData(
                 index=i,
                 label=self._entry_label(e),
                 kind=str(kind).lower(),
                 season_number=getattr(e, "season_number", 1),
                 season_part=getattr(e, "season_part", None),
-                title=(getattr(e, "title", "") or "").strip() or f_english or f_romaji,
+                title=raw_title or f_english or f_romaji,
                 romaji=(getattr(e, "romaji", "") or "").strip() or f_romaji,
                 native=(getattr(e, "native", "") or "").strip() or f_native,
                 episodes=getattr(e, "episodes", None),

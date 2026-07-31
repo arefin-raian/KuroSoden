@@ -27,7 +27,15 @@ def audio_tag(audios: set) -> str:
 
     Distinguishes genuine Dual Audio (both languages in one file) from
     separate Sub + Dub files — "Dual" only appears when a DUAL_AUDIO
-    file exists."""
+    file exists.
+
+    User spec for channel titles:
+    - dual audio → "Dual Audio, Sub & Dub"
+    - separate sub+dub (not dual) → "Sub & Dub"
+    - multi audio → "Multi Audio, Sub, Dub & Dual"
+    - dub only → "Dub"
+    - sub only → "Sub"
+    """
     vals = {a.value if isinstance(a, AudioType) else str(a) for a in audios}
     has_dual = AudioType.DUAL_AUDIO.value in vals
     has_sub = AudioType.SUBBED.value in vals
@@ -35,9 +43,9 @@ def audio_tag(audios: set) -> str:
     multi = AudioType.MULTI.value in vals
 
     if multi:
-        return "Multi Audio"
+        return "Multi Audio, Sub, Dub & Dual"
     if has_dual:
-        return "Dual Audio"
+        return "Dual Audio, Sub & Dub"
     if has_sub and has_dub:
         return "Sub & Dub"
     if has_dub:
@@ -57,8 +65,8 @@ def language_label(languages: set | None) -> str:
     and the other ``"En & Ja"`` — the exact drift the alignment pass set
     out to eliminate.
     """
-    langs = sorted({l.strip().lower() for l in (languages or set()) if l and l.strip()})
-    if not langs:
+    raw = {l.strip().lower() for l in (languages or set()) if l and l.strip()}
+    if not raw:
         return ""
     names = {
         # Full names — canonical, fed in by bot_factory._gather.
@@ -69,6 +77,13 @@ def language_label(languages: set | None) -> str:
         "ja": "Japanese", "en": "English", "hi": "Hindi",
         "ko": "Korean", "zh": "Chinese", "es": "Spanish",
     }
+    # Priority ordering: English first, then Japanese, then the rest
+    # alphabetically — yields "English & Japanese" and "English, Japanese &
+    # Hindi" (the reading order the user expects), never alphabetical drift
+    # like "English, Hindi & Japanese".
+    _priority = {"english": 0, "japanese": 1}
+    langs = sorted(raw, key=lambda l: (_priority.get(names.get(l, l).lower(), 2),
+                                       names.get(l, l.title())))
     labelled = [names.get(l, l.title()) for l in langs]
     if len(labelled) == 1:
         return labelled[0]
@@ -183,13 +198,20 @@ def format_channel_title(
     """Channel title with BOTH names + the decorative audio/language/quality tags.
 
     Distribution *channels* allow a 128-char title (vs a bot's 64), so we can
-    show the English name, the native (Japanese) name in guillemets, then the
-    same ``『 audio 』« languages » qualities`` suffix used for bot names:
+    show the English name, the native (Japanese) name, then the same
+    audio/languages/qualities suffix. User spec:
 
-        "<English> «<Native>» 『 Dual Audio 』« Japanese & English » 1080p 720p 480p"
+        "English〢Romaji《 audio 》« languages » resolutions"
 
-    The native half is dropped first when space is tight; the audio/quality
-    suffix is always preserved (it's what users scan for).
+    Rules:
+    - If English == Romaji/Japanese (same text), keep ONE name only.
+    - Audio labels: "Dual Audio, Sub & Dub" / "Sub & Dub" / "Multi Audio, Sub, Dub & Dual".
+    - Languages: "English & Japanese" or "English, Japanese & Hindi" (Oxford comma before last).
+    - Omit ANY section whose info is unavailable (no languages, no resolutions, etc).
+    - Native half is dropped first when space is tight; the audio/quality suffix
+      is always preserved (it's what users scan for).
+
+    Example: "Takopi's Original Sin〢Takopii no Genzai《 Dual Audio, Sub & Dub 》« English & Japanese » 1080p 720p 480p"
     """
     english = (english or "").strip()
     native = (native or "").strip()
@@ -199,24 +221,41 @@ def format_channel_title(
     langs = language_label(languages)
     quals = " ".join(qualities) if qualities else ""
 
-    suffix_parts = []
-    if tag:
-        suffix_parts.append(f"『 {tag} 』")
-    if langs:
-        suffix_parts.append(f"« {langs} »")
-    if quals:
-        suffix_parts.append(quals)
-    suffix = " ".join(suffix_parts)
+    # The audio/language brackets abut each other and the title with NO spaces
+    # ("…Genzai《 Dual Audio 》« English & Japanese »"); only the resolutions get a
+    # leading space. Each bracket keeps interior spaces ("《 x 》", "« x »").
+    def _build_suffix() -> str:
+        s = ""
+        if tag:
+            s += f"《 {tag} 》"
+        if langs:
+            s += f"« {langs} »"
+        if quals:
+            s += (" " if s else "") + quals
+        return s
 
-    # Try full "English «Native» suffix", then drop native, then just English.
-    for head in ([f"{english} «{native}»" if native and native != english else english,
-                  english] if english else [native]):
-        candidate = f"{head} {suffix}".strip() if suffix else head
-        if len(candidate) <= limit:
-            return candidate
+    suffix = _build_suffix()
+
+    # If English and native are identical, keep only one (avoid "Same〢Same").
+    # Otherwise build "English〢Native" with the separator 〢.
+    if native and native != english:
+        head = f"{english}〢{native}"
+    else:
+        head = english or native or "Anime"
+
+    # Try full "head+suffix", then drop native, then truncate.
+    candidate = f"{head}{suffix}" if suffix else head
+    if len(candidate) <= limit:
+        return candidate
+
+    # Fallback: drop native (if any), keep English + suffix.
+    candidate = f"{english}{suffix}" if suffix else english
+    if len(candidate) <= limit:
+        return candidate
+
     # Last resort: preserve the suffix, truncate the head.
     if suffix:
-        room = limit - len(suffix) - 1
+        room = limit - len(suffix)
         if room > 3:
-            return f"{title[:room - 1].rstrip()}… {suffix}"[:limit]
+            return f"{title[:room - 1].rstrip()}…{suffix}"[:limit]
     return title[:limit]

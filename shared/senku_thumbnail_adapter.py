@@ -102,7 +102,16 @@ class SenkuThumbnailAdapter:
         """
         if entry.tmdb_id:
             return entry.tmdb_id, entry.media_type
-        query = (entry.title or entry.label or "").strip()
+        # The label is a bare "Season 01" / "Season 3 Part 2" for aggregated
+        # franchises — it must NEVER become the TMDB query on its own (it resolves
+        # to a random popular show: the "K-drama backdrops" bug). Only fall back to
+        # the label when it carries real context beyond a season/part number.
+        import re
+        query = (entry.title or "").strip()
+        if not query:
+            label = (entry.label or "").strip()
+            if label and not re.fullmatch(r"Season \d+( Part \d+)?", label):
+                query = label
         if not query:
             return None, entry.media_type
         try:
