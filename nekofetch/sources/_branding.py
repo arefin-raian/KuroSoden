@@ -6,16 +6,15 @@ the new-download mux path (``_mux.py``), the manual re-mux path
 and the on-screen subtitle cue in ``_subs.py``.
 
 Visual style (kept consistent so MediaInfo / VLC / mpv all display the same
-chrome-bracket label across every release):
+label across every release):
 
-  * Track name:    ``"Language〘 @AniXWeebs 〙"``
-                   e.g. ``Japanese〘 @AniXWeebs 〙``
-                   e.g. ``Anime Weebs #2〘 @AniXWeebs 〙`` (no language tag)
+  * Track name:    ``"Language《 Anime Weebs 》"``
+                   e.g. ``Japanese《 Anime Weebs 》``
+                   e.g. ``English《 Anime Weebs 》``
+                   e.g. ``《 Anime Weebs 》`` (no language tag on the track)
 
-The corner brackets (U+3018 / U+3019) and the channel handle are the same
-shape :class:`BrandingService` writes into captions and bot descriptions, so
-the chrome feels uniform whether the user opens MediaInfo or reads a Telegram
-post.
+The double-angle brackets (U+300A / U+300B) wrap the channel NAME (not the @
+handle) so the track label reads cleanly in a player's track menu.
 
 The terminal-level ``subtitle on-screen cue`` is unaffected by this module;
 ``_subs.py`` keeps its own text template for the ASS stream.
@@ -28,21 +27,28 @@ from __future__ import annotations
 # branding block in ``core/constants.py`` / ``services/bot_factory.py``.
 BRAND_HANDLE = "@AniXWeebs"
 
+# Channel display name used in track-title stamps (``《 Anime Weebs 》``). Mirrors
+# ``branding.channel_name`` in config.yaml; kept as a module constant so the pure
+# track-title helpers stay config-free (like ``BRAND_HANDLE``).
+BRAND_NAME = "Anime Weebs"
+
 
 def brand_track_title(name: str | None, ordinal: int) -> str:
-    """Build a stylish track-name label: ``"Language〘 @AniXWeebs 〙"``.
+    """Build a stylish track-name label: ``"Language《 Anime Weebs 》"``.
 
     Args:
         name: the human display name (e.g. ``"Japanese"``, ``"Dual Audio"``).
-            When ``None``/empty/whitespace-only, falls back to
-            ``"Anime Weebs #N"`` for transparency — operators see the
-            brand right next to a sequence number, so a duplicate or
-            untagged track is obvious.
-        ordinal: 1-based track position among its own stream type
-            (audio+audio, audio+sub). Used only when the fallback fires.
+            When ``None``/empty/whitespace-only, the label is just the bare
+            channel stamp ``"《 Anime Weebs 》"`` — no language word and no
+            sequence number (an untagged track carries the brand alone).
+        ordinal: 1-based track position among its own stream type. Retained for
+            signature compatibility with callers; no longer shown.
+
+    Examples:
+        ``Japanese《 Anime Weebs 》`` · ``English《 Anime Weebs 》`` · ``《 Anime Weebs 》``
     """
-    base = name.strip() if name and name.strip() else f"Anime Weebs #{ordinal}"
-    return f"{base}〘 {BRAND_HANDLE} 〙"
+    base = name.strip() if name and name.strip() else ""
+    return f"{base}《 {BRAND_NAME} 》"
 
 
 def brand_container_title(title: str) -> str:

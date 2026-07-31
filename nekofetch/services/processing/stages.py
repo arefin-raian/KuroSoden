@@ -625,8 +625,8 @@ class MetadataStage(Stage):
 # Language code → human display name for track branding. Torrents arrive already
 # muxed, so we read the embedded track's ISO-639 language tag (e.g. "jpn") and
 # turn it into the same display name the streaming mux path uses ("Japanese"),
-# so both paths produce identical chrome-bracket labels. Unknown/blank tags fall
-# back to the "Anime Weebs #N" form inside ``brand_track_title``.
+# so both paths produce identical labels. Unknown/blank tags map to "" so
+# ``brand_track_title`` renders the bare ``《 Anime Weebs 》`` stamp.
 _LANG_DISPLAY = {
     "jpn": "Japanese", "ja": "Japanese", "jp": "Japanese",
     "eng": "English", "en": "English",
@@ -649,8 +649,8 @@ _LANG_DISPLAY = {
 def _lang_display(lang: str) -> str:
     """Map an ISO-639 language tag to a human display name ("jpn" → "Japanese").
 
-    Returns "" for unknown/untagged languages so ``brand_track_title`` uses its
-    "Anime Weebs #N" fallback instead of an ugly raw code.
+    Returns "" for unknown/untagged languages so ``brand_track_title`` renders
+    the bare ``《 Anime Weebs 》`` stamp instead of an ugly raw code.
     """
     c = (lang or "").lower().split("-")[0].strip()
     if c in ("", "und", "unk", "mis", "zxx"):
@@ -691,9 +691,10 @@ class BrandingStage(Stage):
         ``_branding.py`` — with a torrent-specific subtitle rule.
 
           * Container title → ``"AnimeName〢@AniXWeebs"``
-          * Audio track     → ``"Japanese〘 @AniXWeebs 〙"`` (language-based)
+          * Audio track     → ``"Japanese《 Anime Weebs 》"`` (language-based;
+            bare ``"《 Anime Weebs 》"`` when the track has no language tag)
           * Subtitle track  → torrent-specific: keep the ORIGINAL track title
-            (e.g. "Signs & Songs") + ``〘 @AniXWeebs 〙`` (fansub subs carry
+            (e.g. "Signs & Songs") + ``《 Anime Weebs 》`` (fansub subs carry
             meaningful names — Full / Signs&Songs / Dialogue — that we preserve),
             and INJECT a ``Telegram: @AniXWeebs`` cue into the subtitle content of
             every episode. Streaming sources instead name subs by language and are
