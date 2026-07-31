@@ -452,16 +452,33 @@ class BotContentService:
             "_source": None,
         }
 
+        # ── Prefetch cache check (decides whether to probe AcuteBot at all) ──
+        # If AniList data for this title was already fetched + saved at
+        # acceptance, use it and SKIP the AcuteBot userbot probe entirely — that
+        # probe is a live Telegram round-trip that fired on every publish/update
+        # even though the answer was already on disk. Read the blob once here so
+        # both the skip decision and the fallback parse below reuse it.
+        cached_blob = None
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            cached_blob = await load_cached(self._c, anime_doc_id, "anilist",
+                                            anime_doc_id=anime_doc_id)
+        except Exception as exc:  # noqa: BLE001 — cache is best-effort
+            log.debug("bot.content.cache.read_failed", error=str(exc))
+        cache_has_data = bool((cached_blob or {}).get("search"))
+
         # ── Primary: @acutebot via the userbot pool ──
         # Guard: never send a request code (REQ-####) or bare id to AcuteBot —
         # it returns nothing and blanks the info card. If the query still looks
         # like a code at this point (no usable title_hint was available), skip
-        # straight to the AniList fallback below.
+        # straight to the AniList fallback below. Also skip when the prefetch
+        # cache already holds the data (no need for a live probe).
         _still_code = bool(
             not search_query.strip()
             or _re.fullmatch(r"REQ-?\d+", search_query, _re.IGNORECASE)
         )
-        if not _still_code:
+        if not _still_code and not cache_has_data:
             try:
                 from nekofetch.sources.telegram.userbot import UserbotPool
 
@@ -490,19 +507,11 @@ class BotContentService:
                         doc_id=anime_doc_id, query=search_query)
 
         # ── Fallback 1: AniList (or MAL when AniList is down) ──
-        # Prefer the prefetched cache written at acceptance time — it avoids a
-        # live AniList call (and thus the shared-key rate limit) on every
-        # publish/update. Falls through to a live search when absent.
-        cached_search = None
-        try:
-            from nekofetch.services.metadata_prefetch import load_cached
-
-            blob = await load_cached(self._c, anime_doc_id, "anilist",
-                                     anime_doc_id=anime_doc_id)
-            if blob:
-                cached_search = blob.get("search")
-        except Exception as exc:  # noqa: BLE001 — cache is best-effort
-            log.debug("bot.content.cache.read_failed", error=str(exc))
+        # Reuse the prefetch blob already read above (no second disk read). It
+        # was written at acceptance, so this avoids a live AniList call (and the
+        # shared-key rate limit) on every publish/update. Falls through to a live
+        # search only when the cache is absent.
+        cached_search = (cached_blob or {}).get("search")
 
         if cached_search:
             try:
@@ -569,6 +578,36 @@ class BotContentService:
                 log.warning("bot.content.anilist.failed", anime=search_query, error=str(exc))
 
         # ── Fallback 2: TMDB for poster + backdrop ──
+        # Prefer the prefetched TMDB blob (poster/backdrop/overview cached at
+        # acceptance) before any live TMDB call. Only search live on a miss.
+        if not meta.get("poster_url") or not meta.get("banner_url"):
+            try:
+                from nekofetch.services.metadata_prefetch import load_cached, resolve_cached_cover
+
+                if not meta.get("poster_url"):
+                    cover = await resolve_cached_cover(
+                        self._c, anime_doc_id, kind="poster",
+                        anime_doc_id=anime_doc_id)
+                    if cover:
+                        meta["poster_url"] = cover
+                tblob = await load_cached(self._c, anime_doc_id, "tmdb",
+                                          anime_doc_id=anime_doc_id)
+                if tblob:
+                    res = tblob.get("result") or {}
+                    if not meta.get("banner_url"):
+                        bd = res.get("backdrop_url")
+                        if not bd:
+                            # First ranked backdrop from the cached asset list.
+                            bds = tblob.get("backdrops") or []
+                            if bds and isinstance(bds[0], dict):
+                                bd = bds[0].get("url")
+                        if bd:
+                            meta["banner_url"] = bd
+                    if not meta.get("synopsis") and res.get("overview"):
+                        meta["synopsis"] = res["overview"]
+            except Exception as exc:  # noqa: BLE001 — cache miss → live below
+                log.debug("bot.content.tmdb.cache_failed", error=str(exc))
+
         if not meta.get("poster_url"):
             try:
                 url = await self._c.tmdb.poster_for(meta["title"])
@@ -576,7 +615,7 @@ class BotContentService:
                     meta["poster_url"] = url
                 result = await self._c.tmdb.search(meta["title"])
                 if result is not None:
-                    if result.backdrop_url:
+                    if result.backdrop_url and not meta.get("banner_url"):
                         meta["banner_url"] = result.backdrop_url
                     # Use TMDB overview as synopsis if we don't have one yet
                     if not meta.get("synopsis") and result.overview:
@@ -587,6 +626,37 @@ class BotContentService:
         return meta
 
     # ── franchise walking ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _franchise_from_cache(walk: dict) -> dict:
+        """Rebuild ``{id: FranchiseEntry}`` from the cached franchise-walk dict.
+
+        The prefetch serialises ``walk_franchise_full``'s output (a dict of
+        ``FranchiseEntry``) to plain dicts in ``anilist.json``. This reconstructs
+        the dataclasses so ``_walk_franchise`` can treat a cache hit and a live
+        walk identically (same ``.format`` / ``.start_date`` / ``.cover_url``
+        attribute access). Unknown/extra keys are ignored so a schema drift in
+        the cache never crashes the read."""
+        from dataclasses import fields as _dc_fields
+
+        from nekofetch.sources.telegram.anilist import FranchiseEntry
+
+        allowed = {f.name for f in _dc_fields(FranchiseEntry)}
+        out: dict = {}
+        values = walk.values() if isinstance(walk, dict) else (walk or [])
+        for raw in values:
+            if not isinstance(raw, dict):
+                continue
+            aid = raw.get("anilist_id")
+            if aid is None:
+                continue
+            try:
+                out[int(aid)] = FranchiseEntry(
+                    **{k: v for k, v in raw.items() if k in allowed}
+                )
+            except Exception:  # noqa: BLE001 — skip a malformed entry, keep the rest
+                continue
+        return out
 
     async def _walk_franchise(self, anime_doc_id: str, meta: dict) -> dict:
         """Walk the full AniList franchise graph and return sorted entries.
@@ -602,19 +672,36 @@ class BotContentService:
         """
         empty = {"tv": [], "extras": [], "all": []}
         try:
-            # Strip anilist: prefix so we search by title instead of numeric ID.
-            search_query = anime_doc_id
-            if search_query.startswith("anilist:"):
-                search_query = search_query[len("anilist:"):]
-            # Resolve the root via AniList search.
-            search = await self._c.anilist.search(search_query)
-            if search is None:
-                log.debug("bot.content.franchise.no_match", anime=search_query)
-                return empty
-            root_id = search.id
+            entries = None
+            # ── Prefer the prefetched franchise walk (anilist.json["franchise"]) ──
+            # It was written at acceptance by walk_franchise_full, so re-walking
+            # live here just burns the shared AniList key. Reconstruct
+            # FranchiseEntry objects from the cached dicts.
+            try:
+                from nekofetch.services.metadata_prefetch import load_cached
 
-            # Walk the full graph.
-            entries = await self._c.anilist.walk_franchise_full(root_id)
+                blob = await load_cached(self._c, anime_doc_id, "anilist",
+                                         anime_doc_id=anime_doc_id)
+                walk = (blob or {}).get("franchise")
+                if walk:
+                    entries = self._franchise_from_cache(walk)
+                    if entries:
+                        log.info("bot.content.franchise.cache_hit",
+                                 anime=anime_doc_id, entries=len(entries))
+            except Exception as exc:  # noqa: BLE001 — cache miss → live walk
+                log.debug("bot.content.franchise.cache_read_failed", error=str(exc))
+
+            # ── Live fallback (only on cache miss) ──
+            if not entries:
+                search_query = anime_doc_id
+                if search_query.startswith("anilist:"):
+                    search_query = search_query[len("anilist:"):]
+                search = await self._c.anilist.search(search_query)
+                if search is None:
+                    log.debug("bot.content.franchise.no_match", anime=search_query)
+                    return empty
+                root_id = search.id
+                entries = await self._c.anilist.walk_franchise_full(root_id)
             if not entries:
                 log.debug("bot.content.franchise.empty", anime=anime_doc_id)
                 return empty
