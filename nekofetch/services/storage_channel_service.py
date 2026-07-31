@@ -72,23 +72,48 @@ class StorageChannelService:
     def header_text(self, *, title: str, season: int | None, resolution: str,
                     audio: AudioType, episode_from: int | None = None,
                     episode_to: int | None = None,
-                    content_type: str = "Season") -> str:
-        """Build the header text for a storage pack.
+                    content_type: str = "Season",
+                    season_part: int | None = None,
+                    alt_titles: list[str] | None = None) -> str:
+        """Build the caption posted before a storage pack's files.
 
-        ``content_type`` is a human-readable label like "Season", "OVA", "ONA",
-        "Movie", or "Special" — used in the ``{content_type}`` template variable
-        so each entry type can be distinguished in the header. It also selects the
-        per-type header template: movies and OVAs/specials get their own layout
-        (no "Season —") when one is configured, falling back to ``header_template``.
+        Two bold lines (operator spec)::
+
+            ➠ TAKOPI'S ORIGINAL SIN : SEASON 1
+            ➠ 480p [DUAL ∽ ENG + JPN]
+
+        The title line is shortened to Telegram's ~38-char single-line budget by
+        :func:`~nekofetch.services.bot_naming.build_pack_caption` — dropping
+        ``SEASON 1`` → ``S1``, then swapping the title for its shortest synonym,
+        then an acronym, in that order. ``content_type`` ("Season", "OVA", "ONA",
+        "Movie", "Special") selects the season label; ``alt_titles`` are the
+        AniList English/native/synonym strings the shortener may fall back to.
+
+        Setting ``storage_channel.header_template`` to a non-empty *legacy*
+        template restores the old single-line ``{title} — …`` rendering, so the
+        new caption is opt-out via config.
         """
-        branding = BrandingService(self._c)
+        from nekofetch.services.bot_naming import build_pack_caption
+
+        # Legacy escape hatch: a template beginning with "{title}" (the old
+        # inline form) means the operator explicitly wants the flat header. The
+        # new default (empty / "{caption}") uses the two-line builder.
+        tmpl = (self.cfg.header_template or "").strip()
         ct_low = (content_type or "").lower()
         if ct_low == "movie" and self.cfg.movie_header_template:
             tmpl = self.cfg.movie_header_template
         elif ct_low in ("ova", "ona", "special") and self.cfg.special_header_template:
             tmpl = self.cfg.special_header_template
-        else:
-            tmpl = self.cfg.header_template
+
+        use_legacy = bool(tmpl) and "{caption}" not in tmpl and "{title}" in tmpl
+        if not use_legacy:
+            return build_pack_caption(
+                title, season=season, season_part=season_part,
+                resolution=resolution, audio=audio, content_type=content_type,
+                alt_titles=alt_titles,
+            )
+
+        branding = BrandingService(self._c)
         return templates.render(
             tmpl,
             title=title,
@@ -154,6 +179,7 @@ class StorageChannelService:
         episode_to: int | None = None,
         content_type: str = "Season",
         thumb: Path | None = None,
+        alt_titles: list[str] | None = None,
         on_progress=None,
     ) -> StoragePack:
         """Post header, upload files in order, post the end sticker; record the range.
@@ -162,6 +188,8 @@ class StorageChannelService:
         header ("Season", "OVA", "ONA", "Movie", "Special").
         ``thumb`` (when present) is the request's poster, attached to every document
         so the files show a proper cover in Telegram instead of a blank icon.
+        ``alt_titles`` are AniList synonym/native strings the caption builder may
+        fall back to when the full title overflows the 38-char line budget.
         ``on_progress(done, total)`` (when present) receives live upload byte counts
         for the whole pack, so ACTIVE TASKS can render an upload bar + speed."""
         client = self._client
@@ -172,7 +200,8 @@ class StorageChannelService:
             channel_id,
             self.header_text(title=title, season=key.season, resolution=key.resolution,
                              audio=key.audio, episode_from=episode_from, episode_to=episode_to,
-                             content_type=content_type),
+                             content_type=content_type, season_part=key.season_part,
+                             alt_titles=alt_titles),
         )
         # Upload byte accounting across the whole pack so the progress bar reflects
         # the pack, not each individual file resetting to 0.

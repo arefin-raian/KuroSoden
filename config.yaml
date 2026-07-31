@@ -125,16 +125,25 @@ security:
 
 # Database channel: content is stored as ordered packs (header → files → end
 # sticker), one pack per (anime, season, resolution, language). Delivery copies
-# the recorded range. Movies/specials use their own header templates so they
-# don't read "Season —".
-# Variables: {title} {season} {resolution} {language} {content_type}
-#            {episode_from} {episode_to} {group}
+# the recorded range.
+#
+# The pack caption posted before the files is TWO bold lines, fit to Telegram's
+# ~38-char single-line budget (past that the title wraps onto a second row):
+#
+#     ➠ TAKOPI'S ORIGINAL SIN : SEASON 1
+#     ➠ 480p [DUAL ∽ ENG + JPN]
+#
+# The builder (services/bot_naming.build_pack_caption) shortens line 1 in order —
+# SEASON 1 → S1, then full title → shortest synonym → acronym — until it fits.
+# Line-2 audio spread by track kind: DUAL ∽ ENG + JPN · MULTI ∽ ENG + JPN + HIN ·
+# SUB ∽ JPN + EngSubs · DUB ∽ English. Leave the *_header_template fields EMPTY to
+# use this new caption; set a legacy "{title} — …" template to opt back out.
 storage_channel:
   enabled: true
   channel_id: -1002383780897
-  header_template: "<b>{title} — {content_type} {season} [{resolution}] [{language}]</b>"
-  movie_header_template: "<b>{title} — {content_type} [{resolution}] [{language}]</b>"
-  special_header_template: "<b>{title} — {content_type} [{resolution}] [{language}]</b>"
+  header_template: ""
+  movie_header_template: ""
+  special_header_template: ""
   end_sticker_id: "CAACAgUAAxkBAAIxQGo4UAizFl3C4Y_aIz86iuNbyJHLAAJOFwACoa8gVlT9gR8Fr550PAQ"
   include_header_in_delivery: true
   include_sticker_in_delivery: false

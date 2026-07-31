@@ -514,6 +514,10 @@ class PublishingService:
         # has per-installment covers TMDB frequently lacks, and it matches the
         # franchise structure exactly. Falls back to the shared TMDB poster.jpg.
         entry_posters = await self._anilist_entry_posters(anime_doc_id, files)
+        # Shorter title candidates (English/native/synonyms) the caption builder
+        # falls back to when the full title overflows the 38-char line. Resolved
+        # once from the prefetched AniList cache; empty when absent.
+        alt_titles = await self._anilist_alt_titles(anime_doc_id)
 
         uploaded_paths: set[str] = set()
         for (season, season_part, resolution, audio, entry_id), items in ordered_groups:
@@ -551,6 +555,7 @@ class PublishingService:
                     episode_to=max(episodes) if episodes else None,
                     content_type=ct,
                     thumb=poster,
+                    alt_titles=alt_titles,
                     on_progress=on_progress,
                 )
                 # Pack persisted → these files are safely in the channel.
@@ -563,6 +568,43 @@ class PublishingService:
                 _log.warning("publish.upload_pack.failed",
                              season=season, resolution=resolution, error=str(exc))
         return uploaded_paths
+
+    async def _anilist_alt_titles(self, anime_doc_id: str) -> list[str]:
+        """Shorter title candidates for the pack caption's fit-to-38 shortener.
+
+        Reads the prefetched ``anilist.json`` and returns the root media's
+        English / romaji / native names plus every synonym — the pool
+        :func:`~nekofetch.services.bot_naming.build_pack_caption` searches for a
+        shorter alternative title. Empty when the cache is absent."""
+        from nekofetch.core.logging import get_logger
+        _log = get_logger(__name__)
+        out: list[str] = []
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            blob = await load_cached(self._c, anime_doc_id, "anilist",
+                                     anime_doc_id=anime_doc_id)
+            if not blob:
+                return out
+            search = blob.get("search") or {}
+            seen: set[str] = set()
+            for key in ("english", "romaji"):
+                v = search.get(key)
+                if v and v not in seen:
+                    seen.add(v)
+                    out.append(v)
+            for v in (search.get("titles") or []):
+                if v and v not in seen:
+                    seen.add(v)
+                    out.append(v)
+            for v in (search.get("synonyms") or []):
+                if v and v not in seen:
+                    seen.add(v)
+                    out.append(v)
+        except Exception as exc:  # noqa: BLE001 — cache/parse issue → no alts
+            _log.debug("publish.anilist_alt_titles.failed",
+                       anime=anime_doc_id, error=str(exc))
+        return out
 
     async def _anilist_entry_posters(
         self, anime_doc_id: str, files: list[dict],

@@ -17,6 +17,8 @@ the tag is always preserved (the tag is the part users scan for).
 
 from __future__ import annotations
 
+import re
+
 from nekofetch.domain.enums import AudioType
 
 _BOT_NAME_LIMIT = 64
@@ -259,3 +261,124 @@ def format_channel_title(
         if room > 3:
             return f"{title[:room - 1].rstrip()}…{suffix}"[:limit]
     return title[:limit]
+
+
+# ── storage-channel pack caption ─────────────────────────────────────────────
+# The caption posted before a pack's files, two bold lines:
+#
+#     ➠ TAKOPI'S ORIGINAL SIN : SEASON 1
+#     ➠ 480p [DUAL ∽ ENG + JPN]
+#
+# Telegram wraps the title line onto a second row past ~38 characters, so the
+# builder keeps line 1 within that budget by shortening — in order — the season
+# label (SEASON 1 → S1), then the title itself (full → shortest synonym →
+# acronym). The title is kept as full as possible; the acronym is a last resort.
+_CAPTION_ARROW = "➠"          # U+27A0 heavy round-tipped rightwards arrow
+_CAPTION_SWUNG = "∽"          # U+223D reversed tilde, the audio∽languages joiner
+_CAPTION_LINE_LIMIT = 38      # chars before a mobile client breaks the line in two
+
+# Audio-line by track kind: (TAG, language spread). These mirror the operator's
+# canonical variants exactly — DUAL is always ENG+JPN, MULTI adds HIN, SUB is the
+# Japanese track with English subs, DUB is the English track.
+_AUDIO_CAPTION = {
+    AudioType.DUAL_AUDIO: ("DUAL", "ENG + JPN"),
+    AudioType.MULTI:      ("MULTI", "ENG + JPN + HIN"),
+    AudioType.SUBBED:     ("SUB", "JPN + EngSubs"),
+    AudioType.DUBBED:     ("DUB", "English"),
+}
+
+
+def _acronym(title: str) -> str:
+    """Initialism from a title's words: 'Takopi's Original Sin' → 'TOS'.
+
+    Skips articles/particles so a long title still yields a tight acronym, and
+    keeps a leading digit ('86' → '86', '5 Centimeters' → '5C')."""
+    stop = {"the", "a", "an", "of", "no", "to", "and", "&", "wa", "ga", "wo"}
+    words = re.findall(r"[0-9A-Za-z']+", title)
+    letters = [w[0] for w in words if w and w.lower() not in stop]
+    return "".join(letters).upper()
+
+
+def _season_tokens(season, season_part, content_type):
+    """(long, short) season labels for the caption, e.g. ('SEASON 1', 'S1').
+
+    Non-season packs (Movie / OVA / ONA / Special) have no number — the content
+    type itself is the label and both forms collapse to it (e.g. 'MOVIE')."""
+    ct = (content_type or "Season").strip()
+    if season is None or ct.lower() != "season":
+        lbl = ct.upper()
+        return lbl, lbl
+    if season_part:
+        return f"SEASON {season} PART {season_part}", f"S{season}P{season_part}"
+    return f"SEASON {season}", f"S{season}"
+
+
+def _shortest_alt(full_upper: str, alt_titles) -> str:
+    """The shortest alternative title strictly shorter than the full title.
+
+    English & Japanese synonyms are preferred but any is acceptable; we simply
+    take the shortest usable one (the operator's 'the shortest one' rule).
+    Returns '' when no alt title actually helps."""
+    best = ""
+    for raw in alt_titles or []:
+        alt = re.sub(r"\s+", " ", (raw or "").strip()).upper()
+        if not alt or alt == full_upper:
+            continue
+        if len(alt) >= len(full_upper):
+            continue
+        if not best or len(alt) < len(best):
+            best = alt
+    return best
+
+
+def build_pack_caption(
+    title: str, *, season, season_part, resolution: str, audio,
+    content_type: str = "Season", alt_titles=None,
+    line_limit: int = _CAPTION_LINE_LIMIT, arrow: str = _CAPTION_ARROW,
+) -> str:
+    """Two-line bold pack caption fit to ``line_limit`` characters on line 1.
+
+    Line 1 : ``➠ {TITLE} : {SEASON}``  (uppercase, shortened to fit)
+    Line 2 : ``➠ {resolution} [{AUDIO} ∽ {languages}]``
+
+    Shortening ladder for line 1 (first that fits wins):
+        full+SEASON → full+S# → synonym+SEASON → synonym+S# → acronym+SEASON →
+        acronym+S#. Falls through to acronym+S# even if still over budget (only a
+        pathologically long acronym, which can't be shortened further)."""
+    full = re.sub(r"\s+", " ", (title or "Anime").strip()).upper()
+    long_season, short_season = _season_tokens(season, season_part, content_type)
+    syn = _shortest_alt(full, alt_titles)
+    acr = _acronym(full)
+
+    # Title candidates in preference order; skip a synonym/acronym that doesn't
+    # actually shorten anything (or an acronym under 2 letters — useless).
+    heads: list[str] = [full]
+    if syn:
+        heads.append(syn)
+    if acr and len(acr) >= 2 and acr != full:
+        heads.append(acr)
+
+    prefix = f"{arrow} "
+    fixed = len(prefix) + len(" : ")
+
+    def _line(head: str, season_label: str) -> str:
+        return f"{prefix}{head} : {season_label}"
+
+    chosen = _line(acr or full, short_season)   # last-resort default
+    for head in heads:
+        for season_label in (long_season, short_season):
+            if fixed + len(head) + len(season_label) <= line_limit:
+                chosen = _line(head, season_label)
+                break
+        else:
+            continue
+        break
+
+    tag, langs = _AUDIO_CAPTION.get(
+        audio if isinstance(audio, AudioType) else None, ("", ""))
+    if tag:
+        line2 = f"{arrow} {resolution} [{tag} {_CAPTION_SWUNG} {langs}]"
+    else:
+        line2 = f"{arrow} {resolution}"
+
+    return f"<b>{chosen}</b>\n<b>{line2}</b>"
