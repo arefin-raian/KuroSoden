@@ -139,9 +139,45 @@ class SenkuThumbnailAdapter:
             log.debug("senku.thumb.tmdb_cache_failed", error=str(exc))
         return entry.tmdb_id, entry.media_type
 
+    async def _root_doc_id(self, code: str) -> str | None:
+        """Root ``anime_doc_id`` (the prefetch folder key) for a wizard ``code``.
+
+        The prefetch cache is stored under the root title's anilist id, not the
+        Senku request code, so the asset cache lookup needs this. Best-effort —
+        ``None`` just means the cache is skipped and assets fetch live."""
+        try:
+            franchise = await self.cache.get_franchise(code) or {}
+            doc = franchise.get("anime_doc_id") or franchise.get("anilist_id")
+            return str(doc) if doc else None
+        except Exception:  # noqa: BLE001
+            return None
+
     async def fetch_assets(self, asset_type: str, tmdb_id: int,
-                           media_type: str) -> list[dict]:
-        """Ranked assets for one type, via NekoFetch's fetchers (unchanged)."""
+                           media_type: str, anime_doc_id: str | None = None) -> list[dict]:
+        """Ranked assets for one type — prefetch cache first, live on a miss.
+
+        The prefetched ``tmdb.json`` (keyed by ``anime_doc_id`` = the root's
+        anilist id) holds these same ranked lists from acceptance. It's guarded
+        by ``tmdb_id`` via ``load_cached_tmdb_assets`` so a franchise entry whose
+        own TMDB id differs from the cached root falls through to a live fetch of
+        ITS assets — never the wrong installment's. ``anime_doc_id`` must be the
+        prefetch folder key (the root anilist id); without it we skip the cache
+        (the Senku wizard keys its own state by request code, which is NOT the
+        folder key)."""
+        cache_type = "backdrop" if asset_type in ("bg", "backdrop") else asset_type
+        if anime_doc_id:
+            try:
+                from nekofetch.services.metadata_prefetch import load_cached_tmdb_assets
+
+                cached = await load_cached_tmdb_assets(
+                    self._c, anime_doc_id, cache_type,
+                    anime_doc_id=anime_doc_id, tmdb_id=tmdb_id)
+                if cached is not None:
+                    log.info("senku.thumb.cache_hit", type=asset_type,
+                             count=len(cached))
+                    return cached
+            except Exception as exc:  # noqa: BLE001 — cache miss → live below
+                log.debug("senku.thumb.cache_failed", error=str(exc))
         try:
             if asset_type == "logo":
                 return await fetch_logos(self._c.tmdb, tmdb_id, media_type)
@@ -213,7 +249,9 @@ class SenkuThumbnailAdapter:
         tmdb_id, media_type = await self._resolve_tmdb(code, entry)
         if not tmdb_id:
             return [], None, []
-        assets = await self.fetch_assets(asset_type, tmdb_id, media_type)
+        doc_id = await self._root_doc_id(code)
+        assets = await self.fetch_assets(asset_type, tmdb_id, media_type,
+                                         anime_doc_id=doc_id)
         if not assets:
             return [], None, []
         title = entry.title or entry.label
@@ -234,7 +272,10 @@ class SenkuThumbnailAdapter:
         if entry is None:
             return Selection(), None
         tmdb_id, media_type = await self._resolve_tmdb(code, entry)
-        assets = await self.fetch_assets(asset_type, tmdb_id, media_type) if tmdb_id else []
+        doc_id = await self._root_doc_id(code)
+        assets = (await self.fetch_assets(asset_type, tmdb_id, media_type,
+                                          anime_doc_id=doc_id)
+                  if tmdb_id else [])
         if not assets or number < 1 or number > len(assets):
             sel = await self.cache.get_selection(code, index)
             return sel, self.next_asset(sel)

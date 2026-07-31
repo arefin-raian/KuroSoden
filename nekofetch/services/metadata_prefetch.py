@@ -576,3 +576,37 @@ async def resolve_cached_cover(
                 if ref:
                     return ref
     return None
+
+
+async def load_cached_tmdb_assets(
+    container: Container, code: str, asset_type: str,
+    anime_doc_id: str | None = None, tmdb_id: int | None = None,
+) -> list[dict] | None:
+    """Return the prefetched ranked TMDB asset list for a type, or ``None``.
+
+    ``asset_type`` is ``"logo"`` / ``"poster"`` / ``"backdrop"`` (singular, as
+    the thumbnail wizard uses); ``tmdb.json`` stores them plural
+    (``logos`` / ``posters`` / ``backdrops``). Each element keeps its original
+    ``{url, language, width, height, ...}`` shape so a caller can build the
+    Telegraph gallery from the cache exactly as it would from a live fetch.
+    Returns ``None`` (not ``[]``) on a miss so the caller can tell "cached but
+    empty" from "not cached" and fall back to a live fetch only in the latter.
+
+    ``tmdb_id`` guards correctness: the prefetch stores assets for the ROOT
+    title only, but a franchise's individual seasons/movies each have their own
+    TMDB id. If the caller passes a ``tmdb_id`` that doesn't match the cached
+    result's id, we return ``None`` so it fetches that entry's OWN assets live
+    (this is what prevents a wrong-installment / wrong-image bug)."""
+    blob = await load_cached(container, code, "tmdb", anime_doc_id=anime_doc_id)
+    if not blob:
+        return None
+    if tmdb_id is not None:
+        cached_id = (blob.get("result") or {}).get("id")
+        if cached_id is not None and int(cached_id) != int(tmdb_id):
+            return None
+    key = {"logo": "logos", "poster": "posters", "backdrop": "backdrops"}.get(
+        asset_type)
+    if key is None or key not in blob:
+        return None
+    assets = blob.get(key)
+    return assets if isinstance(assets, list) else None

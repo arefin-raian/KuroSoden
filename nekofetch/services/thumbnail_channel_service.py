@@ -807,7 +807,20 @@ class ThumbnailChannelService:
     # ── asset selection ────────────────────────────────────────────────────
 
     async def get_tmdb_id(self, anime_doc_id: str) -> tuple[int | None, str | None]:
-        """Resolve a franchise to its TMDB id. Returns (tmdb_id, media_type)."""
+        """Resolve a franchise to its TMDB id. Returns (tmdb_id, media_type).
+
+        Prefers the prefetched ``tmdb.json`` (the id + media_type resolved at
+        acceptance) before a live TMDB search."""
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            blob = await load_cached(self._c, anime_doc_id, "tmdb",
+                                     anime_doc_id=anime_doc_id)
+            res = (blob or {}).get("result") or {}
+            if res.get("id"):
+                return res["id"], res.get("media_type") or "tv"
+        except Exception as exc:  # noqa: BLE001 — cache miss → live
+            log.debug("thumbcc.tmdb_id.cache_failed", error=str(exc))
         try:
             from nekofetch.core.parsing import clean_anilist_id
             query = clean_anilist_id(anime_doc_id)
@@ -881,8 +894,26 @@ class ThumbnailChannelService:
 
     async def _fetch_assets_for_type(
         self, asset_type: str, tmdb_id: int, media_type: str,
+        anime_doc_id: str | None = None,
     ) -> list[dict]:
-        """Fetch ranked assets from TMDB for the given type."""
+        """Ranked TMDB assets for a type — prefetch cache first, live on a miss.
+
+        The same three fetchers (logos/posters/backdrops) already ran at
+        acceptance and are stored in ``tmdb.json``; reading them here avoids a
+        duplicate TMDB round-trip every time the wizard opens a gallery."""
+        if anime_doc_id:
+            try:
+                from nekofetch.services.metadata_prefetch import load_cached_tmdb_assets
+
+                cached = await load_cached_tmdb_assets(
+                    self._c, anime_doc_id, asset_type, anime_doc_id=anime_doc_id,
+                    tmdb_id=tmdb_id)
+                if cached is not None:
+                    log.info("thumbcc.assets.cache_hit", type=asset_type,
+                             anime=anime_doc_id, count=len(cached))
+                    return cached
+            except Exception as exc:  # noqa: BLE001 — cache miss → live below
+                log.debug("thumbcc.assets.cache_failed", error=str(exc))
         try:
             if asset_type == "logo":
                 return await fetch_logos(self._c.tmdb, tmdb_id, media_type)
@@ -937,7 +968,8 @@ class ThumbnailChannelService:
                             if q.anime_doc_id == anime_doc_id), "—")
 
         # Fetch assets to know how many we have
-        assets = await self._fetch_assets_for_type(asset_type, tmdb_id, media_type)
+        assets = await self._fetch_assets_for_type(
+            asset_type, tmdb_id, media_type, anime_doc_id=anime_doc_id)
         if not assets:
             # TMDB had nothing for this type — still let the admin upload their own.
             type_label = {"logo": "🎨 Logo", "poster": "📰 Poster",
@@ -1025,7 +1057,8 @@ class ThumbnailChannelService:
             await query.answer("Entry not found.", show_alert=True)
             return
 
-        assets = await self._fetch_assets_for_type(asset_type, entry.tmdb_id, entry.media_type)
+        assets = await self._fetch_assets_for_type(
+            asset_type, entry.tmdb_id, entry.media_type, anime_doc_id=anime_doc_id)
         if not assets:
             await query.answer("Could not load assets. Please try picking again.", show_alert=True)
             return
