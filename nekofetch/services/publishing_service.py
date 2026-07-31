@@ -546,10 +546,42 @@ class PublishingService:
                      if (p := Path(i["path"]).with_name(POSTER_THUMB_NAME)).exists()),
                     None,
                 )
+
+            # ── Resume guard: skip a pack already fully in the channel ──
+            # A pack persists its StoragePack row only AFTER all its files ship,
+            # so a row that already covers every episode we have on disk means
+            # this pack completed on a prior run (e.g. before a power-loss). Skip
+            # the re-upload (which would orphan the old messages + duplicate the
+            # files) and just mark these paths clean so they get tidied up. A
+            # pack that crashed mid-upload has NO row (or a partial range) → it
+            # falls through and re-uploads from the beginning, as intended.
+            pack_key = storage.key_from(
+                anime_doc_id, season, resolution, audio,
+                season_part=season_part, entry_id=entry_id,
+            )
+            try:
+                existing_pack = await storage.find_pack(pack_key)
+            except Exception:  # noqa: BLE001 — lookup failure → upload (safe)
+                existing_pack = None
+            if existing_pack is not None:
+                want_eps = {i["episode"] for i in items if i["episode"] is not None}
+                ef, et = existing_pack.episode_from, existing_pack.episode_to
+                have_eps = (set(range(ef, et + 1))
+                            if ef is not None and et is not None else set())
+                complete = (
+                    (want_eps and want_eps.issubset(have_eps))
+                    or (not want_eps and (existing_pack.file_count or 0) >= len(items))
+                )
+                if complete:
+                    _log.info("publish.pack.already_stored.skip",
+                              anime=anime_doc_id, season=season,
+                              resolution=resolution, files=len(items))
+                    uploaded_paths.update(i["path"] for i in items if i.get("path"))
+                    continue
+
             try:
                 await storage.upload_pack(
-                    storage.key_from(anime_doc_id, season, resolution, audio,
-                                     season_part=season_part, entry_id=entry_id),
+                    pack_key,
                     title=title,
                     file_paths=[Path(i["path"]) for i in items],
                     episode_from=min(episodes) if episodes else None,

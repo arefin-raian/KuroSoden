@@ -375,6 +375,8 @@ class VerifyStage(Stage):
         return self.c.config.processing.verify_files
 
     async def process(self, ctx: StageContext) -> None:
+        from sqlalchemy import inspect as _sa_inspect
+
         from nekofetch.core.exceptions import ProcessingError
         from nekofetch.domain.enums import AudioType
         from nekofetch.sources._hls import find_ffprobe
@@ -399,6 +401,25 @@ class VerifyStage(Stage):
             f.verified = ok
             if not ok:
                 corrupt.append(f"{path.name}: {reason}")
+                # Delete the broken file AND its DB row so the next run doesn't
+                # keep tripping over it. Without this, ``_already_have`` sees the
+                # row + on-disk file and skips the re-download forever, and the
+                # encode-resume guard would re-adopt a bad rendition. Dropping
+                # both lets the source be re-downloaded (or the tier re-encoded)
+                # from scratch on the retry — a clean resume, not a stuck loop.
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("verify.corrupt.unlink_failed",
+                                file=path.name, error=str(exc))
+                try:
+                    _sess = _sa_inspect(f).session
+                    if _sess is not None:
+                        _sess.delete(f)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("verify.corrupt.row_drop_failed",
+                                file=path.name, error=str(exc))
+                log.info("verify.corrupt.dropped", file=path.name, reason=reason)
             # ── Ground-truth audio: the file's OWN tracks, not the title guess ──
             # Title/magnet-name parsing lies (a bare request title has no "Dual
             # Audio" in it → SUBBED). The container never lies: 2 audio tracks =
@@ -1018,7 +1039,7 @@ class EncodeStage(Stage):
 
         from nekofetch.core.exceptions import ProcessingError
         from nekofetch.infrastructure.database.postgres.models import MediaFile
-        from nekofetch.sources._hls import find_ffmpeg
+        from nekofetch.sources._hls import find_ffmpeg, find_ffprobe
         from nekofetch.sources._transcode import _encode, select_encoder
 
         heights = [h for h in self.c.config.processing.encode_heights if h > 0]
@@ -1098,6 +1119,52 @@ class EncodeStage(Stage):
                 )
                 out_stem = _swap_resolution(stem, src_res, label)
                 out_path = src.with_name(f"{out_stem}{src.suffix}")
+
+                # ── Resume guard: skip a rendition that's already good ──
+                # A crash mid-job can leave earlier renditions fully encoded on
+                # disk. Re-encoding them wastes hours. If the output exists and
+                # decode-probes clean, adopt it (register a MediaFile row if the
+                # DB doesn't have one yet) and move on. A partial/corrupt file
+                # from a crash mid-encode fails the probe → delete + re-encode.
+                if out_path.exists() and out_path.stat().st_size > 0:
+                    ffprobe = find_ffprobe() or "ffprobe"
+                    ok, reason = await _ffprobe_ok(ffprobe, out_path)
+                    if ok:
+                        done_units += 1
+                        # Is this rendition already known (loaded from DB into
+                        # ctx.files, or added earlier this pass)? Match on the
+                        # natural key so we don't insert a duplicate row.
+                        existing = next(
+                            (r for r in list(ctx.files) + new_rows
+                             if r.season == f.season and r.episode == f.episode
+                             and r.resolution == label and r.audio == f.audio),
+                            None,
+                        )
+                        if existing is None:
+                            row = MediaFile(
+                                job_id=f.job_id, anime_doc_id=f.anime_doc_id,
+                                season=f.season, season_part=f.season_part,
+                                episode=f.episode, resolution=label,
+                                audio=f.audio, original_name=f.original_name,
+                                final_name=out_path.name,
+                                local_path=str(out_path),
+                                size_bytes=out_path.stat().st_size,
+                                container=f.container, verified=True,
+                                processed=False, published=False,
+                            )
+                            new_rows.append(row)
+                            if session is not None:
+                                session.add(row)
+                        ctx.notes.append(f"encode {label}: reused existing (resume)")
+                        log.info("encode.resume.reuse", label=label,
+                                 file=out_path.name)
+                        continue
+                    # Corrupt/partial — drop it and encode fresh.
+                    ctx.notes.append(
+                        f"encode {label}: existing file broken ({reason}) — re-encoding"
+                    )
+                    out_path.unlink(missing_ok=True)
+
                 # Retry a failing encode a few times (transient ffmpeg/disk
                 # hiccups happen). If it STILL fails after _ENCODE_MAX_ATTEMPTS,
                 # raise so the whole job goes to the recovery card — the operator
@@ -1128,6 +1195,26 @@ class EncodeStage(Stage):
                 done_units += 1
                 if not (out_path.exists() and out_path.stat().st_size > 0):
                     ctx.notes.append(f"encode {label}: empty output")
+                    continue
+                # Re-point an existing row for this rendition instead of adding a
+                # duplicate. A resume after a rolled-back VerifyStage failure can
+                # leave a stale row (its file was unlinked, but the row's delete
+                # was rolled back with the failing transaction); re-encoding must
+                # UPDATE that row's path/size, not stack a second row that would
+                # upload the same episode twice.
+                existing = next(
+                    (r for r in list(ctx.files) + new_rows
+                     if r.season == f.season and r.episode == f.episode
+                     and r.resolution == label and r.audio == f.audio),
+                    None,
+                )
+                if existing is not None:
+                    existing.final_name = out_path.name
+                    existing.local_path = str(out_path)
+                    existing.size_bytes = out_path.stat().st_size
+                    existing.verified = True
+                    existing.processed = False
+                    existing.published = False
                     continue
                 row = MediaFile(
                     job_id=f.job_id, anime_doc_id=f.anime_doc_id,
