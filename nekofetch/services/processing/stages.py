@@ -988,6 +988,16 @@ class EncodeStage(Stage):
         # safe fallbacks so an older config without these keys still works.
         preset = getattr(self.c.config.processing, "encode_preset", "veryfast")
         crf_map = getattr(self.c.config.processing, "encode_crf", None) or _ENCODE_CRF
+        # Fair CPU slice per encode so N admins' jobs can encode at once without
+        # thrashing: cores / concurrent-jobs, floor 2. Config override wins.
+        import os as _os
+        _cfg_threads = getattr(self.c.config.processing, "encode_threads", 0)
+        if _cfg_threads and _cfg_threads > 0:
+            enc_threads = _cfg_threads
+        else:
+            cores = _os.cpu_count() or 4
+            jobs = max(1, getattr(self.c.config.downloads, "concurrent_downloads", 5))
+            enc_threads = max(2, cores // jobs)
         # Every (file, height) pair is one encode — count them all so the bar
         # advances per rendition, not per file (a single file with 2 tiers used
         # to jump 0→50→100 with a long silent gap between).
@@ -1023,7 +1033,8 @@ class EncodeStage(Stage):
                 for attempt in range(1, _ENCODE_MAX_ATTEMPTS + 1):
                     try:
                         await _encode(src, out_path, height,
-                                      crf_map.get(height, 23), preset=preset)
+                                      crf_map.get(height, 23), preset=preset,
+                                      threads=enc_threads)
                         last_exc = None
                         break
                     except Exception as exc:  # noqa: BLE001

@@ -223,6 +223,10 @@ class ProcessingConfig(BaseModel):
     encode_crf: dict[int, int] = Field(
         default_factory=lambda: {1080: 21, 720: 22, 480: 23}
     )
+    # x264 threads per encode. 0 = auto: divide the box's cores by
+    # concurrent_downloads (floor 2) so several admins' jobs can encode at once
+    # without oversubscribing the CPU. Set a fixed number to pin it.
+    encode_threads: int = 0
     # When False, the pipeline automatically publishes to the main channel +
     # index channel and brings up the distribution bot right after the storage
     # upload finishes — no admin click required. When True, the existing

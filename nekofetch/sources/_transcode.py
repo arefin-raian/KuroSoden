@@ -27,6 +27,9 @@ OVERSIZE_FACTOR = 1.0  # recompress when size > budget (budget = rate * minutes)
 
 
 def probe_duration_s(path: Path) -> float:
+    """Synchronous duration probe. NOTE: blocking — only call off the event
+    loop (via ``asyncio.to_thread``) or from sync code. Async callers on the
+    shared pipeline loop must use :func:`probe_duration_s_async`."""
     ffprobe = find_ffprobe()
     if not ffprobe:
         return 0.0
@@ -39,6 +42,12 @@ def probe_duration_s(path: Path) -> float:
         return float(r.stdout.strip())
     except (ValueError, AttributeError):
         return 0.0
+
+
+async def probe_duration_s_async(path: Path) -> float:
+    """Non-blocking duration probe for the shared pipeline event loop."""
+    import asyncio
+    return await asyncio.to_thread(probe_duration_s, path)
 
 
 def is_oversized_1080(size_bytes: int, duration_s: float) -> bool:
@@ -60,8 +69,13 @@ async def _run_ffmpeg(cmd: list[str]) -> None:
 
 
 async def _encode(src: Path, out: Path, height: int | None, crf: int,
-                  preset: str = "medium") -> Path:
-    """Re-encode video (x264 CRF); copy ALL audio + subtitles + attachments."""
+                  preset: str = "medium", threads: int | None = None) -> Path:
+    """Re-encode video (x264 CRF); copy ALL audio + subtitles + attachments.
+
+    ``threads`` bounds x264's CPU use per encode. Left unset, ffmpeg grabs every
+    core — fine for one job, but with several admins' jobs encoding at once on
+    the shared box that oversubscribes the CPU and they thrash. The caller passes
+    a fair slice (cores / concurrent-jobs) so parallel encodes coexist."""
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         raise RuntimeError("ffmpeg not found")
@@ -71,6 +85,8 @@ async def _encode(src: Path, out: Path, height: int | None, crf: int,
         "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
         "-pix_fmt", "yuv420p",
     ]
+    if threads and threads > 0:
+        cmd += ["-threads", str(threads)]
     if height:
         cmd += ["-vf", f"scale=-2:{height}"]
     # MKV carries attachments fine; only drop data streams ffmpeg can't copy.

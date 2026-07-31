@@ -701,19 +701,34 @@ class DownloadWorker:
             season = req.season or 1
             folder = _safe_folder(req)
         ext = src_path.suffix.lstrip(".") or "mkv"
-        resolution = _provided_resolution_bucket(src_path)
+        # Off-thread: this runs a sync ffprobe; on the shared pipeline loop it
+        # would stall every other admin's job mid-transfer.
+        resolution = await asyncio.to_thread(_provided_resolution_bucket, src_path)
         dest = (self._c.env.storage_path / "work" / folder
                 / f"S{season:02d}E{int(episode):03d}_{resolution}_manual.{ext}")
         dest.parent.mkdir(parents=True, exist_ok=True)
         if src_path.resolve() != dest.resolve():
             src_path.replace(dest)
-        import hashlib
+
+        # Checksum on a worker thread — hashing a multi-GB file with a sync
+        # read_bytes() on the event loop would freeze EVERY other admin's job
+        # (all pipelines share one loop). Stream it in chunks off-thread instead.
+        def _sha256(p: Path) -> str:
+            import hashlib
+            h = hashlib.sha256()
+            with open(p, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+
+        checksum = await asyncio.to_thread(_sha256, dest)
+        size = await asyncio.to_thread(lambda: dest.stat().st_size)
         async with session_scope(self._c.pg_sessionmaker) as session:
             session.add(MediaFile(
                 job_id=job_id, anime_doc_id=anime_doc_id, season=season,
                 episode=int(episode), resolution=resolution, audio=audio,
-                local_path=str(dest), size_bytes=dest.stat().st_size,
-                checksum=hashlib.sha256(dest.read_bytes()).hexdigest(),
+                local_path=str(dest), size_bytes=size,
+                checksum=checksum,
                 container=ext, verified=True,
             ))
         from nekofetch.services.publishing_service import PublishingService
