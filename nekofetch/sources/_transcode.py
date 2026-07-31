@@ -206,9 +206,20 @@ async def _encode(src: Path, out: Path, height: int | None, crf: int,
             if tune:
                 cmd += ["-tune", tune]
             if psy_rd:
-                params = f"psy-rd={psy_rd}"
-                cmd += ["-x265-params" if enc == "libx265" else "-x264-params",
-                        params]
+                # psy_rd is written x264-style as "<rd>:<trellis>". x264 takes
+                # that pair verbatim (psy-rd=1.0:0.15). x265 splits them into two
+                # keys — psy-rd is a single float and the trellis half is a
+                # separate psy-rdoq — so "1.0:0.15" → "psy-rd=1.0:psy-rdoq=0.15".
+                # Passing the x264 pair to x265 is rejected ("Error setting
+                # option x265-params to value psy-rd=1.0:0.15").
+                if enc == "libx265":
+                    rd, _, rdoq = psy_rd.partition(":")
+                    params = f"psy-rd={rd}"
+                    if rdoq:
+                        params += f":psy-rdoq={rdoq}"
+                    cmd += ["-x265-params", params]
+                else:
+                    cmd += ["-x264-params", f"psy-rd={psy_rd}"]
         cmd += ["-pix_fmt", pix_fmt]
         if threads and threads > 0:
             cmd += ["-threads", str(threads)]

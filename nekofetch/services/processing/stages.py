@@ -874,10 +874,18 @@ class WatermarkStage(Stage):
                 venc += ["-crf", str(crf), "-preset", str(_svtav1_preset(preset)),
                          "-svtav1-params", "tune=0:film-grain=0"]
             else:
+                # psy-rd differs between codecs: x264 takes "<rd>:<trellis>" as
+                # one value (psy-rd=1.0:0.15); x265 splits it into psy-rd (single
+                # float) + a separate psy-rdoq. Feeding the x264 pair to x265 is
+                # rejected ("Error setting option x265-params to value ...").
+                if encoder == "libx265":
+                    psy_params = "psy-rd=1.0:psy-rdoq=0.15"
+                    psy_flag = "-x265-params"
+                else:
+                    psy_params = "psy-rd=1.0:0.15"
+                    psy_flag = "-x264-params"
                 venc += ["-crf", str(crf), "-preset", preset,
-                         "-tune", "animation",
-                         ("-x265-params" if encoder == "libx265" else "-x264-params"),
-                         "psy-rd=1.0:0.15"]
+                         "-tune", "animation", psy_flag, psy_params]
             venc += ["-pix_fmt", pix_fmt]
             args = ["ffmpeg", "-y", "-i", str(src), *extra_inputs,
                     "-filter_complex" if extra_inputs else "-vf", flt,
