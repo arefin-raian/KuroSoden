@@ -76,6 +76,12 @@ class SenkuPublisher:
         if not posts:
             raise PublishError(f"no content to publish for {code}")
 
+        # Push the channel into Telegram Global Search BEFORE the real posts:
+        # send ~100 throwaway messages then delete them all, so the real info
+        # card/watch guide land in a channel that already qualifies for search.
+        # Idempotent per channel (guarded by a Redis flag) and fully best-effort.
+        await self._warm_global_search(client, chat_id, code)
+
         posted, pinned, layout = await self._send_posts(client, chat_id, posts)
 
         # Register a durable channel anchor + persist the message layout so a
@@ -778,6 +784,91 @@ class SenkuPublisher:
             return msg.id
         except Exception:  # noqa: BLE001 — divider is decorative
             return None
+
+    _WARM_COUNT = 100
+    _WARM_BATCH_DELETE = 100
+
+    async def _warm_global_search(self, client, chat_id: int, code: str) -> None:
+        """Send ~100 throwaway messages then delete them, to enter Global Search.
+
+        Telegram only surfaces a channel in global search once it has a minimum
+        posting history. We satisfy that by posting 100 short quotes (from a free
+        public API, with a baked-in fallback list when it's unreachable) and then
+        deleting every one, leaving the channel clean for the real content.
+
+        Guarded by a Redis flag so a re-publish never re-warms. Fully best-effort:
+        any failure just means the channel enters search a little later on its own.
+        """
+        flag = f"nf:dist:{code}:warmed"
+        try:
+            if self._c.redis and await self._c.redis.get(flag):
+                return
+        except Exception:  # noqa: BLE001
+            pass
+
+        quotes = await self._fetch_warm_texts(self._WARM_COUNT)
+        sent_ids: list[int] = []
+        for text in quotes:
+            try:
+                m = await client.send_message(
+                    chat_id, text, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                sent_ids.append(m.id)
+            except Exception as exc:  # noqa: BLE001 — flood/limit → stop, delete what we have
+                log.warning("senku.warm.send_stopped", code=code,
+                            sent=len(sent_ids), error=str(exc))
+                break
+
+        # Delete everything we sent (chunked — delete_messages takes a list).
+        for start in range(0, len(sent_ids), self._WARM_BATCH_DELETE):
+            chunk = sent_ids[start:start + self._WARM_BATCH_DELETE]
+            try:
+                await client.delete_messages(chat_id, chunk)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("senku.warm.delete_blip", code=code, error=str(exc))
+
+        try:
+            if self._c.redis:
+                await self._c.redis.set(flag, "1", ex=30 * 24 * 3600)
+        except Exception:  # noqa: BLE001
+            pass
+        log.info("senku.warm.done", code=code, sent=len(sent_ids))
+
+    async def _fetch_warm_texts(self, count: int) -> list[str]:
+        """``count`` short throwaway strings for the global-search warm-up.
+
+        Pulls from ZenQuotes' free batch endpoint (no key), falling back to a
+        generated list when it's unreachable so warm-up never depends on a third
+        party. Each string is made unique (index-suffixed) so Telegram never
+        rejects a duplicate send."""
+        texts: list[str] = []
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=15.0) as cli:
+                # ZenQuotes returns up to 50 per call on the free "quotes" route.
+                for _ in range((count // 50) + 1):
+                    r = await cli.get("https://zenquotes.io/api/quotes")
+                    if r.status_code != 200:
+                        break
+                    for item in r.json():
+                        q = (item.get("q") or "").strip()
+                        a = (item.get("a") or "").strip()
+                        if q:
+                            texts.append(f"“{q}” — {a}" if a else q)
+                    if len(texts) >= count:
+                        break
+        except Exception as exc:  # noqa: BLE001 — fall back to generated text
+            log.debug("senku.warm.quotes_api_failed", error=str(exc))
+
+        # Ensure exactly ``count`` unique strings (index-suffixed to dodge
+        # Telegram's duplicate-message rejection).
+        out: list[str] = []
+        for i in range(count):
+            base = texts[i] if i < len(texts) else "Preparing the archive…"
+            out.append(f"{base} ·{i + 1}")
+        return out
 
     @staticmethod
     async def _pin_silently(client, chat_id: int, message_id: int) -> None:
