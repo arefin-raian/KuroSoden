@@ -175,7 +175,95 @@ class MetadataPrefetchService:
             if walk is not None:
                 payload["franchise"] = _jsonable(walk)
         await _write_json(out_dir / "anilist.json", payload)
+        # Mirror every AniList cover (root + each franchise installment) to disk
+        # and the image hosts, keyed by anilist_id. The thumbnail stage and the
+        # pack uploader then read the saved file (or a hosted backup) instead of
+        # re-hitting AniList on every run — and each season/OVA pack can use ITS
+        # OWN cover as the file thumbnail (per operator spec), not a shared TMDB
+        # poster.
+        try:
+            await self._mirror_anilist_covers(out_dir, media,
+                                              payload.get("franchise"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("prefetch.anilist.covers_failed", error=str(exc))
         return True
+
+    async def _mirror_anilist_covers(self, out_dir: Path, media: Any,
+                                     franchise: Any) -> None:
+        """Download + locally save + host-mirror every AniList cover.
+
+        Writes ``anilist_images.json`` — ``{"covers": [{anilist_id, source_url,
+        local, catbox, telegraph, imgbb, primary, host}]}`` — so consumers pick
+        each installment's cover by ``anilist_id`` and load it from the local
+        file (cleaned by :func:`cleanup_local_assets`, which wipes ``images/``)
+        or a hosted backup, never a fresh AniList fetch."""
+        from kurosoden.shared.image_backup import backup_bytes
+
+        pairs: list[tuple[int | None, str]] = []
+        root_cover = getattr(media, "cover_url", None)
+        if root_cover:
+            pairs.append((getattr(media, "id", None), root_cover))
+        if isinstance(franchise, dict):
+            for entry in franchise.values():
+                if isinstance(entry, dict) and entry.get("cover_url"):
+                    pairs.append((entry.get("anilist_id"), entry["cover_url"]))
+
+        img_dir = out_dir / "images"
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        async def _one(aid: int | None, url: str) -> None:
+            if not url or url in seen:
+                return
+            seen.add(url)
+            blob = mime = None
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=60.0,
+                                             follow_redirects=True) as cli:
+                    r = await cli.get(url)
+                    r.raise_for_status()
+                    blob = r.content
+                    mime = (r.headers.get("content-type")
+                            or "image/jpeg").split(";", 1)[0].strip()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("prefetch.anilist_cover.download_failed",
+                            url=url, error=str(exc))
+                return
+            if not blob:
+                return
+            ext = ".png" if mime == "image/png" else ".jpg"
+            digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+            local_path = img_dir / f"anilist_{digest}{ext}"
+
+            def _save() -> None:
+                img_dir.mkdir(parents=True, exist_ok=True)
+                local_path.write_bytes(blob)
+            await asyncio.to_thread(_save)
+            mirror = await backup_bytes(self._c, blob, mime=mime or "image/jpeg",
+                                        source_url=url)
+            host = ("imgbb" if mirror.imgbb_url else
+                    "catbox" if mirror.catbox_url else
+                    "telegraph" if mirror.telegraph_url else None)
+            entries.append({
+                "anilist_id": aid, "source_url": url,
+                "local": str(local_path),
+                "catbox": mirror.catbox_url, "telegraph": mirror.telegraph_url,
+                "imgbb": mirror.imgbb_url, "primary": mirror.primary,
+                "host": host,
+            })
+
+        sem = asyncio.Semaphore(4)
+
+        async def _guarded(aid: int | None, url: str) -> None:
+            async with sem:
+                await _one(aid, url)
+
+        if pairs:
+            await asyncio.gather(*(_guarded(a, u) for a, u in pairs),
+                                 return_exceptions=True)
+        await _write_json(out_dir / "anilist_images.json", {"covers": entries})
+        log.info("prefetch.anilist_covers.mirrored", count=len(entries))
 
     # ── Jikan / MAL ──────────────────────────────────────────────────────────
     async def _prefetch_jikan(self, out_dir: Path, title: str,
@@ -427,3 +515,64 @@ async def load_cached(container: Container, code: str, kind: str,
             return None
 
     return await asyncio.to_thread(_read)
+
+
+async def resolve_cached_cover(
+    container: Container, code: str, *,
+    anilist_id: int | None = None, kind: str | None = None,
+    anime_doc_id: str | None = None,
+) -> str | None:
+    """Return a usable image reference for a prefetched cover, offline-first.
+
+    Resolution order (never hits the network for a cache hit):
+      1. AniList cover for ``anilist_id`` — the LOCAL file if it still exists,
+         else a hosted backup (imgbb/catbox/telegraph/primary) from
+         ``anilist_images.json``.
+      2. When ``anilist_id`` is absent, the first AniList cover cached at all.
+      3. A TMDB asset of ``kind`` ("poster"/"logo"/"backdrop") from
+         ``assets.json`` — local file, else hosted backup.
+
+    Returns a filesystem path or an ``http(s)`` URL (ffmpeg's ``_fit_thumb``
+    accepts either), or ``None`` when nothing is cached — the caller then does
+    its old live fetch.
+    """
+    from pathlib import Path as _Path
+
+    def _pick(entry: dict) -> str | None:
+        loc = entry.get("local")
+        if loc and _Path(loc).exists() and _Path(loc).stat().st_size > 0:
+            return loc
+        for key in ("imgbb", "catbox", "telegraph", "primary"):
+            u = entry.get(key)
+            if u:
+                return u
+        return None
+
+    # 1 & 2: AniList covers.
+    covers = await load_cached(container, code, "anilist_images",
+                               anime_doc_id=anime_doc_id)
+    entries = (covers or {}).get("covers") or []
+    if entries:
+        if anilist_id is not None:
+            for e in entries:
+                if e.get("anilist_id") == anilist_id:
+                    ref = _pick(e)
+                    if ref:
+                        return ref
+        # Fallback to the first cover with a usable ref (root cover first — it's
+        # appended first at mirror time).
+        for e in entries:
+            ref = _pick(e)
+            if ref:
+                return ref
+
+    # 3: TMDB asset of the requested kind.
+    if kind:
+        assets = await load_cached(container, code, "assets",
+                                   anime_doc_id=anime_doc_id)
+        for e in (assets or {}).get("images") or []:
+            if e.get("kind") == kind:
+                ref = _pick(e)
+                if ref:
+                    return ref
+    return None

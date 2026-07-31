@@ -538,6 +538,7 @@ class PublishingService:
             dest_dir = Path(items[0]["path"]).parent
             poster = await self._pack_poster(
                 entry_posters, entry_id, season, dest_dir,
+                anime_doc_id=anime_doc_id,
             )
             if poster is None:
                 poster = next(
@@ -660,41 +661,59 @@ class PublishingService:
 
     async def _pack_poster(
         self, entry_posters: dict, entry_id, season, dest_dir,
+        *, anime_doc_id: str | None = None,
     ):
         """Resolve + fit this pack's AniList poster; return a Path or ``None``.
 
-        Prefers a match by the pack's ``entry_id`` (AniList id), then by season
-        index. Downloads the cover and fits it to Telegram's 320×320 thumbnail
-        box next to the media files (a per-entry filename so packs don't clobber
-        each other). ``None`` when there's no AniList cover for this pack — the
-        caller then falls back to the shared TMDB poster."""
+        Offline-first: prefers the cover already downloaded + mirrored at
+        prefetch time (``anilist_images.json`` local file, else a hosted
+        backup) for this pack's ``entry_id`` — no live AniList fetch. Falls back
+        to the franchise-walk cover URL only on a cache miss. Matches by
+        ``entry_id`` (AniList id) first, then season index, and fits the result
+        to Telegram's 320×320 thumbnail box under a per-entry filename so
+        S1/S2/OVA posters never clobber each other. ``None`` when there's no
+        AniList cover for this pack — the caller then uses the shared poster."""
         from pathlib import Path
 
         from nekofetch.core.logging import get_logger
         _log = get_logger(__name__)
 
-        url = None
         eid = _as_int(entry_id)
-        if eid is not None:
-            url = entry_posters.get(("id", eid))
-        if url is None and season is not None:
-            url = entry_posters.get(("season", int(season)))
-        if not url:
-            return None
-
-        # A stable, per-entry filename so S1/S2/OVA posters never overwrite each
-        # other in a shared work dir.
         tag = eid if eid is not None else (f"s{season}" if season is not None else "x")
         dest = Path(dest_dir) / f"poster_anilist_{tag}.jpg"
         if dest.exists() and dest.stat().st_size > 0:
             return dest
+
+        # Prefer the prefetched, already-mirrored cover (local disk or a hosted
+        # backup) so we don't re-download from AniList on every publish.
+        ref = None
+        if anime_doc_id and eid is not None:
+            try:
+                from nekofetch.services.metadata_prefetch import resolve_cached_cover
+
+                ref = await resolve_cached_cover(
+                    self._c, anime_doc_id, anilist_id=eid,
+                    anime_doc_id=anime_doc_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("publish.pack_poster.cache_miss",
+                           entry=eid, error=str(exc))
+        # Cache miss → the franchise-walk cover URL (by entry id, then season).
+        if not ref:
+            if eid is not None:
+                ref = entry_posters.get(("id", eid))
+            if ref is None and season is not None:
+                ref = entry_posters.get(("season", int(season)))
+        if not ref:
+            return None
+
         try:
             from nekofetch.services.processing.stages import ThumbnailStage
 
-            if await ThumbnailStage._fit_thumb(url, dest):
+            if await ThumbnailStage._fit_thumb(ref, dest):
                 return dest
         except Exception as exc:  # noqa: BLE001
-            _log.debug("publish.pack_poster.fit_failed", url=url, error=str(exc))
+            _log.debug("publish.pack_poster.fit_failed", ref=ref, error=str(exc))
         return None
 
     async def reprocess(self, code: str) -> None:

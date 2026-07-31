@@ -914,29 +914,64 @@ class ThumbnailStage(Stage):
         return self.c.config.features.thumbnail_generation and self.c.config.thumbnail.enabled
 
     async def process(self, ctx: StageContext) -> None:
-        """Produce one poster.jpg for the whole request — preferring the official
-        TMDB poster (English/US) over an ffmpeg frame-grab — that the storage
-        uploader attaches as the Telegram document thumbnail for every file.
+        """Produce one poster.jpg for the whole request that the storage uploader
+        attaches as the Telegram document thumbnail for every file.
 
-        The image is fit within 320×320 JPEG (Telegram's thumbnail limit). If TMDB
-        has nothing usable we fall back to a frame from the first file."""
+        Source priority — the prefetched cache FIRST so we never re-hit the
+        network for artwork we already downloaded at acceptance:
+          1. The request's own AniList cover (local file, else hosted backup)
+             from ``anilist_images.json``.
+          2. A prefetched TMDB poster (local, else hosted backup) from
+             ``assets.json``.
+          3. A LIVE TMDB lookup (only when nothing was prefetched).
+          4. A frame-grab from the first file.
+
+        The image is fit within 320×320 JPEG (Telegram's thumbnail limit)."""
         first = next((f for f in ctx.files if f.local_path), None)
         if first is None:
             return
         thumb = Path(first.local_path).with_name(POSTER_THUMB_NAME)
         await _push_stage_progress(self.c, ctx, "Fetching Poster", 0.0)
 
+        # ── 1 & 2: prefetched cache (AniList cover, else cached TMDB poster) ──
+        # anilist_id of THIS request's entry, so the shared poster still prefers
+        # the correct installment's cover when one was cached.
+        aid = None
+        try:
+            fd = ctx.request.franchise_data or {}
+            raw_aid = fd.get("anilist_id") or fd.get("season_anilist_id")
+            aid = int(raw_aid) if raw_aid is not None else None
+        except (TypeError, ValueError):
+            aid = None
+        try:
+            from nekofetch.services.download_service import _safe_anime_doc_id
+            from nekofetch.services.metadata_prefetch import resolve_cached_cover
+
+            code = ctx.request.code
+            anime_doc_id = _safe_anime_doc_id(ctx.request)
+            cached = await resolve_cached_cover(
+                self.c, code, anilist_id=aid, kind="poster",
+                anime_doc_id=anime_doc_id,
+            )
+            if cached and await self._fit_thumb(cached, thumb):
+                ctx.notes.append("thumbnail: cached cover (prefetch)")
+                await _push_stage_progress(self.c, ctx, "Fetching Poster", 100.0)
+                return
+        except Exception as exc:  # noqa: BLE001 - cache miss → live path below
+            ctx.notes.append(f"thumbnail: cache lookup failed ({exc})")
+
+        # ── 3: live TMDB (only reached on a full cache miss) ──
         poster_url = None
         try:
             poster_url = await self.c.tmdb.poster_for(ctx.request.anime_title)
         except Exception as exc:  # noqa: BLE001
             ctx.notes.append(f"thumbnail: tmdb lookup failed ({exc})")
         if poster_url and await self._fit_thumb(poster_url, thumb):
-            ctx.notes.append("thumbnail: TMDB poster")
+            ctx.notes.append("thumbnail: TMDB poster (live)")
             await _push_stage_progress(self.c, ctx, "Fetching Poster", 100.0)
             return
 
-        # Fallback: a frame from the first file, fit to the same thumbnail box.
+        # ── 4: frame from the first file, fit to the same thumbnail box ──
         rc, err = await _run(
             "ffmpeg", "-y", "-ss", "00:00:30", "-i", first.local_path, "-vframes", "1",
             "-vf", "scale=320:320:force_original_aspect_ratio=decrease", str(thumb),
