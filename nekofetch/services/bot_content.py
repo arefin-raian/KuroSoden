@@ -403,14 +403,35 @@ class BotContentService:
         async with session_scope(self._c.pg_sessionmaker) as session:
             return await session.get(DistributionBot, bot_id)
 
-    async def _gather_metadata(self, anime_doc_id: str) -> dict:
+    async def _gather_metadata(self, anime_doc_id: str,
+                               title_hint: str | None = None) -> dict:
         """Collect metadata for the title, primarily via @acutebot with
-        AniList/TMDB as fallback. Returns a flat dict."""
+        AniList/TMDB as fallback. Returns a flat dict.
+
+        ``title_hint`` is a resolved series title the caller already knows (e.g.
+        the franchise English title). It's used as the search query in place of
+        ``anime_doc_id`` whenever the doc id isn't a usable title — most
+        importantly when it's a request code like ``REQ-1061`` (which must NEVER
+        be sent to AcuteBot: it returns nothing and the info card comes out
+        blank)."""
         from nekofetch.providers.acute_bot import fetch_from_acutebot
 
         # Strip anilist: prefix so we search by title, not a numeric ID.
         from nekofetch.core.parsing import clean_anilist_id
         search_query = clean_anilist_id(anime_doc_id)
+
+        # A request code (REQ-1061) or a bare numeric id is not a searchable
+        # title — prefer the caller's resolved title when the doc id is one of
+        # those. This is the fix for "info card sends REQ-#### to the metadata
+        # API instead of the series name".
+        import re as _re
+        _looks_like_code = bool(
+            not search_query
+            or _re.fullmatch(r"REQ-?\d+", search_query, _re.IGNORECASE)
+            or search_query.isdigit()
+        )
+        if title_hint and (_looks_like_code or not search_query.strip()):
+            search_query = title_hint.strip()
 
         meta: dict = {
             "title": search_query,
@@ -432,29 +453,41 @@ class BotContentService:
         }
 
         # ── Primary: @acutebot via the userbot pool ──
-        try:
-            from nekofetch.sources.telegram.userbot import UserbotPool
+        # Guard: never send a request code (REQ-####) or bare id to AcuteBot —
+        # it returns nothing and blanks the info card. If the query still looks
+        # like a code at this point (no usable title_hint was available), skip
+        # straight to the AniList fallback below.
+        _still_code = bool(
+            not search_query.strip()
+            or _re.fullmatch(r"REQ-?\d+", search_query, _re.IGNORECASE)
+        )
+        if not _still_code:
+            try:
+                from nekofetch.sources.telegram.userbot import UserbotPool
 
-            # Cache the pool on the container so we reuse the same Pyrogram
-            # Client connections across calls instead of leaking new ones.
-            pool: UserbotPool | None = getattr(self._c, "_userbot_pool", None)  # type: ignore[attr-defined]
-            if pool is None:
-                pool = UserbotPool.from_env(
-                    self._c.env.telegram_api_id,
-                    self._c.env.telegram_api_hash,
-                    str(self._c.env.session_path),
-                )
-                self._c._userbot_pool = pool  # type: ignore[attr-defined]
-            # Persistent directory where AcuteBot photos are saved.
-            photo_dir = str(self._c.env.storage_path / "acutebot_cards")
-            acute = await fetch_from_acutebot(search_query, pool, photo_dir=photo_dir)
-            if acute is not None:
-                meta.update(acute)
-                meta["_source"] = "acutebot"
-                log.info("bot.content.metadata.acutebot", anime=search_query, photo=acute.get("poster_url"))
-                return meta
-        except Exception as exc:
-            log.debug("bot.content.acutebot.failed", anime=search_query, error=str(exc))
+                # Cache the pool on the container so we reuse the same Pyrogram
+                # Client connections across calls instead of leaking new ones.
+                pool: UserbotPool | None = getattr(self._c, "_userbot_pool", None)  # type: ignore[attr-defined]
+                if pool is None:
+                    pool = UserbotPool.from_env(
+                        self._c.env.telegram_api_id,
+                        self._c.env.telegram_api_hash,
+                        str(self._c.env.session_path),
+                    )
+                    self._c._userbot_pool = pool  # type: ignore[attr-defined]
+                # Persistent directory where AcuteBot photos are saved.
+                photo_dir = str(self._c.env.storage_path / "acutebot_cards")
+                acute = await fetch_from_acutebot(search_query, pool, photo_dir=photo_dir)
+                if acute is not None:
+                    meta.update(acute)
+                    meta["_source"] = "acutebot"
+                    log.info("bot.content.metadata.acutebot", anime=search_query, photo=acute.get("poster_url"))
+                    return meta
+            except Exception as exc:
+                log.debug("bot.content.acutebot.failed", anime=search_query, error=str(exc))
+        else:
+            log.warning("bot.content.metadata.code_query_skipped_acute",
+                        doc_id=anime_doc_id, query=search_query)
 
         # ── Fallback 1: AniList (or MAL when AniList is down) ──
         try:

@@ -427,7 +427,8 @@ class SenkuPublisher:
 
         # Data the builders need — loaded exactly as generate_posts does.
         packs = await svc._load_packs(anime_doc_id)
-        meta = await svc._gather_metadata(anime_doc_id)
+        # Pass the resolved title so a REQ-#### doc id never reaches AcuteBot.
+        meta = await svc._gather_metadata(anime_doc_id, title_hint=title)
         walked = await svc._walk_franchise(anime_doc_id, meta)
 
         # Reorder the AniList walk to the admin's *confirmed* order, and bridge

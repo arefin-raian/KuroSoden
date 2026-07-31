@@ -419,6 +419,26 @@ def register(client: Client, container: Container) -> None:
         await fsm.clear(user_id)
         await cache.set_channel(code, handle=display, chat_id=chat.id)
 
+        async def _sweep_channel_service_notices() -> None:
+            """Delete the "changed the group name/photo" service messages that
+            Telegram auto-posts when the bot sets the channel title/photo.
+
+            Scans a small window of the most recent history and removes any
+            message carrying a ``new_chat_title`` / ``new_chat_photo`` (or the
+            generic service-message flag). Best-effort — a leftover notice is
+            cosmetic, never fatal to the wizard."""
+            try:
+                async for m in client.get_chat_history(chat.id, limit=15):
+                    if (getattr(m, "new_chat_title", None) is not None
+                            or getattr(m, "new_chat_photo", None) is not None
+                            or getattr(m, "service", None) is not None):
+                        try:
+                            await client.delete_messages(chat.id, m.id)
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception as exc:  # noqa: BLE001 — sweep is best-effort
+                log.debug("senku.wiz.service_sweep_blip", code=code, error=str(exc))
+
         # ── Bot-driven finalisation ─────────────────────────────────────────
         # Both bots are admins now, so Senku sets the decorated title + the
         # description ITSELF (the admin shouldn't type these). A small progress
@@ -466,6 +486,9 @@ def register(client: Client, container: Container) -> None:
         else:
             steps[1] = ("Set channel description", "done")
         await _edit_progress()
+
+        # 3) Sweep the service notices Telegram posted for the title/photo change.
+        await _sweep_channel_service_notices()
 
         await send_screen(
             client, chat_id,
