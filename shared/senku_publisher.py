@@ -630,11 +630,12 @@ class SenkuPublisher:
         """Map ``anilist_id → public thumbnail URL`` for entries the admin rendered.
 
         Phase 3 stores each rendered card as ``file://<path>`` in the entry's
-        selection. Telegram can't serve a local path, so we upload each render
-        to catbox once here. A failed upload just omits that entry — the card
-        builder falls back to the AniList poster via ``_pick_card_image``.
+        selection. Telegram can't serve a local path, so we mirror each render
+        across the configured hosts (ImgBB first) here. A failed upload just omits
+        that entry — the card builder falls back to the AniList poster via
+        ``_pick_card_image``.
         """
-        from nekofetch.providers.catbox import upload_bytes
+        from kurosoden.shared.image_backup import backup_bytes
 
         out: dict[int, str] = {}
         for entry in entries:
@@ -647,37 +648,47 @@ class SenkuPublisher:
             path = Path(url[len("file://"):])
             try:
                 data = path.read_bytes()
-                public = await upload_bytes(data, filename=f"thumb_{entry.index}.jpg")
-                out[entry.anilist_id] = public
+                result = await backup_bytes(self._c, data, mime="image/jpeg")
+                public = result.primary
+                if public:
+                    out[entry.anilist_id] = public
             except Exception as exc:  # noqa: BLE001 — a missing render just falls back
                 log.warning("senku.publish.thumb_bridge_failed",
                             code=code, entry=entry.index, error=str(exc))
         return out
 
     async def _cache_image(self, image) -> str | None:
-        """Push a card image URL through catbox (matching the bot's read path).
+        """Mirror a card image across the configured hosts and return the best URL.
 
         ``image`` may be a URL string, a ``Path``, or ``None``. A ``file://`` /
-        local path is uploaded as bytes; a remote URL is cached via catbox's
-        URL uploader; ``None`` passes through. On any failure the original
-        string is returned so a single broken cache never drops the image.
+        local path is read to bytes; a remote URL is downloaded once — then both
+        go through the multi-host uploader (``image_backup``), which honours
+        ``bot.image_host_order`` (ImgBB first by default, catbox/telegraph as
+        fallbacks). :attr:`BackupImage.primary` picks the best surviving mirror.
+
+        Previously this was catbox-ONLY, which is why the log only ever showed
+        catbox.moe even though ImgBB is configured and more reliable. On any
+        failure the original string is returned so a broken cache never drops the
+        image. ``None`` passes through.
         """
         if not image:
             return None
         image_str = str(image)
         try:
-            if image_str.startswith("file://") or Path(image_str).exists():
-                from nekofetch.providers.catbox import upload_bytes
+            from kurosoden.shared.image_backup import backup_bytes, backup_image
 
+            # Local file → read bytes and mirror across hosts.
+            if image_str.startswith("file://") or Path(image_str).exists():
                 raw = Path(image_str[len("file://"):] if image_str.startswith("file://")
                            else image_str).read_bytes()
-                cached = await upload_bytes(raw, filename="card.jpg")
-                return cached or image_str
+                result = await backup_bytes(self._c, raw, mime="image/jpeg")
+                return result.primary or image_str
+            # Remote URL → mirror across hosts (gated by the cache feature flag,
+            # preserving the prior behaviour of not re-hosting remote URLs when
+            # caching is disabled).
             if self._c.config.features.catbox_image_cache:
-                from nekofetch.providers.catbox import upload_from_url
-
-                cached = await upload_from_url(image_str)
-                return cached or image_str
+                result = await backup_image(self._c, image_str)
+                return result.primary or image_str
         except Exception as exc:  # noqa: BLE001 — caching is best-effort
             log.debug("senku.publish.image_cache_failed", url=image_str, error=str(exc))
         return image_str

@@ -691,8 +691,11 @@ class BotConfig(BaseModel):
     # of host keys tried in order; the first that sticks becomes the primary URL.
     # Recognized: "catbox", "telegraph", "imgbb". Unknown keys are ignored. ImgBB
     # needs IMGBB_API_KEY set in .env, else that host is skipped.
+    # Upload/mirror order for card images. ImgBB leads — it's the host that
+    # actually sticks (catbox intermittently 500s/disconnects, telegraph killed
+    # its upload endpoint). primary() picks imgbb → catbox → telegraph → source.
     image_host_order: list[str] = Field(
-        default_factory=lambda: ["catbox", "telegraph", "imgbb"]
+        default_factory=lambda: ["imgbb", "catbox", "telegraph"]
     )
     # Username suffix formatting. The base suffix is shared; ``format_bot_username``
     # appends "_bot" for bot entities (Telegram requirement) and leaves it off for
