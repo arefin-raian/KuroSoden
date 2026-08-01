@@ -690,18 +690,38 @@ def _lang_display(lang: str) -> str:
 _TORRENT_SOURCES = frozenset({"nyaa"})
 
 
-_CORNER_OVERLAY = {
-    "top_left": "10:10",
-    "top_right": "main_w-overlay_w-10:10",
-    "bottom_left": "10:main_h-overlay_h-10",
-    "bottom_right": "main_w-overlay_w-10:main_h-overlay_h-10",
-}
-_CORNER_TEXT = {
-    "top_left": "x=10:y=10",
-    "top_right": "x=w-tw-10:y=10",
-    "bottom_left": "x=10:y=h-th-10",
-    "bottom_right": "x=w-tw-10:y=h-th-10",
-}
+# Corner position expressions, parameterised by per-edge margin (px). ``m`` is
+# the configured ``watermark.margin``.
+def _corner_overlay(corner: str, m: int) -> str:
+    return {
+        "top_left": f"{m}:{m}",
+        "top_right": f"main_w-overlay_w-{m}:{m}",
+        "bottom_left": f"{m}:main_h-overlay_h-{m}",
+        "bottom_right": f"main_w-overlay_w-{m}:main_h-overlay_h-{m}",
+    }.get(corner, f"main_w-overlay_w-{m}:main_h-overlay_h-{m}")
+
+
+def _corner_text(corner: str, m: int) -> str:
+    return {
+        "top_left": f"x={m}:y={m}",
+        "top_right": f"x=w-tw-{m}:y={m}",
+        "bottom_left": f"x={m}:y=h-th-{m}",
+        "bottom_right": f"x=w-tw-{m}:y=h-th-{m}",
+    }.get(corner, f"x=w-tw-{m}:y=h-th-{m}")
+
+
+# Directory holding the shipped watermark fonts (resources/fonts/).
+_FONTS_DIR = Path(__file__).resolve().parents[3] / "resources" / "fonts"
+
+
+def _resolve_font_path(font: str) -> str:
+    """Absolute path to a watermark font under resources/fonts/, or "" if unset
+    or missing (caller then omits fontfile → ffmpeg default)."""
+    name = (font or "").strip()
+    if not name:
+        return ""
+    p = _FONTS_DIR / name
+    return str(p) if p.exists() else ""
 
 
 class BrandingStage(Stage):
@@ -873,8 +893,9 @@ class WatermarkStage(Stage):
 
     def _filter(self, w) -> tuple[str, list[str]]:
         """Build the ffmpeg filter and any extra input args for the configured watermark."""
+        margin = int(getattr(w, "margin", 16) or 0)
         if w.type == "image" and w.image_path:
-            pos = _CORNER_OVERLAY.get(w.corner, _CORNER_OVERLAY["bottom_right"])
+            pos = _corner_overlay(w.corner, margin)
             # scale watermark to a fraction of video width, apply opacity, overlay
             flt = (
                 f"[1:v]format=rgba,colorchannelmixer=aa={w.opacity},"
@@ -882,12 +903,27 @@ class WatermarkStage(Stage):
             )
             return flt, ["-i", w.image_path]
         # text watermark
-        pos = _CORNER_TEXT.get(w.corner, _CORNER_TEXT["bottom_right"])
-        text = (w.text or "").replace(":", r"\:").replace("'", r"\'")
-        fontsize = "h*" + str(max(w.scale, 0.03))
+        pos = _corner_text(w.corner, margin)
+        # drawtext is picky: escape the ffmpeg-special chars in the user's text.
+        text = (
+            (w.text or "")
+            .replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
+            .replace("%", r"\%")
+        )
+        # Size as a fraction of frame HEIGHT (0.03 ≈ a small, tasteful corner mark).
+        fontsize = f"h*{max(float(w.scale or 0.03), 0.01)}"
+        font_path = _resolve_font_path(getattr(w, "font", ""))
+        font_clause = ""
+        if font_path:
+            # Backslash-escape the path for the drawtext option string.
+            esc = font_path.replace("\\", r"\\").replace(":", r"\:")
+            font_clause = f"fontfile='{esc}':"
+        # Clean semi-transparent white with a soft shadow for legibility on light
+        # frames (no heavy box — matches the reference corner-mark look).
         flt = (
-            f"drawtext=text='{text}':fontcolor=white@{w.opacity}:"
-            f"fontsize={fontsize}:{pos}:box=1:boxcolor=black@0.3:boxborderw=6"
+            f"drawtext={font_clause}text='{text}':fontcolor=white@{w.opacity}:"
+            f"fontsize={fontsize}:{pos}:"
+            f"shadowcolor=black@0.45:shadowx=2:shadowy=2"
         )
         return flt, []
 

@@ -321,6 +321,15 @@ FIELD_DOCS: dict[str, FieldDoc] = {
     "watermark.image_path": FieldDoc(
         desc="Path to a watermark image file, used when type = image.",
         example="/data/branding/watermark.png"),
+    "watermark.font": FieldDoc(
+        desc="Font for the text watermark (blank = ffmpeg default).",
+        option_notes={
+            "": "ffmpeg built-in default font",
+            "galantic.regular.otf": "Galantic — clean display serif",
+            "golden-varsity.regular.ttf": "Golden Varsity — collegiate block",
+            "hit-me-punk.01.ttf": "Hit Me Punk — grungy brush",
+            "sportzan.regular.ttf": "Sportzan — bold sporty sans",
+        }),
     "watermark.corner": FieldDoc(
         desc="Which corner of the frame the watermark sits in.",
         option_notes={
@@ -329,10 +338,14 @@ FIELD_DOCS: dict[str, FieldDoc] = {
             "top_right": "upper-right corner",
             "top_left": "upper-left corner",
         }),
+    "watermark.margin": FieldDoc(
+        desc="Distance in pixels from each frame edge (per corner).", example="16"),
     "watermark.opacity": FieldDoc(
-        desc="Watermark opacity from 0.0 (invisible) to 1.0 (solid).", example="0.6"),
+        desc="Watermark opacity from 0.0 (invisible) to 1.0 (solid).", example="0.55"),
     "watermark.scale": FieldDoc(
-        desc="Watermark size as a fraction of frame width (0.12 = 12%).", example="0.12"),
+        desc="Text watermark size as a fraction of frame HEIGHT (0.03 = 3%). "
+             "For an image watermark it's a fraction of frame width.",
+        example="0.03"),
 
     # ── branding ──────────────────────────────────────────────────────────────
     "branding.enabled": FieldDoc(

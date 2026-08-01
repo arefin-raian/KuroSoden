@@ -278,9 +278,18 @@ class WatermarkConfig(BaseModel):
     type: str = "text"
     text: str = "Anime Weebs"
     image_path: str = ""
+    # Font file name under resources/fonts/ for the text watermark. "" = ffmpeg's
+    # built-in default font. Picked from the shipped fonts in the Levi settings UI.
+    font: str = ""
     corner: str = "bottom_right"
-    opacity: float = 0.6
-    scale: float = 0.12
+    # Distance in pixels from each frame edge the watermark hugs (per the chosen
+    # corner). Default 16px.
+    margin: int = 16
+    opacity: float = 0.55
+    # Text watermark size as a fraction of frame HEIGHT (0.03 ≈ one step larger
+    # than a typical player's small corner mark). For an image watermark this is
+    # a fraction of frame WIDTH (legacy meaning).
+    scale: float = 0.03
 
 
 class BrandingConfig(BaseModel):
