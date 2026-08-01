@@ -217,17 +217,17 @@ class ProcessingConfig(BaseModel):
     # Target rendition heights produced from the source file. Uploaded smallest
     # first, so packs post as 480p → 720p → 1080p.
     encode_heights: list[int] = Field(default_factory=lambda: [720, 480])
-    # x264 speed/efficiency preset for the derived tiers. NOT "veryfast" — that
-    # disables trellis/adaptive-B-frames/motion-search, so a lean source can come
-    # out LARGER after downscale. "fast" is the size/speed sweet spot: ~2x quicker
-    # than "medium" but compresses far better than veryfast. Paired with
-    # -tune animation + explicit psy-rd (set in _transcode._encode) for anime.
-    # Valid: ultrafast…veryslow.
-    encode_preset: str = "fast"
-    # Constant Rate Factor per tier (lower = better quality/larger). Tuned to
-    # pair with the fast preset — visually clean for downscaled 720p/480p.
+    # x264 speed/efficiency preset for the derived tiers. "faster" is the chosen
+    # speed/size balance — noticeably quicker than "fast"/"medium" while
+    # -tune animation + psy-rd + per-tier CRF keep quality natural for the
+    # resolution. Derived tiers always encode as libx264 regardless of source
+    # codec (fast + small + universally playable). Valid: ultrafast…veryslow.
+    encode_preset: str = "faster"
+    # Constant Rate Factor per tier (higher = smaller). 480p 26 → <100 MB, 720p 24
+    # → ~100–200 MB from a ~300 MB source. 1080p key is used only by the watermark
+    # re-encode (derived tiers never include 1080p).
     encode_crf: dict[int, int] = Field(
-        default_factory=lambda: {1080: 21, 720: 22, 480: 23}
+        default_factory=lambda: {1080: 21, 720: 24, 480: 26}
     )
     # x264 threads per encode. 0 = auto: divide the box's cores by
     # concurrent_downloads (floor 2) so several admins' jobs can encode at once

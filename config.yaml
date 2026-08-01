@@ -45,12 +45,17 @@ processing:
   # (packs post as 480p → 720p → 1080p).
   encode: true
   encode_heights: [720, 480]
-  # x264/x265 speed preset for the derived tiers. NOT "veryfast" — it disables
-  # the compression features that keep files small, so a lean source can come out
-  # LARGER after downscale. "fast" is the sweet spot: ~2x quicker than medium but
-  # compresses far better than veryfast. Paired with -tune animation + psy-rd.
+  # Derived 480p/720p tiers ALWAYS encode as libx264 (fast + universally playable
+  # + small at these sizes) regardless of the source codec. The 1080p source is
+  # passthrough (never re-encoded here).
+  # Speed preset for the derived tiers. "faster" is the chosen speed/size balance
+  # for x264 — noticeably quicker than "fast"/"medium" while -tune animation +
+  # psy-rd + the per-tier CRF below keep quality natural for the resolution.
   # Options (slow→fast): veryslow slower slow medium fast faster veryfast superfast ultrafast
-  encode_preset: fast
+  encode_preset: faster
+  # Per-height CRF (higher = smaller). 480p 26 → <100 MB; 720p 24 → ~100–200 MB
+  # from a ~300 MB source. 1080p key is only used by the watermark re-encode.
+  encode_crf: {1080: 21, 720: 24, 480: 26}
   # false (default): auto-publish to main + index channels and bring up the
   # distribution bot right after storage upload — no admin click.
   # true: gate publishing behind an admin approval card.

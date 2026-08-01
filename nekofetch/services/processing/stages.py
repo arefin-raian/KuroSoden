@@ -1066,7 +1066,7 @@ class EncodeStage(Stage):
         from nekofetch.core.exceptions import ProcessingError
         from nekofetch.infrastructure.database.postgres.models import MediaFile
         from nekofetch.sources._hls import find_ffmpeg, find_ffprobe
-        from nekofetch.sources._transcode import _encode, select_encoder
+        from nekofetch.sources._transcode import _encode
 
         heights = [h for h in self.c.config.processing.encode_heights if h > 0]
         if not heights:
@@ -1126,11 +1126,15 @@ class EncodeStage(Stage):
         for i, f in enumerate(sources):
             src = Path(f.local_path)
             src_res = f.resolution or "1080p"
-            # Pick the encoder from the SOURCE codec once per file so derived
-            # tiers never downgrade efficiency (HEVC→HEVC, AV1→AV1, h264→h264),
-            # which is what caused a downscaled tier to come out larger.
             ffmpeg = find_ffmpeg()
-            encoder = await select_encoder(src, ffmpeg) if ffmpeg else "libx264"
+            # Derived 480p/720p tiers ALWAYS encode as libx264. At these small
+            # target sizes x264 "faster" is dramatically quicker than libx265 /
+            # SVT-AV1 for indistinguishable perceptual quality — the whole point
+            # of the lower tiers is a small, fast, universally-playable file.
+            # (The 1080p source stays untouched — we never re-encode it here — so
+            # its original HEVC/AV1 efficiency is preserved; only the WATERMARK
+            # path re-encodes 1080p and it keeps the codec-aware select_encoder.)
+            encoder = "libx264"
             # Rename put the resolution token in the stem (e.g.
             # "... [1080p] ..."); we swap it per rendition so names stay correct.
             stem = src.stem
@@ -1287,8 +1291,11 @@ class EncodeStage(Stage):
 
 
 # Derived-rendition CRFs (mirrors _transcode._CRF; kept local so the stage owns
-# its quality knobs).
-_ENCODE_CRF = {1080: 21, 720: 21, 480: 22}
+# its quality knobs). Higher CRF on the small tiers = smaller files at quality
+# that still reads "natural" for that resolution: 480p CRF 26 lands well under
+# 100 MB, 720p CRF 24 ~100–200 MB from a ~300 MB source. 1080p is never derived
+# here (source passthrough); the key exists only for the watermark re-encode.
+_ENCODE_CRF = {1080: 21, 720: 24, 480: 26}
 
 # How many times to retry a single failing tier encode before failing the whole
 # job (which routes to the recovery card so the operator can switch torrents).
