@@ -71,7 +71,40 @@ async def probe_video_codec(path: Path) -> str:
         return ""
 
 
-# Which encoder to derive each tier with, keyed by the SOURCE codec. The rule is
+async def probe_pixel_format(path: Path) -> str:
+    """Return the source's video ``pix_fmt`` (``yuv420p``/``yuv420p10le``/
+    ``p010le``/…) lowercased, or "" if it can't be read."""
+    ffprobe = find_ffprobe()
+    if not ffprobe:
+        return ""
+
+    def _run() -> str:
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=pix_fmt", "-of", "default=nw=1:nk=1",
+             str(path)],
+            capture_output=True, text=True,
+        )
+        return (r.stdout or "").strip().lower()
+
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def is_10bit(pix_fmt: str) -> bool:
+    """True if a ffprobe ``pix_fmt`` string denotes ≥10-bit video.
+
+    Covers the planar 10/12-bit ``yuv*10le``/``12le`` families and the
+    semi-planar ``p010``/``p016`` families hardware pipelines use. 8-bit
+    formats (``yuv420p``, ``nv12``, …) and an empty/unknown string → False, so
+    we default to the safe 8-bit path when the probe can't tell."""
+    pf = (pix_fmt or "").lower()
+    if not pf:
+        return False
+    return ("10le" in pf or "10be" in pf or "12le" in pf or "12be" in pf
+            or "p010" in pf or "p016" in pf)
 # "never downgrade efficiency": an HEVC/AV1/VP9 source re-encoded to x264 would
 # INFLATE (x264 needs ~40% more bits for the same quality), which is exactly the
 # 250MB→256MB regression. So match the source's efficiency class or better, and
@@ -159,6 +192,155 @@ async def select_encoder(src: Path, ffmpeg: str) -> str:
         log.warning("encode.encoder_unavailable", codec=codec, wanted=ideal,
                     fallback="libx264")
     return "libx264"
+
+
+# Hardware HEVC encoders — 10-bit capable for watermark fallback. Paired with
+# the H.264 set to build the full fast-encoder ladder.
+_HW_HEVC_ENCODERS = ("hevc_nvenc", "hevc_qsv", "hevc_vaapi")
+
+
+async def build_watermark_encode_args(
+    ffmpeg: str,
+    src: Path,
+    out: Path,
+    filtergraph: str,
+    extra_inputs: list[str],
+    *,
+    crf: int,
+    preset: str,
+    threads: int,
+    fast: bool,
+    is_10bit: bool,
+) -> list[tuple[str, list[str]]]:
+    """Build an ordered ladder of (encoder_name, ffmpeg_args) candidates for
+    watermarking ``src`` → ``out``. The caller tries each in order; first
+    success wins. Every candidate preserves ALL audio + subs + attachments
+    (``-map 0 ... -map -0:d?``). Returns [] if ffmpeg is unavailable.
+
+    **Ladder (fast=True):**
+    - 10-bit: ``hevc_nvenc`` (GPU) → ``hevc_qsv``/``hevc_vaapi`` (if avail) →
+      ``libx265`` 10-bit → ``libx264`` 8-bit (downconvert, last resort).
+    - 8-bit: ``h264_nvenc`` (GPU) → ``libx264``.
+
+    **fast=False:** codec-matched software (via ``select_encoder``) → ``libx264``.
+    """
+    if not ffmpeg:
+        return []
+
+    avail_cache: dict[str, bool] = {}
+
+    async def _avail(enc: str) -> bool:
+        if enc not in avail_cache:
+            avail_cache[enc] = await asyncio.to_thread(_encoder_available, ffmpeg, enc)
+        return avail_cache[enc]
+
+    def _cmd(encoder: str, venc: list[str], vf_tail: str) -> list[str]:
+        # Append a format= conversion so frames match the encoder's pixel format
+        # (works for both -vf text and -filter_complex overlay graphs).
+        graph = f"{filtergraph},{vf_tail}" if vf_tail else filtergraph
+        flag = "-filter_complex" if extra_inputs else "-vf"
+        # -map 0 keeps EVERY stream; -c copy default; only video is re-encoded
+        # with the watermark filter; drop uncopyable data streams. This is the
+        # _encode() pattern — preserves dual-audio + subs + attachments (the old
+        # watermark cmd omitted -map and silently kept only one audio + no subs).
+        return [
+            ffmpeg, "-y", "-loglevel", "error", "-i", str(src),
+            *extra_inputs,
+            flag, graph,
+            "-map", "0", "-c", "copy",
+            *venc,
+            "-map", "-0:d?", str(out),
+        ]
+
+    q = str(crf)
+    ladder: list[tuple[str, list[str]]] = []
+
+    def _x265_10() -> list[str]:
+        return ["-c:v", "libx265", "-pix_fmt", "yuv420p10le",
+                "-crf", q, "-preset", preset,
+                "-x265-params", "psy-rd=1.0:psy-rdoq=0.15",
+                "-threads", str(threads)]
+
+    def _x264_8() -> list[str]:
+        return ["-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-crf", q, "-preset", preset, "-tune", "animation",
+                "-x264-params", "psy-rd=1.0,0.15",
+                "-threads", str(threads)]
+
+    if not fast:
+        # Quality path: codec-matched software, then universal libx264.
+        sw = await select_encoder(src, ffmpeg)
+        if sw == "libx265" and await _avail("libx265"):
+            ladder.append(("libx265", _cmd("libx265", _x265_10(), "")))
+        elif sw == "libsvtav1" and await _avail("libsvtav1"):
+            ladder.append(("libsvtav1", _cmd("libsvtav1", [
+                "-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le",
+                "-crf", q, "-preset", str(_svtav1_preset(preset)),
+                "-svtav1-params", "tune=0:film-grain=0",
+            ], "")))
+        ladder.append(("libx264", _cmd("libx264", _x264_8(), "format=yuv420p")))
+        return ladder
+
+    # Fast path.
+    if is_10bit:
+        for enc in _HW_HEVC_ENCODERS:          # 1. hardware HEVC (keeps 10-bit)
+            if await _avail(enc):
+                venc = ["-c:v", enc, "-pix_fmt", "p010le"]
+                if enc == "hevc_nvenc":
+                    venc += ["-preset", "p4", "-rc", "constqp", "-qp", q]
+                elif enc == "hevc_qsv":
+                    venc += ["-global_quality", q]
+                else:  # hevc_vaapi
+                    venc += ["-qp", q]
+                ladder.append((enc, _cmd(enc, venc, "format=p010le")))
+                break
+        if await _avail("libx265"):            # 2. software x265 10-bit
+            ladder.append(("libx265", _cmd("libx265", _x265_10(), "")))
+        # 3. libx264 8-bit downconvert (universal last resort)
+        ladder.append(("libx264", _cmd("libx264", _x264_8(), "format=yuv420p")))
+    else:
+        for enc in _HW_H264_ENCODERS:          # 8-bit: fastest H.264 hardware
+            if await _avail(enc):
+                venc = ["-c:v", enc, "-pix_fmt", "yuv420p"]
+                if enc in ("h264_nvenc", "h264_amf"):
+                    venc += ["-preset", "p4", "-cq", q]
+                elif enc == "h264_qsv":
+                    venc += ["-global_quality", q]
+                else:  # h264_vaapi
+                    venc += ["-qp", q]
+                ladder.append((enc, _cmd(enc, venc, "format=yuv420p")))
+                break
+        ladder.append(("libx264", _cmd("libx264", _x264_8(), "format=yuv420p")))
+
+    return ladder
+
+
+async def run_watermark(
+    candidates: list[tuple[str, list[str]]],
+    *, on_progress=None, duration_s: float | None = None,
+    on_candidate_fail=None,
+) -> str:
+    """Try each (encoder, args) candidate in order; return the encoder name of
+    the first that succeeds. Raises the LAST error if all fail.
+
+    ``on_candidate_fail(encoder, error)`` (optional) is awaited for each failed
+    candidate so the caller can log the encoder + ffmpeg error tail before the
+    ladder falls through to the next one."""
+    last_exc: Exception | None = None
+    for encoder, args in candidates:
+        try:
+            await _run_ffmpeg(args, on_progress=on_progress, duration_s=duration_s)
+            return encoder
+        except Exception as exc:  # noqa: BLE001 — try the next candidate
+            last_exc = exc
+            if on_candidate_fail is not None:
+                try:
+                    await on_candidate_fail(encoder, exc)
+                except Exception:  # noqa: BLE001
+                    pass
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("no watermark encoder candidates available")
 
 
 def is_oversized_1080(size_bytes: int, duration_s: float) -> bool:

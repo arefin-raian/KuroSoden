@@ -979,8 +979,8 @@ class WatermarkStage(Stage):
     async def process(self, ctx: StageContext) -> None:
         from nekofetch.sources._hls import find_ffmpeg
         from nekofetch.sources._transcode import (
-            _ENCODER_PIXFMT, _run_ffmpeg, _svtav1_preset, probe_duration_s_async,
-            select_encoder, select_fast_encoder,
+            build_watermark_encode_args, is_10bit, probe_duration_s_async,
+            probe_pixel_format, run_watermark,
         )
 
         w = self.c.config.watermark
@@ -1030,72 +1030,27 @@ class WatermarkStage(Stage):
             )
             out = src.with_name(src.stem + ".wm" + src.suffix)
             flt, extra_inputs = self._filter(w)
-            # Burning a watermark forces a full video re-encode. Two paths:
-            #   • fast (default): fastest H.264 encoder available — a hardware
-            #     encoder (NVENC/QSV/VAAPI) if the box has one, else libx264. Far
-            #     quicker than re-encoding an HEVC/AV1 source back to its own slow
-            #     software codec; a corner mark's quality rides on the source.
-            #   • quality: the codec-aware (source-matching) encoder, as before.
-            if getattr(w, "fast", True):
-                encoder = (await select_fast_encoder(ffmpeg)) if ffmpeg else "libx264"
-            else:
-                encoder = (await select_encoder(src, ffmpeg)) if ffmpeg else "libx264"
-            pix_fmt = _ENCODER_PIXFMT.get(encoder, "yuv420p")
-            hw_h264 = encoder in ("h264_nvenc", "h264_qsv", "h264_vaapi", "h264_amf")
-            # h264_nvenc/qsv/vaapi/amf are 8-bit H.264 only — they CANNOT ingest a
-            # 10-bit surface (anime sources are routinely 10-bit HEVC). Feeding one
-            # in fails at encoder init (~instant), which reads in the log as
-            # "watermarking never happened" (stage flips to thumbnail in ~2s). So
-            # for a hardware H.264 encode force 8-bit output AND append
-            # format=yuv420p to the filter chain so frames are downconverted before
-            # they reach the encoder.
-            if hw_h264:
-                pix_fmt = "yuv420p"
-            venc: list[str] = ["-c:v", encoder]
-            if encoder == "libsvtav1":
-                venc += ["-crf", str(crf), "-preset", str(_svtav1_preset(preset)),
-                         "-svtav1-params", "tune=0:film-grain=0"]
-            elif encoder in ("h264_nvenc", "h264_qsv", "h264_vaapi", "h264_amf"):
-                # Hardware H.264: rate-control flags differ from libx264's -crf.
-                # NVENC/AMF use -cq, QSV uses -global_quality, VAAPI uses -qp.
-                # None take -tune animation / x264-params (software-only), so keep
-                # the command minimal — the hardware ASIC handles quality/speed.
-                q = str(crf)
-                if encoder in ("h264_nvenc", "h264_amf"):
-                    venc += ["-preset", "p4", "-cq", q]
-                elif encoder == "h264_qsv":
-                    venc += ["-global_quality", q]
-                else:  # h264_vaapi
-                    venc += ["-qp", q]
-            else:
-                # libx264 / libx265 share the CRF + word-preset + tune + psy-rd
-                # vocabulary. psy-rd is written "<rd>:<trellis>". x264: the
-                # -x264-params string uses ':' as ITS separator, so the pair must
-                # be comma-joined ("psy-rd=1.0,0.15") or x264 mis-parses "0.15" as
-                # a bogus option. x265: splits into psy-rd + a separate psy-rdoq.
-                if encoder == "libx265":
-                    psy_params = "psy-rd=1.0:psy-rdoq=0.15"
-                    psy_flag = "-x265-params"
-                else:
-                    psy_params = "psy-rd=1.0,0.15"
-                    psy_flag = "-x264-params"
-                venc += ["-crf", str(crf), "-preset", preset,
-                         "-tune", "animation", psy_flag, psy_params]
-            venc += ["-pix_fmt", pix_fmt]
-            # -threads is a software-x264/x265 knob; hardware encoders ignore it
-            # (the ASIC runs its own pipeline), so only pass it on the SW path.
-            if not hw_h264 and encoder != "libsvtav1":
-                venc += ["-threads", str(wm_threads)]
-            # Hardware H.264 can't take a 10-bit surface — pin the filter output to
-            # 8-bit yuv420p right before the encoder (works for both the -vf text
-            # path and the -filter_complex image-overlay path, which ends at [0:v]
-            # /the overlay label; a trailing ",format=..." on the last filter is
-            # valid in either).
-            flt_final = f"{flt},format=yuv420p" if hw_h264 else flt
-            args = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
-                    *extra_inputs,
-                    "-filter_complex" if extra_inputs else "-vf", flt_final,
-                    *venc, "-c:a", "copy", str(out)]
+            # Burning a watermark forces a full video re-encode. Build a ROBUST
+            # encoder ladder (best→safest) so ANY source — h264/hevc/av1/vp9/…,
+            # 8-bit or 10-bit — gets watermarked and never silently skipped:
+            #   • fast (default): hardware encoder matched to the source bit depth
+            #     (hevc_nvenc for 10-bit, h264_nvenc for 8-bit) → software x265/
+            #     x264 fallback. GPU-fast when available, always succeeds.
+            #   • quality: codec-matched software → libx264 last resort.
+            # The source's real pixel format decides the ladder — a 10-bit HEVC
+            # anime source stays 10-bit (via hevc_nvenc / libx265) instead of
+            # being force-degraded to 8-bit or failing on an 8-bit-only encoder.
+            pix_fmt = await probe_pixel_format(src)
+            src_10 = is_10bit(pix_fmt)
+            candidates = await build_watermark_encode_args(
+                ffmpeg or "", src, out, flt, extra_inputs,
+                crf=crf, preset=preset, threads=wm_threads,
+                fast=bool(getattr(w, "fast", True)), is_10bit=src_10,
+            )
+            if not candidates:
+                ctx.notes.append("watermark: ffmpeg unavailable")
+                out.unlink(missing_ok=True)
+                continue
 
             # Live per-file heartbeat: stream ffmpeg's -progress so THIS file's
             # own 0→100 fraction drives the bar (like the download/encode cards)
@@ -1120,19 +1075,35 @@ class WatermarkStage(Stage):
                     episode=_ep, season=_sea, resolution=_res, audio=_aud,
                 )
 
+            # Each ladder candidate that fails logs its encoder + ffmpeg error
+            # tail before falling through to the next, so a rejected hardware
+            # flag or bad filter is diagnosable rather than silently skipped.
+            async def _on_cand_fail(encoder, exc, _src=src):  # noqa: ANN001
+                log.warning(
+                    "watermark.candidate_failed",
+                    job_id=getattr(ctx, "job_id", None),
+                    file=_src.name, encoder=encoder,
+                    error=str(exc)[:400],
+                )
+
             try:
-                await _run_ffmpeg(args, on_progress=_wm_progress, duration_s=dur_s)
-            except Exception as exc:  # noqa: BLE001 — note + skip this file
-                # LOUD: a silently-skipped watermark looks like "watermarking
-                # never happened" in the log (stage flips straight to thumbnail).
-                # Surface the real ffmpeg error tail + the exact command so the
-                # cause (bad filter, NVENC flag, missing font) is diagnosable.
+                used = await run_watermark(
+                    candidates, on_progress=_wm_progress, duration_s=dur_s,
+                    on_candidate_fail=_on_cand_fail,
+                )
+                log.info("watermark.encoded", file=src.name, encoder=used,
+                         source_10bit=src_10)
+            except Exception as exc:  # noqa: BLE001 — whole ladder exhausted
+                # LOUD: every candidate failed. A silently-skipped watermark
+                # reads as "watermarking never happened" (stage flips straight to
+                # thumbnail) — surface the final error + pixel format so the cause
+                # is diagnosable.
                 log.warning(
                     "watermark.file_failed",
                     job_id=getattr(ctx, "job_id", None),
-                    file=src.name, encoder=encoder,
+                    file=src.name, pix_fmt=pix_fmt or "?",
+                    candidates=[c[0] for c in candidates],
                     error=str(exc)[:400],
-                    cmd=" ".join(args),
                 )
                 ctx.notes.append(f"watermark: {str(exc)[:200] or 'ffmpeg unavailable'}")
                 out.unlink(missing_ok=True)
