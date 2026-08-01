@@ -369,6 +369,261 @@ class RequestService:
                 except Exception:  # noqa: BLE001
                     pass
 
+    async def _purge_request_rows(self, session, req) -> dict:
+        """Tear down everything downstream of a request row, in-session.
+
+        Shared teardown for :meth:`delete_request` and :meth:`reassign_fresh`:
+        deletes storage packs (channel messages + rows), MediaFile rows + local
+        files, and DownloadJob rows for ``req``. Returns
+        ``{"job_ids", "files", "packs", "work_folder"}`` for follow-up cleanup.
+        Does NOT touch the Request row itself — the caller decides whether to
+        delete it (full delete) or recreate a fresh one (reassign)."""
+        from pathlib import Path
+
+        from sqlalchemy import delete, select
+
+        from nekofetch.core.parsing import clean_anilist_id
+        from nekofetch.infrastructure.database.postgres.models import (
+            DownloadJob,
+            MediaFile,
+            StoragePack,
+        )
+
+        doc_key = req.anime_doc_id or clean_anilist_id(req.source_ref)
+        jobs = (await session.execute(
+            select(DownloadJob).where(DownloadJob.request_id == req.id)
+        )).scalars().all()
+        job_ids = [j.id for j in jobs]
+        files = (await session.execute(
+            select(MediaFile).where(MediaFile.job_id.in_(job_ids))
+        )).scalars().all() if job_ids else []
+        packs = (await session.execute(
+            select(StoragePack).where(StoragePack.anime_doc_id == doc_key)
+        )).scalars().all() if doc_key else []
+
+        for pack in packs:
+            await self._purge_pack_messages(pack)
+
+        removed_files = 0
+        work_folder: str | None = None
+        for mf in files:
+            removed_files += 1
+            if mf.local_path:
+                try:
+                    p = Path(mf.local_path)
+                    work_folder = work_folder or (p.parent.name if p.parent else None)
+                    p.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        if job_ids:
+            await session.execute(delete(MediaFile).where(MediaFile.job_id.in_(job_ids)))
+        for pack in packs:
+            await session.delete(pack)
+        for job in jobs:
+            await session.delete(job)
+
+        return {
+            "job_ids": job_ids, "files": removed_files,
+            "packs": len(packs), "work_folder": work_folder,
+        }
+
+    async def _clear_assignments(self, session, code: str) -> None:
+        """Delete the AdminAssignment rows for ``code`` so a purged/reassigned
+        request leaves no dangling stage ownership. AdminAssignment keys on the
+        request CODE (a string, no FK), so this cleanup is manual."""
+        try:
+            from sqlalchemy import delete
+            from kurosoden.shared.admin_assignment import AdminAssignment
+            await session.execute(
+                delete(AdminAssignment).where(AdminAssignment.request_code == code)
+            )
+        except Exception:  # noqa: BLE001 — assignment table optional/absent
+            pass
+
+    async def _prune_work_dir(self, code: str) -> None:
+        """Best-effort rmtree of a request's on-disk work folder + Redis flags."""
+        try:
+            import shutil
+            from nekofetch.services.download_service import _safe_folder
+            folder = None
+            async with session_scope(self._c.pg_sessionmaker) as session:
+                req = await RequestRepository(session).get_by_code(code)
+                if req is not None:
+                    folder = _safe_folder(req)
+            if folder:
+                work_dir = self._c.env.storage_path / "work" / folder
+                if work_dir.exists():
+                    shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _clear_job_flags(self, code: str, job_ids: list[int]) -> None:
+        if not self._c.redis:
+            return
+        for jid in job_ids:
+            try:
+                if self._c.progress:
+                    await self._c.progress.delete(jid)
+                await self._c.redis.delete(
+                    f"nf:job:{jid}:skip", f"nf:job:{jid}:cancel",
+                    f"nf:job:{jid}:progressmsg",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await self._c.redis.delete(f"nf:stuck:{code}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def delete_request(self, code: str) -> dict:
+        """Delete a request ENTIRELY — rows, files, packs, assignments — and tell
+        the requester it was removed.
+
+        Owner-only action (the caller enforces the gate). Everything downstream of
+        the request is torn down (like :meth:`abandon`) AND the Request row itself
+        is deleted, so it stops for every stage bot (Senku/Gojo). The original
+        requester is DMed "your request was removed". Prefetched metadata under
+        ``metadata/`` is intentionally left intact (it's keyed by anime_doc_id and
+        cheap to reuse). Returns ``{title, files, packs, user_id}``."""
+        title = code
+        user_id = None
+        job_ids: list[int] = []
+        summary = {"files": 0, "packs": 0}
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            req = await RequestRepository(session).get_by_code(code)
+            if req is None:
+                raise NotFound(code)
+            title = req.anime_title or code
+            user_id = req.user_id
+            summary = await self._purge_request_rows(session, req)
+            job_ids = summary["job_ids"]
+            await self._clear_assignments(session, code)
+            await session.delete(req)
+            await session.flush()
+
+        await self._prune_work_dir(code)
+        await self._clear_job_flags(code, job_ids)
+
+        # Notify the original requester (resolve their telegram id from the DB user).
+        await self._notify_user_removed(user_id, title, code)
+
+        from nekofetch.services.log_channel_service import LogChannelService
+        await LogChannelService(self._c).event(
+            "admin", "request_deleted", code=code, anime=title,
+            files=summary["files"], packs=summary["packs"],
+        )
+        return {"title": title, "files": summary["files"],
+                "packs": summary["packs"], "user_id": user_id}
+
+    async def reassign_fresh(self, code: str) -> dict:
+        """Re-fetch a request under a BRAND-NEW ticket, discarding the old one.
+
+        Owner-only action (the caller enforces the gate). Tears the old request all
+        the way down (packs/messages, files, jobs, assignments) AND deletes the old
+        Request row, then creates a NEW request (new ``REQ-####`` code) from the
+        same anime/source/scope so the download pipeline restarts from scratch and
+        re-assigns the ``levi`` stage. The requester is DMed the new ticket.
+        Prefetched metadata (keyed by anime_doc_id) is reused. Returns
+        ``{title, old_code, new_code, user_id}``."""
+        from nekofetch.domain.enums import DownloadScope
+
+        title = code
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            req = await RequestRepository(session).get_by_code(code)
+            if req is None:
+                raise NotFound(code)
+            # Snapshot everything needed to mint the replacement before teardown.
+            snap = {
+                "user_id": req.user_id,
+                "anime_doc_id": req.anime_doc_id,
+                "anime_title": req.anime_title,
+                "source": req.source,
+                "source_ref": req.source_ref,
+                "scope": req.scope,
+                "season": req.season,
+                "franchise_data": req.franchise_data,
+            }
+            title = req.anime_title or code
+            summary = await self._purge_request_rows(session, req)
+            job_ids = summary["job_ids"]
+            await self._clear_assignments(session, code)
+            await session.delete(req)
+            await session.flush()
+
+            # Mint the fresh request in the SAME transaction so a crash can't leave
+            # the old one deleted with no replacement.
+            requests = RequestRepository(session)
+            seq = await requests.next_sequence()
+            new_code = f"{REQUEST_PREFIX}-{seq}"
+            try:
+                scope_val = DownloadScope(snap["scope"])
+            except (ValueError, TypeError):
+                scope_val = DownloadScope.ENTIRE_SERIES
+            new_req = Request(
+                code=new_code,
+                user_id=snap["user_id"],
+                anime_doc_id=snap["anime_doc_id"],
+                anime_title=snap["anime_title"],
+                source=snap["source"],
+                source_ref=snap["source_ref"],
+                scope=scope_val.value,
+                season=snap["season"],
+                episodes=None,
+                franchise_data=snap["franchise_data"],
+                status=RequestStatus.QUEUED,
+            )
+            await requests.add(new_req)
+            await session.flush()
+
+        await self._prune_work_dir(code)
+        await self._clear_job_flags(code, job_ids)
+
+        # Re-assign the download stage for the new ticket (fresh offer/duty).
+        try:
+            from kurosoden.shared.admin_assignment import AdminAssignmentEngine
+            await AdminAssignmentEngine(self._c.pg_sessionmaker).assign(new_code, "levi")
+        except Exception as exc:  # noqa: BLE001 — recovery sweep will still pick it up
+            from nekofetch.core.logging import get_logger
+            get_logger(__name__).warning(
+                "request.reassign_fresh.assign_failed", code=new_code, error=str(exc))
+
+        await self._notify_user_requeued(snap["user_id"], title, code, new_code)
+
+        from nekofetch.services.log_channel_service import LogChannelService
+        await LogChannelService(self._c).event(
+            "admin", "request_reassigned", code=code, new_code=new_code, anime=title,
+        )
+        return {"title": title, "old_code": code, "new_code": new_code,
+                "user_id": snap["user_id"]}
+
+    async def _telegram_id_for(self, user_id) -> int | None:
+        """Resolve a DB user_id → their telegram id for a user-facing DM."""
+        if user_id is None:
+            return None
+        try:
+            from nekofetch.infrastructure.database.postgres.models import User
+            async with session_scope(self._c.pg_sessionmaker) as session:
+                u = await session.get(User, user_id)
+                return u.telegram_id if u else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _notify_user_removed(self, user_id, title: str, code: str) -> None:
+        tid = await self._telegram_id_for(user_id)
+        if tid is None:
+            return
+        from nekofetch.services.notification_service import NotificationService
+        await NotificationService(self._c).request_removed(tid, title, code)
+
+    async def _notify_user_requeued(self, user_id, title: str,
+                                    old_code: str, new_code: str) -> None:
+        tid = await self._telegram_id_for(user_id)
+        if tid is None:
+            return
+        from nekofetch.services.notification_service import NotificationService
+        await NotificationService(self._c).request_requeued(tid, title, old_code, new_code)
+
     async def update_franchise_data(self, code: str, data: dict) -> None:
         """Replace the franchise_data JSON blob for a request.
 
@@ -380,6 +635,32 @@ class RequestService:
             if req is None:
                 raise NotFound(code)
             req.franchise_data = data
+
+    async def list_active(self, *, limit: int = 30) -> list[Request]:
+        """In-flight requests for the owner's Manage-Requests console.
+
+        Anything past acceptance and not yet published/rejected — i.e. the
+        requests an owner might want to re-fetch fresh or delete: QUEUED,
+        DOWNLOADING, PROCESSING, READY, APPROVED, FAILED. Newest first, detached
+        for safe UI reads."""
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+
+        statuses = (
+            RequestStatus.QUEUED, RequestStatus.DOWNLOADING,
+            RequestStatus.PROCESSING, RequestStatus.READY,
+            RequestStatus.APPROVED, RequestStatus.FAILED,
+        )
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            rows = (await session.execute(
+                select(Request)
+                .where(Request.status.in_(statuses))
+                .order_by(Request.id.desc())
+                .limit(limit)
+                .options(selectinload(Request.user))
+            )).scalars().all()
+            session.expunge_all()
+            return list(rows)
 
     async def stats(self) -> RequestStats:
         """Real request counters, grouped for the Command / Board panels.

@@ -442,3 +442,190 @@ def register(client: Client, container: Container) -> None:
             card(V.reassigned(code, name), bot_name=BOT,
                  buttons=[[(V.BTN_BACK_MANAGE, cb("mg", "roster"))]]),
             old_msg=q.message)
+
+    # ── Request lifecycle (OWNER-ONLY): re-fetch fresh OR delete a request ──────
+    # Distinct from the stage-reassign above (which moves an assignment between
+    # admins on the SAME request). Here the owner can restart a request under a
+    # brand-new ticket, or delete it outright — both tear down the old rows/files
+    # and DM the requester. Gated to the owner because they're destructive.
+    def _is_owner(obj) -> bool:
+        from nekofetch.services.auth_service import AuthService
+        user = getattr(obj, "nf_user", None)
+        if user is None:
+            return False
+        try:
+            return AuthService(container).is_owner(user)
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _owner_guard(q: CallbackQuery) -> bool:
+        if q.message is None:
+            await q.answer()
+            return False
+        if not _is_owner(q):
+            await q.answer("🔒 That's the owner's console.", show_alert=True)
+            return False
+        return True
+
+    def _req_service():
+        from nekofetch.services.request_service import RequestService
+        return RequestService(container)
+
+    async def _render_requests(client: Client, chat_id: int,
+                               old_msg: CallbackQuery | None) -> None:
+        reqs = await _req_service().list_active(limit=20)
+        rows = []
+        for r in reqs:
+            st = r.status.value if hasattr(r.status, "value") else str(r.status)
+            label = f"{V.esc(r.code)} · {V.esc((r.anime_title or '')[:22])} [{st}]"
+            rows.append([(label, cb("mg", "reqdet", r.code))])
+        rows.append([(V.BTN_BACK_ADMIN, cb(BOT, "admin"))])
+        caption = (
+            f"{V.ICON} <b>Manage Requests</b>\n\n"
+            f"<b>{len(reqs)}</b> in flight. Tap one to re-fetch it under a fresh "
+            f"ticket or delete it.\n\n"
+            "<i>A commander prunes the line so the charge stays clean.</i>"
+        )
+        await send_screen(client, chat_id,
+                          card(caption, image=_art(), bot_name=BOT, buttons=rows),
+                          old_msg=old_msg)
+
+    @client.on_callback_query(filters.regex(r"^mg\|reqs"))
+    async def _requests_list(_: Client, q: CallbackQuery) -> None:
+        if not await _owner_guard(q):
+            return
+        await q.answer()
+        await _render_requests(client, q.message.chat.id, q.message)
+
+    @client.on_callback_query(filters.regex(r"^mg\|reqdet\|"))
+    async def _request_detail(_: Client, q: CallbackQuery) -> None:
+        if not await _owner_guard(q):
+            return
+        code = _parts(q)[2]
+        try:
+            req = await _req_service().get(code)
+        except Exception:  # noqa: BLE001 — vanished mid-navigation
+            await q.answer("That request is gone.", show_alert=True)
+            await _render_requests(client, q.message.chat.id, q.message)
+            return
+        await q.answer()
+        st = req.status.value if hasattr(req.status, "value") else str(req.status)
+        caption = (
+            f"{V.ICON} <b>{V.esc(req.anime_title or code)}</b>\n\n"
+            f"<b>ticket:</b> <code>{V.esc(code)}</code>\n"
+            f"<b>status:</b> {V.esc(st)}\n\n"
+            "<b>♻️ Reassign fresh</b> — tear this down and re-fetch it under a "
+            "NEW ticket (the requester is told).\n"
+            "<b>🗑 Delete</b> — remove it entirely; it stops for every stage and "
+            "the requester is told it was removed.\n\n"
+            "<i>Both are irreversible.</i>"
+        )
+        rows = [
+            [("♻️ Reassign fresh", cb("mg", "refresh", code))],
+            [("🗑 Delete request", cb("mg", "purge", code))],
+            [("↩️ Back", cb("mg", "reqs", 0))],
+        ]
+        await send_screen(client, q.message.chat.id,
+                          card(caption, bot_name=BOT, buttons=rows),
+                          old_msg=q.message)
+
+    @client.on_callback_query(filters.regex(r"^mg\|refresh\|"))
+    async def _request_refresh_confirm(_: Client, q: CallbackQuery) -> None:
+        if not await _owner_guard(q):
+            return
+        code = _parts(q)[2]
+        await q.answer()
+        caption = (
+            f"{V.ICON} <b>Re-fetch <code>{V.esc(code)}</code> fresh?</b>\n\n"
+            "This deletes the old ticket, its jobs, files, and any uploaded "
+            "packs, then creates a NEW ticket and restarts the download from "
+            "scratch. The requester is notified of the new ticket.\n\n"
+            "<i>Prefetched metadata is kept.</i>"
+        )
+        rows = [
+            [("✅ Yes, re-fetch", cb("mg", "refreshok", code))],
+            [("↩️ Cancel", cb("mg", "reqdet", code))],
+        ]
+        await send_screen(client, q.message.chat.id,
+                          card(caption, bot_name=BOT, buttons=rows),
+                          old_msg=q.message)
+
+    @client.on_callback_query(filters.regex(r"^mg\|refreshok\|"))
+    async def _request_refresh_commit(_: Client, q: CallbackQuery) -> None:
+        if not await _owner_guard(q):
+            return
+        code = _parts(q)[2]
+        await q.answer("Re-fetching…")
+        try:
+            result = await _req_service().reassign_fresh(code)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("lelouch.request.reassign_failed", code=code, error=str(exc))
+            await send_screen(
+                client, q.message.chat.id,
+                card(f"{V.ICON} <b>Couldn't re-fetch <code>{V.esc(code)}</code>.</b>\n\n"
+                     f"<code>{V.esc(str(exc))[:200]}</code>",
+                     bot_name=BOT,
+                     buttons=[[("↩️ Back", cb("mg", "reqs", 0))]]),
+                old_msg=q.message)
+            return
+        new_code = result.get("new_code", "?")
+        caption = (
+            f"{V.ICON} <b>Restarted.</b>\n\n"
+            f"<code>{V.esc(code)}</code> was cleared and re-fetched as "
+            f"<code>{V.esc(new_code)}</code>. The download stage has been "
+            f"assigned and the requester notified.\n\n"
+            "<i>Fresh line, fresh charge.</i>"
+        )
+        await send_screen(client, q.message.chat.id,
+                          card(caption, bot_name=BOT,
+                               buttons=[[("↩️ Back", cb("mg", "reqs", 0))]]),
+                          old_msg=q.message)
+
+    @client.on_callback_query(filters.regex(r"^mg\|purge\|"))
+    async def _request_purge_confirm(_: Client, q: CallbackQuery) -> None:
+        if not await _owner_guard(q):
+            return
+        code = _parts(q)[2]
+        await q.answer()
+        caption = (
+            f"{V.ICON} <b>Delete <code>{V.esc(code)}</code> entirely?</b>\n\n"
+            "This removes the request, its jobs, files, and any uploaded packs, "
+            "and stops it for every stage. The requester is told it was removed.\n\n"
+            "<i>This cannot be undone.</i>"
+        )
+        rows = [
+            [("🗑 Yes, delete", cb("mg", "purgeok", code))],
+            [("↩️ Cancel", cb("mg", "reqdet", code))],
+        ]
+        await send_screen(client, q.message.chat.id,
+                          card(caption, bot_name=BOT, buttons=rows),
+                          old_msg=q.message)
+
+    @client.on_callback_query(filters.regex(r"^mg\|purgeok\|"))
+    async def _request_purge_commit(_: Client, q: CallbackQuery) -> None:
+        if not await _owner_guard(q):
+            return
+        code = _parts(q)[2]
+        await q.answer("Deleting…")
+        try:
+            await _req_service().delete_request(code)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("lelouch.request.delete_failed", code=code, error=str(exc))
+            await send_screen(
+                client, q.message.chat.id,
+                card(f"{V.ICON} <b>Couldn't delete <code>{V.esc(code)}</code>.</b>\n\n"
+                     f"<code>{V.esc(str(exc))[:200]}</code>",
+                     bot_name=BOT,
+                     buttons=[[("↩️ Back", cb("mg", "reqs", 0))]]),
+                old_msg=q.message)
+            return
+        caption = (
+            f"{V.ICON} <b>Removed.</b>\n\n"
+            f"<code>{V.esc(code)}</code> and everything under it is gone. The "
+            f"requester has been notified.\n\n"
+            "<i>The line is clean.</i>"
+        )
+        await send_screen(client, q.message.chat.id,
+                          card(caption, bot_name=BOT,
+                               buttons=[[("↩️ Back", cb("mg", "reqs", 0))]]),
+                          old_msg=q.message)

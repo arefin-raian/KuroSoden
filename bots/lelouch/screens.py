@@ -59,6 +59,7 @@ def admin_panel(*, mode: str, requests_open: bool, total: int,
          (V.BTN_AVAIL, cb(BOT, "avail"))],
         [(V.BTN_HOURS, cb(BOT, "hours")),
          (V.BTN_SETTINGS, cb(BOT, "settings"))],
+        [("🗂 Manage Requests", cb("mg", "reqs", 0))],
         [(V.BTN_CLEAR_DATABASE, cb(BOT, "dbclear"))],
         [(V.BTN_HOME, cb(BOT, "home"))],
     ]

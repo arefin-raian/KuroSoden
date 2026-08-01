@@ -97,3 +97,31 @@ class NotificationService:
             f"this is a non-fatal warning. processing will continue."
             f"</blockquote>"
         )
+
+    async def request_removed(self, user_id: int, anime_title: str, request_code: str) -> None:
+        """Tell a requester their request was removed by staff (owner delete)."""
+        await self._send(
+            user_id,
+            f"<blockquote><b>🗑 request removed</b></blockquote>\n\n"
+            f"<blockquote expandable>"
+            f"<b>anime:</b> {anime_title}\n"
+            f"<b>request:</b> <code>#{request_code}</code>\n\n"
+            f"your request was removed by staff. if you think this was a mistake, "
+            f"feel free to request it again."
+            f"</blockquote>"
+        )
+
+    async def request_requeued(self, user_id: int, anime_title: str,
+                               old_code: str, new_code: str) -> None:
+        """Tell a requester their request was re-fetched under a fresh ticket."""
+        await self._send(
+            user_id,
+            f"<blockquote><b>♻️ request restarted</b></blockquote>\n\n"
+            f"<blockquote expandable>"
+            f"<b>anime:</b> {anime_title}\n"
+            f"<b>old ticket:</b> <code>#{old_code}</code>\n"
+            f"<b>new ticket:</b> <code>#{new_code}</code>\n\n"
+            f"we're re-fetching your request from scratch under a new ticket. "
+            f"the old one has been cleared."
+            f"</blockquote>"
+        )
