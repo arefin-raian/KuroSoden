@@ -381,9 +381,17 @@ THUMB_RENDER_FAIL = (
 
 # ── Watch-order confirm / edit ──────────────────────────────────────────────────
 
-def watch_order_card(title: str, order_html: str) -> str:
+def watch_order_card(title: str, order_html: str, *, rendered: bool = False) -> str:
+    # When we arrive here straight from the thumbnail loop, fold the old "All
+    # thumbnails rendered" beat into this card's header so it's ONE message, not
+    # a separate "rendered → tap Order is correct → order card" hop.
+    head = (
+        f"{ICON} <b>All thumbnails rendered — now confirm the watch order</b>"
+        if rendered else
+        f"{ICON} <b>Step 3 — Confirm the watch order</b>"
+    )
     return (
-        f"{ICON} <b>Step 3 — Confirm the watch order</b>\n\n"
+        f"{head}\n\n"
         f"<b>{esc(title)}</b>\n\n"
         f"{order_html}\n\n"
         "<i>Season 3 Part 2 is not Season 4 — I've kept them straight, but you have "

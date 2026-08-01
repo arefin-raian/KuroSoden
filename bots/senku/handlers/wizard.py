@@ -518,16 +518,10 @@ def register(client: Client, container: Container) -> None:
         franchise = await cache.get_franchise(code)
         title = await _title_of(code, franchise)
         if entry is None:
-            # Every entry rendered — hand to Phase 4 (watch-order confirm).
-            total = len(await cache.get_entries(code))
-            await send_screen(
-                client, chat_id,
-                card(V.thumb_generated(total, total), image=await _art(franchise, title),
-                     bot_name=BOT,
-                     buttons=[[(V.BTN_ORDER_CORRECT, cb(BOT, "wiz", "order", code))],
-                              [(V.BTN_HOME, cb(BOT, "home"))]]),
-                old_msg=old_msg,
-            )
+            # Every entry rendered — go STRAIGHT to Phase 4 (watch-order confirm).
+            # No separate "all rendered → tap Order is correct" hop: that card's
+            # only job was to navigate here, so fold it into this one message.
+            await _enter_watch_order(chat_id, code, old_msg=old_msg, rendered=True)
             return
         sel = await cache.get_selection(code, entry.index)
         asset = thumbs.next_asset(sel)
@@ -637,12 +631,17 @@ def register(client: Client, container: Container) -> None:
             log.debug("senku.wiz.thumb_preview_failed", code=code, error=str(exc))
         await _thumb_next(q.message.chat.id, code, old_msg=None)
 
-    async def _enter_watch_order(chat_id: int, code: str, *, old_msg: Message | None) -> None:
+    async def _enter_watch_order(chat_id: int, code: str, *, old_msg: Message | None,
+                                 rendered: bool = False) -> None:
         """Enter the watch-order confirm step (Phase 4) — the last gate before publish.
 
         Renders the numbered order with Confirm/Edit buttons. Confirm publishes;
         Edit drops into a free-text step (``STATE_AWAIT_ORDER``) that re-maps the
         pasted order and returns here for a second look.
+
+        ``rendered=True`` when we arrive straight from the thumbnail loop, so the
+        card header folds in the old "All thumbnails rendered" beat (one message
+        instead of a separate confirm-then-navigate hop).
         """
         entries = await cache.get_entries(code)
         franchise = await cache.get_franchise(code)
@@ -650,7 +649,7 @@ def register(client: Client, container: Container) -> None:
         order_html = franchise_map.render_watch_order(entries)
         await send_screen(
             client, chat_id,
-            card(V.watch_order_card(title, order_html),
+            card(V.watch_order_card(title, order_html, rendered=rendered),
                  image=await _art(franchise, title), bot_name=BOT,
                  buttons=[
                      [(V.BTN_ORDER_CORRECT, cb(BOT, "wiz", "post", code))],
