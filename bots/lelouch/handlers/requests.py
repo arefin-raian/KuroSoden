@@ -472,6 +472,14 @@ def register(client: Client, container: Container) -> None:
                 scope=DownloadScope.ENTIRE_SERIES,
                 season=None,
                 episodes=None,
+                # Key the request by its AniList id so every downstream stage
+                # (thumbnail, publish) resolves the SAME metadata folder the
+                # prefetch writes to (folder = anime_doc_id). Without this a
+                # torrent request's anime_doc_id was None and _safe_anime_doc_id
+                # fell back to the request CODE — a folder the prefetch never
+                # wrote — so cached AniList/TMDB art was missed and the thumbnail
+                # hit TMDB live every time.
+                anime_doc_id=(f"{anilist_id}" if anilist_id else None),
                 franchise_data=franchise_json,
             )
         except NekoFetchError as exc:

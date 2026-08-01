@@ -213,13 +213,27 @@ async def _run_ffmpeg(cmd: list[str], *, on_progress=None,
                 except Exception:  # noqa: BLE001 — progress must never break encode
                     pass
 
+        async def _drain_err() -> bytes:
+            assert proc.stderr is not None
+            return await proc.stderr.read()
+
+        # CRITICAL: do NOT use proc.communicate() here — it reads stdout AND
+        # stderr internally, which races the _pump() reader on the same stdout
+        # pipe and raises "read() called while another coroutine is already
+        # waiting for incoming data", failing every real encode. Instead pump
+        # stdout and drain stderr in their OWN tasks, then wait() for exit.
         pump_task = asyncio.ensure_future(_pump())
-        _, err = await proc.communicate()
-        pump_task.cancel()
+        err_task = asyncio.ensure_future(_drain_err())
+        await proc.wait()
+        # Both readers hit EOF once the process exits; await them to collect.
         try:
             await pump_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             pass
+        try:
+            err = await err_task
+        except Exception:  # noqa: BLE001
+            err = b""
         if proc.returncode != 0:
             raise RuntimeError(
                 f"ffmpeg transcode failed: {err.decode(errors='replace')[-300:]}")

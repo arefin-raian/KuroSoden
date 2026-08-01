@@ -1001,9 +1001,22 @@ class WatermarkStage(Stage):
             cores = _os.cpu_count() or 4
             jobs = max(1, getattr(self.c.config.downloads, "concurrent_downloads", 5))
             wm_threads = max(2, cores // jobs)
-        n = len(ctx.files)
+        # Watermark ONLY the highest-resolution files on disk (the torrent
+        # source, typically 1080p). EncodeStage runs AFTER this and derives the
+        # 720p/480p tiers FROM the already-watermarked source, so those tiers
+        # inherit the mark for free and must never be watermarked again. Marking
+        # only the source also means one burn per episode, not one per tier.
+        def _res_h(mf) -> int:
+            r = (mf.resolution or "").rstrip("p")
+            return int(r) if r.isdigit() else 0
+
+        on_disk = [f for f in ctx.files
+                   if f.local_path and Path(f.local_path).exists()]
+        max_h = max((_res_h(f) for f in on_disk), default=0)
+        targets = [f for f in on_disk if _res_h(f) == max_h and max_h > 0] or on_disk
+        n = len(targets)
         await _push_stage_progress(self.c, ctx, "Watermarking", 0.0, file_index=0, file_total=n)
-        for i, f in enumerate(ctx.files):
+        for i, f in enumerate(targets):
             if not f.local_path:
                 continue
             src = Path(f.local_path)
