@@ -593,7 +593,7 @@ def register(client: Client, container: Container) -> None:
         title = await _title_of(code, franchise)
         await send_screen(
             client, chat_id,
-            card(V.thumb_entry_header(entry.label, entry.index, len(entries)),
+            card(V.thumb_generate_header(entry.label, entry.index, len(entries)),
                  image=await _art(franchise, title), bot_name=BOT,
                  buttons=[[(V.BTN_GENERATE, cb(BOT, "wiz", "gen", code, str(entry.index)))],
                           [(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))]]),
@@ -683,7 +683,10 @@ def register(client: Client, container: Container) -> None:
         franchise = await cache.get_franchise(code)
         title = await _title_of(code, franchise)
         # "Working" card — publishing walks the whole pack + catbox uploads.
-        await send_screen(
+        # Capture it so the terminal card (done/fail) EDITS this same message in
+        # place (delete-then-send) instead of stacking a second card below it —
+        # the flow should read as one evolving message.
+        work_msg = await send_screen(
             client, chat_id,
             card(V.publishing(title), image=await _art(franchise, title), bot_name=BOT),
             old_msg=old_msg,
@@ -699,7 +702,7 @@ def register(client: Client, container: Container) -> None:
                 card(V.PUBLISH_FAIL, image=pick_artwork(BOT), bot_name=BOT,
                      buttons=[[(V.BTN_PUBLISH, cb(BOT, "wiz", "post", code))],
                               [(V.BTN_HOME, cb(BOT, "home"))]]),
-                old_msg=None,
+                old_msg=work_msg,
             )
             return
         # Hand the request to Gojo (publish stage) and clear the working cache.
@@ -715,7 +718,7 @@ def register(client: Client, container: Container) -> None:
             card(V.published_done(title), image=await _art(franchise, title), bot_name=BOT,
                  buttons=[[(V.BTN_TASKS, cb(BOT, "tasks"))],
                           [(V.BTN_HOME, cb(BOT, "home"))]]),
-            old_msg=None,
+            old_msg=work_msg,
         )
 
     # ── /create — open the wizard for the admin's most recent task ─────────────
@@ -850,6 +853,12 @@ def register(client: Client, container: Container) -> None:
             return
         code = data.get("code", "")
         raw = (message.text or "").strip()
+        # Consume the admin's typed input: delete it so the wizard stays a single
+        # evolving card instead of leaving the pasted link/order lingering above.
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001 — best-effort (needs delete rights)
+            pass
 
         if state == STATE_AWAIT_ORDER:
             if not raw:

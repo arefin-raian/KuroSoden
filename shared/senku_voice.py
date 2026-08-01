@@ -299,6 +299,20 @@ def thumb_entry_header(label: str, index: int, total: int) -> str:
     )
 
 
+def thumb_generate_header(label: str, index: int, total: int) -> str:
+    """Header for the Generate-Thumbnail card — all assets are chosen, so there
+    is NO gallery to open here (that wording belongs to the asset-pick card).
+    Reuses the same title line but tells the admin the card is ready to render."""
+    if total <= 1:
+        head = f"{ICON} <b>{esc(label)}</b>"
+    else:
+        head = f"{ICON} <b>Entry {index} / {total}</b>  ·  <b>{esc(label)}</b>"
+    return (
+        f"{head}\n\n"
+        "All assets picked. Tap <b>Generate Thumbnail</b> to render this card."
+    )
+
+
 def thumb_pick_prompt(asset: str) -> str:
     words = {"logo": "logo", "poster": "poster", "bg": "backdrop"}
     a = words.get(asset, asset)

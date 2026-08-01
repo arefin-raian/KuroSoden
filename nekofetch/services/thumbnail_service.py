@@ -28,9 +28,14 @@ from nekofetch.core.logging import get_logger
 
 log = get_logger(__name__)
 
-_TEMPLATE_DIR = Path(__file__).resolve().parents[3] / "thumbnail"
+# repo layout: <repo>/nekofetch/services/thumbnail_service.py — so parents[2]
+# is the repo root, where the sibling `thumbnail/` and `data/` dirs live.
+# (Was parents[3], which climbed one level ABOVE the repo → on prod that
+# resolved to /root/thumbnail/index.html and the template was never found.)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_TEMPLATE_DIR = _REPO_ROOT / "thumbnail"
 _DEFAULT_TEMPLATE = _TEMPLATE_DIR / "index.html"
-_OUTPUT_DIR = Path(__file__).resolve().parents[3] / "data" / "thumbnails"
+_OUTPUT_DIR = _REPO_ROOT / "data" / "thumbnails"
 
 # The template's native design ratio (matches the reference browser render at
 # 1366×641). device_scale_factor=2 doubles the output resolution for crisp text.
