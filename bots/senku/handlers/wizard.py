@@ -22,6 +22,8 @@ to the Phase 3 handler once it lands.
 
 from __future__ import annotations
 
+import asyncio
+
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import CallbackQuery, Message
@@ -420,24 +422,46 @@ def register(client: Client, container: Container) -> None:
         await cache.set_channel(code, handle=display, chat_id=chat.id)
 
         async def _sweep_channel_service_notices() -> None:
-            """Delete the "changed the group name/photo" service messages that
-            Telegram auto-posts when the bot sets the channel title/photo.
+            """Delete the "changed the channel name/photo/description" service
+            messages Telegram auto-posts when the bot edits the channel.
 
-            Scans a small window of the most recent history and removes any
-            message carrying a ``new_chat_title`` / ``new_chat_photo`` (or the
-            generic service-message flag). Best-effort — a leftover notice is
-            cosmetic, never fatal to the wizard."""
-            try:
-                async for m in client.get_chat_history(chat.id, limit=15):
-                    if (getattr(m, "new_chat_title", None) is not None
-                            or getattr(m, "new_chat_photo", None) is not None
-                            or getattr(m, "service", None) is not None):
-                        try:
-                            await client.delete_messages(chat.id, m.id)
-                        except Exception:  # noqa: BLE001
-                            pass
-            except Exception as exc:  # noqa: BLE001 — sweep is best-effort
-                log.debug("senku.wiz.service_sweep_blip", code=code, error=str(exc))
+            Telegram posts these service messages ASYNCHRONOUSLY — they can land
+            a beat AFTER set_chat_title/description returns, so a single immediate
+            scan often misses them (the notice isn't in history yet). We therefore
+            run several passes with a short settle delay between them, over a wider
+            history window, and match the service flags AND the new-title text.
+            Best-effort — a leftover notice is cosmetic, never fatal."""
+
+            def _is_service_notice(m) -> bool:
+                # Pyrogram exposes the service kind as `m.service` (a
+                # MessageServiceType enum) plus convenience attrs. Any of these
+                # present ⇒ it's an auto-posted service message about the channel.
+                return (
+                    getattr(m, "new_chat_title", None) is not None
+                    or getattr(m, "new_chat_photo", None) is not None
+                    or getattr(m, "delete_chat_photo", None)
+                    or getattr(m, "service", None) is not None
+                )
+
+            async def _one_pass() -> int:
+                removed = 0
+                try:
+                    async for m in client.get_chat_history(chat.id, limit=30):
+                        if _is_service_notice(m):
+                            try:
+                                await client.delete_messages(chat.id, m.id)
+                                removed += 1
+                            except Exception:  # noqa: BLE001
+                                pass
+                except Exception as exc:  # noqa: BLE001 — sweep is best-effort
+                    log.debug("senku.wiz.service_sweep_blip", code=code, error=str(exc))
+                return removed
+
+            # A few spaced passes catch notices that arrive slightly late.
+            for delay in (0.0, 1.5, 2.5):
+                if delay:
+                    await asyncio.sleep(delay)
+                await _one_pass()
 
         # ── Bot-driven finalisation ─────────────────────────────────────────
         # Both bots are admins now, so Senku sets the decorated title + the
