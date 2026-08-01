@@ -82,11 +82,25 @@ _TIERS: dict[str, tuple[list, list, list]] = {
 
 
 def default_commands(bot: str) -> list[BotCommand]:
-    """The global-default menu for a bot — the lowest-privilege view. Empty for
-    the staff-only pipeline bots (a stranger sees nothing); the user commands for
-    Lelouch."""
+    """The global-default menu for a bot — shown before per-user scoping kicks in.
+
+    For the staff-only pipeline bots (levi/senku/gojo) this is the STAFF tier,
+    NOT empty. The old empty default meant the ``☰`` menu stayed blank until
+    ``/start`` fired, the user's role resolved, AND Telegram refreshed the
+    per-chat scope — any hiccup in that chain left staff/owner with no menu at
+    all (the reported "Senku has no commands"). Strangers are already blocked by
+    the auth middleware, so surfacing the command list here leaks nothing the bot
+    description doesn't; ``apply_for_user`` still refines the owner up to the
+    settings-inclusive tier on ``/start``. Lelouch (user-facing) keeps its user
+    tier as the default."""
     tiers = _TIERS.get(bot)
-    return list(tiers[0]) if tiers else []
+    if not tiers:
+        return []
+    user, staff, _owner = tiers
+    # Lelouch is open to users → its user tier is the right public default.
+    # The staff-only bots have an empty user tier, so fall back to the staff tier
+    # so their menu is never blank for the people who actually use them.
+    return list(user) if user else list(staff)
 
 
 def _role_tier(bot: str, *, is_staff: bool, is_owner: bool) -> list[BotCommand]:

@@ -33,10 +33,19 @@ def _command_names(commands) -> list[str]:
     return [cmd.command for cmd in commands]
 
 
-def test_staff_only_bots_publish_empty_global_menu():
-    assert default_commands("levi") == []
-    assert default_commands("senku") == []
-    assert default_commands("gojo") == []
+def test_staff_only_bots_publish_staff_global_menu():
+    # Staff-only bots surface their STAFF tier as the global default so the ☰
+    # menu is never blank before per-user scoping kicks in (strangers are gated
+    # by the auth middleware, not by an empty menu). Owner-only /settings must
+    # NOT leak into the global default.
+    for bot in ("levi", "senku", "gojo"):
+        names = _command_names(default_commands(bot))
+        assert "start" in names
+        assert "tasks" in names
+        assert "settings" not in names
+    # Senku's staff tier specifically includes its operational commands.
+    senku = _command_names(default_commands("senku"))
+    assert {"create", "generate"}.issubset(senku)
 
 
 def test_lelouch_global_menu_is_plain_user_only():
