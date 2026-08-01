@@ -736,21 +736,27 @@ class SenkuPublisher:
             caption = self._resolve_caption(post.get("caption") or "", handle, fmt)
             markup = build_audio_keyboard(post.get("button_data"), fmt)
             image = post.get("image")
-            try:
+
+            async def _do_send():
                 if image:
-                    msg = await client.send_photo(
+                    return await client.send_photo(
                         chat_id, image, caption=caption,
                         reply_markup=markup, parse_mode=ParseMode.HTML,
                     )
-                else:
-                    # Text posts (notably the watch guide) carry quality
-                    # hyperlinks — suppress the link preview so a t.me thumbnail
-                    # card never appears under the guide.
-                    msg = await client.send_message(
-                        chat_id, caption,
-                        reply_markup=markup, parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
+                # Text posts (notably the watch guide) carry quality hyperlinks —
+                # suppress the link preview so a t.me thumbnail card never appears.
+                return await client.send_message(
+                    chat_id, caption,
+                    reply_markup=markup, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+
+            try:
+                # Honour FloodWait: the publish cards are few, but they share the
+                # bot's per-channel rate budget with the warm-up burst, so a
+                # transient FLOOD_WAIT here should WAIT + retry (bounded) rather
+                # than drop the card (which left the channel with posted=0).
+                msg = await self._send_with_flood_retry(_do_send)
                 posted += 1
             except Exception as exc:  # noqa: BLE001 — a partial channel still ships
                 log.warning("senku.publish.post_failed",
@@ -788,16 +794,58 @@ class SenkuPublisher:
         return resolve_premium_emoji(caption, fmt)
 
     @staticmethod
-    async def _send_divider(client, chat_id: int, divider_id: str) -> int | None:
+    async def _send_with_flood_retry(fn, *, max_waits: int = 3):
+        """Run ``fn`` (an async send), honouring Telegram FloodWait up to
+        ``max_waits`` times. A FloodWait means "wait N seconds then it'll work",
+        so we sleep and retry rather than dropping the message. Non-flood errors
+        and waits longer than ~90s propagate to the caller."""
+        import asyncio
+
+        from pyrogram.errors import FloodWait
+
+        for _ in range(max_waits + 1):
+            try:
+                return await fn()
+            except FloodWait as fw:
+                wait = int(getattr(fw, "value", 0) or 0)
+                if wait > 90:
+                    raise
+                await asyncio.sleep(wait + 1)
+        return await fn()
+
+    async def _send_divider(self, client, chat_id: int, divider_id: str) -> int | None:
         """Post a divider sticker; return its message id (``None`` on failure)."""
         try:
-            msg = await client.send_sticker(chat_id, divider_id)
+            msg = await self._send_with_flood_retry(
+                lambda: client.send_sticker(chat_id, divider_id)
+            )
             return msg.id
         except Exception:  # noqa: BLE001 — divider is decorative
             return None
 
     _WARM_COUNT = 100
     _WARM_BATCH_DELETE = 100
+
+    async def _acquire_userbot(self):
+        """Return a started userbot Client, or ``None`` if none is configured.
+
+        Reuses the pool cached on the container (same pattern as bot_content /
+        bot_factory) so we don't leak Pyrogram connections."""
+        try:
+            from nekofetch.sources.telegram.userbot import UserbotPool
+
+            pool = getattr(self._c, "_userbot_pool", None)
+            if pool is None:
+                pool = UserbotPool.from_env(
+                    self._c.env.telegram_api_id,
+                    self._c.env.telegram_api_hash,
+                    str(self._c.env.session_path),
+                )
+                self._c._userbot_pool = pool  # type: ignore[attr-defined]
+            return await pool.acquire()
+        except Exception as exc:  # noqa: BLE001 — no userbot → caller falls back to bot
+            log.info("senku.warm.no_userbot", error=str(exc))
+            return None
 
     async def _warm_global_search(self, client, chat_id: int, code: str) -> None:
         """Send ~100 throwaway messages then delete them, to enter Global Search.
@@ -807,8 +855,15 @@ class SenkuPublisher:
         public API, with a baked-in fallback list when it's unreachable) and then
         deleting every one, leaving the channel clean for the real content.
 
-        Guarded by a Redis flag so a re-publish never re-warms. Fully best-effort:
-        any failure just means the channel enters search a little later on its own.
+        BOTS hit a hard ~20 msg/min channel limit (that's why this used to die at
+        'warm sent=20' with FLOOD_WAIT). USER accounts don't have that per-channel
+        cap, so we send via the USERBOT when one is configured and can reach the
+        channel — the userbot is an admin on the distribution channels anyway.
+        Only if there's no usable userbot do we fall back to the bot client, and
+        there we PACE the sends and honour FloodWait so it degrades gracefully
+        instead of erroring out.
+
+        Guarded by a Redis flag so a re-publish never re-warms. Fully best-effort.
         """
         flag = f"nf:dist:{code}:warmed"
         try:
@@ -818,24 +873,31 @@ class SenkuPublisher:
             pass
 
         quotes = await self._fetch_warm_texts(self._WARM_COUNT)
+
+        # Prefer the userbot (no 20/min channel cap). Fall back to the bot client.
+        ub = await self._acquire_userbot()
         sent_ids: list[int] = []
-        for text in quotes:
-            try:
-                m = await client.send_message(
-                    chat_id, text, parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-                sent_ids.append(m.id)
-            except Exception as exc:  # noqa: BLE001 — flood/limit → stop, delete what we have
-                log.warning("senku.warm.send_stopped", code=code,
-                            sent=len(sent_ids), error=str(exc))
-                break
+        via = "userbot" if ub is not None else "bot"
+        if ub is not None:
+            sent_ids = await self._warm_send(ub, chat_id, code, quotes, pace=False)
+            # If the userbot couldn't post at all (not a member / no rights),
+            # fall back to the bot so warm-up still happens.
+            if not sent_ids:
+                via = "bot"
+                ub = None
+        if ub is None:
+            sent_ids = await self._warm_send(
+                client, chat_id, code, quotes, pace=True,
+            )
+            deleter = client
+        else:
+            deleter = ub
 
         # Delete everything we sent (chunked — delete_messages takes a list).
         for start in range(0, len(sent_ids), self._WARM_BATCH_DELETE):
             chunk = sent_ids[start:start + self._WARM_BATCH_DELETE]
             try:
-                await client.delete_messages(chat_id, chunk)
+                await deleter.delete_messages(chat_id, chunk)
             except Exception as exc:  # noqa: BLE001
                 log.warning("senku.warm.delete_blip", code=code, error=str(exc))
 
@@ -844,7 +906,42 @@ class SenkuPublisher:
                 await self._c.redis.set(flag, "1", ex=30 * 24 * 3600)
         except Exception:  # noqa: BLE001
             pass
-        log.info("senku.warm.done", code=code, sent=len(sent_ids))
+        log.info("senku.warm.done", code=code, sent=len(sent_ids), via=via)
+
+    async def _warm_send(self, sender, chat_id: int, code: str,
+                         quotes: list[str], *, pace: bool) -> list[int]:
+        """Send the warm-up quotes via ``sender`` (userbot or bot). Returns the
+        message ids sent. When ``pace`` (bot path), sleep ~1s between sends and
+        honour FloodWait so the bot's channel rate-limit degrades gracefully
+        instead of erroring the whole warm-up out at message 20."""
+        import asyncio
+
+        from pyrogram.errors import FloodWait
+
+        sent_ids: list[int] = []
+        for text in quotes:
+            try:
+                m = await sender.send_message(
+                    chat_id, text, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                sent_ids.append(m.id)
+                if pace:
+                    await asyncio.sleep(1.1)  # stay under the bot's per-chat cap
+            except FloodWait as fw:
+                # Honour Telegram's requested wait, then continue (bot path).
+                wait = int(getattr(fw, "value", 0) or 0)
+                if wait and wait <= 60:
+                    await asyncio.sleep(wait + 1)
+                    continue
+                log.warning("senku.warm.flood", code=code,
+                            sent=len(sent_ids), wait=wait)
+                break
+            except Exception as exc:  # noqa: BLE001 — stop, delete what we have
+                log.warning("senku.warm.send_stopped", code=code,
+                            sent=len(sent_ids), error=str(exc))
+                break
+        return sent_ids
 
     async def _fetch_warm_texts(self, count: int) -> list[str]:
         """``count`` short throwaway strings for the global-search warm-up.
