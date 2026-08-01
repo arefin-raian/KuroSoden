@@ -1059,13 +1059,15 @@ class WatermarkStage(Stage):
                     venc += ["-qp", q]
             else:
                 # libx264 / libx265 share the CRF + word-preset + tune + psy-rd
-                # vocabulary. psy-rd is written x264-style; x265 splits it into a
-                # single float + a separate psy-rdoq, so the pair must be reshaped.
+                # vocabulary. psy-rd is written "<rd>:<trellis>". x264: the
+                # -x264-params string uses ':' as ITS separator, so the pair must
+                # be comma-joined ("psy-rd=1.0,0.15") or x264 mis-parses "0.15" as
+                # a bogus option. x265: splits into psy-rd + a separate psy-rdoq.
                 if encoder == "libx265":
                     psy_params = "psy-rd=1.0:psy-rdoq=0.15"
                     psy_flag = "-x265-params"
                 else:
-                    psy_params = "psy-rd=1.0:0.15"
+                    psy_params = "psy-rd=1.0,0.15"
                     psy_flag = "-x264-params"
                 venc += ["-crf", str(crf), "-preset", preset,
                          "-tune", "animation", psy_flag, psy_params]

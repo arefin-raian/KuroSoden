@@ -314,20 +314,27 @@ async def _encode(src: Path, out: Path, height: int | None, crf: int,
             if tune:
                 cmd += ["-tune", tune]
             if psy_rd:
-                # psy_rd is written x264-style as "<rd>:<trellis>". x264 takes
-                # that pair verbatim (psy-rd=1.0:0.15). x265 splits them into two
-                # keys — psy-rd is a single float and the trellis half is a
-                # separate psy-rdoq — so "1.0:0.15" → "psy-rd=1.0:psy-rdoq=0.15".
-                # Passing the x264 pair to x265 is rejected ("Error setting
-                # option x265-params to value psy-rd=1.0:0.15").
+                # psy_rd is written "<rd>:<trellis>" (e.g. "1.0:0.15").
+                #
+                # x264: the -x264-params STRING itself uses ':' as its option
+                # separator, so "psy-rd=1.0:0.15" is mis-parsed as two options —
+                # "psy-rd=1.0" and a bogus standalone "0.15" — which x264 rejects
+                # ("Error setting option x264-params to value psy-rd=1.0:0.15").
+                # x264's psy-rd sub-parser accepts a COMMA between its two floats,
+                # so inside -x264-params the pair must be "psy-rd=1.0,0.15".
+                #
+                # x265: splits the pair into two separate keys — psy-rd is a single
+                # float and the trellis half is a separate psy-rdoq — joined by the
+                # x265-params ':' separator: "psy-rd=1.0:psy-rdoq=0.15".
+                rd, _, trellis = psy_rd.partition(":")
                 if enc == "libx265":
-                    rd, _, rdoq = psy_rd.partition(":")
                     params = f"psy-rd={rd}"
-                    if rdoq:
-                        params += f":psy-rdoq={rdoq}"
+                    if trellis:
+                        params += f":psy-rdoq={trellis}"
                     cmd += ["-x265-params", params]
                 else:
-                    cmd += ["-x264-params", f"psy-rd={psy_rd}"]
+                    params = f"psy-rd={rd},{trellis}" if trellis else f"psy-rd={rd}"
+                    cmd += ["-x264-params", params]
         cmd += ["-pix_fmt", pix_fmt]
         if threads and threads > 0:
             cmd += ["-threads", str(threads)]
