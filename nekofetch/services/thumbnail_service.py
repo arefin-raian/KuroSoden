@@ -218,6 +218,28 @@ async def gather_thumbnail_fields(container: Any, title: str,
             anilist_score = round(_score * 10)
         synopsis = synopsis or (_a("synopsis") or "")
 
+    # ── Jikan (MyAnimeList) cache: last-resort fill for synopsis / score /
+    # genres when neither TMDB nor AniList supplied them. This is the read-side
+    # consumer of the prefetched jikan.json — without it the prefetch is dead
+    # weight. Cache-only (no live call); a hit logs jikan.cache.hit.
+    if anime_doc_id and (not synopsis or anilist_score is None or not genres):
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached_jikan
+
+            jk = await load_cached_jikan(container, anime_doc_id,
+                                         anime_doc_id=anime_doc_id)
+            if jk:
+                if not synopsis and jk.get("synopsis"):
+                    synopsis = jk["synopsis"]
+                if anilist_score is None and jk.get("score") is not None:
+                    # MAL score is 0-10; the ring wants 0-100.
+                    anilist_score = round(float(jk["score"]) * 10)
+                if not genres and jk.get("genres"):
+                    genres = [g.get("name") for g in jk["genres"]
+                              if isinstance(g, dict) and g.get("name")]
+        except Exception as exc:  # noqa: BLE001 — cache miss / shape drift
+            log.debug("thumbfields.jikan_cache.failed", error=str(exc))
+
     # Language label from what the title actually carries (see bot_factory):
     #   sub→Japanese, dub→English, dual→Japanese & English,
     #   multi→Japanese, English & Hindi. Union per-pack audio into one label.

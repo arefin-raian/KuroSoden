@@ -97,7 +97,7 @@ watermark:
   text: "@anixweebs"
   image_path: ""
   font: "hit-me-punk.01.ttf"    # font file under resources/fonts/ ("" = ffmpeg default)
-  corner: bottom_right          # top_left | top_right | bottom_left | bottom_right
+  corner: top_left              # top_left | top_right | bottom_left | bottom_right
   margin: 16                    # pixels from each frame edge (per corner)
   opacity: 0.55
   scale: 0.03                   # text: fraction of frame HEIGHT; image: of WIDTH

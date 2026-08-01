@@ -207,13 +207,28 @@ def _content_type_label(season: int | None, episode_count: int,
     return KIND_SPECIAL
 
 
+def _audio_str(audio) -> str | None:
+    """The audio enum's string value (``"sub"``/``"dub"``/``"dual"``…), or None.
+    Used to tag per-file progress snapshots so the card shows the audio badge."""
+    if audio is None:
+        return None
+    return audio.value if hasattr(audio, "value") else str(audio)
+
+
 async def _push_stage_progress(
     c, ctx: StageContext, stage_name: str, progress: float,
     *, file_index: int | None = None, file_total: int | None = None,
+    episode: int | None = None, season: int | None = None,
+    resolution: str | None = None, audio: str | None = None,
 ) -> None:
     """Push a ProgressSnapshot for the current processing stage so the log channel
     shows bars even during compression/watermarking. Falls back silently if Redis
-    is unavailable — cosmetic telemetry must never break the actual job."""
+    is unavailable — cosmetic telemetry must never break the actual job.
+
+    ``episode``/``season``/``resolution``/``audio`` tag the snapshot with the
+    CURRENT FILE's identity so per-file stages (encode, watermark) render an
+    episode header + transfer panel exactly like the per-episode download card,
+    instead of one anonymous batch bar."""
     store = getattr(c, "progress", None)
     if store is None:
         return
@@ -226,6 +241,10 @@ async def _push_stage_progress(
             stage=stage_name,
             episode_index=file_index,
             total_episodes=file_total,
+            current_episode=episode,
+            season=season,
+            resolution=resolution,
+            audio=audio,
         )
         await store.set(snap, ttl=600)
     except Exception:  # noqa: BLE001
@@ -968,6 +987,14 @@ class WatermarkStage(Stage):
             if not f.local_path:
                 continue
             src = Path(f.local_path)
+            # Tag the card with THIS file's identity + "file i of n" as we start
+            # it, so the watermark pass walks episode-by-episode like downloads.
+            await _push_stage_progress(
+                self.c, ctx, "Watermarking", 0.0,
+                file_index=i + 1, file_total=n,
+                episode=f.episode, season=f.season,
+                resolution=f.resolution, audio=_audio_str(f.audio),
+            )
             out = src.with_name(src.stem + ".wm" + src.suffix)
             flt, extra_inputs = self._filter(w)
             # Burning a watermark forces a video re-encode (including the 1080p
@@ -1005,13 +1032,32 @@ class WatermarkStage(Stage):
                 out.replace(src)  # swap in the watermarked file
             except OSError as exc:
                 ctx.notes.append(f"watermark swap failed: {exc}")
-            pct = ((i + 1) / n) * 100
-            await _push_stage_progress(self.c, ctx, "Watermarking", pct, file_index=i + 1, file_total=n)
+            pct = 100.0
+            await _push_stage_progress(
+                self.c, ctx, "Watermarking", pct,
+                file_index=i + 1, file_total=n,
+                episode=f.episode, season=f.season,
+                resolution=f.resolution, audio=_audio_str(f.audio),
+            )
 
 
 # Name of the shared poster thumbnail dropped in a request's work folder. The
 # uploader looks for this sibling and attaches it to every file in the pack.
 POSTER_THUMB_NAME = "poster.jpg"
+
+
+def _log_thumb_live_fallback(ctx: StageContext) -> None:
+    """Loud marker that the file thumbnail had to hit TMDB live — reached ONLY
+    when neither an AniList cover nor a cached TMDB poster was prefetched. The
+    operator wants file thumbnails on AniList posters, so any occurrence of this
+    log points at a prefetch gap (metadata folder missing / AniList had no
+    cover) rather than a normal code path."""
+    log.warning(
+        "thumbnail.tmdb.live_fallback",
+        code=getattr(ctx.request, "code", None),
+        anime=getattr(ctx.request, "anime_title", None),
+        hint="no prefetched AniList/TMDB cover — check metadata prefetch",
+    )
 
 
 class ThumbnailStage(Stage):
@@ -1056,18 +1102,30 @@ class ThumbnailStage(Stage):
 
             code = ctx.request.code
             anime_doc_id = _safe_anime_doc_id(ctx.request)
+            # 1: AniList cover FIRST — pass no ``kind`` so resolve_cached_cover
+            # returns an AniList cover (this entry's, else the root cover) and
+            # does NOT substitute a TMDB poster on an AniList miss. This is what
+            # keeps the file thumbnail on the AniList poster whenever ANY AniList
+            # cover was prefetched.
             cached = await resolve_cached_cover(
-                self.c, code, anilist_id=aid, kind="poster",
-                anime_doc_id=anime_doc_id,
+                self.c, code, anilist_id=aid, anime_doc_id=anime_doc_id,
             )
             if cached and await self._fit_thumb(cached, thumb):
-                ctx.notes.append("thumbnail: cached cover (prefetch)")
+                ctx.notes.append("thumbnail: AniList cover (prefetch)")
+                await _push_stage_progress(self.c, ctx, "Fetching Poster", 100.0)
+                return
+            # 2: cached TMDB poster — only reached when AniList had nothing.
+            cached_tmdb = await resolve_cached_cover(
+                self.c, code, kind="poster", anime_doc_id=anime_doc_id,
+            )
+            if cached_tmdb and await self._fit_thumb(cached_tmdb, thumb):
+                ctx.notes.append("thumbnail: cached TMDB poster (prefetch)")
                 await _push_stage_progress(self.c, ctx, "Fetching Poster", 100.0)
                 return
         except Exception as exc:  # noqa: BLE001 - cache miss → live path below
             ctx.notes.append(f"thumbnail: cache lookup failed ({exc})")
 
-        # ── 3: live TMDB (only reached on a full cache miss) ──
+        # ── 3: live TMDB (only reached on a full AniList + TMDB cache miss) ──
         poster_url = None
         try:
             poster_url = await self.c.tmdb.poster_for(ctx.request.anime_title)
@@ -1075,6 +1133,7 @@ class ThumbnailStage(Stage):
             ctx.notes.append(f"thumbnail: tmdb lookup failed ({exc})")
         if poster_url and await self._fit_thumb(poster_url, thumb):
             ctx.notes.append("thumbnail: TMDB poster (live)")
+            _log_thumb_live_fallback(ctx)
             await _push_stage_progress(self.c, ctx, "Fetching Poster", 100.0)
             return
 
@@ -1203,9 +1262,10 @@ class EncodeStage(Stage):
                 if label == src_res:
                     continue  # never "downscale" to the same tier
                 await _push_stage_progress(
-                    self.c, ctx, f"Encoding {label}",
-                    (done_units / total_units) * 100,
+                    self.c, ctx, f"Encoding {label}", 0.0,
                     file_index=i + 1, file_total=n,
+                    episode=f.episode, season=f.season, resolution=label,
+                    audio=_audio_str(f.audio),
                 )
                 out_stem = _swap_resolution(stem, src_res, label)
                 out_path = src.with_name(f"{out_stem}{src.suffix}")
@@ -1261,23 +1321,27 @@ class EncodeStage(Stage):
                 # can then switch to a different torrent rather than shipping an
                 # incomplete quality set.
                 last_exc: Exception | None = None
-                # Live heartbeat for THIS rendition: blend the units already done
-                # with the current encode's fraction so the bar climbs smoothly
-                # AND the snapshot TTL keeps refreshing through a long encode (the
-                # cause of the card going stale → falling back to "Downloading").
+                # Live heartbeat for THIS rendition: the bar shows the CURRENT
+                # file's own encode fraction (0→100 per file), tagged with its
+                # episode/resolution, so the card walks file-by-file like the
+                # download card instead of one batch-global bar. The 2s throttle
+                # also keeps the snapshot TTL fresh through a long encode (else
+                # the card goes stale → falls back to "Downloading").
                 _hb = {"t": 0.0}
+                _aud = _audio_str(f.audio)
 
-                async def _enc_progress(frac, _base=done_units):  # noqa: ANN001
+                async def _enc_progress(frac, _ep=f.episode, _sea=f.season,
+                                        _lab=label, _aud=_aud, _i=i):  # noqa: ANN001
                     import time as _t
                     now = _t.monotonic()
                     if now - _hb["t"] < 2.0:
                         return
                     _hb["t"] = now
-                    unit = _base + (frac if frac is not None else 0.0)
-                    pct = min(100.0, (unit / total_units) * 100)
+                    pct = min(100.0, max(0.0, (frac if frac is not None else 0.0) * 100))
                     await _push_stage_progress(
-                        self.c, ctx, f"Encoding {label}", pct,
-                        file_index=i + 1, file_total=n,
+                        self.c, ctx, f"Encoding {_lab}", pct,
+                        file_index=_i + 1, file_total=n,
+                        episode=_ep, season=_sea, resolution=_lab, audio=_aud,
                     )
 
                 for attempt in range(1, _ENCODE_MAX_ATTEMPTS + 1):
@@ -1339,8 +1403,10 @@ class EncodeStage(Stage):
                 if session is not None:
                     session.add(row)
             await _push_stage_progress(
-                self.c, ctx, "Encoding", (done_units / total_units) * 100,
+                self.c, ctx, "Encoding", 100.0,
                 file_index=i + 1, file_total=n,
+                episode=f.episode, season=f.season,
+                resolution=src_res, audio=_audio_str(f.audio),
             )
 
         # Make the renditions visible to STORE (and the storage uploader, which

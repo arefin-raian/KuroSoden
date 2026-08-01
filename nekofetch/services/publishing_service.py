@@ -596,6 +596,18 @@ class PublishingService:
                     continue
 
             try:
+                # Per-file identity so the upload card walks episode-by-episode
+                # (like the download card) instead of showing one pack-wide bar.
+                file_meta = [
+                    {
+                        "episode": i.get("episode"),
+                        "season": season,
+                        "resolution": resolution,
+                        "audio": (audio.value if hasattr(audio, "value") else audio),
+                        "title": title,
+                    }
+                    for i in items
+                ]
                 await storage.upload_pack(
                     pack_key,
                     title=title,
@@ -606,6 +618,7 @@ class PublishingService:
                     thumb=poster,
                     alt_titles=alt_titles,
                     on_progress=on_progress,
+                    file_meta=file_meta,
                 )
                 # Pack persisted → these files are safely in the channel.
                 uploaded_paths.update(i["path"] for i in items if i.get("path"))
@@ -756,6 +769,23 @@ class PublishingService:
                 ref = entry_posters.get(("id", eid))
             if ref is None and season is not None:
                 ref = entry_posters.get(("season", int(season)))
+        # STILL nothing → the ROOT AniList cover (first cached cover). This keeps
+        # every file thumbnail on an AniList poster even when a pack has no
+        # entry_id / season match, so we NEVER silently fall through to the
+        # shared TMDB poster.jpg just because the per-entry lookup missed.
+        if not ref and anime_doc_id:
+            try:
+                from nekofetch.services.metadata_prefetch import resolve_cached_cover
+
+                ref = await resolve_cached_cover(
+                    self._c, anime_doc_id, anime_doc_id=anime_doc_id,
+                )
+                if ref:
+                    _log.info("publish.pack_poster.root_fallback",
+                              anime=anime_doc_id, entry=eid, season=season)
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("publish.pack_poster.root_miss",
+                           anime=anime_doc_id, error=str(exc))
         if not ref:
             return None
 

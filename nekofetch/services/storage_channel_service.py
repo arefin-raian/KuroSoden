@@ -181,6 +181,7 @@ class StorageChannelService:
         thumb: Path | None = None,
         alt_titles: list[str] | None = None,
         on_progress=None,
+        file_meta: list[dict] | None = None,
     ) -> StoragePack:
         """Post header, upload files in order, post the end sticker; record the range.
 
@@ -190,8 +191,11 @@ class StorageChannelService:
         so the files show a proper cover in Telegram instead of a blank icon.
         ``alt_titles`` are AniList synonym/native strings the caption builder may
         fall back to when the full title overflows the 38-char line budget.
-        ``on_progress(done, total)`` (when present) receives live upload byte counts
-        for the whole pack, so ACTIVE TASKS can render an upload bar + speed."""
+        ``on_progress(done, total, meta)`` (when present) receives live upload byte
+        counts for the CURRENT FILE (not the pack), plus a ``meta`` dict tagging the
+        file's episode/resolution/audio + index — so ACTIVE TASKS renders a per-file
+        upload bar exactly like the per-episode download card. ``file_meta`` is a
+        parallel list (one dict per ``file_paths`` entry) supplying that identity."""
         client = self._client
         channel_id = self.cfg.channel_id
         thumb_arg = str(thumb) if thumb and thumb.exists() else None
@@ -203,25 +207,24 @@ class StorageChannelService:
                              content_type=content_type, season_part=key.season_part,
                              alt_titles=alt_titles),
         )
-        # Upload byte accounting across the whole pack so the progress bar reflects
-        # the pack, not each individual file resetting to 0.
-        sizes = [p.stat().st_size if p.exists() else 0 for p in file_paths]
-        pack_total = sum(sizes)
-        uploaded_before = 0
-
+        n_files = len(file_paths)
         file_ids: list[int] = []
         for idx, path in enumerate(file_paths):
+            # Per-file identity for the progress card (episode/resolution/audio +
+            # "file i of n"), so the upload walks file-by-file like the download.
+            meta = dict((file_meta or [{}] * n_files)[idx] or {})
+            meta.setdefault("file_index", idx + 1)
+            meta.setdefault("file_total", n_files)
             prog_cb = None
             if on_progress is not None:
-                base = uploaded_before
-
-                async def prog_cb(current, total, _base=base):  # noqa: ANN001
-                    await on_progress(_base + current, pack_total)
+                async def prog_cb(current, total, _meta=meta):  # noqa: ANN001
+                    # Report THIS file's own bytes (resets to 0 per file) — the
+                    # card shows the current episode's transfer, not a pack sum.
+                    await on_progress(current, total, _meta)
 
             sent = await client.send_document(
                 channel_id, str(path), thumb=thumb_arg, progress=prog_cb,
             )
-            uploaded_before += sizes[idx]
             file_ids.append(sent.id)
 
         end_id = file_ids[-1] if file_ids else header.id

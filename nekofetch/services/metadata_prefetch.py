@@ -281,6 +281,7 @@ class MetadataPrefetchService:
         """
         url = "https://api.jikan.moe/v4/anime"
         params = {"q": title, "limit": 1}
+        log.info("prefetch.jikan.start", title=title, anilist_id=anilist_id)
 
         async def _fetch() -> dict | None:
             try:
@@ -297,8 +298,12 @@ class MetadataPrefetchService:
                             await asyncio.sleep(1.5 * (attempt + 1))
                             continue
                         if r.status_code >= 400:
+                            log.warning("prefetch.jikan.http_error",
+                                        transport="curl_cffi", status=r.status_code)
                             return None
                         return r.json()
+                    log.warning("prefetch.jikan.gave_up",
+                                transport="curl_cffi", status=r.status_code)
                     return None
                 finally:
                     try:
@@ -306,6 +311,8 @@ class MetadataPrefetchService:
                     except Exception:  # noqa: BLE001
                         pass
             # Fallback: plain httpx (may 504 behind Cloudflare).
+            log.warning("prefetch.jikan.no_curl_cffi",
+                        hint="curl_cffi not installed — httpx may 504 behind Cloudflare")
             import httpx
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as cli:
                 for attempt in range(3):
@@ -315,6 +322,7 @@ class MetadataPrefetchService:
                         continue
                     r.raise_for_status()
                     return r.json()
+                log.warning("prefetch.jikan.gave_up", transport="httpx")
                 return None
 
         try:
@@ -324,8 +332,12 @@ class MetadataPrefetchService:
             return False
         data = (body or {}).get("data") or []
         if not data:
+            log.info("prefetch.jikan.empty", title=title)
             return False
-        await _write_json(out_dir / "jikan.json", {"query": title, "top": data[0]})
+        top = data[0]
+        await _write_json(out_dir / "jikan.json", {"query": title, "top": top})
+        log.info("prefetch.jikan.ok", title=title,
+                 mal_id=top.get("mal_id"), score=top.get("score"))
         return True
 
     # ── TMDB (metadata + all artwork, mirrored) ────────────────────────────────
@@ -610,3 +622,24 @@ async def load_cached_tmdb_assets(
         return None
     assets = blob.get(key)
     return assets if isinstance(assets, list) else None
+
+
+async def load_cached_jikan(
+    container: Container, code: str, *, anime_doc_id: str | None = None,
+) -> dict | None:
+    """Return the prefetched Jikan (MyAnimeList) top hit, or ``None`` on a miss.
+
+    Reads ``jikan.json`` (written at acceptance by ``_prefetch_jikan``) and
+    returns its ``top`` payload — the full MAL record for the best title match
+    (``synopsis``, ``score``, ``genres``, ``rating``, …). This is the read-side
+    consumer that makes the Jikan prefetch actually useful: callers use it as a
+    synopsis/score/genre fallback behind AniList + TMDB. A hit emits a visible
+    ``jikan.cache.hit`` log so the operator can confirm the cache is being used.
+    """
+    blob = await load_cached(container, code, "jikan", anime_doc_id=anime_doc_id)
+    top = (blob or {}).get("top") if blob else None
+    if top:
+        log.info("jikan.cache.hit", code=code,
+                 mal_id=top.get("mal_id"), score=top.get("score"))
+    return top or None
+

@@ -1553,24 +1553,43 @@ class DownloadWorker:
 
     def _upload_progress(self, job_id: int, title: str):
         """Rolling-window progress callback for the storage upload — same speed/ETA
-        treatment as downloads, tagged with the 'Uploading' stage."""
-        st = {"last": 0.0, "win_t": time.monotonic(), "win_done": 0}
+        treatment as downloads, tagged with the 'Uploading' stage.
 
-        async def on_progress(done: int, total: int) -> None:
+        ``meta`` (per current file) carries episode/season/resolution/audio +
+        file index/total, so the card renders a PER-FILE upload bar (episode
+        header + "File i / n") exactly like the per-episode download card,
+        instead of one flat pack-wide bar."""
+        st = {"last": 0.0, "win_t": time.monotonic(), "win_done": 0, "key": None}
+
+        async def on_progress(done: int, total: int, meta: dict | None = None) -> None:
             now = time.monotonic()
-            if now - st["last"] < 0.5:
+            meta = meta or {}
+            # Reset the rolling speed window whenever a new file starts (its bytes
+            # restart at 0), so speed/ETA reflect the current file, not a jump.
+            fkey = (meta.get("file_index"), meta.get("resolution"), meta.get("episode"))
+            if fkey != st["key"]:
+                st["key"] = fkey
+                st["win_t"], st["win_done"], st["last"] = now, 0, 0.0
+            if now - st["last"] < 0.5 and done < total:
                 return
             dt = max(now - st["win_t"], 1e-6)
             speed = max(done - st["win_done"], 0) / dt
             st["win_t"], st["win_done"], st["last"] = now, done, now
             pct = (done / total * 100) if total else 0.0
             eta = int((total - done) / speed) if speed > 0 else None
+            ep = meta.get("episode")
             if self._c.progress:
                 try:
                     await self._c.progress.set(ProgressSnapshot(
                         job_id=job_id, status=JobStatus.RUNNING.value, progress=pct,
                         speed_bps=speed, downloaded_bytes=done, total_bytes=total,
                         eta_seconds=eta, stage="Uploading", label=title,
+                        current_episode=int(ep) if ep is not None else None,
+                        season=meta.get("season"),
+                        resolution=meta.get("resolution"),
+                        audio=meta.get("audio"),
+                        episode_index=meta.get("file_index"),
+                        total_episodes=meta.get("file_total"),
                     ))
                 except Exception:  # noqa: BLE001
                     pass
