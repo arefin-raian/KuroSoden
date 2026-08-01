@@ -605,35 +605,39 @@ class PublishingService:
     async def _anilist_alt_titles(self, anime_doc_id: str) -> list[str]:
         """Shorter title candidates for the pack caption's fit-to-38 shortener.
 
-        Reads the prefetched ``anilist.json`` and returns the root media's
-        English / romaji / native names plus every synonym — the pool
-        :func:`~nekofetch.services.bot_naming.build_pack_caption` searches for a
-        shorter alternative title. Empty when the cache is absent."""
+        Sourced from the FRANCHISE ROOT (base series) — not the confirmed
+        installment — so a sequel request never seeds "Kisekoi 2" as the name.
+        Reads the prefetched ``anilist.json``: the ROOT entry's English / romaji /
+        titles, plus the search blob's synonyms, all filtered to English/Latin
+        script (no Filipino/Thai/Korean names). Empty when the cache is absent."""
         from nekofetch.core.logging import get_logger
         _log = get_logger(__name__)
         out: list[str] = []
         try:
+            from nekofetch.services.bot_naming import is_latin_script, root_titles
             from nekofetch.services.metadata_prefetch import load_cached
 
             blob = await load_cached(self._c, anime_doc_id, "anilist",
                                      anime_doc_id=anime_doc_id)
             if not blob:
                 return out
+            root = root_titles(blob)          # ROOT english/romaji/titles (Latin-only)
             search = blob.get("search") or {}
             seen: set[str] = set()
-            for key in ("english", "romaji"):
-                v = search.get(key)
-                if v and v not in seen:
+
+            def _add(v):
+                if v and is_latin_script(v) and v not in seen:
                     seen.add(v)
                     out.append(v)
-            for v in (search.get("titles") or []):
-                if v and v not in seen:
-                    seen.add(v)
-                    out.append(v)
+
+            _add(root.get("english"))
+            _add(root.get("romaji"))
+            for v in root.get("titles") or []:
+                _add(v)
+            # Synonyms are only cached for the confirmed media (root synonyms
+            # aren't walked) — still useful as extra SHORT candidates, Latin-only.
             for v in (search.get("synonyms") or []):
-                if v and v not in seen:
-                    seen.add(v)
-                    out.append(v)
+                _add(v)
         except Exception as exc:  # noqa: BLE001 — cache/parse issue → no alts
             _log.debug("publish.anilist_alt_titles.failed",
                        anime=anime_doc_id, error=str(exc))

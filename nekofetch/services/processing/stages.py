@@ -65,43 +65,47 @@ def _main_title(title: str) -> str:
 def _short_title(title: str, franchise_data: dict | None = None) -> str:
     """Return the shortest usable title for file naming.
 
-    Priority:
-      1. A synonym from ``franchise_data`` that is shorter than the original
-         title and at least 3 characters long.
-      2. The "main title" before a subtitle divider, when it's short enough to
-         stand on its own (e.g. "Tsukimichi: Moonlit Fantasy" → "Tsukimichi").
+    Titles up to 4 words are kept whole (operator rule: "up to four words is
+    fine"); 5+ words get shortened. Priority:
+      1. An English/Latin-script synonym from ``franchise_data`` that is shorter
+         than the original title and at least 3 characters long.
+      2. The "main title" before a subtitle divider, when ≤ 4 words
+         (e.g. "Tsukimichi: Moonlit Fantasy" → "Tsukimichi").
       3. An acronym generated from the title.
       4. The original title if all else fails.
     """
     if not title:
         return ""
 
-    # 1. Check AniList synonyms (stored in franchise_data)
+    # 1. Check AniList synonyms (stored in franchise_data) — English/Latin script
+    #    only (AniList mixes in Filipino/Thai/Korean synonyms we must never use).
     if franchise_data:
+        from nekofetch.services.bot_naming import is_latin_script
         synonyms = franchise_data.get("synonyms", [])
         if synonyms:
-            # Pick the shortest synonym that's still recognizable (>= 3 chars)
-            # and shorter than the original title.
+            # Pick the shortest synonym that's still recognizable (>= 3 chars),
+            # shorter than the original title, and written in English script.
             candidates = [
                 s for s in synonyms
-                if len(s) >= 3 and len(s) < len(title)
+                if len(s) >= 3 and len(s) < len(title) and is_latin_script(s)
             ]
             if candidates:
                 return min(candidates, key=len)
 
     # 2. Prefer the main title before a subtitle divider when it's concise
-    #    (<= 3 words). This handles the very common "Name: Tagline" pattern
+    #    (<= 4 words). This handles the very common "Name: Tagline" pattern
     #    without collapsing a genuinely multi-word name into an acronym.
     main = _main_title(title)
     if main != title:
         main_words = [w for w in re.split(r"[\s\-]+", main.strip()) if w]
-        if len(main_words) <= 3:
+        if len(main_words) <= 4:
             return main
 
-    # 3. For short titles (<= 3 words), keep the original — no acronym needed
+    # 3. For short titles (<= 4 words), keep the original — no acronym needed.
+    #    (Operator rule: up to four words is fine; five+ get shortened.)
     words = re.split(r"[\s\-]+", title.strip())
     words = [w for w in words if w]
-    if len(words) <= 3:
+    if len(words) <= 4:
         return title
 
     # 4. Long titles (> 3 words): shorten. Acronym the main title if we have a

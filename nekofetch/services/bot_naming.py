@@ -24,6 +24,89 @@ from nekofetch.domain.enums import AudioType
 _BOT_NAME_LIMIT = 64
 
 
+# Non-Latin script ranges (mirrors nekofetch.sources._normalize._SCRIPTS). A title
+# containing ANY of these is a foreign-script synonym (Japanese/Korean/Thai/…)
+# and must never be chosen for a caption or filename — English script only.
+_NON_LATIN = re.compile(
+    "["
+    "぀-ヿ"      # hiragana / katakana
+    "가-힣"      # hangul
+    "ऀ-ॿ"      # devanagari
+    "؀-ۿ"      # arabic
+    "֐-׿"      # hebrew
+    "฀-๿"      # thai
+    "Ѐ-ӿ"      # cyrillic
+    "一-鿿"      # CJK ideographs
+    "]"
+)
+
+
+def is_latin_script(s: str | None) -> bool:
+    """True when ``s`` is a usable English/Latin-script title.
+
+    Rejects any string carrying a non-Latin script character (the Filipino/Thai/
+    Korean/Japanese synonyms AniList mixes in). Empty/whitespace is not usable.
+    Latin-1 accents (é, ñ, â…) are fine — those are still English-readable names.
+    """
+    t = (s or "").strip()
+    if not t:
+        return False
+    return _NON_LATIN.search(t) is None
+
+
+def latin_only(titles) -> list[str]:
+    """Filter an iterable of titles to English/Latin-script ones (order-preserving)."""
+    return [t for t in (titles or []) if is_latin_script(t)]
+
+
+def root_titles(anilist_blob: dict | None, fallback_title: str = "") -> dict:
+    """Base-series titles from a prefetched ``anilist.json`` blob.
+
+    Names must derive from the franchise ROOT, not the operator-confirmed
+    installment (a sequel like "Kisekoi 2" would otherwise leak into filenames /
+    captions). The franchise walk tags the seed entry ``relation == "ROOT"``; we
+    read its ``english_title`` and ``titles`` ([english, romaji, native]).
+
+    Returns ``{"english", "romaji", "titles": [...]}`` — falling back to the
+    search blob, then ``fallback_title``, when no ROOT entry is cached. All
+    returned strings are guaranteed Latin-script (native is dropped if not).
+    """
+    blob = anilist_blob or {}
+    search = blob.get("search") or {}
+    walk = blob.get("franchise") or {}
+
+    english = romaji = ""
+    titles: list[str] = []
+
+    # 1. Prefer the ROOT franchise entry.
+    entries = walk.values() if isinstance(walk, dict) else (walk or [])
+    root = next((e for e in entries
+                 if isinstance(e, dict) and (e.get("relation") == "ROOT")), None)
+    if root:
+        rt = root.get("titles") or []
+        english = root.get("english_title") or (rt[0] if len(rt) > 0 else "")
+        romaji = rt[1] if len(rt) > 1 else ""
+        titles = list(rt)
+
+    # 2. Fall back to the confirmed-media search blob.
+    if not english:
+        english = search.get("english") or ""
+    if not romaji:
+        romaji = search.get("romaji") or ""
+    if not titles:
+        titles = list(search.get("titles") or [])
+
+    # 3. Last resort.
+    if not english and fallback_title:
+        english = fallback_title
+
+    return {
+        "english": english if is_latin_script(english) else "",
+        "romaji": romaji if is_latin_script(romaji) else "",
+        "titles": latin_only(titles),
+    }
+
+
 def audio_tag(audios: set) -> str:
     """The audio-type label for a set of available audio tracks.
 
@@ -314,13 +397,16 @@ def _season_tokens(season, season_part, content_type):
 
 
 def _shortest_alt(full_upper: str, alt_titles) -> str:
-    """The shortest alternative title strictly shorter than the full title.
+    """The shortest English-script alternative title strictly shorter than the
+    full title.
 
-    English & Japanese synonyms are preferred but any is acceptable; we simply
-    take the shortest usable one (the operator's 'the shortest one' rule).
+    Only Latin-script names are eligible (no Filipino/Thai/Korean synonyms); among
+    those we take the shortest usable one (the operator's 'shortest one' rule).
     Returns '' when no alt title actually helps."""
     best = ""
     for raw in alt_titles or []:
+        if not is_latin_script(raw):
+            continue
         alt = re.sub(r"\s+", " ", (raw or "").strip()).upper()
         if not alt or alt == full_upper:
             continue
