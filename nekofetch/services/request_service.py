@@ -441,20 +441,20 @@ class RequestService:
         except Exception:  # noqa: BLE001 — assignment table optional/absent
             pass
 
-    async def _prune_work_dir(self, code: str) -> None:
-        """Best-effort rmtree of a request's on-disk work folder + Redis flags."""
+    async def _prune_work_dir(self, folder: str | None) -> None:
+        """Best-effort rmtree of a request's on-disk work folder.
+
+        Takes the folder NAME directly (computed by the caller while the Request
+        row still exists) — by the time this runs the row is already deleted, so
+        re-deriving the folder from a DB lookup would find nothing and leak the
+        directory. ``metadata/`` is a sibling of ``work/`` and is never touched."""
+        if not folder:
+            return
         try:
             import shutil
-            from nekofetch.services.download_service import _safe_folder
-            folder = None
-            async with session_scope(self._c.pg_sessionmaker) as session:
-                req = await RequestRepository(session).get_by_code(code)
-                if req is not None:
-                    folder = _safe_folder(req)
-            if folder:
-                work_dir = self._c.env.storage_path / "work" / folder
-                if work_dir.exists():
-                    shutil.rmtree(work_dir, ignore_errors=True)
+            work_dir = self._c.env.storage_path / "work" / folder
+            if work_dir.exists():
+                shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:  # noqa: BLE001
             pass
 
@@ -496,13 +496,15 @@ class RequestService:
                 raise NotFound(code)
             title = req.anime_title or code
             user_id = req.user_id
+            from nekofetch.services.download_service import _safe_folder
+            work_folder = _safe_folder(req)  # compute BEFORE the row is deleted
             summary = await self._purge_request_rows(session, req)
             job_ids = summary["job_ids"]
             await self._clear_assignments(session, code)
             await session.delete(req)
             await session.flush()
 
-        await self._prune_work_dir(code)
+        await self._prune_work_dir(work_folder)
         await self._clear_job_flags(code, job_ids)
 
         # Notify the original requester (resolve their telegram id from the DB user).
@@ -545,6 +547,8 @@ class RequestService:
                 "franchise_data": req.franchise_data,
             }
             title = req.anime_title or code
+            from nekofetch.services.download_service import _safe_folder
+            work_folder = _safe_folder(req)  # compute BEFORE the row is deleted
             summary = await self._purge_request_rows(session, req)
             job_ids = summary["job_ids"]
             await self._clear_assignments(session, code)
@@ -576,7 +580,7 @@ class RequestService:
             await requests.add(new_req)
             await session.flush()
 
-        await self._prune_work_dir(code)
+        await self._prune_work_dir(work_folder)
         await self._clear_job_flags(code, job_ids)
 
         # Re-assign the download stage for the new ticket (fresh offer/duty).
