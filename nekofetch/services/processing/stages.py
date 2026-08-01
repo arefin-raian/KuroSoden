@@ -226,6 +226,31 @@ async def _push_stage_progress(
         await store.set(snap, ttl=600)
     except Exception:  # noqa: BLE001
         pass
+    # Also mirror the coarse stage NAME onto the job row so the dashboard has a
+    # truthful fallback if the Redis snapshot ever lapses (its TTL, an eviction,
+    # a Redis restart). Without this the fallback showed "Downloading 0%" for a
+    # job that was really mid-encode. Only write on a stage-NAME change — the
+    # per-second heartbeat must not hammer Postgres.
+    coarse = (stage_name or "").split()[0] if stage_name else ""
+    if coarse and _LAST_JOB_STAGE.get(ctx.job_id) != coarse:
+        _LAST_JOB_STAGE[ctx.job_id] = coarse
+        try:
+            from nekofetch.infrastructure.database.postgres.models import DownloadJob
+            from nekofetch.infrastructure.database.postgres.session import session_scope
+
+            async with session_scope(c.pg_sessionmaker) as session:
+                job = await session.get(DownloadJob, ctx.job_id)
+                if job is not None:
+                    state = dict(job.resume_state or {})
+                    state["stage"] = stage_name
+                    job.resume_state = state
+        except Exception:  # noqa: BLE001 — telemetry mirror, never fatal
+            pass
+
+
+# Per-job last coarse stage name written to the DB, so the heartbeat only
+# persists on an actual stage transition (not every progress tick).
+_LAST_JOB_STAGE: dict[int, str] = {}
 
 
 async def _run(*args: str) -> tuple[int, str]:
@@ -1172,11 +1197,31 @@ class EncodeStage(Stage):
                 # can then switch to a different torrent rather than shipping an
                 # incomplete quality set.
                 last_exc: Exception | None = None
+                # Live heartbeat for THIS rendition: blend the units already done
+                # with the current encode's fraction so the bar climbs smoothly
+                # AND the snapshot TTL keeps refreshing through a long encode (the
+                # cause of the card going stale → falling back to "Downloading").
+                _hb = {"t": 0.0}
+
+                async def _enc_progress(frac, _base=done_units):  # noqa: ANN001
+                    import time as _t
+                    now = _t.monotonic()
+                    if now - _hb["t"] < 2.0:
+                        return
+                    _hb["t"] = now
+                    unit = _base + (frac if frac is not None else 0.0)
+                    pct = min(100.0, (unit / total_units) * 100)
+                    await _push_stage_progress(
+                        self.c, ctx, f"Encoding {label}", pct,
+                        file_index=i + 1, file_total=n,
+                    )
+
                 for attempt in range(1, _ENCODE_MAX_ATTEMPTS + 1):
                     try:
                         await _encode(src, out_path, height,
                                       crf_map.get(height, 23), preset=preset,
-                                      threads=enc_threads, encoder=encoder)
+                                      threads=enc_threads, encoder=encoder,
+                                      on_progress=_enc_progress)
                         last_exc = None
                         break
                     except Exception as exc:  # noqa: BLE001

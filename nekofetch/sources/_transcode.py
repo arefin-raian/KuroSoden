@@ -136,7 +136,61 @@ def is_oversized_1080(size_bytes: int, duration_s: float) -> bool:
     return size_bytes > budget * OVERSIZE_FACTOR
 
 
-async def _run_ffmpeg(cmd: list[str]) -> None:
+async def _run_ffmpeg(cmd: list[str], *, on_progress=None,
+                      duration_s: float | None = None) -> None:
+    """Run an ffmpeg encode.
+
+    When ``on_progress`` is given, ``-progress pipe:1`` is appended and the
+    callback is invoked ``await on_progress(fraction)`` (0.0–1.0) roughly once a
+    second as ffmpeg reports ``out_time_us``. ``duration_s`` (the source length)
+    turns elapsed encode-time into a fraction; without it the callback still
+    fires with ``None`` so the caller can at least keep its heartbeat alive.
+    A callback error never aborts the encode — progress is cosmetic.
+    """
+    if on_progress is not None:
+        # Emit machine-readable progress on stdout; keep stderr for the error tail.
+        cmd = [cmd[0], *cmd[1:], "-progress", "pipe:1", "-nostats"] \
+            if "-progress" not in cmd else cmd
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+
+        async def _pump() -> None:
+            assert proc.stdout is not None
+            while True:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                line = raw.decode(errors="ignore").strip()
+                if not line.startswith("out_time_us=") and \
+                        not line.startswith("out_time_ms="):
+                    continue
+                try:
+                    micros = int(line.split("=", 1)[1])
+                except (ValueError, IndexError):
+                    continue
+                # out_time_ms is a misnomer in ffmpeg — it's microseconds too.
+                secs = micros / 1_000_000
+                frac = None
+                if duration_s and duration_s > 0:
+                    frac = max(0.0, min(1.0, secs / duration_s))
+                try:
+                    await on_progress(frac)
+                except Exception:  # noqa: BLE001 — progress must never break encode
+                    pass
+
+        pump_task = asyncio.ensure_future(_pump())
+        _, err = await proc.communicate()
+        pump_task.cancel()
+        try:
+            await pump_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg transcode failed: {err.decode(errors='replace')[-300:]}")
+        return
+
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
     )
@@ -160,7 +214,7 @@ async def _encode(src: Path, out: Path, height: int | None, crf: int,
                   preset: str = "fast", threads: int | None = None,
                   *, encoder: str = "libx264",
                   tune: str = "animation", psy_rd: str = "1.0:0.15",
-                  guard_inflation: bool = True) -> Path:
+                  guard_inflation: bool = True, on_progress=None) -> Path:
     """Re-encode video (CRF); copy ALL audio + subtitles + attachments.
 
     ``encoder`` is chosen per SOURCE codec by :func:`select_encoder` so we never
@@ -182,6 +236,10 @@ async def _encode(src: Path, out: Path, height: int | None, crf: int,
         what it came from.
 
     ``threads`` bounds CPU use per encode so parallel jobs don't thrash.
+
+    ``on_progress`` (when given) is awaited ~1×/sec with the encode fraction
+    (0.0–1.0) so a long encode keeps its live progress card fresh instead of
+    going stale mid-transcode.
     """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
@@ -189,6 +247,8 @@ async def _encode(src: Path, out: Path, height: int | None, crf: int,
 
     enc = encoder or "libx264"
     pix_fmt = _ENCODER_PIXFMT.get(enc, "yuv420p")
+    # Source length drives the progress fraction; probe once, best-effort.
+    dur_s = await probe_duration_s_async(src) if on_progress is not None else None
 
     def _build(crf_val: int) -> list[str]:
         cmd = [
@@ -229,7 +289,7 @@ async def _encode(src: Path, out: Path, height: int | None, crf: int,
         cmd += ["-map", "-0:d?", str(out)]
         return cmd
 
-    await _run_ffmpeg(_build(crf))
+    await _run_ffmpeg(_build(crf), on_progress=on_progress, duration_s=dur_s)
 
     # Inflation guard — only meaningful for a genuine downscale (a same-res
     # recompress is handled by the oversize path). If we somehow produced a file
@@ -243,7 +303,8 @@ async def _encode(src: Path, out: Path, height: int | None, crf: int,
         if src_sz and out_sz and out_sz >= src_sz:
             log.info("encode.inflation_retry", src_mb=round(src_sz / 1048576, 1),
                      out_mb=round(out_sz / 1048576, 1), crf=crf, retry_crf=crf + 3)
-            await _run_ffmpeg(_build(crf + 3))
+            await _run_ffmpeg(_build(crf + 3), on_progress=on_progress,
+                              duration_s=dur_s)
     return out
 
 

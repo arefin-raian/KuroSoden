@@ -77,6 +77,15 @@ class QueueService:
                 req = await RequestRepository(session).get(job.request_id)
                 # Prefer fast live progress from Redis when present.
                 snap = await self._c.progress.get(job.id) if self._c.progress else None
+                # Snapshot gone but job still RUNNING (TTL lapse / Redis restart):
+                # fall back to the last stage mirrored on the job row so the card
+                # keeps showing "Encoding"/"Uploading" instead of resetting to a
+                # bogus "Downloading 0%".
+                fallback_stage = None
+                if snap is None:
+                    st = job.status.value if isinstance(job.status, JobStatus) else job.status
+                    if str(st).upper() == "RUNNING":
+                        fallback_stage = (job.resume_state or {}).get("stage")
                 rows.append(
                     QueueRow(
                         job_id=job.id,
@@ -89,7 +98,7 @@ class QueueService:
                         current_episode=(snap.current_episode if snap else job.current_episode),
                         downloaded_bytes=(snap.downloaded_bytes if snap else job.downloaded_bytes),
                         total_bytes=(snap.total_bytes if snap else job.total_bytes),
-                        stage=(snap.stage if snap else None),
+                        stage=(snap.stage if snap else fallback_stage),
                         season=(snap.season if snap else None),
                         episode_index=(snap.episode_index if snap else None),
                         total_episodes=(snap.total_episodes if snap else None),
