@@ -88,12 +88,18 @@ async def _job_view(container: Container, job_id: int) -> dict | None:
         req = await session.get(Request, job.request_id)
         status = job.status.value if isinstance(job.status, JobStatus) else str(job.status)
         started = job.started_at
+        rs = job.resume_state or {}
         view = {
             "status": status,
             "title": (req.anime_title if req else "—"),
             "code": (req.code if req else ""),
             "started_ts": started.timestamp() if started else None,
-            "partial": bool((job.resume_state or {}).get("partial_failures")),
+            "partial": bool(rs.get("partial_failures")),
+            # Coarse stage mirrored onto the row by _push_stage_progress. This is
+            # the ONLY truthful stage source once the Redis snapshot's TTL lapses
+            # (a single long encode/watermark file can outlive it). Without this
+            # the card fell back to stage=None → "Downloading 0%" and froze.
+            "stage": rs.get("stage"),
         }
     snap = await container.progress.get(job_id) if container.progress else None
     if snap is not None:
@@ -200,8 +206,25 @@ async def _refresh_loop(client: Client, container: Container, job_id: int,
                         chat_id: int, msg_id: int) -> None:
     deadline = time.monotonic() + _MAX_LIFETIME
     last_text = ""
+    held = False
     while time.monotonic() < deadline:
         await asyncio.sleep(_REFRESH_CADENCE)
+
+        # While the naming/caption confirm cards own this message, stand down so
+        # we never repaint the live card over a confirm prompt. When the hold
+        # lifts, force one repaint (drop last_text) so the card returns to live.
+        if container.redis is not None:
+            try:
+                hold = await container.redis.get(f"nf:job:{job_id}:confirm_hold")
+            except Exception:  # noqa: BLE001
+                hold = None
+            if hold:
+                held = True
+                continue
+            if held:
+                held = False
+                last_text = ""  # ensure the next edit fires even if text matches
+
         try:
             view = await _job_view(container, job_id)
         except Exception as exc:  # noqa: BLE001

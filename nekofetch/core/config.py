@@ -290,6 +290,12 @@ class WatermarkConfig(BaseModel):
     # than a typical player's small corner mark). For an image watermark this is
     # a fraction of frame WIDTH (legacy meaning).
     scale: float = 0.03
+    # Fast burn: use a hardware H.264 encoder (NVENC/QSV/VAAPI) when the box has
+    # one, else libx264 — dramatically faster than re-encoding back to the
+    # source's HEVC/AV1 on CPU. A corner mark's quality is dominated by the
+    # source, so this trades a little 1080p size for a large wall-clock win.
+    # Set false to keep the slower codec-aware (source-matching) re-encode.
+    fast: bool = True
 
 
 class BrandingConfig(BaseModel):

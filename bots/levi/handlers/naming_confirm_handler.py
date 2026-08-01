@@ -124,6 +124,13 @@ def register(client: Client, container: Container) -> None:
         await _release(redis, job_id, kind, text)
         await _disarm_reply(redis, message.chat.id)
 
+        # The admin's edited value has been captured — delete their message so the
+        # chat stays clean (the single evolving card is the only surface we keep).
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001 — best-effort tidy
+            pass
+
         # Edit the confirm card in place so the admin sees their value took.
         ref = await safe_redis_get(redis, _card_key(job_id, kind),
                                    label="naming_confirm.cardref_read")

@@ -346,6 +346,11 @@ FIELD_DOCS: dict[str, FieldDoc] = {
         desc="Text watermark size as a fraction of frame HEIGHT (0.03 = 3%). "
              "For an image watermark it's a fraction of frame width.",
         example="0.03"),
+    "watermark.fast": FieldDoc(
+        desc="Fast watermark burn: use the quickest H.264 encoder available "
+             "(GPU NVENC/QSV/VAAPI if present, else libx264) instead of "
+             "re-encoding to the source's slower codec. Much faster; trades a "
+             "little 1080p size. Turn off for a codec-matching quality burn."),
 
     # ── branding ──────────────────────────────────────────────────────────────
     "branding.enabled": FieldDoc(

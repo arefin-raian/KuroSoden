@@ -87,7 +87,7 @@ class ProcessingPipeline:
 
             for stage in default_stages(self._c):
                 if not stage.enabled():
-                    note = f"{stage.stage.value}: skipped (disabled)"
+                    note = f"{stage.log_name}: skipped (disabled)"
                     ctx.notes.append(note)
                     continue
                 # Respect a Cancel that arrived between the download loop and
@@ -97,11 +97,14 @@ class ProcessingPipeline:
                 if await self._cancel_requested(job_id):
                     await self._finalize_cancelled(job_id, req)
                     raise _CancelJob()
-                log.info("processing.stage", job_id=job_id, stage=stage.stage.value)
+                # Use log_name (not stage.value) so Watermark — which shares the
+                # BRANDING enum with real Branding — reads "watermarking", not a
+                # second "branding" line.
+                log.info("processing.stage", job_id=job_id, stage=stage.log_name)
                 from nekofetch.services.log_channel_service import LogChannelService
 
                 await LogChannelService(self._c).event(
-                    "processing", stage.stage.value, job=job_id,
+                    "processing", stage.log_name, job=job_id,
                     anime=req.anime_title if req else None,
                 )
                 try:
@@ -112,10 +115,10 @@ class ProcessingPipeline:
                 except Exception as exc:  # noqa: BLE001
                     job.status = JobStatus.FAILED
                     await LogChannelService(self._c).event(
-                        "error", f"{stage.stage.value}_failed", job=job_id,
+                        "error", f"{stage.log_name}_failed", job=job_id,
                         error=str(exc)[:300],
                     )
-                    raise ProcessingError(f"{stage.stage.value}: {exc}") from exc
+                    raise ProcessingError(f"{stage.log_name}: {exc}") from exc
 
             # Processing done → READY. Uploading the verified packs to the storage
             # (database) channel happens automatically right after (see the worker);

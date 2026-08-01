@@ -268,6 +268,7 @@ class DownloadWorker:
             variants = await source.get_variants(episodes[0].source_ref)
             available = {v.resolution for v in variants}
         except Exception:
+            variants = []
             available = set()
         resolutions = self._resolutions_to_fetch(req, available)
         resolutions.sort(
@@ -278,10 +279,13 @@ class DownloadWorker:
 
         # Interactive naming/caption confirm (once per job, best-effort). Blocks
         # for the admin's Use-it/Edit reply with a 10-min timeout → default. Uses
-        # the smallest target tier + the primary audio for the example.
+        # the smallest target tier + the DETECTED audio for the example — the same
+        # `variants` the download loop resolves against, so the preview shows the
+        # real tag (e.g. "Dual" on a native dual-audio source) instead of the
+        # first *configured* language ("Dub").
         try:
             await self._run_naming_confirms(
-                job_id, req, resolutions, audios,
+                job_id, req, resolutions, audios, variants,
                 season=episodes[0].season if episodes else None,
             )
         except Exception as exc:  # noqa: BLE001 — confirm is a nicety, never fatal
@@ -756,12 +760,15 @@ class DownloadWorker:
         return f"nf:job:{job_id}:skip"
 
     async def _run_naming_confirms(self, job_id: int, req, resolutions: list[str],
-                                   audios, *, season: int | None) -> None:
+                                   audios, variants=None, *,
+                                   season: int | None) -> None:
         """Show the filename + caption confirm cards and persist the admin's
         choices onto the job's ``resume_state`` for RenameStage / the upload path.
 
         Best-effort and gated once-per-job by the confirm service. The admin chat
-        is the one the live progress card lives in (nf:job:{id}:progressmsg)."""
+        is the one the live progress card lives in (nf:job:{id}:progressmsg); the
+        confirm cards EVOLVE that same message (name → caption → back to the live
+        card) rather than spamming new messages."""
         from kurosoden.bots.levi.handlers.progress_monitor import _load_msg_ref
         from nekofetch.services import naming_confirm as nc
 
@@ -772,13 +779,37 @@ class DownloadWorker:
             return
         ref = await _load_msg_ref(self._c, job_id)
         chat_id = ref[0] if ref else None
+        msg_id = ref[1] if ref else None
         if chat_id is None:
             return  # no interactive surface — RenameStage uses its computed default
 
-        # Representative example: smallest tier, primary audio.
+        # Representative example: smallest tier, and the audio the download will
+        # ACTUALLY lay down. Resolve it the same way the download loop does
+        # (_resolve_audio_targets collapses SUB/DUB → DUAL_AUDIO on a native
+        # dual-audio source) so the preview never shows "Dub" for a dual file.
         smallest = resolutions[-1] if resolutions else "480p"
         audio = (list(audios)[0] if audios else None)
+        try:
+            resolved = self._resolve_audio_targets(
+                list(audios or []), variants or [], smallest)
+            if resolved:
+                audio = resolved[0]
+        except Exception:  # noqa: BLE001 — fall back to the first configured audio
+            pass
 
+        # Hold the live-card refresher off this message while the gates own it, so
+        # the download/idle card can't repaint over the confirm cards mid-review.
+        await self._set_confirm_hold(job_id, True)
+        try:
+            await self._run_naming_confirms_inner(
+                job_id, req, confirm, nc, chat_id, msg_id,
+                smallest=smallest, audio=audio, season=season)
+        finally:
+            await self._set_confirm_hold(job_id, False)
+
+    async def _run_naming_confirms_inner(self, job_id, req, confirm, nc,
+                                         chat_id, msg_id, *, smallest, audio,
+                                         season) -> None:
         # Pull the cached anilist blob once for the "usable names" block.
         blob = None
         try:
@@ -788,6 +819,12 @@ class DownloadWorker:
         except Exception:  # noqa: BLE001
             blob = None
         names = nc.usable_names(self._c, blob, req)
+        if not names:
+            # Distinguish "title genuinely has no English synonyms" from "the
+            # AniList blob never loaded" — the operator asked to see synonyms, so
+            # a miss here points at a prefetch gap worth checking.
+            log.info("download.naming_confirm.no_usable_names",
+                     job_id=job_id, code=req.code, had_blob=bool(blob))
         names_block = ""
         if names:
             names_block = "\n\n<b>Usable names</b>\n" + "\n".join(f"• <code>{n}</code>" for n in names)
@@ -804,13 +841,16 @@ class DownloadWorker:
         )
         chosen_name = await confirm.confirm(
             job_id, "name", default_text=example_name,
-            card_text=name_card, chat_id=chat_id)
+            card_text=name_card, chat_id=chat_id, msg_id=msg_id)
         if chosen_name and chosen_name != example_name:
+            # Only the TITLE is taken from an edit — season/episode/audio/
+            # resolution are ALWAYS re-derived per real file downstream, so a
+            # wrong audio/res typed into the example can never corrupt naming.
             parsed = nc.parse_filename_edit(chosen_name)
             if parsed.get("title"):
                 await self._merge_resume_state(job_id, {"name_title": parsed["title"]})
 
-        # ── caption gate ──
+        # ── caption gate ── (same message)
         example_cap = nc.build_example_caption(
             self._c, req, resolution=smallest, audio=audio, season=season,
             alt_titles=names)
@@ -823,7 +863,7 @@ class DownloadWorker:
         )
         chosen_cap = await confirm.confirm(
             job_id, "caption", default_text=example_cap,
-            card_text=cap_card, chat_id=chat_id)
+            card_text=cap_card, chat_id=chat_id, msg_id=msg_id)
         if chosen_cap and chosen_cap != example_cap:
             cap_title = nc.extract_caption_title(chosen_cap)
             if cap_title:
@@ -838,6 +878,25 @@ class DownloadWorker:
                 state = dict(job.resume_state or {})
                 state.update(patch)
                 job.resume_state = state
+
+    async def _set_confirm_hold(self, job_id: int, on: bool) -> None:
+        """Pause/resume the live progress-card refresher while the naming/caption
+        confirm cards own that message. The refresh loop checks this flag and
+        skips its edit while set, so the download/idle card can't repaint over a
+        confirm card. TTL a little over the two 10-min gates so a crashed worker
+        can't wedge the card forever."""
+        redis = self._c.redis
+        if redis is None:
+            return
+        key = f"nf:job:{job_id}:confirm_hold"
+        try:
+            if on:
+                await safe_redis_set(redis, key, "1", label="confirm_hold.on",
+                                     ex=25 * 60)
+            else:
+                await safe_redis_delete(redis, key, label="confirm_hold.off")
+        except Exception:  # noqa: BLE001 — cosmetic coordination, never fatal
+            pass
 
     async def _control_flags(self, job_id: int) -> tuple[bool, bool, bool]:
         """Read cancel / source-abort / skip in ONE Redis round-trip.

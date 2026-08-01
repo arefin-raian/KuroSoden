@@ -111,6 +111,40 @@ def _encoder_available(ffmpeg: str, encoder: str) -> bool:
         return False
 
 
+# H.264 hardware encoders, fastest/most-common first. A watermark burn is a full
+# re-encode of the whole file; on a box with any of these, it runs many times
+# faster than software x264/x265 — and a corner mark's quality is dominated by
+# the source, so H.264 output is an easy trade for the wall-clock win.
+_HW_H264_ENCODERS = ("h264_nvenc", "h264_qsv", "h264_vaapi", "h264_amf")
+
+_HW_ENCODER_CACHE: dict[str, str] = {}
+
+
+async def select_fast_encoder(ffmpeg: str) -> str:
+    """Pick the FASTEST available H.264 encoder for a re-encode where speed beats
+    codec efficiency (the watermark burn). Prefers a hardware encoder when the
+    build/box has one; falls back to ``libx264``. Result is cached per ffmpeg
+    path (encoder availability doesn't change at runtime).
+
+    NOTE: hardware encoders take *encoder-specific* rate-control flags, so the
+    caller must branch on the returned name (e.g. NVENC uses ``-cq`` not ``-crf``,
+    VAAPI needs a ``hwupload`` filter). When unsure, callers can treat anything
+    other than ``libx264`` as "hardware" and use its documented flags."""
+    if not ffmpeg:
+        return "libx264"
+    if ffmpeg in _HW_ENCODER_CACHE:
+        return _HW_ENCODER_CACHE[ffmpeg]
+    chosen = "libx264"
+    for enc in _HW_H264_ENCODERS:
+        if await asyncio.to_thread(_encoder_available, ffmpeg, enc):
+            chosen = enc
+            break
+    _HW_ENCODER_CACHE[ffmpeg] = chosen
+    if chosen != "libx264":
+        log.info("encode.fast_encoder.selected", encoder=chosen)
+    return chosen
+
+
 async def select_encoder(src: Path, ffmpeg: str) -> str:
     """Pick the derive-encoder for ``src`` from its codec, honouring availability.
 

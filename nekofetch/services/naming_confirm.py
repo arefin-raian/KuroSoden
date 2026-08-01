@@ -251,13 +251,18 @@ class NamingConfirm:
 
     async def confirm(
         self, job_id: int, kind: str, *, default_text: str,
-        card_text: str, chat_id: int | None,
+        card_text: str, chat_id: int | None, msg_id: int | None = None,
     ) -> str:
         """Show the confirm card and block until the admin answers or the timeout.
 
         Returns the admin's edited text, or ``default_text`` on Use-it / timeout /
         any infrastructure gap. Fires once per (job, kind); subsequent calls
         short-circuit to the default (already confirmed).
+
+        When ``msg_id`` is given (the live progress-card message), the confirm
+        card EVOLVES that message in place — name gate → caption gate → back to
+        the live card — so the flow is one message, never three. Only when no
+        such message exists do we send a fresh one.
         """
         if await self.already_confirmed(job_id, kind):
             return default_text
@@ -286,21 +291,32 @@ class NamingConfirm:
             InlineKeyboardButton("✅ Use it", callback_data=cb("levi", "nmuse", job_id, kind)),
             InlineKeyboardButton("✏️ Edit", callback_data=cb("levi", "nmedit", job_id, kind)),
         ]])
-        card = None
-        try:
-            card = await levi.send_message(
-                chat_id, card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        except Exception as exc:  # noqa: BLE001 — can't show card → use default
-            log.warning("naming_confirm.card_failed", job=job_id, kind=kind, error=str(exc))
-            await self._cleanup(job_id, kind, chat_id)
-            await self._mark_confirmed(job_id, kind)
-            return default_text
+        card_id = None
+        # Prefer evolving the live progress-card message in place.
+        if msg_id is not None:
+            try:
+                await levi.edit_message_text(
+                    chat_id, msg_id, card_text, parse_mode=ParseMode.HTML,
+                    reply_markup=kb)
+                card_id = msg_id
+            except Exception as exc:  # noqa: BLE001 — fall through to send-new
+                log.debug("naming_confirm.edit_inplace_failed",
+                          job=job_id, kind=kind, error=str(exc))
+        if card_id is None:
+            try:
+                sent = await levi.send_message(
+                    chat_id, card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+                card_id = sent.id
+            except Exception as exc:  # noqa: BLE001 — can't show card → use default
+                log.warning("naming_confirm.card_failed", job=job_id, kind=kind, error=str(exc))
+                await self._cleanup(job_id, kind, chat_id)
+                await self._mark_confirmed(job_id, kind)
+                return default_text
         # Stash the card ref so the handler edits THIS message in place.
-        if card is not None:
-            await safe_redis_set(
-                redis, f"nf:job:{job_id}:{kind}_card",
-                f"{chat_id}:{card.id}", label="naming_confirm.cardref",
-                ex=_CONFIRM_TIMEOUT_S + 60)
+        await safe_redis_set(
+            redis, f"nf:job:{job_id}:{kind}_card",
+            f"{chat_id}:{card_id}", label="naming_confirm.cardref",
+            ex=_CONFIRM_TIMEOUT_S + 60)
 
         # ── block-poll the awaiting flag ──
         loops = int(_CONFIRM_TIMEOUT_S / _POLL_INTERVAL_S)
@@ -320,7 +336,7 @@ class NamingConfirm:
             log.info("naming_confirm.timeout", job=job_id, kind=kind)
             try:
                 await levi.edit_message_text(
-                    chat_id, card.id,
+                    chat_id, card_id,
                     card_text + "\n\n<i>No response — using the default.</i>",
                     parse_mode=ParseMode.HTML)
             except Exception:  # noqa: BLE001

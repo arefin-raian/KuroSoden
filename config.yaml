@@ -101,6 +101,7 @@ watermark:
   margin: 16                    # pixels from each frame edge (per corner)
   opacity: 0.55
   scale: 0.03                   # text: fraction of frame HEIGHT; image: of WIDTH
+  fast: true                    # true = fastest H.264 (hw NVENC/QSV/VAAPI, else x264); false = codec-aware (slower, source-matching)
 
 # Branding applied to files & footers.
 branding:

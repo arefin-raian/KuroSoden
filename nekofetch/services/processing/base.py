@@ -28,6 +28,14 @@ class Stage(ABC):
     def __init__(self, container: Container) -> None:
         self.c = container
 
+    @property
+    def log_name(self) -> str:
+        """Human/telemetry label for this stage. Defaults to the enum value, but
+        stages that SHARE a :class:`ProcessingStage` (e.g. Branding + Watermark
+        both map to ``BRANDING``) override it so the activity log and the live
+        card don't show the same word twice for two different operations."""
+        return self.stage.value
+
     @abstractmethod
     def enabled(self) -> bool:
         """Whether this stage runs, per configuration toggles."""

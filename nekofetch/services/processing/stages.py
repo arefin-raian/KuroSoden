@@ -931,6 +931,12 @@ class WatermarkStage(Stage):
 
     stage = ProcessingStage.BRANDING
 
+    # Shares the BRANDING enum with BrandingStage but is a DIFFERENT operation —
+    # give it its own label so logs/events/the live card read "watermarking".
+    @property
+    def log_name(self) -> str:
+        return "watermarking"
+
     def enabled(self) -> bool:
         return self.c.config.watermark.enabled
 
@@ -973,14 +979,28 @@ class WatermarkStage(Stage):
     async def process(self, ctx: StageContext) -> None:
         from nekofetch.sources._hls import find_ffmpeg
         from nekofetch.sources._transcode import (
-            _ENCODER_PIXFMT, _svtav1_preset, select_encoder,
+            _ENCODER_PIXFMT, _run_ffmpeg, _svtav1_preset, probe_duration_s_async,
+            select_encoder, select_fast_encoder,
         )
 
         w = self.c.config.watermark
         ffmpeg = find_ffmpeg()
-        preset = getattr(self.c.config.processing, "encode_preset", "fast")
+        # A watermark burn is a full re-encode. Keep it FAST — a corner mark's
+        # quality is dominated by the source, so a quicker preset costs nothing
+        # visible but saves large wall-clock. Config wins; floor at "faster".
+        preset = getattr(self.c.config.processing, "encode_preset", "faster") or "faster"
         crf = (getattr(self.c.config.processing, "encode_crf", None)
                or {}).get(1080, 21)
+        # Fair CPU slice so N admins can watermark at once without thrashing:
+        # cores / concurrent-jobs, floor 2. Config override wins.
+        import os as _os
+        _cfg_threads = getattr(self.c.config.processing, "encode_threads", 0)
+        if _cfg_threads and _cfg_threads > 0:
+            wm_threads = _cfg_threads
+        else:
+            cores = _os.cpu_count() or 4
+            jobs = max(1, getattr(self.c.config.downloads, "concurrent_downloads", 5))
+            wm_threads = max(2, cores // jobs)
         n = len(ctx.files)
         await _push_stage_progress(self.c, ctx, "Watermarking", 0.0, file_index=0, file_total=n)
         for i, f in enumerate(ctx.files):
@@ -997,21 +1017,37 @@ class WatermarkStage(Stage):
             )
             out = src.with_name(src.stem + ".wm" + src.suffix)
             flt, extra_inputs = self._filter(w)
-            # Burning a watermark forces a video re-encode (including the 1080p
-            # source tier). Do it with the SAME codec-aware, tuned settings as
-            # EncodeStage so the watermarked file stays small + high quality
-            # instead of ffmpeg's bloated defaults. Preserve the source codec.
-            encoder = (await select_encoder(src, ffmpeg)) if ffmpeg else "libx264"
+            # Burning a watermark forces a full video re-encode. Two paths:
+            #   • fast (default): fastest H.264 encoder available — a hardware
+            #     encoder (NVENC/QSV/VAAPI) if the box has one, else libx264. Far
+            #     quicker than re-encoding an HEVC/AV1 source back to its own slow
+            #     software codec; a corner mark's quality rides on the source.
+            #   • quality: the codec-aware (source-matching) encoder, as before.
+            if getattr(w, "fast", True):
+                encoder = (await select_fast_encoder(ffmpeg)) if ffmpeg else "libx264"
+            else:
+                encoder = (await select_encoder(src, ffmpeg)) if ffmpeg else "libx264"
             pix_fmt = _ENCODER_PIXFMT.get(encoder, "yuv420p")
             venc: list[str] = ["-c:v", encoder]
             if encoder == "libsvtav1":
                 venc += ["-crf", str(crf), "-preset", str(_svtav1_preset(preset)),
                          "-svtav1-params", "tune=0:film-grain=0"]
+            elif encoder in ("h264_nvenc", "h264_qsv", "h264_vaapi", "h264_amf"):
+                # Hardware H.264: rate-control flags differ from libx264's -crf.
+                # NVENC/AMF use -cq, QSV uses -global_quality, VAAPI uses -qp.
+                # None take -tune animation / x264-params (software-only), so keep
+                # the command minimal — the hardware ASIC handles quality/speed.
+                q = str(crf)
+                if encoder in ("h264_nvenc", "h264_amf"):
+                    venc += ["-preset", "p4", "-cq", q]
+                elif encoder == "h264_qsv":
+                    venc += ["-global_quality", q]
+                else:  # h264_vaapi
+                    venc += ["-qp", q]
             else:
-                # psy-rd differs between codecs: x264 takes "<rd>:<trellis>" as
-                # one value (psy-rd=1.0:0.15); x265 splits it into psy-rd (single
-                # float) + a separate psy-rdoq. Feeding the x264 pair to x265 is
-                # rejected ("Error setting option x265-params to value ...").
+                # libx264 / libx265 share the CRF + word-preset + tune + psy-rd
+                # vocabulary. psy-rd is written x264-style; x265 splits it into a
+                # single float + a separate psy-rdoq, so the pair must be reshaped.
                 if encoder == "libx265":
                     psy_params = "psy-rd=1.0:psy-rdoq=0.15"
                     psy_flag = "-x265-params"
@@ -1020,21 +1056,47 @@ class WatermarkStage(Stage):
                     psy_flag = "-x264-params"
                 venc += ["-crf", str(crf), "-preset", preset,
                          "-tune", "animation", psy_flag, psy_params]
-            venc += ["-pix_fmt", pix_fmt]
-            args = ["ffmpeg", "-y", "-i", str(src), *extra_inputs,
+            venc += ["-pix_fmt", pix_fmt, "-threads", str(wm_threads)]
+            args = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+                    *extra_inputs,
                     "-filter_complex" if extra_inputs else "-vf", flt,
                     *venc, "-c:a", "copy", str(out)]
-            rc, err = await _run(*args)
-            if rc != 0:
-                ctx.notes.append(f"watermark: {err.strip() or 'ffmpeg unavailable'}")
+
+            # Live per-file heartbeat: stream ffmpeg's -progress so THIS file's
+            # own 0→100 fraction drives the bar (like the download/encode cards)
+            # AND the snapshot TTL stays fresh through a long burn — without this
+            # a single >10-min file let the snapshot lapse and the card froze on
+            # "Downloading 0%". Throttled to ~2s.
+            dur_s = await probe_duration_s_async(src)
+            _hb = {"t": 0.0}
+
+            async def _wm_progress(frac, _ep=f.episode, _sea=f.season,
+                                   _res=f.resolution, _aud=_audio_str(f.audio),
+                                   _i=i):  # noqa: ANN001
+                import time as _t
+                now = _t.monotonic()
+                if now - _hb["t"] < 2.0:
+                    return
+                _hb["t"] = now
+                pct = min(99.0, max(0.0, (frac if frac is not None else 0.0) * 100))
+                await _push_stage_progress(
+                    self.c, ctx, "Watermarking", pct,
+                    file_index=_i + 1, file_total=n,
+                    episode=_ep, season=_sea, resolution=_res, audio=_aud,
+                )
+
+            try:
+                await _run_ffmpeg(args, on_progress=_wm_progress, duration_s=dur_s)
+            except Exception as exc:  # noqa: BLE001 — note + skip this file
+                ctx.notes.append(f"watermark: {str(exc)[:200] or 'ffmpeg unavailable'}")
+                out.unlink(missing_ok=True)
                 continue
             try:
                 out.replace(src)  # swap in the watermarked file
             except OSError as exc:
                 ctx.notes.append(f"watermark swap failed: {exc}")
-            pct = 100.0
             await _push_stage_progress(
-                self.c, ctx, "Watermarking", pct,
+                self.c, ctx, "Watermarking", 100.0,
                 file_index=i + 1, file_total=n,
                 episode=f.episode, season=f.season,
                 resolution=f.resolution, audio=_audio_str(f.audio),
