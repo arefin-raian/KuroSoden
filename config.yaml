@@ -92,11 +92,11 @@ thumbnail:
 
 # Optional watermark stage (off by default). type: text | image.
 watermark:
-  enabled: false
+  enabled: true
   type: text
-  text: "Anime Weebs"
+  text: "@anixweebs"
   image_path: ""
-  font: ""                      # font file under resources/fonts/ ("" = ffmpeg default)
+  font: "hit-me-punk.01.ttf"    # font file under resources/fonts/ ("" = ffmpeg default)
   corner: bottom_right          # top_left | top_right | bottom_left | bottom_right
   margin: 16                    # pixels from each frame edge (per corner)
   opacity: 0.55
