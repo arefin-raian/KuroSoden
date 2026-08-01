@@ -1041,6 +1041,16 @@ class WatermarkStage(Stage):
             else:
                 encoder = (await select_encoder(src, ffmpeg)) if ffmpeg else "libx264"
             pix_fmt = _ENCODER_PIXFMT.get(encoder, "yuv420p")
+            hw_h264 = encoder in ("h264_nvenc", "h264_qsv", "h264_vaapi", "h264_amf")
+            # h264_nvenc/qsv/vaapi/amf are 8-bit H.264 only — they CANNOT ingest a
+            # 10-bit surface (anime sources are routinely 10-bit HEVC). Feeding one
+            # in fails at encoder init (~instant), which reads in the log as
+            # "watermarking never happened" (stage flips to thumbnail in ~2s). So
+            # for a hardware H.264 encode force 8-bit output AND append
+            # format=yuv420p to the filter chain so frames are downconverted before
+            # they reach the encoder.
+            if hw_h264:
+                pix_fmt = "yuv420p"
             venc: list[str] = ["-c:v", encoder]
             if encoder == "libsvtav1":
                 venc += ["-crf", str(crf), "-preset", str(_svtav1_preset(preset)),
@@ -1071,10 +1081,20 @@ class WatermarkStage(Stage):
                     psy_flag = "-x264-params"
                 venc += ["-crf", str(crf), "-preset", preset,
                          "-tune", "animation", psy_flag, psy_params]
-            venc += ["-pix_fmt", pix_fmt, "-threads", str(wm_threads)]
+            venc += ["-pix_fmt", pix_fmt]
+            # -threads is a software-x264/x265 knob; hardware encoders ignore it
+            # (the ASIC runs its own pipeline), so only pass it on the SW path.
+            if not hw_h264 and encoder != "libsvtav1":
+                venc += ["-threads", str(wm_threads)]
+            # Hardware H.264 can't take a 10-bit surface — pin the filter output to
+            # 8-bit yuv420p right before the encoder (works for both the -vf text
+            # path and the -filter_complex image-overlay path, which ends at [0:v]
+            # /the overlay label; a trailing ",format=..." on the last filter is
+            # valid in either).
+            flt_final = f"{flt},format=yuv420p" if hw_h264 else flt
             args = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
                     *extra_inputs,
-                    "-filter_complex" if extra_inputs else "-vf", flt,
+                    "-filter_complex" if extra_inputs else "-vf", flt_final,
                     *venc, "-c:a", "copy", str(out)]
 
             # Live per-file heartbeat: stream ffmpeg's -progress so THIS file's
@@ -1103,6 +1123,17 @@ class WatermarkStage(Stage):
             try:
                 await _run_ffmpeg(args, on_progress=_wm_progress, duration_s=dur_s)
             except Exception as exc:  # noqa: BLE001 — note + skip this file
+                # LOUD: a silently-skipped watermark looks like "watermarking
+                # never happened" in the log (stage flips straight to thumbnail).
+                # Surface the real ffmpeg error tail + the exact command so the
+                # cause (bad filter, NVENC flag, missing font) is diagnosable.
+                log.warning(
+                    "watermark.file_failed",
+                    job_id=getattr(ctx, "job_id", None),
+                    file=src.name, encoder=encoder,
+                    error=str(exc)[:400],
+                    cmd=" ".join(args),
+                )
                 ctx.notes.append(f"watermark: {str(exc)[:200] or 'ffmpeg unavailable'}")
                 out.unlink(missing_ok=True)
                 continue
