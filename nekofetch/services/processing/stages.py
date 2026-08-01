@@ -507,15 +507,35 @@ class RenameStage(Stage):
     def enabled(self) -> bool:
         return self.c.config.rename.enabled
 
+    async def _confirmed_name_title(self, job_id: int) -> str:
+        """The admin-confirmed title override for this job, if any (set by the
+        pre-rename confirm card into DownloadJob.resume_state["name_title"])."""
+        try:
+            from nekofetch.infrastructure.database.postgres.models import DownloadJob
+            from nekofetch.infrastructure.database.postgres.session import session_scope
+            async with session_scope(self.c.pg_sessionmaker) as session:
+                job = await session.get(DownloadJob, job_id)
+                if job is not None:
+                    return (job.resume_state or {}).get("name_title") or ""
+        except Exception:  # noqa: BLE001 — override is optional
+            pass
+        return ""
+
     async def process(self, ctx: StageContext) -> None:
         branding = BrandingService(self.c)
         cfg = self.c.config.rename
         n = len(ctx.files)
         await _push_stage_progress(self.c, ctx, "Renaming", 0.0, file_index=0, file_total=n)
 
-        # Pre-compute short title from AniList synonyms or acronym fallback
+        # Pre-compute short title from AniList synonyms or acronym fallback.
+        # An admin-confirmed filename override (from the pre-rename confirm card)
+        # replaces the title verbatim — the operator edited the example, so honour
+        # their exact title for every file's name.
         anime_title = ctx.request.anime_title
         franchise_data = ctx.request.franchise_data or {}
+        override_title = await self._confirmed_name_title(ctx.job_id)
+        if override_title:
+            anime_title = override_title
         short_title = _short_title(anime_title, franchise_data)
 
         # Pre-compute total episodes per season for dynamic padding AND for the

@@ -117,6 +117,22 @@ class PublishingService:
             from nekofetch.services.download_service import _safe_anime_doc_id
             anime_doc_id = _safe_anime_doc_id(req)
             title = req.anime_title
+            # An admin-confirmed caption title (from the pre-upload confirm card)
+            # overrides the pack caption's title line for this request. Line 2 of
+            # the caption (resolution/audio) is always auto-derived per pack, so we
+            # only override the TITLE stem. Best-effort: any job for this request
+            # that recorded a ``caption_title`` in its resume_state wins.
+            try:
+                jobs = (await session.execute(
+                    select(DownloadJob).where(DownloadJob.request_id == req.id)
+                )).scalars().all()
+                for j in jobs:
+                    ct = (j.resume_state or {}).get("caption_title")
+                    if ct:
+                        title = ct
+                        break
+            except Exception:  # noqa: BLE001 — override is optional
+                pass
             # Extract the AniList entry ID from franchise_data so storage packs
             # track which specific entry (season/movie/OVA) the files belong to.
             # ``anilist_id`` is stored as a STRING at the request-creation sites

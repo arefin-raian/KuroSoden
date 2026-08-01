@@ -82,6 +82,16 @@ def register_all(client: Client, container: Container) -> None:
 
     register_progress(client, container)
 
+    # ── Interactive filename / caption confirm gate (worker ↔ bot) ─────────
+    # The headless download worker posts a confirm card and blocks; this handler
+    # consumes the admin's Use-it / Edit answer and releases the worker. Its
+    # text consumer sits in group=13 so it never collides with review's group=12.
+    from kurosoden.bots.levi.handlers.naming_confirm_handler import (
+        register as register_naming_confirm,
+    )
+
+    register_naming_confirm(client, container)
+
     # Expose the spawn hook on the container so the shared review enqueue path
     # can raise a live card without importing a Levi module directly.
     async def _spawn_card(job_id: int, chat_id: int) -> None:

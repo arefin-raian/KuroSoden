@@ -276,6 +276,17 @@ class DownloadWorker:
 
         all_failed: list[dict] = []
 
+        # Interactive naming/caption confirm (once per job, best-effort). Blocks
+        # for the admin's Use-it/Edit reply with a 10-min timeout → default. Uses
+        # the smallest target tier + the primary audio for the example.
+        try:
+            await self._run_naming_confirms(
+                job_id, req, resolutions, audios,
+                season=episodes[0].season if episodes else None,
+            )
+        except Exception as exc:  # noqa: BLE001 — confirm is a nicety, never fatal
+            log.debug("download.naming_confirm.skipped", job_id=job_id, error=str(exc))
+
         try:
             for resolution in resolutions:
                 if await self._source_abort_requested(job_id):
@@ -743,6 +754,90 @@ class DownloadWorker:
     @staticmethod
     def _skip_key(job_id: int) -> str:
         return f"nf:job:{job_id}:skip"
+
+    async def _run_naming_confirms(self, job_id: int, req, resolutions: list[str],
+                                   audios, *, season: int | None) -> None:
+        """Show the filename + caption confirm cards and persist the admin's
+        choices onto the job's ``resume_state`` for RenameStage / the upload path.
+
+        Best-effort and gated once-per-job by the confirm service. The admin chat
+        is the one the live progress card lives in (nf:job:{id}:progressmsg)."""
+        from kurosoden.bots.levi.handlers.progress_monitor import _load_msg_ref
+        from nekofetch.services import naming_confirm as nc
+
+        confirm = nc.NamingConfirm(self._c)
+        # Nothing to do if BOTH gates are already answered (resume / re-entry).
+        if (await confirm.already_confirmed(job_id, "name")
+                and await confirm.already_confirmed(job_id, "caption")):
+            return
+        ref = await _load_msg_ref(self._c, job_id)
+        chat_id = ref[0] if ref else None
+        if chat_id is None:
+            return  # no interactive surface — RenameStage uses its computed default
+
+        # Representative example: smallest tier, primary audio.
+        smallest = resolutions[-1] if resolutions else "480p"
+        audio = (list(audios)[0] if audios else None)
+
+        # Pull the cached anilist blob once for the "usable names" block.
+        blob = None
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+            doc = clean_anilist_id(req.franchise_data.get("anilist_id")) if req.franchise_data else None
+            blob = await load_cached(self._c, req.code, "anilist", anime_doc_id=doc) if doc else None
+        except Exception:  # noqa: BLE001
+            blob = None
+        names = nc.usable_names(self._c, blob, req)
+        names_block = ""
+        if names:
+            names_block = "\n\n<b>Usable names</b>\n" + "\n".join(f"• <code>{n}</code>" for n in names)
+
+        # ── filename gate ──
+        example_name = nc.build_example_filename(
+            self._c, req, resolution=smallest, audio=audio, season=season, episode=1)
+        name_card = (
+            "🎬 <b>File name preview</b>\n\n"
+            f"<code>{example_name}</code>\n"
+            "\n<i>Tap Use it, or Edit to send a corrected episode-1 name "
+            "(I'll apply the same pattern to every file).</i>"
+            f"{names_block}"
+        )
+        chosen_name = await confirm.confirm(
+            job_id, "name", default_text=example_name,
+            card_text=name_card, chat_id=chat_id)
+        if chosen_name and chosen_name != example_name:
+            parsed = nc.parse_filename_edit(chosen_name)
+            if parsed.get("title"):
+                await self._merge_resume_state(job_id, {"name_title": parsed["title"]})
+
+        # ── caption gate ──
+        example_cap = nc.build_example_caption(
+            self._c, req, resolution=smallest, audio=audio, season=season,
+            alt_titles=names)
+        cap_card = (
+            "📝 <b>Pack caption preview</b>\n\n"
+            f"{example_cap}\n"
+            "\n<i>Tap Use it, or Edit to change the TITLE line "
+            "(the quality line is set automatically per pack).</i>"
+            f"{names_block}"
+        )
+        chosen_cap = await confirm.confirm(
+            job_id, "caption", default_text=example_cap,
+            card_text=cap_card, chat_id=chat_id)
+        if chosen_cap and chosen_cap != example_cap:
+            cap_title = nc.extract_caption_title(chosen_cap)
+            if cap_title:
+                await self._merge_resume_state(job_id, {"caption_title": cap_title})
+
+    async def _merge_resume_state(self, job_id: int, patch: dict) -> None:
+        """Merge keys into DownloadJob.resume_state (additive, like the existing
+        partial_failures / stage writers)."""
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            job = await session.get(DownloadJob, job_id)
+            if job is not None:
+                state = dict(job.resume_state or {})
+                state.update(patch)
+                job.resume_state = state
 
     async def _control_flags(self, job_id: int) -> tuple[bool, bool, bool]:
         """Read cancel / source-abort / skip in ONE Redis round-trip.
