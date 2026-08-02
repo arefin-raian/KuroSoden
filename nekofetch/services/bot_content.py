@@ -1158,6 +1158,17 @@ class BotContentService:
         bot_usernames = self._c.config.bot.filestore_bots
         if not bot_usernames or not self._c.config.storage_channel.enabled:
             return {}
+        # Defensive: a config value may be a single comma-joined string (a bad
+        # runtime override) or carry ``@``/whitespace. Flatten + clean so RR sees
+        # real, separate usernames instead of one malformed entry.
+        bot_usernames = [
+            u.strip().lstrip("@")
+            for entry in bot_usernames
+            for u in str(entry).split(",")
+            if u.strip()
+        ]
+        if not bot_usernames:
+            return {}
 
         links: dict[str, str] = {}
         for pack in packs:

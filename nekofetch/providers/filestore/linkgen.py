@@ -64,7 +64,22 @@ def build_fstore_link(
     else:
         payload = f"get-{start_msg_id * cid}"
     encoded = _encode(payload)
-    return f"https://t.me/{bot_username}?start={encoded}"
+    return f"https://t.me/{_clean_username(bot_username)}?start={encoded}"
+
+
+def _clean_username(username: str) -> str:
+    """Normalise a bot username for a ``t.me/<username>`` deep link.
+
+    Telegram rejects ``t.me/@name`` (leading ``@``) and any URL with spaces or
+    stray commas as ``BUTTON_URL_INVALID``. Config values are entered by hand and
+    have shown up as ``"@Name"`` or even a whole comma-joined list stuffed into
+    one field, so we defensively strip a leading ``@``, surrounding whitespace,
+    and take only the first token before a comma/space — a malformed value can
+    still make a *wrong* link, but never an *invalid* one that kills the post."""
+    if not username:
+        return username
+    first = username.strip().lstrip("@").split(",")[0].split()[0]
+    return first.lstrip("@")
 
 async def pick_fstore_bot_rr(redis, usernames: list[str]) -> str | None:
     """Pick the next bot from the list using **round-robin** cycling.
