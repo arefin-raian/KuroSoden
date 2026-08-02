@@ -921,31 +921,52 @@ class AdminAssignmentEngine:
                 await session.commit()
 
     async def get_active_tasks(
-        self, admin_telegram_id: int, _session=None
+        self, admin_telegram_id: int, *, stage: str | None = None, _session=None
     ) -> list[AdminAssignment]:
-        """Get all duty tasks for an admin."""
+        """Get active duty tasks for an admin.
+
+        ``stage`` scopes the result to a single pipeline stage (``"senku"`` /
+        ``"levi"`` / ``"gojo"``). Each staff bot MUST pass its own stage — one
+        request has a separate assignment row per stage, so an unfiltered list
+        makes the SAME request show up as two near-identical task buttons (the
+        reported "two buttons for one task"). ``None`` returns every stage (used
+        by the owner's cross-stage overview in Lelouch).
+        """
         async with self._maybe_session(_session) as session:
+            conds = [
+                AdminAssignment.admin_telegram_id == admin_telegram_id,
+                AdminAssignment.status.in_(ACTIVE_STATUSES),
+            ]
+            if stage is not None:
+                conds.append(AdminAssignment.stage == stage)
             result = await session.execute(
-                select(AdminAssignment).where(
-                    AdminAssignment.admin_telegram_id == admin_telegram_id,
-                    AdminAssignment.status.in_(ACTIVE_STATUSES),
-                ).order_by(AdminAssignment.created_at.asc())
+                select(AdminAssignment).where(*conds)
+                .order_by(AdminAssignment.created_at.asc())
             )
             return list(result.scalars().all())
 
     async def get_pending_offers(
-        self, admin_telegram_id: int, *, now: datetime | None = None, _session=None
+        self, admin_telegram_id: int, *, stage: str | None = None,
+        now: datetime | None = None, _session=None
     ) -> list[AdminAssignment]:
-        """Get unexpired pending offers for an admin."""
+        """Get unexpired pending offers for an admin.
+
+        ``stage`` scopes to a single pipeline stage — see :meth:`get_active_tasks`
+        for why each bot must pass its own (avoids duplicate offer buttons).
+        """
         clock = self._utc(now)
         async with self._maybe_session(_session) as session:
+            conds = [
+                AdminAssignment.admin_telegram_id == admin_telegram_id,
+                AdminAssignment.status == "offered",
+                AdminAssignment.expires_at.is_not(None),
+                AdminAssignment.expires_at > clock,
+            ]
+            if stage is not None:
+                conds.append(AdminAssignment.stage == stage)
             result = await session.execute(
-                select(AdminAssignment).where(
-                    AdminAssignment.admin_telegram_id == admin_telegram_id,
-                    AdminAssignment.status == "offered",
-                    AdminAssignment.expires_at.is_not(None),
-                    AdminAssignment.expires_at > clock,
-                ).order_by(AdminAssignment.expires_at.asc())
+                select(AdminAssignment).where(*conds)
+                .order_by(AdminAssignment.expires_at.asc())
             )
             return list(result.scalars().all())
 

@@ -203,8 +203,8 @@ def register(client: Client, container: Container) -> None:
         from nekofetch.infrastructure.repositories.request_repo import RequestRepository
 
         engine = AdminAssignmentEngine(container.pg_sessionmaker)
-        active = await engine.get_active_tasks(admin_id)
-        offers = await engine.get_pending_offers(admin_id)
+        active = await engine.get_active_tasks(admin_id, stage="levi")
+        offers = await engine.get_pending_offers(admin_id, stage="levi")
 
         if not active and not offers:
             screen = Screen(
@@ -271,7 +271,7 @@ def register(client: Client, container: Container) -> None:
         from kurosoden.shared.admin_assignment import AdminAssignmentEngine
 
         engine = AdminAssignmentEngine(container.pg_sessionmaker)
-        offers = await engine.get_pending_offers(admin_id)
+        offers = await engine.get_pending_offers(admin_id, stage="levi")
         return any(a.request_code == code for a in offers)
 
     async def _anime_image(req) -> object:

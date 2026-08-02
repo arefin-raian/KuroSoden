@@ -152,8 +152,8 @@ def register(client: Client, container: Container) -> None:
         from nekofetch.infrastructure.repositories.request_repo import RequestRepository
 
         engine = AdminAssignmentEngine(container.pg_sessionmaker)
-        active = await engine.get_active_tasks(user_id)
-        offers = await engine.get_pending_offers(user_id)
+        active = await engine.get_active_tasks(user_id, stage="gojo")
+        offers = await engine.get_pending_offers(user_id, stage="gojo")
 
         if not active and not offers:
             await send_screen(

@@ -33,8 +33,8 @@ def register(client: Client, container: Container) -> None:
         from nekofetch.infrastructure.repositories.request_repo import RequestRepository
 
         engine = AdminAssignmentEngine(container.pg_sessionmaker)
-        active = await engine.get_active_tasks(message.from_user.id)
-        offers = await engine.get_pending_offers(message.from_user.id)
+        active = await engine.get_active_tasks(message.from_user.id, stage="senku")
+        offers = await engine.get_pending_offers(message.from_user.id, stage="senku")
 
         from kurosoden.shared import senku_voice as V
         from nekofetch.ui.artwork import pick_artwork

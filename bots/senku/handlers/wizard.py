@@ -978,7 +978,7 @@ async def _latest_task(container: Container, message: Message) -> str | None:
         from kurosoden.shared.admin_assignment import AdminAssignmentEngine
 
         engine = AdminAssignmentEngine(container.pg_sessionmaker)
-        active = await engine.get_active_tasks(message.from_user.id)
+        active = await engine.get_active_tasks(message.from_user.id, stage="senku")
         return active[0].request_code if active else None
     except Exception as exc:  # noqa: BLE001
         log.warning("senku.wiz.latest_task_failed", error=str(exc))
