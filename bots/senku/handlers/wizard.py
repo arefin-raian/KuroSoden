@@ -430,7 +430,32 @@ def register(client: Client, container: Container) -> None:
             scan often misses them (the notice isn't in history yet). We therefore
             run several passes with a short settle delay between them, over a wider
             history window, and match the service flags AND the new-title text.
+
+            IMPORTANT: a Telegram BOT client cannot reliably read channel history
+            via ``get_chat_history`` (it usually comes back empty), so the bot-only
+            sweep silently found nothing and the notice stayed. We prefer a USERBOT
+            (a real account that CAN read history and delete the service message)
+            and only fall back to the bot client if no userbot is available.
             Best-effort — a leftover notice is cosmetic, never fatal."""
+
+            # Prefer a userbot: bots can't page channel history, real accounts can.
+            sweep_client = client
+            try:
+                from nekofetch.sources.telegram.userbot import UserbotPool
+
+                pool = getattr(container, "_userbot_pool", None)
+                if pool is None:
+                    pool = UserbotPool.from_env(
+                        container.env.telegram_api_id,
+                        container.env.telegram_api_hash,
+                        str(container.env.session_path),
+                    )
+                    container._userbot_pool = pool  # type: ignore[attr-defined]
+                ub = await pool.acquire()
+                if ub is not None:
+                    sweep_client = ub
+            except Exception as exc:  # noqa: BLE001 — no userbot → use bot client
+                log.debug("senku.wiz.sweep_no_userbot", code=code, error=str(exc))
 
             def _is_service_notice(m) -> bool:
                 # Pyrogram exposes the service kind as `m.service` (a
@@ -446,10 +471,10 @@ def register(client: Client, container: Container) -> None:
             async def _one_pass() -> int:
                 removed = 0
                 try:
-                    async for m in client.get_chat_history(chat.id, limit=30):
+                    async for m in sweep_client.get_chat_history(chat.id, limit=30):
                         if _is_service_notice(m):
                             try:
-                                await client.delete_messages(chat.id, m.id)
+                                await sweep_client.delete_messages(chat.id, m.id)
                                 removed += 1
                             except Exception:  # noqa: BLE001
                                 pass
@@ -458,10 +483,13 @@ def register(client: Client, container: Container) -> None:
                 return removed
 
             # A few spaced passes catch notices that arrive slightly late.
-            for delay in (0.0, 1.5, 2.5):
+            total = 0
+            for delay in (0.0, 1.5, 2.5, 3.0):
                 if delay:
                     await asyncio.sleep(delay)
-                await _one_pass()
+                total += await _one_pass()
+            if total:
+                log.info("senku.wiz.service_swept", code=code, removed=total)
 
         # ── Bot-driven finalisation ─────────────────────────────────────────
         # Both bots are admins now, so Senku sets the decorated title + the

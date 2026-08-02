@@ -25,6 +25,7 @@ from __future__ import annotations
 from sqlalchemy import select
 
 import calendar
+import re
 
 from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
@@ -46,6 +47,35 @@ log = get_logger(__name__)
 _RES_ORDER = {"360p": 360, "480p": 480, "540p": 540, "720p": 720, "1080p": 1080}
 _BTN_QUALITIES = ("480p", "720p", "1080p")
 _TV_FORMATS = {"TV", "TV_SHORT", "TV_SPECIAL"}
+
+# AniList synopses (fetched asHtml:false) still embed literal HTML — <br>, <i>,
+# <b>, and a trailing "<source>" fragment. Strip ALL tags before truncating so a
+# mid-tag slice can't leave a dangling "<" that Pyrogram re-escapes to "&lt;".
+_HTML_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def _clean_synopsis(text: str | None, *, limit: int = 350) -> str:
+    """Flatten a synopsis for a card: strip HTML, collapse whitespace, trim.
+
+    AniList ships the description with literal ``<br>``/``<i>`` tags; a naive
+    ``[:N]`` slice can cut inside a tag and leave a stray ``<`` (renders as the
+    literal ``&lt;``). We remove every tag first, collapse runs of whitespace to
+    single spaces, then trim to ``limit`` on a WORD boundary and add an ellipsis.
+    Keeps an inline ``(Source: …)`` credit when it fits.
+    """
+    if not text or text == "—":
+        return "—"
+    # Turn explicit breaks into spaces first, then drop any remaining tags.
+    text = text.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
+    text = _HTML_TAG_RE.sub("", text)
+    text = " ".join(text.split())
+    if not text:
+        return "—"
+    if len(text) <= limit:
+        return text
+    # Trim on a word boundary so we never end mid-word or mid-entity.
+    clipped = text[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:-—")
+    return f"{clipped}…"
 
 
 class BotContentService:
@@ -466,19 +496,20 @@ class BotContentService:
                                             anime_doc_id=anime_doc_id)
         except Exception as exc:  # noqa: BLE001 — cache is best-effort
             log.debug("bot.content.cache.read_failed", error=str(exc))
-        cache_has_data = bool((cached_blob or {}).get("search"))
 
         # ── Primary: @acutebot via the userbot pool ──
-        # Guard: never send a request code (REQ-####) or bare id to AcuteBot —
-        # it returns nothing and blanks the info card. If the query still looks
-        # like a code at this point (no usable title_hint was available), skip
-        # straight to the AniList fallback below. Also skip when the prefetch
-        # cache already holds the data (no need for a live probe).
+        # AcuteBot is ALWAYS the primary source for the info card — it returns a
+        # richer card (backdrop + curated fields) than the raw API. Only skip it
+        # when the query still looks like a request code (REQ-#### or bare id)
+        # with no usable title, since AcuteBot returns nothing for those and
+        # would blank the card. A populated prefetch cache is NOT a reason to
+        # skip: we want AcuteBot's answer when available and only fall back to
+        # the cached AniList/TMDB blob if the live probe fails.
         _still_code = bool(
             not search_query.strip()
             or _re.fullmatch(r"REQ-?\d+", search_query, _re.IGNORECASE)
         )
-        if not _still_code and not cache_has_data:
+        if not _still_code:
             try:
                 from nekofetch.sources.telegram.userbot import UserbotPool
 
@@ -746,6 +777,12 @@ class BotContentService:
         """
         merged = dict(base_meta)
         merged["title"] = entry.english_title or base_meta.get("title", "—")
+        # Romaji (transliterated original) for the "<b>English</b>〢Romaji" header.
+        # FranchiseEntry.titles is English-first [english, romaji, native], so the
+        # 2nd entry is the romaji when it exists and differs from the English name.
+        titles = list(getattr(entry, "titles", None) or [])
+        romaji = titles[1] if len(titles) > 1 else ""
+        merged["romaji"] = romaji or ""
         if entry.synopsis:
             merged["synopsis"] = entry.synopsis
         if entry.banner_url:
@@ -907,7 +944,7 @@ class BotContentService:
             last_aired=meta.get("last_aired") or "—",
             runtime=meta.get("runtime") or "—",
             episodes=str(meta.get("episode_count") or "—"),
-            synopsis=(meta.get("synopsis") or "")[:400] or "—",
+            synopsis=_clean_synopsis(meta.get("synopsis"), limit=400),
         )
         return caption, image
 
@@ -990,6 +1027,35 @@ class BotContentService:
             return f"[{langs_label}]"
         return "—"
 
+    @staticmethod
+    def entry_language_tag(audios: set[AudioType], *, has_english_subs: bool = False) -> str:
+        """Entry-card LANGUAGE label — the operator's 5 canonical variants.
+
+        Distinct from the channel-title ``bot_naming.audio_tag`` (which reads
+        "Dual Audio, Sub & Dub"): the ENTRY post uses a tighter label the
+        operator specified exactly:
+
+          * dual-audio file        → ``Dual Audio [English & Japanese]``
+          * separate sub + dub     → ``Sub & Dub [English & Japanese]``
+          * sub only               → ``Sub [Japanese + ESubs]``
+          * dub only + eng subs    → ``Dub [English + Subs]``
+          * dub only               → ``Dub [English]``
+        """
+        vals = set(audios)
+        has_dual = AudioType.DUAL_AUDIO in vals or AudioType.MULTI in vals
+        has_sub = AudioType.SUBBED in vals
+        has_dub = AudioType.DUBBED in vals
+
+        if has_dual:
+            return "Dual Audio [English & Japanese]"
+        if has_sub and has_dub:
+            return "Sub & Dub [English & Japanese]"
+        if has_dub:
+            return "Dub [English + Subs]" if has_english_subs else "Dub [English]"
+        if has_sub:
+            return "Sub [Japanese + ESubs]"
+        return "Sub [Japanese + ESubs]"
+
     def _render(self, override: str, key: str, **kwargs) -> str:
         """Render a card from a config override (if set) else the ``en.json`` key.
 
@@ -1021,11 +1087,10 @@ class BotContentService:
         fmt = self._c.config.post_format
         ep_max = max((p.episode_to or p.file_count or 0) for p in packs) if packs else 0
         audios = {p.audio for p in packs}
-        # When packs is empty the language field falls back to the most
-        # common shape — Sub only. Keeping the same words as the canonical
-        # :func:`bot_naming.audio_tag` output so the empty-pack fallback
-        # doesn't drift from "Sub […language…]".
-        lang_str = self._language_tag(audios) if audios else "Sub [Japanese]"
+        # Entry-card LANGUAGE label (tighter than the channel-title audio_tag):
+        # "Dual Audio [English & Japanese]" / "Sub & Dub [...]" / etc. Empty packs
+        # fall back to the sub-only shape.
+        lang_str = self.entry_language_tag(audios) if audios else "Sub [Japanese + ESubs]"
         # Collect qualities.
         quals = sorted(
             {p.resolution for p in packs},
@@ -1033,9 +1098,17 @@ class BotContentService:
         )
         qual_str = ", ".join(quals) if quals else "Multi Quality"
         genres = ", ".join(meta.get("genres", []) or []) or "—"
-        synopsis = (meta.get("synopsis") or "")[:300] or "—"
+        synopsis = _clean_synopsis(meta.get("synopsis"))
         score = meta.get("score") or "—"
-        title = meta.get("title", "—")
+        # Title header: "<b>English</b>〢Romaji" when a distinct romaji exists,
+        # else just "<b>English</b>". Only the English name is bold; the romaji
+        # tail sits outside the <b>. The template slot is the whole header HTML.
+        english = meta.get("title", "—")
+        romaji = (meta.get("romaji") or "").strip()
+        if romaji and romaji != english:
+            title = f"<b>{english}</b>〢{romaji}"
+        else:
+            title = f"<b>{english}</b>"
 
         # A single-episode entry (movie / one-shot OVA / special) shows a
         # runtime; a multi-episode entry shows an episode count. Prefer the

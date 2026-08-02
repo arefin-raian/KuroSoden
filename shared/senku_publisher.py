@@ -212,6 +212,30 @@ class SenkuPublisher:
         meta = await svc._gather_metadata(anime_doc_id)
         walked = await svc._walk_franchise(anime_doc_id, meta)
 
+        # Bridge the admin's rendered per-entry thumbnails to public URLs, keyed by
+        # anilist_id — same as the full publish path — so appended cards carry the
+        # GENERATED thumbnail, not the AniList poster. The distribution cache is
+        # keyed by request code, so resolve the code from anime_doc_id first.
+        generated: dict[int, str] = {}
+        try:
+            from sqlalchemy import select as _select
+
+            from nekofetch.infrastructure.database.postgres.models import Request
+            from nekofetch.infrastructure.database.postgres.session import session_scope
+            async with session_scope(self._c.pg_sessionmaker) as _s:
+                code = (await _s.execute(
+                    _select(Request.code).where(
+                        Request.anime_doc_id == anime_doc_id
+                    ).order_by(Request.id.desc())
+                )).scalars().first()
+            if code:
+                entries = await self.cache.get_entries(code)
+                if entries:
+                    generated = await self._bridge_thumbnails(code, entries)
+        except Exception as exc:  # noqa: BLE001 — missing thumbs just fall back
+            log.warning("senku.update.thumb_bridge_failed",
+                        anime=anime_doc_id, error=str(exc))
+
         wanted = set(new_anilist_ids or [])
         tv = list(walked.get("tv", []))
         cards: list[dict] = []
@@ -224,6 +248,9 @@ class SenkuPublisher:
                 continue
 
             entry_meta = svc._entry_meta(meta, entry)
+            gen = generated.get(aid)
+            if gen:
+                entry_meta["poster_url"] = gen
             if entry.format in _TV_FORMATS:
                 season = (tv.index(entry) + 1) if entry in tv else 1
                 entry_packs = [p for p in packs if p.season == season]
@@ -544,6 +571,7 @@ class SenkuPublisher:
         from sqlalchemy import delete, select
 
         from nekofetch.infrastructure.database.postgres.models import (
+            BotContentPost,
             ChannelLayout,
             DistributionBot,
         )
@@ -594,6 +622,33 @@ class SenkuPublisher:
                     tg_message_id=item.get("tg_message_id"),
                     anilist_id=item.get("anilist_id"),
                     is_pinned=bool(item.get("is_pinned")),
+                ))
+
+        # Snapshot the card CONTENT into BotContentPost rows so the ban-restore
+        # backup (BackupService.record_distribution_channel) has something to
+        # capture. The manual wizard path only ever wrote ChannelLayout (message
+        # ids), so a restore found an empty channel. Only content cards are stored
+        # (dividers/footers carry no reusable caption+image+buttons). Replaces any
+        # prior rows so a re-publish refreshes the snapshot.
+        content = [
+            it for it in layout
+            if it.get("caption") and it.get("kind") not in ("divider",)
+        ]
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            await session.execute(
+                delete(BotContentPost).where(BotContentPost.bot_id == bot_id)
+            )
+            for order, it in enumerate(content):
+                session.add(BotContentPost(
+                    bot_id=bot_id,
+                    post_type=it.get("post_type") or it.get("kind") or "season_card",
+                    order=order,
+                    caption=it.get("caption") or "",
+                    image_url=it.get("image"),
+                    image_cached_url=it.get("image"),
+                    button_data=it.get("button_data"),
+                    is_pinned=bool(it.get("is_pinned")),
+                    tg_message_id=it.get("tg_message_id"),
                 ))
 
     def _reorder_franchise(
@@ -773,6 +828,15 @@ class SenkuPublisher:
                 "tg_message_id": msg.id,
                 "anilist_id": post.get("anilist_id"),
                 "is_pinned": pinned,
+                # Carry the card CONTENT so _persist_channel can snapshot it into
+                # BotContentPost rows — the manual (wizard) publish path never had
+                # those, so the ban-restore backup found an empty channel. The raw
+                # (unresolved) caption is stored so {BOT_QUAL:…} re-resolves against
+                # whatever handle the restored channel gets.
+                "caption": post.get("caption") or "",
+                "image": post.get("image"),
+                "button_data": post.get("button_data"),
+                "post_type": post.get("post_type") or "season_card",
             })
 
         return posted, pinned_ids, layout
@@ -896,14 +960,17 @@ class SenkuPublisher:
         # Before the warm-up burst, clear any leftover 'channel name changed to …'
         # service notice Telegram posted when the wizard renamed the channel — the
         # user wants it gone immediately after the rename, not buried under quotes.
-        swept = await self._sweep_service_notices(client, chat_id)
+        # Sweep with the USERBOT when available: a bot client can't reliably page
+        # channel history, so a bot-only sweep silently finds nothing. Acquire it
+        # once here and reuse it for the warm-up burst below.
+        ub = await self._acquire_userbot()
+        swept = await self._sweep_service_notices(ub or client, chat_id)
         if swept:
             log.info("senku.warm.notice_swept", code=code, removed=swept)
 
         quotes = await self._fetch_warm_texts(self._WARM_COUNT)
 
         # Prefer the userbot (no 20/min channel cap). Fall back to the bot client.
-        ub = await self._acquire_userbot()
         sent_ids: list[int] = []
         via = "userbot" if ub is not None else "bot"
         if ub is not None:

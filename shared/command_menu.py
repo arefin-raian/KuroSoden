@@ -125,17 +125,33 @@ async def apply_for_user(
     """
     is_staff = False
     is_owner = False
+    # Ownership is defined by Telegram id (security.owner_id / ADMIN_IDS[0]), NOT
+    # by a DB role — so resolve it from ``user_id`` directly. This still fires when
+    # ``nf_user`` is None (middleware race, fresh account) or the owner's DB row
+    # isn't STAFF/ADMIN, which is exactly the case that used to write senku's empty
+    # user tier and leave the owner with a blank ☰ menu.
+    try:
+        from nekofetch.services.auth_service import AuthService
+        is_owner = user_id in AuthService(container).owner_ids()
+    except Exception:  # noqa: BLE001
+        is_owner = False
     if nf_user is not None:
         try:
             is_staff = Role(nf_user.role) in (Role.STAFF, Role.ADMIN)
         except Exception:  # noqa: BLE001
             is_staff = False
-        try:
-            from nekofetch.services.auth_service import AuthService
-            is_owner = AuthService(container).is_owner(nf_user)
-        except Exception:  # noqa: BLE001
-            is_owner = False
+        if not is_owner:
+            try:
+                from nekofetch.services.auth_service import AuthService
+                is_owner = AuthService(container).is_owner(nf_user)
+            except Exception:  # noqa: BLE001
+                is_owner = False
     cmds = _role_tier(bot, is_staff=is_staff, is_owner=is_owner)
+    # Never write an empty per-chat menu: an empty scope SHADOWS the global default
+    # (default_commands), so a blank user tier (senku/levi/gojo) would erase the
+    # menu the operator actually needs. Fall back to the bot's default tier.
+    if not cmds:
+        cmds = default_commands(bot)
     try:
         await client.set_bot_commands(cmds, scope=BotCommandScopeChat(chat_id=user_id))
     except Exception as exc:  # noqa: BLE001

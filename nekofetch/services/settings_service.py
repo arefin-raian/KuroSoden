@@ -63,6 +63,68 @@ class SettingsService:
             upsert=True,
         )
 
+    def _config_yaml_keys(self) -> dict[str, set[str]]:
+        """Return ``{section: {field, …}}`` for keys actually written in config.yaml.
+
+        We only seed the DB with keys the operator has authored in config.yaml —
+        not every pydantic default — so the ``runtime_overrides`` doc mirrors the
+        file the operator edits, and untouched sub-defaults stay out of Mongo.
+        """
+        try:
+            import yaml
+
+            from nekofetch.core.config import get_env
+
+            path = getattr(get_env(), "config_path", None) or "config.yaml"
+            from pathlib import Path
+
+            p = Path(path)
+            if not p.exists():
+                return {}
+            data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except Exception as exc:  # noqa: BLE001 — seed is best-effort
+            log.debug("settings.seed.config_read_failed", error=str(exc))
+            return {}
+        out: dict[str, set[str]] = {}
+        for section, values in data.items():
+            if isinstance(values, dict):
+                out[section] = set(values.keys())
+        return out
+
+    async def _seed_overrides_from_config(self) -> None:
+        """Seed ``runtime_overrides`` from config.yaml for keys not yet present.
+
+        On a fresh deployment the overrides doc is empty, so the in-bot Settings
+        panel has nothing persisted and edits start from a blank slate. We copy
+        every config.yaml ``section.field`` that isn't already overridden into the
+        doc, using the live (validated) config value. Existing overrides win and
+        are never touched — this only fills gaps, so operator edits survive.
+        """
+        if self._c.collections is None:
+            return
+        yaml_keys = self._config_yaml_keys()
+        if not yaml_keys:
+            return
+        doc = await self._load_doc()
+        hidden = set(self._HIDDEN_FIELDS)
+        added: list[str] = []
+        for section, fields in yaml_keys.items():
+            target = getattr(self._c.config, section, None)
+            if target is None or not hasattr(target, "model_dump"):
+                continue
+            live = target.model_dump(mode="json")
+            existing = doc.get(section, {})
+            for field in fields:
+                if field in hidden or field not in live:
+                    continue
+                if field in existing:
+                    continue  # operator override already set — never clobber
+                doc.setdefault(section, {})[field] = live[field]
+                added.append(f"{section}.{field}")
+        if added:
+            await self._save_doc(doc)
+            log.info("settings.seed.config_defaults", seeded=added)
+
     async def apply_overrides(self) -> None:
         """Apply persisted overrides onto the live config (called at startup).
 
@@ -71,6 +133,7 @@ class SettingsService:
         immediately explained by the log (the override wins until it's cleared).
         """
         await self.seed_defaults()
+        await self._seed_overrides_from_config()
         overrides = await self._load_doc()
         applied: list[str] = []
         for section, values in overrides.items():

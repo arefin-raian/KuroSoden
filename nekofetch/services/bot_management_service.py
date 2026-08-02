@@ -114,10 +114,14 @@ class BotManagementService:
         ``creation_scope`` records how the channel was made ("own" | "userbot")
         and ``userbot_account`` the owning session (for a "userbot"-scoped
         channel) so :class:`ChannelQuotaService` can tally each session's usage.
-        """
-        if not self._c.config.features.distribution_bots:
-            raise NekoFetchError("distribution_bots feature is disabled")
 
+        NOTE: this is NOT gated on ``features.distribution_bots``. That flag only
+        governs the AUTO-created delivery-bot pipeline (BotOrchestrator). Senku's
+        admin-built distribution CHANNELS are the supported delivery path and must
+        register even with auto-creation off — gating this here was the bug that
+        logged "register channel failed … distribution_bots feature is disabled"
+        after the operator manually built and posted to a channel.
+        """
         async with session_scope(self._c.pg_sessionmaker) as session:
             existing = (
                 await session.execute(

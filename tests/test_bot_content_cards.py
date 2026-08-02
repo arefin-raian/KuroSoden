@@ -99,7 +99,9 @@ def test_season_template_override_wins_over_catalog():
     packs = [_Pack(season=1, episode_from=1, episode_to=12, file_count=12)]
     meta = {"title": "Overridden", "entry_episodes": 12}
     caption, _ = svc._build_season_card(meta, season=1, packs=packs)
-    assert caption == "OVERRIDE Overridden :: 12 eps"
+    # The {title} slot now carries the styled header (<b>English</b>, with 〢Romaji
+    # appended when it differs) — the template's job is the surrounding layout.
+    assert caption == "OVERRIDE <b>Overridden</b> :: 12 eps"
 
 
 def test_movie_template_override_receives_duration():
@@ -108,7 +110,7 @@ def test_movie_template_override_receives_duration():
     packs = [_Pack(season=None, episode_from=1, episode_to=1, file_count=1)]
     meta = {"title": "Film", "duration_min": 128, "entry_episodes": 1}
     caption, _ = svc._build_season_card(meta, season=1, packs=packs)
-    assert caption == "Film runs 2h 8m"
+    assert caption == "<b>Film</b> runs 2h 8m"
 
 
 def test_malformed_override_falls_back_to_catalog():

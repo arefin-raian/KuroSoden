@@ -485,8 +485,10 @@ class MainChannelConfig(BaseModel):
     enabled: bool = False
     channel_id: int = 0
     # Variables: {title} {tag} {episodes} {qualities} {languages} {genres} {overview}
+    # {title} arrives pre-rendered as "<b>English</b>〢Romaji" (same header the
+    # entry posts use), so the template must NOT re-wrap it in <b>.
     caption_template: str = (
-        "<blockquote><b>{title}『 </b>#{tag} <b>』</b></blockquote>\n\n"
+        "<blockquote>{title}<b>『 </b>#{tag} <b>』</b></blockquote>\n\n"
         "<b>⌬ EPISODES :</b> {episodes}\n"
         "<b>⌬ QUALITY :</b> {qualities}\n"
         "<b>⌬ LANGUAGE :</b> {languages}\n"

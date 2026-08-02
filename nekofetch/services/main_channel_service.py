@@ -79,6 +79,12 @@ class PublicationFacts:
     invite_link: str | None = None
     anime_doc_id_bot: int | None = None  # DistributionBot.id (for lazy link minting)
     _audios: set = field(default_factory=set)
+    # Title parts for the "<b>English</b>〢Romaji" caption header. ``title`` stays
+    # PLAIN (drives the TMDB search); ``title_html`` is the rendered header the
+    # caption template uses, built at the end of gather_facts.
+    _english: str = ""
+    _romaji: str = ""
+    title_html: str = ""
 
 
 class MainChannelService:
@@ -136,18 +142,38 @@ class MainChannelService:
                 if minted:
                     facts.invite_link = minted
 
-        # Enrich with metadata when the provider is implemented (else graceful blanks).
-        from nekofetch.services.enrichment_service import EnrichmentService
+        # Genres / studio-tag / title from the PREFETCHED AniList search blob.
+        # The main channel NEVER hits a source scraper (kaa.lt) at publish — that
+        # was the 404 — so enrichment is gone. Genres + studio come from the
+        # cached AniList media; the overview is overridden by TMDB below (TMDB's
+        # franchise-level synopsis is preferred for the main post per spec).
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
 
-        data = await EnrichmentService(self._c).get_template_data(anime_doc_id)
-        if data is not None:
-            facts.genres = ", ".join(data.genres) or facts.genres
-            facts.overview = (data.synopsis or facts.overview)
-            if data.studio:
-                facts.tag = data.studio.replace(" ", "")
-            facts.poster_url = data.header_image or facts.poster_url
-            if data.episode_count and facts.episodes == "—":
-                facts.episodes = str(data.episode_count)
+            ablob = await load_cached(self._c, anime_doc_id, "anilist",
+                                      anime_doc_id=anime_doc_id)
+            search = (ablob or {}).get("search") or {}
+            if search:
+                genres = search.get("genres") or []
+                if genres:
+                    facts.genres = ", ".join(genres)
+                studio = search.get("studio")
+                if studio:
+                    facts.tag = studio.replace(" ", "")
+                if not facts.overview or facts.overview == "—":
+                    facts.overview = search.get("synopsis") or facts.overview
+                # Capture english/romaji for the title header built at the end
+                # (kept out of facts.title so the plain title still drives the
+                # TMDB search below — the HTML header would break that lookup).
+                english = (search.get("english") or "").strip()
+                romaji = (search.get("romaji") or "").strip()
+                if english:
+                    facts.title = english  # plain, TMDB-search-safe
+                facts._english = english or facts.title
+                facts._romaji = romaji
+        except Exception as exc:  # noqa: BLE001 — cache miss → pack/TMDB facts stand
+            log.debug("mainchannel.anilist_cache.failed",
+                      anime=anime_doc_id, error=str(exc))
 
         # ── Franchise-level corrections (per Gojo spec) ──
         #   • EPISODES = Σ episodes of the TV-season continuity chain ONLY
@@ -228,6 +254,17 @@ class MainChannelService:
         # the <blockquote>).
         facts.overview = _collapse(facts.overview)
 
+        # Build the "<b>English</b>〢Romaji" caption header now that the plain
+        # title has served the TMDB search. Romaji only when it differs.
+        english = (facts._english or facts.title or "").strip()
+        romaji = (facts._romaji or "").strip()
+        if romaji and romaji != english:
+            facts.title_html = f"<b>{english}</b>〢{romaji}"
+        elif english:
+            facts.title_html = f"<b>{english}</b>"
+        else:
+            facts.title_html = facts.title
+
         return facts
 
     async def _apply_franchise_facts(
@@ -299,11 +336,13 @@ class MainChannelService:
                       anime=anime_doc_id, error=str(exc))
 
     def _caption(self, f: PublicationFacts) -> str:
+        # {title} is the pre-rendered "<b>English</b>〢Romaji" header; fall back
+        # to the plain title if the header wasn't built (cache miss).
         return templates.render(
             self.cfg.caption_template,
-            title=f.title, tag=f.tag, episodes=f.episodes, qualities=f.qualities,
-            languages=f.languages, genres=f.genres, overview=f.overview,
-            rating=f.rating,
+            title=f.title_html or f.title, tag=f.tag, episodes=f.episodes,
+            qualities=f.qualities, languages=f.languages, genres=f.genres,
+            overview=f.overview, rating=f.rating,
         )
 
     async def _buttons(self, f: PublicationFacts) -> InlineKeyboardMarkup | None:

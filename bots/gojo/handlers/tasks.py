@@ -848,9 +848,18 @@ async def _review_for_publish(
     client: Client, container: Container, message: Message,
     request_code: str, fsm: FSM,
 ) -> None:
-    """Show the caption/thumbnail for admin review before publishing."""
+    """Show the REAL caption/photo/buttons for admin review before publishing.
+
+    The old review card was generic prose + mascot art — the operator couldn't
+    tell what would actually go live. This renders the exact main-channel post
+    (same ``gather_facts`` → ``_caption`` → ``_buttons`` and the same photo the
+    publisher would use) into the admin's chat, so "Publish Now" is a confirmed
+    WYSIWYG. Reuses :class:`MainChannelService` so the preview can never drift
+    from the real post.
+    """
     from nekofetch.infrastructure.database.postgres.session import session_scope
     from nekofetch.infrastructure.repositories.request_repo import RequestRepository
+    from nekofetch.services.main_channel_service import MainChannelService
 
     async with session_scope(container.pg_sessionmaker) as session:
         req = await RequestRepository(session).get_by_code(request_code)
@@ -860,14 +869,37 @@ async def _review_for_publish(
                 parse_mode=ParseMode.HTML,
             )
             return
-        title = req.anime_title
         anime_doc_id = req.anime_doc_id
 
+    try:
+        mcs = MainChannelService(container)
+        facts = await mcs.gather_facts(anime_doc_id)
+        caption = mcs._caption(facts)
+        markup = await mcs._buttons(facts)
+        photo_url = facts.backdrop_url or facts.poster_url
+    except Exception as exc:  # noqa: BLE001 — fall back to the generic review card
+        log.warning("gojo.publish.preview_failed", code=request_code, error=str(exc))
+        await send_screen(
+            client, message.chat.id,
+            Screen(
+                caption=V.review_card(req.anime_title, request_code, anime_doc_id),
+                image=pick_artwork("gojo"),
+                keyboard=_publish_keyboard(request_code),
+            ),
+        )
+        return
+
+    # Tag the preview so it's unambiguous this is NOT the live post. send_screen
+    # already trims to the photo-caption budget, so a long synopsis can't fail it.
+    preview_caption = caption + (
+        f"\n\n<blockquote>⬆️ This is the exact caption & photo that will be "
+        f"posted to the main channel.</blockquote>"
+    )
     await send_screen(
         client, message.chat.id,
         Screen(
-            caption=V.review_card(title, request_code, anime_doc_id),
-            image=pick_artwork("gojo"),
+            caption=preview_caption,
+            image=photo_url or pick_artwork("gojo"),
             keyboard=_publish_keyboard(request_code),
         ),
     )
