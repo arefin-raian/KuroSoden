@@ -274,6 +274,17 @@ class ThumbnailConfig(BaseModel):
 
 
 class WatermarkConfig(BaseModel):
+    # Watermark policy:
+    #   "off"    — never burn a watermark.
+    #   "always" — always burn it on the highest-res source.
+    #   "auto"   — burn ONLY when subtitle branding wasn't possible, i.e. the
+    #              file has no brandable TEXT subtitle track (PGS/image subs, or
+    #              no subs). When a text sub is present our channel cue is injected
+    #              there instead, so the video is left un-watermarked. This is the
+    #              default: watermarking becomes a smart fallback for PGS releases.
+    mode: str = "auto"
+    # Vestigial master switch kept for back-compat with older configs. ``mode``
+    # now drives behaviour; the stage runs whenever ``mode != "off"``.
     enabled: bool = False
     type: str = "text"
     text: str = "Anime Weebs"

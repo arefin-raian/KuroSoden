@@ -30,8 +30,8 @@ TG_BLUE_ASS = "&H00D99E22"  # ASS is &HAABBGGRR  (22 9E D9 -> D9 9E 22)
 WHITE_ASS = "&H00FFFFFF"
 
 # Branding text (on-screen subtitle cue — the ASS-style "Telegram: @AniXWeebs"
-# block is structurally different from the chrome-bracket track-title format
-# used in ``_branding.brand_track_title`` so it stays local to this module).
+# block is structurally different from the bracket track-title format used in
+# ``_branding.brand_subtitle_title`` so it stays local to this module).
 BRAND_PREFIX = "Telegram:"
 
 # Max time the branding stays on screen, and margin kept clear of real dialogue.

@@ -25,8 +25,10 @@ from pathlib import Path
 from nekofetch.core.logging import get_logger
 from nekofetch.sources._branding import (
     BRAND_HANDLE,
+    ENCODED_BY_TAG,
+    brand_audio_title,
     brand_container_title,
-    brand_track_title,
+    brand_subtitle_title,
 )
 from nekofetch.sources._hls import find_ffmpeg, find_ffprobe
 from nekofetch.sources._mux import _is_english, iso639_2
@@ -152,18 +154,17 @@ def detect_audio_config(langs: list[str | None]) -> tuple[str, bool]:
 
 
 def track_title(lang: str | None, ordinal: int) -> str:
-    """Title for an audio/subtitle track.
+    """Title for an AUDIO track (manual re-mux path).
 
-    Delegates to :func:`nekofetch.sources._branding.brand_track_title` so the
-    chrome-bracket style stays identical across the new-download path, the
-    manual re-mux path, and the dual-audio path. Kept as a thin local alias
-    so existing call sites in this module don't need to flip.
+    Delegates to :func:`nekofetch.sources._branding.brand_audio_title` so the
+    audio bracket style (``『 @AniXWeebs 』``) stays identical across the
+    new-download path, the manual re-mux path, and the dual-audio path.
 
-    Known language → "Language〘 @AniXWeebs 〙".
-    Unknown       → "Anime Weebs #N〘 @AniXWeebs 〙" where N is the 1-based
-                    ordinal of this track *within its own stream type*.
+    Known language → ``"Language『 @AniXWeebs 』"``.
+    Unknown       → ``"Audio Track 〢N『 @AniXWeebs 』"`` where N is the 1-based
+                    ordinal of this track among the audio streams.
     """
-    return brand_track_title(_LANG_NAME.get(lang) if lang else None, ordinal)
+    return brand_audio_title(_LANG_NAME.get(lang) if lang else None, ordinal)
 
 
 # Noise to strip when deriving a clean release title for the container.
@@ -278,8 +279,8 @@ async def normalize_release(src: Path, dest: Path, *, title: str | None = None,
         if sig:
             seen_sigs.add(sig)
         # ordinal = this track's 1-based position among the kept subtitle streams
-        title = brand_track_title(_LANG_NAME.get(lang) if lang else None,
-                                   len(processed) + 1)
+        title = brand_subtitle_title(_LANG_NAME.get(lang) if lang else None,
+                                     len(processed) + 1)
         processed.append((ass, title, lang))
         report["subtitles"].append({"lang": lang, "title": title,
                                      "from_tag": bool(tag_lang)})
@@ -313,7 +314,8 @@ async def normalize_release(src: Path, dest: Path, *, title: str | None = None,
     for i in range(len(processed)):
         cmd += ["-map", f"{i + 1}:0"]
     cmd += ["-c:v", "copy", "-c:a", "copy", "-c:s", "copy",
-            "-map_metadata", "-1", "-metadata", f"title={container_title}"]
+            "-map_metadata", "-1", "-metadata", f"title={container_title}",
+            "-metadata", f"ENCODED_BY={ENCODED_BY_TAG}"]
     for i, (title, lang) in enumerate(audio_plan):
         cmd += [f"-metadata:s:a:{i}", f"title={title}"]
         if lang:

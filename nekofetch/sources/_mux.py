@@ -21,7 +21,13 @@ import subprocess
 from pathlib import Path
 
 from nekofetch.core.logging import get_logger
-from nekofetch.sources._branding import brand_container_title, brand_track_title
+from nekofetch.sources._branding import (
+    ENCODED_BY_TAG,
+    brand_audio_title,
+    brand_container_title,
+    brand_subtitle_title,
+    is_meaningful_track_name,
+)
 from nekofetch.sources._hls import find_ffmpeg, find_ffprobe
 from nekofetch.sources._subs import process_subtitle
 
@@ -57,6 +63,28 @@ def iso639_2(code: str) -> str:
         return "und"
     c = code.lower().split("-")[0].strip()
     return _LANG3.get(c, c if len(c) == 3 else "und")
+
+
+# Language code → display name for track labels (``English``, ``Japanese``).
+# Local copy so this module stays import-cycle-free (``_normalize`` imports FROM
+# ``_mux``). Accepts both 2-letter and 3-letter codes; unknown → "".
+_LANG_DISPLAY: dict[str, str] = {
+    "ja": "Japanese", "jpn": "Japanese", "jp": "Japanese",
+    "en": "English", "eng": "English", "us": "English",
+    "hi": "Hindi", "hin": "Hindi", "es": "Spanish", "spa": "Spanish",
+    "fr": "French", "fra": "French", "de": "German", "deu": "German",
+    "it": "Italian", "ita": "Italian", "pt": "Portuguese", "por": "Portuguese",
+    "ru": "Russian", "rus": "Russian", "ko": "Korean", "kor": "Korean",
+    "zh": "Chinese", "zho": "Chinese", "cn": "Chinese",
+}
+
+
+def lang_display(code: str | None) -> str:
+    """Display name for a language code (``"English"``), or "" if unknown."""
+    if not code:
+        return ""
+    c = code.lower().split("-")[0].strip()
+    return _LANG_DISPLAY.get(c, "")
 
 
 def _is_english(lang: str | None) -> bool:
@@ -157,8 +185,11 @@ async def mux_to_mkv(
     cmd += ["-c:v", "copy", "-c:a", "copy", "-c:s", "copy"]
 
     for i, (name, lang) in enumerate(out_audio):
+        # Audio label: keep a meaningful source/display name, else fall back to
+        # the language ("English") — never a generic layout word ("Stereo").
         cmd += [f"-metadata:s:a:{i}", f"language={iso639_2(lang)}",
-                f"-metadata:s:a:{i}", f"title={brand_track_title(name, i + 1)}"]
+                f"-metadata:s:a:{i}",
+                f"title={brand_audio_title(name, i + 1, fallback_lang=lang_display(lang))}"]
     # Default audio: English is the default track when dual audio.
     # Falls back to the first track for all other configs.
     audio_langs = [lang for _n, lang in out_audio]
@@ -168,8 +199,11 @@ async def mux_to_mkv(
     for i in range(len(out_audio)):
         cmd += [f"-disposition:a:{i}", "default" if i == default_audio else "0"]
     for i, (_p, name, lang) in enumerate(subs):
+        # Subtitle label: prefer a meaningful source name (fansub "Full Subs"),
+        # else the language ("English"), else the bare "〘 By @AniXWeebs 〙".
+        sub_name = name if is_meaningful_track_name(name) else lang_display(lang)
         cmd += [f"-metadata:s:s:{i}", f"language={iso639_2(lang)}",
-                f"-metadata:s:s:{i}", f"title={brand_track_title(name, i + 1)}"]
+                f"-metadata:s:s:{i}", f"title={brand_subtitle_title(sub_name, i + 1)}"]
     # English subtitles are the default (auto-selected on playback).
     # When no English sub exists, NO track is default — never force a
     # non-English sub onto the viewer.
@@ -185,6 +219,8 @@ async def mux_to_mkv(
         # already pre-branded (e.g. ``_normalize.py`` adding the marker itself),
         # the helper detects it and returns the title unchanged.
         cmd += ["-metadata", f"title={brand_container_title(title)}"]
+    # Video credit: a container-level ENCODED_BY tag on every muxed release.
+    cmd += ["-metadata", f"ENCODED_BY={ENCODED_BY_TAG}"]
 
     cmd += [str(out)]
 

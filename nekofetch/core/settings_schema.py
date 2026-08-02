@@ -311,7 +311,17 @@ FIELD_DOCS: dict[str, FieldDoc] = {
         desc="Generate the preview images used on channel cards."),
 
     # ── watermark ─────────────────────────────────────────────────────────────
-    "watermark.enabled": FieldDoc(desc="Burn a watermark into releases during processing."),
+    "watermark.mode": FieldDoc(
+        desc="When to burn the video watermark.",
+        option_notes={
+            "auto": "watermark ONLY when subtitle branding wasn't possible "
+                    "(no text sub track — e.g. PGS/image subs). Default.",
+            "always": "always watermark the highest-resolution source.",
+            "off": "never watermark.",
+        }),
+    "watermark.enabled": FieldDoc(
+        desc="Deprecated — use watermark.mode. Kept for back-compat; the stage "
+             "runs whenever watermark.mode is not 'off'."),
     "watermark.type": FieldDoc(
         desc="What kind of watermark to apply.",
         option_notes={"text": "render the watermark text below",

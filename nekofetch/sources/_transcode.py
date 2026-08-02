@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 from nekofetch.core.logging import get_logger
+from nekofetch.sources._branding import ENCODED_BY_TAG
 from nekofetch.sources._hls import find_ffmpeg, find_ffprobe
 
 log = get_logger(__name__)
@@ -249,6 +250,7 @@ async def build_watermark_encode_args(
             flag, graph,
             "-map", "0", "-c", "copy",
             *venc,
+            "-metadata", f"ENCODED_BY={ENCODED_BY_TAG}",
             "-map", "-0:d?", str(out),
         ]
 
@@ -522,6 +524,10 @@ async def _encode(src: Path, out: Path, height: int | None, crf: int,
             cmd += ["-threads", str(threads)]
         if height:
             cmd += ["-vf", f"scale=-2:{height}"]
+        # Video credit: re-stamp the container ENCODED_BY on every derived tier
+        # (a re-encode is exactly when this should read as OUR encode, not the
+        # source's Lavf tag).
+        cmd += ["-metadata", f"ENCODED_BY={ENCODED_BY_TAG}"]
         # MKV carries attachments fine; only drop data streams ffmpeg can't copy.
         cmd += ["-map", "-0:d?", str(out)]
         return cmd

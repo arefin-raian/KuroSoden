@@ -22,7 +22,7 @@ from urllib.parse import urljoin
 import httpx
 
 from nekofetch.core.logging import get_logger
-from nekofetch.sources._branding import brand_track_title
+from nekofetch.sources._branding import ENCODED_BY_TAG, brand_audio_title
 from nekofetch.sources._hls import find_ffmpeg
 
 log = get_logger(__name__)
@@ -90,10 +90,11 @@ async def merge_dual(sub_file: Path, dub_file: Path, dest: Path) -> bool:
         "-i", str(sub_file), "-i", str(dub_file),
         "-map", "0:v:0", "-map", "0:a:0", "-map", "1:a:0", "-map", "0:s?",
         "-c", "copy",
+        "-metadata", f"ENCODED_BY={ENCODED_BY_TAG}",
         "-metadata:s:a:0", "language=jpn", "-metadata:s:a:0",
-        f"title={brand_track_title('Japanese', 1)}",
+        f"title={brand_audio_title('Japanese', 1)}",
         "-metadata:s:a:1", "language=eng", "-metadata:s:a:1",
-        f"title={brand_track_title('English', 2)}",
+        f"title={brand_audio_title('English', 2)}",
         "-disposition:a:0", "default", str(dest),
     ]
     proc = await asyncio.create_subprocess_exec(

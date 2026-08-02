@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 
 from nekofetch.core.logging import get_logger
-from nekofetch.sources._branding import BRAND_HANDLE
+from nekofetch.sources._branding import BRAND_HANDLE, ENCODED_BY_TAG
 from nekofetch.sources._subs import (
     BRAND_PREFIX,
     TG_BLUE_ASS,
@@ -204,7 +204,7 @@ def is_text_sub(codec: str) -> bool:
 
 async def brand_torrent_subtitles(
     src, dest, *, sub_tracks: list[dict], video_ms: int | None = None,
-    container_title: str | None = None, brand_track_title=None,
+    container_title: str | None = None, brand_subtitle_title=None,
 ) -> dict:
     """Extract text subs, inject the Telegram cue, remux back into ``dest``.
 
@@ -212,9 +212,10 @@ async def brand_torrent_subtitles(
     title}). Text tracks are extracted to ``.ass``, branded via
     :func:`brand_ass_text`, and remuxed as the new subtitle streams (image subs
     pass through by copy). Every subtitle track's TITLE is set to
-    ``brand_track_title(original_title, ordinal)`` — for torrents the caller
+    ``brand_subtitle_title(original_title, ordinal)`` — for torrents the caller
     passes a helper that keeps the ORIGINAL title (e.g. "Signs & Songs") and adds
-    the chrome handle, instead of a language label. Audio/video are copied as-is.
+    the ``〘 @AniXWeebs 〙`` handle, instead of a language label. Audio/video are
+    copied as-is; a container-level ENCODED_BY credit is added.
 
     Returns a manifest ``{branded_tracks, total_cues, ok}``. Best-effort: on any
     ffmpeg failure it leaves ``dest`` unwritten and reports ``ok=False`` so the
@@ -279,15 +280,17 @@ async def brand_torrent_subtitles(
         # Preserve attachments (fonts!) so styled .ass renders correctly.
         cmd += ["-map", "0:t?", "-c:t", "copy"]
 
-        # 3. Per-track TITLE metadata (torrent rule: original title + chrome handle).
+        # 3. Per-track TITLE metadata (torrent rule: original title + 〘 handle 〙).
         for out_i, tr in enumerate(sub_tracks):
-            if brand_track_title is not None:
-                title = brand_track_title(tr.get("title", ""), out_i + 1)
+            if brand_subtitle_title is not None:
+                title = brand_subtitle_title(tr.get("title", ""), out_i + 1)
                 cmd += [f"-metadata:s:s:{out_i}", f"title={title}"]
             if tr.get("lang"):
                 cmd += [f"-metadata:s:s:{out_i}", f"language={tr['lang']}"]
         if container_title:
             cmd += ["-metadata", f"title={container_title}"]
+        # Video credit: container-level ENCODED_BY on the torrent remux.
+        cmd += ["-metadata", f"ENCODED_BY={ENCODED_BY_TAG}"]
 
         cmd += ["-map", "-0:d?", str(dest)]  # drop data streams ffmpeg can't copy
         proc = await asyncio.create_subprocess_exec(

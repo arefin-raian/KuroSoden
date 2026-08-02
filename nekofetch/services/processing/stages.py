@@ -328,6 +328,41 @@ async def _audio_track_langs(ffprobe: str, path: Path) -> list[str]:
     return await _track_langs(ffprobe, path, "a")
 
 
+async def _audio_tracks(ffprobe: str, path: Path) -> list[dict]:
+    """Probe every audio track: ``{lang, title}`` in order (``""`` when unset).
+
+    Mirrors :func:`_sub_tracks` for audio. :class:`BrandingStage` uses ``title``
+    to honour a MEANINGFUL source track name (torrent rule) and falls back to the
+    language when the title is a generic layout word like "Stereo"/"5.1".
+    """
+    import json
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe, "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream_tags=language,title",
+            "-of", "json", str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except Exception:  # noqa: BLE001
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(out or b"{}")
+    except ValueError:
+        return []
+    tracks: list[dict] = []
+    for s in data.get("streams", []):
+        tags = s.get("tags", {}) or {}
+        tracks.append({
+            "lang": tags.get("language", "") or "",
+            "title": tags.get("title", "") or "",
+        })
+    return tracks
+
+
 async def _track_langs(ffprobe: str, path: Path, select: str) -> list[str]:
     """Return the language tag of each track of a stream type, in order.
 
@@ -693,8 +728,8 @@ class MetadataStage(Stage):
 # Language code → human display name for track branding. Torrents arrive already
 # muxed, so we read the embedded track's ISO-639 language tag (e.g. "jpn") and
 # turn it into the same display name the streaming mux path uses ("Japanese"),
-# so both paths produce identical labels. Unknown/blank tags map to "" so
-# ``brand_track_title`` renders the bare ``《 Anime Weebs 》`` stamp.
+# so both paths produce identical labels. Unknown/blank tags map to "" so the
+# audio/subtitle brand helpers fall back to their placeholder form.
 _LANG_DISPLAY = {
     "jpn": "Japanese", "ja": "Japanese", "jp": "Japanese",
     "eng": "English", "en": "English",
@@ -717,8 +752,8 @@ _LANG_DISPLAY = {
 def _lang_display(lang: str) -> str:
     """Map an ISO-639 language tag to a human display name ("jpn" → "Japanese").
 
-    Returns "" for unknown/untagged languages so ``brand_track_title`` renders
-    the bare ``《 Anime Weebs 》`` stamp instead of an ugly raw code.
+    Returns "" for unknown/untagged languages so the audio/subtitle brand helpers
+    fall back to their placeholder form instead of an ugly raw code.
     """
     c = (lang or "").lower().split("-")[0].strip()
     if c in ("", "und", "unk", "mis", "zxx"):
@@ -774,19 +809,22 @@ class BrandingStage(Stage):
         return self.c.config.processing.branding and self.c.config.branding.enabled
 
     async def process(self, ctx: StageContext) -> None:
-        """Brand a torrent's already-muxed MKV with the canonical chrome-bracket
-        style — matching the labels the streaming mux path writes via
+        """Brand a torrent's already-muxed MKV with the canonical per-stream
+        bracket styles — matching the labels the streaming mux path writes via
         ``_branding.py`` — with a torrent-specific subtitle rule.
 
           * Container title → ``"AnimeName〢@AniXWeebs"``
-          * Audio track     → ``"Japanese《 Anime Weebs 》"`` (language-based;
-            bare ``"《 Anime Weebs 》"`` when the track has no language tag)
+          * Audio track     → ``"English『 @AniXWeebs 』"`` (meaningful source
+            title if present, else language; ``"Audio Track 〢N『 @AniXWeebs 』"``
+            when neither is available)
           * Subtitle track  → torrent-specific: keep the ORIGINAL track title
-            (e.g. "Signs & Songs") + ``《 Anime Weebs 》`` (fansub subs carry
+            (e.g. "Signs & Songs") + ``〘 @AniXWeebs 〙`` (fansub subs carry
             meaningful names — Full / Signs&Songs / Dialogue — that we preserve),
             and INJECT a ``Telegram: @AniXWeebs`` cue into the subtitle content of
             every episode. Streaming sources instead name subs by language and are
             already content-branded at mux time by ``_subs``.
+          * Video credit    → container-level ``ENCODED_BY`` (set in the mux/remux
+            builders, not here — mkvpropedit can't set an arbitrary global tag).
 
         Streaming sources arrive branded (mux path), so this stage only re-affirms
         their metadata cheaply via ``mkvpropedit`` (no content remux). Torrents get
@@ -795,8 +833,10 @@ class BrandingStage(Stage):
         unsupported container records a note and moves on rather than failing.
         """
         from nekofetch.sources._branding import (
+            brand_audio_title,
             brand_container_title,
-            brand_track_title,
+            brand_subtitle_title,
+            is_meaningful_track_name,
         )
         from nekofetch.sources._hls import find_ffprobe
 
@@ -819,7 +859,7 @@ class BrandingStage(Stage):
             #    keep original-title track names via a single remux. ──
             if is_torrent and ffprobe:
                 did = await self._brand_torrent_file(
-                    ctx, path, branded_title, brand_track_title,
+                    ctx, path, branded_title, brand_subtitle_title,
                 )
                 if did:
                     pct = ((i + 1) / n) * 100
@@ -829,25 +869,33 @@ class BrandingStage(Stage):
                 # Remux unavailable/failed → fall through to metadata-only branding
                 # so the file is at least title/track branded.
 
-            audio_langs = await _track_langs(ffprobe, path, "a") if ffprobe else []
-            sub_langs = await _track_langs(ffprobe, path, "s") if ffprobe else []
+            audio = await _audio_tracks(ffprobe, path) if ffprobe else []
+            subs = await _sub_tracks(ffprobe, path) if ffprobe else []
 
             tags: list[str] = []
             # Container title — branded + idempotent (the helper no-ops if already
             # branded), so re-running the stage never double-appends the handle.
             if branded_title:
                 tags += ["--edit", "info", "--set", f"title={branded_title}"]
-            # Audio: fall back to a single track when the probe found none (so a
-            # container ffprobe can't read still gets a branded track name).
-            audio_count = len(audio_langs) or 1
+            # Audio: keep a MEANINGFUL source title (torrent rule), else the
+            # language, else "Audio Track 〢N". Fall back to one track when the
+            # probe found none (so a container ffprobe can't read still gets a name).
+            audio_count = len(audio) or 1
             for t in range(1, audio_count + 1):
-                lang = audio_langs[t - 1] if t - 1 < len(audio_langs) else ""
-                name = brand_track_title(_lang_display(lang), t)
+                tr = audio[t - 1] if t - 1 < len(audio) else {}
+                name = brand_audio_title(
+                    tr.get("title", ""), t,
+                    fallback_lang=_lang_display(tr.get("lang", "")))
                 tags += ["--edit", f"track:a{t}", "--set", f"name={name}"]
             # Subtitles: only name tracks we actually detected — never invent a
-            # phantom subtitle track on a file that has none.
-            for t in range(1, len(sub_langs) + 1):
-                name = brand_track_title(_lang_display(sub_langs[t - 1]), t)
+            # phantom subtitle track. Keep the original title (fansub "Full Subs"),
+            # else the language, else the bare "〘 By @AniXWeebs 〙".
+            for t in range(1, len(subs) + 1):
+                tr = subs[t - 1]
+                sub_name = tr.get("title", "") \
+                    if is_meaningful_track_name(tr.get("title", "")) \
+                    else _lang_display(tr.get("lang", ""))
+                name = brand_subtitle_title(sub_name, t)
                 tags += ["--edit", f"track:s{t}", "--set", f"name={name}"]
 
             rc, err = await _run("mkvpropedit", f.local_path, *tags)
@@ -855,14 +903,14 @@ class BrandingStage(Stage):
                 ctx.notes.append(f"branding: {err.strip() or 'mkvpropedit unavailable'}")
             else:
                 ctx.notes.append(
-                    f"branding: title + {audio_count} audio + {len(sub_langs)} "
+                    f"branding: title + {audio_count} audio + {len(subs)} "
                     "subtitle track(s) branded"
                 )
             pct = ((i + 1) / n) * 100
             await _push_stage_progress(self.c, ctx, "Branding", pct, file_index=i + 1, file_total=n)
 
     async def _brand_torrent_file(
-        self, ctx: StageContext, path: Path, branded_title: str, brand_track_title,
+        self, ctx: StageContext, path: Path, branded_title: str, brand_subtitle_title,
     ) -> bool:
         """Torrent subtitle branding for one file: inject the Telegram cue into
         subtitle content + keep original-title track names, via one remux.
@@ -872,6 +920,7 @@ class BrandingStage(Stage):
         Audio-track names + container title are applied afterwards via mkvpropedit
         (fast, no second remux) so this method owns ONLY the subtitle work.
         """
+        from nekofetch.sources._branding import brand_audio_title
         from nekofetch.sources._hls import find_ffprobe
         from nekofetch.sources._torrent_subs import brand_torrent_subtitles
 
@@ -886,7 +935,7 @@ class BrandingStage(Stage):
             manifest = await brand_torrent_subtitles(
                 path, tmp_out, sub_tracks=sub_tracks, video_ms=video_ms,
                 container_title=branded_title or None,
-                brand_track_title=brand_track_title,
+                brand_subtitle_title=brand_subtitle_title,
             )
         except Exception as exc:  # noqa: BLE001 — remux failure is recoverable
             ctx.notes.append(f"branding(torrent): remux error {exc}")
@@ -904,16 +953,19 @@ class BrandingStage(Stage):
             return False
 
         # Audio track names + container title (subtitle titles were set in the
-        # remux). Cheap metadata-only mkvpropedit pass, no second transcode.
-        audio_langs = await _track_langs(ffprobe, path, "a")
+        # remux). Cheap metadata-only mkvpropedit pass, no second transcode. Keep a
+        # meaningful source audio title (torrent rule), else the language.
+        audio = await _audio_tracks(ffprobe, path)
         tags: list[str] = []
         if branded_title:
             tags += ["--edit", "info", "--set", f"title={branded_title}"]
-        audio_count = len(audio_langs) or 1
+        audio_count = len(audio) or 1
         for t in range(1, audio_count + 1):
-            lang = audio_langs[t - 1] if t - 1 < len(audio_langs) else ""
-            tags += ["--edit", f"track:a{t}", "--set",
-                     f"name={brand_track_title(_lang_display(lang), t)}"]
+            tr = audio[t - 1] if t - 1 < len(audio) else {}
+            name = brand_audio_title(
+                tr.get("title", ""), t,
+                fallback_lang=_lang_display(tr.get("lang", "")))
+            tags += ["--edit", f"track:a{t}", "--set", f"name={name}"]
         await _run("mkvpropedit", str(path), *tags)
         ctx.notes.append(
             f"branding(torrent): {manifest['branded_tracks']} sub track(s) content-branded "
@@ -925,8 +977,11 @@ class BrandingStage(Stage):
 class WatermarkStage(Stage):
     """Optional video watermark overlay (text or image) via ffmpeg.
 
-    Opt-in (``watermark.enabled``) and re-encodes video, so it is off by default. Honors
-    corner, opacity, and scale. Falls back to a note (not a failure) when ffmpeg is missing.
+    Gated by ``watermark.mode``: ``off`` never runs, ``always`` burns the mark on
+    the highest-res source, and ``auto`` (default) burns it ONLY when subtitle
+    branding wasn't possible — i.e. a file with no brandable TEXT subtitle track
+    (PGS/image subs, or no subs). Honors corner, opacity, and scale. Re-encodes
+    video; falls back to a note (not a failure) when ffmpeg is missing.
     """
 
     stage = ProcessingStage.BRANDING
@@ -937,8 +992,18 @@ class WatermarkStage(Stage):
     def log_name(self) -> str:
         return "watermarking"
 
+    def _mode(self) -> str:
+        """Resolved watermark mode. Honors the new ``mode`` field; falls back to
+        the legacy ``enabled`` bool (True → "always") for old configs."""
+        w = self.c.config.watermark
+        mode = (getattr(w, "mode", "") or "").strip().lower()
+        if mode in ("off", "always", "auto"):
+            return mode
+        # Legacy config without ``mode``: honour the old enabled bool.
+        return "always" if getattr(w, "enabled", False) else "off"
+
     def enabled(self) -> bool:
-        return self.c.config.watermark.enabled
+        return self._mode() != "off"
 
     def _filter(self, w) -> tuple[str, list[str]]:
         """Build the ffmpeg filter and any extra input args for the configured watermark."""
@@ -977,7 +1042,8 @@ class WatermarkStage(Stage):
         return flt, []
 
     async def process(self, ctx: StageContext) -> None:
-        from nekofetch.sources._hls import find_ffmpeg
+        from nekofetch.sources._hls import find_ffmpeg, find_ffprobe
+        from nekofetch.sources._torrent_subs import is_text_sub
         from nekofetch.sources._transcode import (
             build_watermark_encode_args, is_10bit, probe_duration_s_async,
             probe_pixel_format, run_watermark,
@@ -985,6 +1051,10 @@ class WatermarkStage(Stage):
 
         w = self.c.config.watermark
         ffmpeg = find_ffmpeg()
+        mode = self._mode()
+        # In "auto" mode we only watermark files whose subtitle branding wasn't
+        # possible — so we need ffprobe to check for a brandable text sub track.
+        ffprobe = find_ffprobe() if mode == "auto" else None
         # A watermark burn is a full re-encode. Keep it FAST — a corner mark's
         # quality is dominated by the source, so a quicker preset costs nothing
         # visible but saves large wall-clock. Config wins; floor at "faster".
@@ -1020,6 +1090,22 @@ class WatermarkStage(Stage):
             if not f.local_path:
                 continue
             src = Path(f.local_path)
+            # ── "auto" mode: skip the watermark when subtitle branding covered
+            #    this file. A brandable TEXT subtitle track (ASS/SRT/VTT/…) means
+            #    our channel cue was injected there, so the video is left clean;
+            #    only PGS/image-only or sub-less files get the burn. ──
+            if mode == "auto" and ffprobe:
+                subs = await _sub_tracks(ffprobe, src)
+                has_text_sub = any(is_text_sub(t.get("codec", "")) for t in subs)
+                if has_text_sub:
+                    log.info("watermark.auto_skip", file=src.name,
+                             reason="text_subtitle_branded",
+                             sub_tracks=len(subs))
+                    ctx.notes.append(
+                        f"watermark: skipped {src.name} (auto — text subs branded)")
+                    continue
+                log.info("watermark.auto_burn", file=src.name,
+                         reason="no_text_subtitle", sub_tracks=len(subs))
             # Tag the card with THIS file's identity + "file i of n" as we start
             # it, so the watermark pass walks episode-by-episode like downloads.
             await _push_stage_progress(
