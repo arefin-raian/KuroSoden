@@ -231,7 +231,9 @@ class SenkuPublisher:
             if code:
                 entries = await self.cache.get_entries(code)
                 if entries:
-                    generated = await self._bridge_thumbnails(code, entries)
+                    # Incremental updates identify entries by anilist_id, so use
+                    # the id-keyed map (index-keyed map is for the full publish).
+                    _by_index, generated = await self._bridge_thumbnails(code, entries)
         except Exception as exc:  # noqa: BLE001 — missing thumbs just fall back
             log.warning("senku.update.thumb_bridge_failed",
                         anime=anime_doc_id, error=str(exc))
@@ -465,9 +467,21 @@ class SenkuPublisher:
         walked = await svc._walk_franchise(anime_doc_id, meta)
 
         # Reorder the AniList walk to the admin's *confirmed* order, and bridge
-        # each entry's locally-rendered thumbnail to a public URL.
+        # each entry's locally-rendered thumbnail to a public URL. The bridge
+        # returns BOTH index-keyed and anilist_id-keyed maps (an index is always
+        # present; an id may be None for a mapping-built entry like Takopi's ONA),
+        # so every card — info, TV and extras — can use the generated render.
         franchise = self._reorder_franchise(walked, entries)
-        generated = await self._bridge_thumbnails(code, entries)
+        generated_by_index, generated_by_id = await self._bridge_thumbnails(code, entries)
+
+        def _gen(entry) -> str | None:
+            """The rendered thumbnail for a walked franchise entry, if any."""
+            url = generated_by_id.get(getattr(entry, "anilist_id", None))
+            if url:
+                return url
+            return generated_by_index.get(
+                franchise.get("origin_index", {}).get(id(entry))
+            )
 
         posts: list[dict] = []
         order = 0
@@ -483,7 +497,7 @@ class SenkuPublisher:
             # every entry in confirmed order and take the first bridged render.
             info_gen = None
             for _entry in (*franchise["tv"], *franchise["extras"]):
-                info_gen = generated.get(getattr(_entry, "anilist_id", None))
+                info_gen = _gen(_entry)
                 if info_gen:
                     break
             info_image = svc._pick_card_image(info_gen, info_default, meta)
@@ -499,7 +513,7 @@ class SenkuPublisher:
         for i, entry in enumerate(franchise["tv"], start=1):
             season_packs = [p for p in packs if p.season == i]
             entry_meta = svc._entry_meta(meta, entry)
-            gen = generated.get(entry.anilist_id)
+            gen = _gen(entry)
             if gen:
                 entry_meta["poster_url"] = gen
             caption, image = svc._build_season_card(entry_meta, i, season_packs)
@@ -521,7 +535,7 @@ class SenkuPublisher:
                 or (p.entry_id is None and p.season is None)
             ]
             entry_meta = svc._entry_meta(meta, entry)
-            gen = generated.get(entry.anilist_id)
+            gen = _gen(entry)
             if gen:
                 entry_meta["poster_url"] = gen
             is_movie = entry.format == "MOVIE" or (
@@ -668,41 +682,72 @@ class SenkuPublisher:
         ``anilist_id`` and re-emit them in the cached entry order; any AniList
         entry the admin dropped is excluded, and any cached entry AniList
         couldn't resolve is skipped (it has no card-quality metadata anyway).
+
+        Also returns ``origin_index``: ``id(franchise_entry) → cache EntryData
+        index``. The thumbnail bridge is keyed by cache ``index`` (renders exist
+        per confirmed entry, and a mapping-built entry may have no ``anilist_id``),
+        so the card builders use this to find the right render even when ids are
+        absent — including the ``anilist_id``-less fallback below.
         """
         by_id = {
             e.anilist_id: e
             for e in walked.get("all", [])
             if getattr(e, "anilist_id", None) is not None
         }
+        origin_index: dict[int, int] = {}
         ordered: list = []
         for ce in entries:
             if ce.anilist_id is not None and ce.anilist_id in by_id:
-                ordered.append(by_id[ce.anilist_id])
+                fe = by_id[ce.anilist_id]
+                ordered.append(fe)
+                origin_index[id(fe)] = ce.index
         # If the cached entries never carried anilist_ids (bare franchise), fall
-        # back to the AniList walk order so the channel still gets cards.
+        # back to the AniList walk order so the channel still gets cards. Map each
+        # walked entry positionally to the cached entry at the same slot so the
+        # per-entry render still resolves by index.
         if not ordered:
             ordered = list(walked.get("all", []))
+            for k, fe in enumerate(ordered):
+                if k < len(entries):
+                    origin_index[id(fe)] = entries[k].index
         tv = [e for e in ordered if e.format in _TV_FORMATS]
         extras = [e for e in ordered if e.format not in _TV_FORMATS]
-        return {"tv": tv, "extras": extras, "all": ordered}
+        return {"tv": tv, "extras": extras, "all": ordered,
+                "origin_index": origin_index}
 
     async def _bridge_thumbnails(
         self, code: str, entries: list[EntryData],
-    ) -> dict[int, str]:
-        """Map ``anilist_id → public thumbnail URL`` for entries the admin rendered.
+    ) -> tuple[dict[int, str], dict[int, str]]:
+        """Mirror each rendered entry thumbnail to a public URL.
 
         Phase 3 stores each rendered card as ``file://<path>`` in the entry's
         selection. Telegram can't serve a local path, so we mirror each render
-        across the configured hosts (ImgBB first) here. A failed upload just omits
-        that entry — the card builder falls back to the AniList poster via
-        ``_pick_card_image``.
+        across the configured hosts (ImgBB first) here.
+
+        Returns ``(by_index, by_anilist_id)``:
+          * ``by_index``  — ``entry.index → url`` for EVERY rendered entry. Index
+            is always present, so this works for mapping-built entries whose
+            ``anilist_id`` is ``None`` (e.g. a single-ONA franchise like Takopi —
+            the earlier ``anilist_id``-only map came back EMPTY, so the render was
+            never uploaded and the cards fell back to the AniList poster).
+          * ``by_anilist_id`` — ``anilist_id → url`` for entries that HAVE an id,
+            for callers that can match on it directly.
+
+        A failed upload just omits that entry — the card builder falls back to the
+        AniList poster via ``_pick_card_image``. The upload preserves the render's
+        real image type (webp/png/jpg) so a ``.webp`` render is not silently
+        relabelled ``.jpg``.
         """
         from kurosoden.shared.image_backup import backup_bytes
 
-        out: dict[int, str] = {}
+        _MIME_BY_SUFFIX = {
+            ".webp": "image/webp", ".png": "image/png",
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        }
+
+        by_index: dict[int, str] = {}
+        by_anilist: dict[int, str] = {}
         for entry in entries:
-            if entry.anilist_id is None:
-                continue
             sel = await self.cache.get_selection(code, entry.index)
             url = sel.thumbnail_url if sel else None
             if not url or not url.startswith("file://"):
@@ -710,14 +755,17 @@ class SenkuPublisher:
             path = Path(url[len("file://"):])
             try:
                 data = path.read_bytes()
-                result = await backup_bytes(self._c, data, mime="image/jpeg")
+                mime = _MIME_BY_SUFFIX.get(path.suffix.lower(), "image/jpeg")
+                result = await backup_bytes(self._c, data, mime=mime)
                 public = result.primary
                 if public:
-                    out[entry.anilist_id] = public
+                    by_index[entry.index] = public
+                    if entry.anilist_id is not None:
+                        by_anilist[entry.anilist_id] = public
             except Exception as exc:  # noqa: BLE001 — a missing render just falls back
                 log.warning("senku.publish.thumb_bridge_failed",
                             code=code, entry=entry.index, error=str(exc))
-        return out
+        return by_index, by_anilist
 
     async def _cache_image(self, image) -> str | None:
         """Mirror a card image across the configured hosts and return the best URL.

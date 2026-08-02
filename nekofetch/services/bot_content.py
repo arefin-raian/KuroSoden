@@ -44,6 +44,73 @@ from nekofetch.ui import templates
 
 log = get_logger(__name__)
 
+
+async def _jikan_search(title: str) -> dict | None:
+    """Search MyAnimeList via Jikan (jikan.moe) and return the top anime record.
+
+    Jikan is public/unauthenticated but rate-limited (~3 req/s) and sits behind
+    Cloudflare, which serves Python's stock TLS fingerprint a synthetic 504. We
+    mirror :meth:`MetadataPrefetchService._prefetch_jikan`: curl_cffi with Chrome
+    impersonation first (falling back to plain httpx), one search call, take the
+    first hit. Returns the raw MAL ``anime`` payload (``mal_id``, ``title``,
+    ``title_english``, ``synopsis``, ``score``, ``genres``, ``episodes``,
+    ``aired``, ``duration``, ``images.jpg.large_image_url``) or ``None``.
+    """
+    import asyncio
+
+    url = "https://api.jikan.moe/v4/anime"
+    params = {"q": title, "limit": 1}
+
+    async def _fetch() -> dict | None:
+        try:
+            from curl_cffi import requests as cf_requests
+        except ImportError:  # noqa: BLE001
+            cf_requests = None
+        if cf_requests is not None:
+            sess = cf_requests.AsyncSession(
+                impersonate="chrome", timeout=30.0, allow_redirects=True)
+            try:
+                for attempt in range(3):
+                    r = await sess.get(url, params=params)
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    if r.status_code >= 400:
+                        log.warning("bot.content.jikan.http_error",
+                                    transport="curl_cffi", status=r.status_code)
+                        return None
+                    return r.json()
+                log.warning("bot.content.jikan.gave_up",
+                            transport="curl_cffi", status=getattr(r, "status_code", None))
+                return None
+            finally:
+                try:
+                    await sess.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        log.warning("bot.content.jikan.no_curl_cffi",
+                    hint="curl_cffi not installed — httpx may 504 behind Cloudflare")
+        import httpx
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as cli:
+            for attempt in range(3):
+                r = await cli.get(url, params=params)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                r.raise_for_status()
+                return r.json()
+
+    try:
+        body = await _fetch()
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        log.warning("bot.content.jikan.failed", title=title, error=str(exc))
+        return None
+    data = (body or {}).get("data") or []
+    if not data:
+        log.debug("bot.content.jikan.empty", title=title)
+        return None
+    return data[0]
+
 _RES_ORDER = {"360p": 360, "480p": 480, "540p": 540, "720p": 720, "1080p": 1080}
 _BTN_QUALITIES = ("480p", "720p", "1080p")
 _TV_FORMATS = {"TV", "TV_SHORT", "TV_SPECIAL"}
@@ -607,6 +674,76 @@ class BotContentService:
                              anime=search_query, source=meta["_source"])
             except Exception as exc:
                 log.warning("bot.content.anilist.failed", anime=search_query, error=str(exc))
+
+        # ── Fallback 1.5: MyAnimeList (Jikan) for the fields AniList didn't fill ──
+        # MAL is the tier BETWEEN AniList and TMDB: when AcuteBot is down and
+        # AniList is thin (or unreachable), reconstruct the card from the
+        # prefetched Jikan blob first, then a live Jikan search. Fills ONLY what
+        # is still empty — never overwrites a value AniList already supplied.
+        # TMDB remains the last resort.
+        def _needs_mal() -> bool:
+            return not any(
+                meta.get(k) for k in
+                ("synopsis", "score", "genres", "poster_url", "title")
+            ) or not meta.get("synopsis")
+
+        if _needs_mal():
+            mal_top = None
+            try:
+                from nekofetch.services.metadata_prefetch import load_cached_jikan
+
+                mal_top = await load_cached_jikan(
+                    self._c, anime_doc_id, anime_doc_id=anime_doc_id)
+            except Exception as exc:  # noqa: BLE001 — cache miss → live search
+                log.debug("bot.content.jikan.cache_failed", error=str(exc))
+            if mal_top is None:
+                mal_top = await _jikan_search(search_query or meta.get("title", ""))
+
+            if mal_top:
+                img = (mal_top.get("images") or {}).get("jpg") or {}
+                aired = mal_top.get("aired") or {}
+                supplied_any = False
+                if not meta.get("title"):
+                    meta["title"] = (mal_top.get("title_english")
+                                     or mal_top.get("title") or meta.get("title"))
+                    supplied_any = True
+                if not meta.get("english"):
+                    meta["english"] = mal_top.get("title_english")
+                    supplied_any = True
+                if not meta.get("romaji") and mal_top.get("title"):
+                    meta["romaji"] = mal_top.get("title")
+                    supplied_any = True
+                if not meta.get("synopsis"):
+                    meta["synopsis"] = mal_top.get("synopsis")
+                    supplied_any = True
+                if not meta.get("score"):
+                    meta["score"] = str(mal_top["score"]) if mal_top.get("score") else None
+                    supplied_any = True
+                if not meta.get("genres"):
+                    meta["genres"] = [
+                        g["name"] for g in (mal_top.get("genres") or [])
+                        if isinstance(g, dict) and g.get("name")
+                    ]
+                    supplied_any = True
+                if not meta.get("episode_count") and mal_top.get("episodes"):
+                    meta["episode_count"] = mal_top["episodes"]
+                    supplied_any = True
+                if not meta.get("poster_url") and img.get("large_image_url"):
+                    meta["poster_url"] = img["large_image_url"]
+                    supplied_any = True
+                if not meta.get("first_aired") and aired.get("string"):
+                    meta["first_aired"] = aired["string"]
+                    supplied_any = True
+                if not meta.get("runtime") and mal_top.get("duration"):
+                    # "24 min per ep" → "24 min/ep" to match the other tiers.
+                    meta["runtime"] = re.sub(
+                        r"\s*per\s*ep\s*$", "/ep", str(mal_top["duration"]).strip(),
+                    )
+                    supplied_any = True
+                if supplied_any:
+                    meta["_source"] = "myanimelist"
+                    log.info("bot.content.metadata.mal_fallback",
+                             anime=search_query, score=meta.get("score"))
 
         # ── Fallback 2: TMDB for poster + backdrop ──
         # Prefer the prefetched TMDB blob (poster/backdrop/overview cached at
@@ -1176,20 +1313,29 @@ class BotContentService:
             bot = await pick_fstore_bot_rr(self._c.redis, bot_usernames)
             if bot is None:
                 continue
-            if file_ids:
-                link = build_fstore_link(
-                    bot_username=bot,
-                    channel_id=pack.channel_id,
-                    start_msg_id=file_ids[0],
-                    end_msg_id=file_ids[-1],
-                )
-            else:
-                link = build_fstore_link(
-                    bot_username=bot,
-                    channel_id=pack.channel_id,
-                    start_msg_id=pack.start_message_id,
-                    end_msg_id=pack.end_message_id,
-                )
+            # A pack is the FULL message range in the database channel:
+            #   header/caption → file 1 … file N → end sticker
+            # (see StoragePack layout). Tapping a quality button must deliver the
+            # whole pack — the caption, every file, and the ending sticker — so the
+            # range starts at the header message (fallback: the first file, then
+            # start_message_id) and ENDS at end_message_id (the sticker/last). The
+            # previous code ended at file_ids[-1], which dropped the caption and
+            # the end sticker from what a user actually received.
+            start = (
+                pack.header_message_id
+                or (file_ids[0] if file_ids else None)
+                or pack.start_message_id
+            )
+            # end_message_id is the end sticker / last message. Fall back to the
+            # last recorded file, then to start itself, so a legacy pack with a
+            # NULL end still delivers something sane rather than a single file.
+            end = pack.end_message_id or (file_ids[-1] if file_ids else start)
+            link = build_fstore_link(
+                bot_username=bot,
+                channel_id=pack.channel_id,
+                start_msg_id=start,
+                end_msg_id=end,
+            )
             # Key includes audio type so separate sub/dub packs don't overwrite
             links[f"{pack.resolution}_{pack.audio.value}"] = link
         return links
