@@ -78,9 +78,13 @@ async def build_channel_essentials(
     native = (meta.get("native") or "").strip() or native
     base_title = english or romaji or (anime_doc_id or "Anime")
 
-    # The FINAL title the bot sets itself once it's an admin (EN + JP + tags).
+    # The FINAL title the bot sets itself once it's an admin. Per spec it shows
+    # BOTH the English AND the Romaji name (joined by 〢) when they differ —
+    # "English〢Romaji《 audio 》« languages » qualities". We pass ROMAJI (not the
+    # native/Japanese-script name) as the second half: the spec example is
+    # "Takopi's Original Sin〢Takopii no Genzai …" — Takopii no Genzai is romaji.
     title = format_channel_title(
-        english or base_title, native,
+        english or base_title, romaji,
         audios=meta.get("audios") or set(),
         languages=meta.get("languages"),
         qualities=meta.get("qualities"),
@@ -131,8 +135,11 @@ _DESC_LINKS = [
     ("𝗢𝗻𝗴𝗼𝗶𝗻𝗴", "@Ongoing_AniXWeebs"),
     ("𝗡𝗲𝘁𝘄𝗼𝗿𝗸", "@WeebsXServer"),
 ]
-# Removal sequence by index: Network(4) → Ongoing(3) → Movies(2) → Index(1).
-_DESC_DROP_ORDER = [4, 3, 2, 1]
+# Removal sequence by IMPORTANCE (least-important-mentioned removed FIRST):
+# Index(1) → Movies(2) → Ongoing(3) → Network(4). Index/Movies are surfaced many
+# times on the main channel already, Ongoing less so, and Network is essentially
+# a single post — so Index goes first and Network is the last to be dropped.
+_DESC_DROP_ORDER = [1, 2, 3, 4]
 
 _DESC_HEADER = "𝗪𝗮𝘁𝗰𝗵/𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 {title} 🎐"
 _DESC_FOOTER = "ᴊᴏɪɴ ᴏᴜʀ ᴄᴏᴍᴍᴜɴɪᴛʏ ꜰᴏʀ ᴍᴏʀᴇ ᴄᴏɴᴛᴇɴᴛ 💌"

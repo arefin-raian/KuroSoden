@@ -276,31 +276,34 @@ def format_channel_username_candidates(
 
 
 def format_channel_title(
-    english: str | None, native: str | None, *,
+    english: str | None, romaji: str | None, *,
     audios: set | None = None, languages: set | None = None,
     qualities: list[str] | None = None, limit: int = 128,
 ) -> str:
     """Channel title with BOTH names + the decorative audio/language/quality tags.
 
-    Distribution *channels* allow a 128-char title (vs a bot's 64), so we can
-    show the English name, the native (Japanese) name, then the same
+    Distribution *channels* allow a 128-char title (Telegram's setChatTitle cap),
+    so we can show the English name, the Romaji name, then the same
     audio/languages/qualities suffix. User spec:
 
         "English〢Romaji《 audio 》« languages » resolutions"
 
     Rules:
-    - If English == Romaji/Japanese (same text), keep ONE name only.
+    - Show BOTH names ("English〢Romaji") whenever they differ; if English ==
+      Romaji (same text) keep ONE name only (avoid "Same〢Same").
     - Audio labels: "Dual Audio, Sub & Dub" / "Sub & Dub" / "Multi Audio, Sub, Dub & Dual".
     - Languages: "English & Japanese" or "English, Japanese & Hindi" (Oxford comma before last).
     - Omit ANY section whose info is unavailable (no languages, no resolutions, etc).
-    - Native half is dropped first when space is tight; the audio/quality suffix
-      is always preserved (it's what users scan for).
+    - Overflow order when >128 chars: drop the QUALITIES first (keep both names +
+      audio + languages), then the Romaji half, then hard-truncate. The user wants
+      the qualities sacrificed last-in / first-out — both names matter more than
+      the resolution list.
 
-    Example: "Takopi's Original Sin〢Takopii no Genzai《 Dual Audio, Sub & Dub 》« English & Japanese » 1080p 720p 480p"
+    Example: "Takopi's Original Sin〢Takopii no Genzai《 Dual Audio, Sub & Dub 》« English & Japanese » 480p 720p 1080p"
     """
     english = (english or "").strip()
-    native = (native or "").strip()
-    title = english or native or "Anime"
+    romaji = (romaji or "").strip()
+    title = english or romaji or "Anime"
 
     tag = audio_tag(audios or set())
     langs = language_label(languages)
@@ -309,40 +312,44 @@ def format_channel_title(
     # The audio/language brackets abut each other and the title with NO spaces
     # ("…Genzai《 Dual Audio 》« English & Japanese »"); only the resolutions get a
     # leading space. Each bracket keeps interior spaces ("《 x 》", "« x »").
-    def _build_suffix() -> str:
+    def _build_suffix(*, with_quals: bool) -> str:
         s = ""
         if tag:
             s += f"《 {tag} 》"
         if langs:
             s += f"« {langs} »"
-        if quals:
+        if with_quals and quals:
             s += (" " if s else "") + quals
         return s
 
-    suffix = _build_suffix()
-
-    # If English and native are identical, keep only one (avoid "Same〢Same").
-    # Otherwise build "English〢Native" with the separator 〢.
-    if native and native != english:
-        head = f"{english}〢{native}"
+    # If English and romaji are identical, keep only one (avoid "Same〢Same").
+    # Otherwise build "English〢Romaji" with the separator 〢.
+    if romaji and romaji != english:
+        head = f"{english}〢{romaji}"
     else:
-        head = english or native or "Anime"
+        head = english or romaji or "Anime"
 
-    # Try full "head+suffix", then drop native, then truncate.
-    candidate = f"{head}{suffix}" if suffix else head
+    # 1) Full title: both names + audio + languages + qualities.
+    candidate = f"{head}{_build_suffix(with_quals=True)}"
     if len(candidate) <= limit:
         return candidate
 
-    # Fallback: drop native (if any), keep English + suffix.
-    candidate = f"{english}{suffix}" if suffix else english
+    # 2) Drop the QUALITIES first (keep both names + audio + languages).
+    candidate = f"{head}{_build_suffix(with_quals=False)}"
     if len(candidate) <= limit:
         return candidate
 
-    # Last resort: preserve the suffix, truncate the head.
-    if suffix:
-        room = limit - len(suffix)
+    # 3) Drop the Romaji half — keep English + audio + languages (no qualities).
+    suffix_noq = _build_suffix(with_quals=False)
+    candidate = f"{english}{suffix_noq}" if suffix_noq else english
+    if len(candidate) <= limit:
+        return candidate
+
+    # 4) Last resort: preserve the (quality-less) suffix, truncate the head.
+    if suffix_noq:
+        room = limit - len(suffix_noq)
         if room > 3:
-            return f"{title[:room - 1].rstrip()}…{suffix}"[:limit]
+            return f"{title[:room - 1].rstrip()}…{suffix_noq}"[:limit]
     return title[:limit]
 
 

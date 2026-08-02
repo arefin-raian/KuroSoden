@@ -847,6 +847,27 @@ class SenkuPublisher:
             log.info("senku.warm.no_userbot", error=str(exc))
             return None
 
+    @staticmethod
+    async def _sweep_service_notices(client, chat_id: int) -> int:
+        """Delete Telegram's auto-posted 'channel name/photo/description changed'
+        service messages. Best-effort; returns how many were removed. Scans a
+        small recent window since these notices are always the latest messages."""
+        removed = 0
+        try:
+            async for m in client.get_chat_history(chat_id, limit=15):
+                if (getattr(m, "new_chat_title", None) is not None
+                        or getattr(m, "new_chat_photo", None) is not None
+                        or getattr(m, "delete_chat_photo", None)
+                        or getattr(m, "service", None) is not None):
+                    try:
+                        await client.delete_messages(chat_id, m.id)
+                        removed += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001 — sweep is best-effort
+            pass
+        return removed
+
     async def _warm_global_search(self, client, chat_id: int, code: str) -> None:
         """Send ~100 throwaway messages then delete them, to enter Global Search.
 
@@ -871,6 +892,13 @@ class SenkuPublisher:
                 return
         except Exception:  # noqa: BLE001
             pass
+
+        # Before the warm-up burst, clear any leftover 'channel name changed to …'
+        # service notice Telegram posted when the wizard renamed the channel — the
+        # user wants it gone immediately after the rename, not buried under quotes.
+        swept = await self._sweep_service_notices(client, chat_id)
+        if swept:
+            log.info("senku.warm.notice_swept", code=code, removed=swept)
 
         quotes = await self._fetch_warm_texts(self._WARM_COUNT)
 
