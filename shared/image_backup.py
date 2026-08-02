@@ -154,10 +154,45 @@ async def _upload_catbox(blob: bytes, mime: str, ext: str, source_url: str) -> s
         return None
 
 
+async def _upload_kappa(blob: bytes, ext: str, source_url: str) -> str | None:
+    """Push bytes to the kappa.lol anonymous file host. Returns the URL or None.
+
+    kappa.lol is a live, key-less, permanent anonymous host — our real third
+    mirror now that telegra.ph/graph.org (and 0x0.st) killed anonymous uploads.
+    Response is JSON: ``{"link": "https://kappa.lol/<id>", ...}``."""
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True,
+                                     headers={"User-Agent": "Mozilla/5.0"}) as cli:
+            r = await cli.post("https://kappa.lol/api/upload",
+                               files={"file": (f"post{ext}", blob)})
+        if r.status_code >= 400:
+            log.warning("imgbackup.kappa.http_error", status=r.status_code,
+                        body=(r.text or "")[:200])
+            return None
+        body = r.json()
+        url = body.get("link") or (
+            f"https://kappa.lol/{body['id']}{body.get('ext', '')}"
+            if body.get("id") else None
+        )
+        if isinstance(url, str) and url.startswith("http"):
+            log.info("imgbackup.kappa.ok", url=url, bytes=len(blob))
+            return url
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        log.warning("imgbackup.kappa.failed", url=source_url, error=str(exc))
+    return None
+
+
 async def _upload_telegraph(
     container: Container, blob: bytes, mime: str, source_url: str,
 ) -> str | None:
-    """Push bytes to the telegra.ph file host. Returns the URL or None."""
+    """Third durable mirror. Tries telegra.ph/graph.org first (in case Telegram
+    ever re-enables anonymous uploads), then falls back to the LIVE kappa.lol host.
+
+    Telegram disabled telegra.ph AND graph.org ``/upload`` (both 400 now), so in
+    practice this returns a kappa.lol URL. We keep the ``telegraph`` host name +
+    ``image_telegraph_url`` column so nothing downstream (restore, schema) has to
+    change — the column simply carries whichever third-host URL stuck."""
+    ext = ".png" if mime == "image/png" else ".jpg"
     try:
         token = getattr(
             getattr(container.config, "thumbnail_channel", None),
@@ -168,10 +203,12 @@ async def _upload_telegraph(
         client = TelegraphClient(token or "")
         url = await client.upload_image(blob, mime_type=mime)
         await client.close()
-        return url
-    except Exception as exc:  # noqa: BLE001 — best-effort
-        log.warning("imgbackup.telegraph.failed", url=source_url, error=str(exc))
-        return None
+        if url:
+            return url
+    except Exception as exc:  # noqa: BLE001 — telegraph dead → try kappa.lol
+        log.debug("imgbackup.telegraph.failed", url=source_url, error=str(exc))
+    # telegra.ph/graph.org are down for uploads — use the live anonymous host.
+    return await _upload_kappa(blob, ext, source_url)
 
 
 # Default host order when config doesn't specify one. Each host is independent so

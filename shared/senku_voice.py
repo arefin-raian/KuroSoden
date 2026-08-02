@@ -437,6 +437,31 @@ PUBLISH_FAIL = (
 )
 
 
+def filestore_missing(is_owner: bool) -> str:
+    """Blocked-publish card when no file-store bots are configured.
+
+    The quality buttons resolve through file-store bots; with none set, the
+    channel would post links that lead nowhere. Owners get the settings path;
+    everyone else is told to ask an admin. Both keep a Continue button so a
+    fix-then-retry is one tap."""
+    if is_owner:
+        fix = (
+            "Add them in <b>Settings → File-store bots</b> (paste the bot "
+            "@usernames — commas are fine), then tap <b>Continue</b>."
+        )
+    else:
+        fix = (
+            "Ask your admin to add the file-store bots in Settings, then tap "
+            "<b>Continue</b> to publish."
+        )
+    return (
+        f"{ICON} <b>Hold on — no file-store bots configured.</b>\n\n"
+        "The quality buttons need at least one file-store bot to hand out the "
+        f"download links, or the channel ships dead buttons. {fix}"
+    )
+
+
+
 # ── Errors / misc ───────────────────────────────────────────────────────────────
 
 GENERIC_FAIL = (

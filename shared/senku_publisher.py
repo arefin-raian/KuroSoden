@@ -475,11 +475,18 @@ class SenkuPublisher:
         # ── 1. Info card ──
         info_caption, info_default = await svc._build_info_card(meta)
         if info_caption:
-            first_tv = franchise["tv"][0] if franchise["tv"] else None
-            info_image = svc._pick_card_image(
-                generated.get(getattr(first_tv, "anilist_id", None)),
-                info_default, meta,
-            )
+            # Prefer the FIRST generated thumbnail across the whole franchise —
+            # TV seasons first, then extras. A movie-only / OVA-only franchise has
+            # an EMPTY tv list (Takopi: tv=0 extras=1), so keying only off the
+            # first TV entry left the pinned info card on the AniList poster while
+            # the actual entry card correctly used the generated thumbnail. Walk
+            # every entry in confirmed order and take the first bridged render.
+            info_gen = None
+            for _entry in (*franchise["tv"], *franchise["extras"]):
+                info_gen = generated.get(getattr(_entry, "anilist_id", None))
+                if info_gen:
+                    break
+            info_image = svc._pick_card_image(info_gen, info_default, meta)
             posts.append({
                 "post_type": "info_card", "order": order,
                 "caption": info_caption,
@@ -912,6 +919,83 @@ class SenkuPublisher:
             return None
 
     @staticmethod
+    def _member_status(member) -> str:
+        return getattr(getattr(member, "status", None), "value",
+                       str(getattr(member, "status", "")))
+
+    async def _ensure_userbot_can_post(self, admin_client, ub, chat_id: int) -> bool:
+        """Make sure the userbot can post the warm-up burst in ``chat_id``.
+
+        The userbot needs to be an admin (or at least a posting member) to fire
+        100 messages without the bot's 20/min channel cap. If it ISN'T already an
+        admin, we add + promote it via the bot admin client (which is a channel
+        admin), then tell the caller to demote it afterwards. If it's already an
+        admin we leave it alone (and the caller won't touch it).
+
+        Returns ``True`` when WE promoted the userbot (caller must undo it), and
+        ``False`` when it was already an admin or promotion failed (leave as-is).
+        """
+        try:
+            me = await ub.get_me()
+            uid = me.id
+        except Exception as exc:  # noqa: BLE001 — can't identify userbot → skip
+            log.debug("senku.warm.userbot_me_failed", error=str(exc))
+            return False
+
+        # Already an admin/creator? Then we didn't add it — never demote it.
+        try:
+            member = await admin_client.get_chat_member(chat_id, uid)
+            if self._member_status(member) in ("administrator", "creator"):
+                return False
+        except Exception:  # noqa: BLE001 — not a member yet → try to add + promote
+            pass
+
+        from pyrogram.types import ChatPrivileges
+
+        try:
+            try:
+                await admin_client.add_chat_members(chat_id, uid)
+            except Exception as exc:  # noqa: BLE001 — may already be a member
+                log.debug("senku.warm.userbot_add_skipped", error=str(exc))
+            await admin_client.promote_chat_member(
+                chat_id, uid,
+                privileges=ChatPrivileges(
+                    can_post_messages=True, can_delete_messages=True,
+                    can_invite_users=True,
+                ),
+            )
+            log.info("senku.warm.userbot_promoted", chat_id=chat_id, user_id=uid)
+            return True
+        except Exception as exc:  # noqa: BLE001 — bot lacks promote rights → bot path
+            log.info("senku.warm.userbot_promote_failed",
+                     chat_id=chat_id, error=str(exc))
+            return False
+
+    async def _demote_userbot(self, admin_client, ub, chat_id: int) -> None:
+        """Undo :meth:`_ensure_userbot_can_post` — strip all rights then remove the
+        userbot from the channel, so we leave it exactly as we found it."""
+        from pyrogram.types import ChatPrivileges
+
+        try:
+            me = await ub.get_me()
+            uid = me.id
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            # Strip admin rights (all-False privileges), then drop membership.
+            await admin_client.promote_chat_member(
+                chat_id, uid, privileges=ChatPrivileges(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("senku.warm.userbot_demote_failed", error=str(exc))
+        try:
+            await admin_client.ban_chat_member(chat_id, uid)
+            await admin_client.unban_chat_member(chat_id, uid)  # kick, don't blacklist
+            log.info("senku.warm.userbot_removed", chat_id=chat_id, user_id=uid)
+        except Exception as exc:  # noqa: BLE001 — leaving it in is harmless
+            log.debug("senku.warm.userbot_remove_failed", error=str(exc))
+
+    @staticmethod
     async def _sweep_service_notices(client, chat_id: int) -> int:
         """Delete Telegram's auto-posted 'channel name/photo/description changed'
         service messages. Best-effort; returns how many were removed. Scans a
@@ -971,14 +1055,23 @@ class SenkuPublisher:
         quotes = await self._fetch_warm_texts(self._WARM_COUNT)
 
         # Prefer the userbot (no 20/min channel cap). Fall back to the bot client.
+        # If the userbot isn't already an admin of the channel, promote it (via the
+        # bot admin client) so it can fire all 100 — then demote + remove it after,
+        # but ONLY if WE were the ones who promoted it (leave a pre-existing admin
+        # userbot untouched).
         sent_ids: list[int] = []
         via = "userbot" if ub is not None else "bot"
+        we_promoted = False
         if ub is not None:
+            we_promoted = await self._ensure_userbot_can_post(client, ub, chat_id)
             sent_ids = await self._warm_send(ub, chat_id, code, quotes, pace=False)
             # If the userbot couldn't post at all (not a member / no rights),
             # fall back to the bot so warm-up still happens.
             if not sent_ids:
                 via = "bot"
+                if we_promoted:
+                    await self._demote_userbot(client, ub, chat_id)
+                    we_promoted = False
                 ub = None
         if ub is None:
             sent_ids = await self._warm_send(
@@ -995,6 +1088,11 @@ class SenkuPublisher:
                 await deleter.delete_messages(chat_id, chunk)
             except Exception as exc:  # noqa: BLE001
                 log.warning("senku.warm.delete_blip", code=code, error=str(exc))
+
+        # Undo the temporary promotion (strip rights + kick) now that the burst is
+        # done — only when we added the userbot ourselves.
+        if we_promoted and ub is not None:
+            await self._demote_userbot(client, ub, chat_id)
 
         try:
             if self._c.redis:

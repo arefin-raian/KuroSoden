@@ -35,7 +35,7 @@ from nekofetch.domain.enums import Role
 from nekofetch.ui.artwork import (
     ensure_anime_art, key_for_franchise, next_anime_art, pick_artwork,
 )
-from nekofetch.ui.components import cb
+from nekofetch.ui.components import cb, keyboard
 from nekofetch.ui.screens import Screen, card, send_screen
 
 from kurosoden.shared import senku_voice as V
@@ -348,13 +348,18 @@ def register(client: Client, container: Container) -> None:
     async def _ask_channel(chat_id: int, user_id: int, code: str,
                            *, old_msg: Message | None) -> None:
         """Step 4 — LINK: arm the reply flow to receive the channel link."""
-        await fsm.set(user_id, STATE_AWAIT_CHANNEL, code=code)
-        await send_screen(
+        prompt = await send_screen(
             client, chat_id,
             card(V.CHANNEL_ASK_LINK, image=pick_artwork(BOT), bot_name=BOT,
                  buttons=[[(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))]]),
             old_msg=old_msg,
         )
+        # Stash the prompt card's message id so the finalise step can REPLACE it
+        # (old_msg=) with the title/description progress card instead of sending a
+        # separate message — the "name/description goes out as a new message with
+        # no buttons" complaint.
+        await fsm.set(user_id, STATE_AWAIT_CHANNEL, code=code,
+                      prompt_msg_id=prompt.id, prompt_chat_id=prompt.chat.id)
 
     async def _verify_and_store(chat_id: int, user_id: int, code: str, raw: str) -> None:
         """Resolve the channel, confirm BOTH Senku and Gojo are admins, store, advance.
@@ -364,6 +369,13 @@ def register(client: Client, container: Container) -> None:
         Senku (which becomes the cached peer), then check Gojo's membership through
         Senku's peer by Gojo's user id, so Gojo needn't have seen the channel yet.
         """
+        # The "please send the channel link" prompt card id (stashed at
+        # _ask_channel) — the finalise step edits THIS card in place into the
+        # title/description progress card instead of sending a separate message.
+        _state, _data = await fsm.get(user_id)
+        prompt_chat_id = _data.get("prompt_chat_id") or chat_id
+        prompt_msg_id = _data.get("prompt_msg_id")
+
         handle = raw.strip()
         target: str | int = handle
         if not handle.startswith("@") and not handle.lstrip("-").isdigit():
@@ -407,6 +419,13 @@ def register(client: Client, container: Container) -> None:
         if not gojo_ok:
             missing.append("Gojo")
         if chat is None or missing:
+            # Replace the prompt card with the failure card (keep the flow single
+            # -message). The admin can fix rights and tap "I've added them".
+            if prompt_msg_id:
+                try:
+                    await client.delete_messages(prompt_chat_id, prompt_msg_id)
+                except Exception:  # noqa: BLE001
+                    pass
             await send_screen(
                 client, chat_id,
                 card(V.channel_verify_failed(display, missing or None),
@@ -493,15 +512,35 @@ def register(client: Client, container: Container) -> None:
 
         # ── Bot-driven finalisation ─────────────────────────────────────────
         # Both bots are admins now, so Senku sets the decorated title + the
-        # description ITSELF (the admin shouldn't type these). A small progress
-        # card, edited in place, mirrors the download bar's stage list.
+        # description ITSELF (the admin shouldn't type these). We EDIT the "send
+        # the channel link" prompt card in place into a progress card (mirrors the
+        # download bar's stage list) — never a separate message — and keep a
+        # Cancel button on it throughout.
         steps = [("Set channel title", "active"),
                  ("Set channel description", "todo")]
-        prog = await send_screen(
-            client, chat_id,
-            card(V.channel_setup_progress(steps), image=pick_artwork(BOT),
-                 bot_name=BOT),
-        )
+        cancel_kb = keyboard([[(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))]])
+
+        prog = None
+        if prompt_msg_id:
+            # Edit the existing prompt card (caption + keep the Cancel button).
+            try:
+                await client.edit_message_caption(
+                    prompt_chat_id, prompt_msg_id,
+                    caption=V.channel_setup_progress(steps),
+                    parse_mode=ParseMode.HTML, reply_markup=cancel_kb,
+                )
+            except Exception as exc:  # noqa: BLE001 — fall back to a fresh card
+                log.debug("senku.wiz.progress_edit_failed", code=code, error=str(exc))
+                prompt_msg_id = None
+        if not prompt_msg_id:
+            prog = await send_screen(
+                client, chat_id,
+                card(V.channel_setup_progress(steps), image=pick_artwork(BOT),
+                     bot_name=BOT,
+                     buttons=[[(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))]]),
+            )
+            prompt_chat_id, prompt_msg_id = prog.chat.id, prog.id
+
         ctx = await _channel_ctx(code)
         ess = ctx[2] if ctx else None
         final_title = ess.title if ess else (chat.title or display)
@@ -509,9 +548,9 @@ def register(client: Client, container: Container) -> None:
         async def _edit_progress() -> None:
             try:
                 await client.edit_message_caption(
-                    prog.chat.id, prog.id,
+                    prompt_chat_id, prompt_msg_id,
                     caption=V.channel_setup_progress(steps),
-                    parse_mode=ParseMode.HTML,
+                    parse_mode=ParseMode.HTML, reply_markup=cancel_kb,
                 )
             except Exception:  # noqa: BLE001 — progress is cosmetic
                 pass
@@ -542,12 +581,18 @@ def register(client: Client, container: Container) -> None:
         # 3) Sweep the service notices Telegram posted for the title/photo change.
         await _sweep_channel_service_notices()
 
+        # Replace the progress card with the "setup done → continue" card. We
+        # delete the progress message by id (it may have been an edited prompt
+        # card, so there's no Message object to hand to old_msg).
+        try:
+            await client.delete_messages(prompt_chat_id, prompt_msg_id)
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
         await send_screen(
             client, chat_id,
             card(V.channel_setup_done(display, final_title),
                  image=pick_artwork(BOT), bot_name=BOT,
                  buttons=[[(V.BTN_CONTINUE, cb(BOT, "wiz", "thumbs", code))]]),
-            old_msg=prog,
         )
 
     async def _enter_thumbnails(chat_id: int, code: str, *, old_msg: Message | None) -> None:
@@ -733,6 +778,32 @@ def register(client: Client, container: Container) -> None:
         await fsm.clear(user_id)
         franchise = await cache.get_franchise(code)
         title = await _title_of(code, franchise)
+
+        # ── Filestore guard: never publish dead quality buttons ──
+        # The quality links come from file-store bots; with none configured the
+        # channel would ship links that lead nowhere. Block with a clear card and
+        # a Continue button on the SAME message so a fix-then-retry is one tap.
+        filestore = list(
+            getattr(getattr(container.config, "bot", None), "filestore_bots", None)
+            or []
+        )
+        if not filestore:
+            # Owner detection by telegram id (owner is defined by id, not DB role).
+            try:
+                from nekofetch.services.auth_service import AuthService
+
+                owner = user_id in AuthService(container).owner_ids()
+            except Exception:  # noqa: BLE001
+                owner = False
+            await send_screen(
+                client, chat_id,
+                card(V.filestore_missing(owner), image=pick_artwork(BOT), bot_name=BOT,
+                     buttons=[[(V.BTN_CONTINUE, cb(BOT, "wiz", "post", code))],
+                              [(V.BTN_HOME, cb(BOT, "home"))]]),
+                old_msg=old_msg,
+            )
+            return
+
         # "Working" card — publishing walks the whole pack + catbox uploads.
         # Capture it so the terminal card (done/fail) EDITS this same message in
         # place (delete-then-send) instead of stacking a second card below it —

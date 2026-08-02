@@ -204,18 +204,22 @@ class SettingsService:
         return bool(current) and all(isinstance(x, int) for x in current)
 
     async def set_list_add(self, section: str, field: str, raw: str) -> list:
-        """Append one entry to a list field (deduped), preserving element type.
+        """Append entr(y/ies) to a list field (deduped), preserving element type.
 
-        Unlike :meth:`set_typed` (which replaces the whole list), this adds a
-        single value to what's already there — so a force-sub channel list grows
-        one id at a time instead of the new value wiping the old ones."""
+        Accepts a COMMA-SEPARATED input so pasting "a, b, c" adds three separate
+        entries (each gets its own delete button) instead of one literal "a,b,c"
+        item — the reported filestore-bots bug. A single value still works (no
+        comma → one entry). Unlike :meth:`set_typed` (which REPLACES the whole
+        list), this adds to what's already there, so existing entries survive."""
         current = list(getattr(self.section(section), field, []) or [])
-        raw = raw.strip()
-        if not raw:
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if not parts:
             return current
-        item: object = int(raw) if self._is_int_list(section, field, current) else raw
-        if item not in current:
-            current.append(item)
+        is_int = self._is_int_list(section, field, current)
+        for part in parts:
+            item: object = int(part) if is_int else part
+            if item not in current:
+                current.append(item)
         await self.set_value(section, field, current)
         return current
 
