@@ -265,11 +265,13 @@ def channel_verify_failed(handle: str, missing: list[str] | None = None) -> str:
             f"{ICON} <b>Almost — {esc(handle)} still needs {esc(who)} as admin.</b>\n\n"
             "Both <b>Senku</b> (me) and <b>Gojo</b> must be administrators: I post the "
             "info card + watch guide, Gojo runs publishing. Add the missing bot with "
-            "full permissions, then send the @username again."
+            "full permissions, then <b>send the @username again</b> — the link field is "
+            "still open."
         )
     return (
         f"{ICON} <b>Can't reach {esc(handle)}.</b> Either the handle's wrong or I'm not an "
-        "admin there yet. Add me as admin, double-check the username, and send it again."
+        "admin there yet. Add me as admin, double-check the username, and <b>send the "
+        "@username again</b> — the link field is still open."
     )
 
 
@@ -431,6 +433,24 @@ def published_done(title: str) -> str:
     )
 
 
+def task_aborted(title: str, *, by_cancel: bool = True) -> str:
+    """Shown when a pipeline task is aborted (user cancel) but NOT deleted.
+
+    The task stays assigned and still appears in /tasks — aborting only parks the
+    in-progress work so the admin can pick it back up any time. The recurring
+    artwork is attached by the caller (each bot uses its own character art)."""
+    if by_cancel:
+        return (
+            f"{ICON} <b>Aborted.</b> {esc(title)} is parked — not gone. The task is "
+            "still in your list, exactly where you left it. Open it whenever you want "
+            "to pick the experiment back up."
+        )
+    return (
+        f"{ICON} <b>Task parked.</b> {esc(title)} is still assigned to you and waiting "
+        "in your task list. No work is lost — open it whenever you're ready."
+    )
+
+
 PUBLISH_FAIL = (
     f"{ICON} <b>Something broke mid-publish.</b> The method's sound — it's the wire. "
     "Check the logs and run it again; the flow picks up where it left off."
@@ -479,6 +499,7 @@ NO_TASK = (
 BTN_BEGIN = "▶️ Begin"
 BTN_CONTINUE = "✓ Continue"
 BTN_TASKS = "📋 My Titles"
+BTN_OPEN_TASKS = "📋 Open Tasks"
 BTN_HOME = "⇐ Home"
 BTN_BACK = "⇐ Back"
 BTN_SETTINGS = "⚙️ Settings"

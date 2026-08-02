@@ -45,7 +45,7 @@ def _publish_keyboard(code: str):
          (V.BTN_PUBLISH_SILENT, cb("gojo", "publish_silent", code))],
         [(V.BTN_SCHEDULE, cb("gojo", "publish_schedule", code)),
          (V.BTN_EDIT_CAPTION, cb("gojo", "publish_edit", code))],
-        [(V.BTN_CANCEL, cb("gojo", "home"))],
+        [(V.BTN_CANCEL, cb("gojo", "publish_park", code))],
     )
 
 
@@ -271,6 +271,40 @@ def register(client: Client, container: Container) -> None:
         code = (q.data or "").split("|", 2)[2]
         await q.answer()
         await _review_for_publish(client, container, q.message, code, fsm)
+
+    @client.on_callback_query(filters.regex(r"^gojo\|publish_park\|"))
+    async def _publish_park(_: Client, q: CallbackQuery) -> None:
+        # Cancel on the publish-review card ABORTS the in-progress publish but
+        # KEEPS the task assigned — it stays in /tasks so the admin can re-open it
+        # any time. (Offer accept/reject is a separate flow and untouched.)
+        if q.message is None or q.from_user is None:
+            await q.answer()
+            return
+        code = (q.data or "").split("|", 2)[2]
+        await fsm.clear(q.from_user.id)
+        title = code
+        try:
+            from nekofetch.infrastructure.database.postgres.session import session_scope
+            from nekofetch.infrastructure.repositories.request_repo import (
+                RequestRepository,
+            )
+
+            async with session_scope(container.pg_sessionmaker) as session:
+                req = await RequestRepository(session).get_by_code(code)
+                if req:
+                    title = req.anime_title
+        except Exception:  # noqa: BLE001 — title is cosmetic
+            pass
+        await q.answer("Cancelled.")
+        await send_screen(
+            client, q.message.chat.id,
+            Screen(
+                caption=V.task_aborted(title),
+                image=pick_artwork("gojo"),
+                keyboard=keyboard([(V.BTN_OPEN_TASKS, cb("gojo", "tasks"))]),
+            ),
+            old_msg=q.message,
+        )
 
     @client.on_callback_query(filters.regex(r"^gojo\|publish_confirm\|"))
     async def _cb_publish(_: Client, q: CallbackQuery) -> None:

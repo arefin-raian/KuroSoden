@@ -420,13 +420,16 @@ def register(client: Client, container: Container) -> None:
             missing.append("Gojo")
         if chat is None or missing:
             # Replace the prompt card with the failure card (keep the flow single
-            # -message). The admin can fix rights and tap "I've added them".
+            # -message). Crucially we KEEP the link step armed: the admin can just
+            # send the @username / link AGAIN (no button tap needed) and we retry —
+            # a bad or not-yet-admin handle must never dead-end the wizard. The
+            # "I've added them" button is a convenience re-check for the same input.
             if prompt_msg_id:
                 try:
                     await client.delete_messages(prompt_chat_id, prompt_msg_id)
                 except Exception:  # noqa: BLE001
                     pass
-            await send_screen(
+            fail = await send_screen(
                 client, chat_id,
                 card(V.channel_verify_failed(display, missing or None),
                      image=pick_artwork(BOT), bot_name=BOT,
@@ -435,6 +438,10 @@ def register(client: Client, container: Container) -> None:
                          [(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))],
                      ]),
             )
+            # Re-arm the free-text step so a re-typed handle is picked up, and point
+            # the prompt id at THIS failure card so the retry edits in place.
+            await fsm.set(user_id, STATE_AWAIT_CHANNEL, code=code,
+                          prompt_msg_id=fail.id, prompt_chat_id=fail.chat.id)
             return
 
         await fsm.clear(user_id)
@@ -948,13 +955,21 @@ def register(client: Client, container: Container) -> None:
             await q.answer()
             await _publish(chat_id, q.from_user.id, code, old_msg=q.message)
         elif action == "cancel":
+            # Abort-but-keep: cancel parks the in-progress pipeline (clears the
+            # distribution cache + the FSM so nothing half-built lingers) but the
+            # task ASSIGNMENT stays — the admin still sees it in /tasks and can
+            # re-open it any time. The card tells them exactly that and gives a
+            # single "Open Tasks" button back into the list.
             await fsm.clear(q.from_user.id)
+            franchise = await cache.get_franchise(code)
+            title = await _title_of(code, franchise)
+            await cache.clear(code)
             await q.answer("Cancelled.")
             await send_screen(
                 client, chat_id,
-                card(V.HOME_BODY, image=pick_artwork(BOT), bot_name=BOT,
-                     buttons=[[(V.BTN_TASKS, cb(BOT, "tasks"))],
-                              [(V.BTN_HOME, cb(BOT, "home"))]]),
+                card(V.task_aborted(title), image=await _art(franchise, title),
+                     bot_name=BOT,
+                     buttons=[[(V.BTN_OPEN_TASKS, cb(BOT, "tasks"))]]),
                 old_msg=q.message,
             )
         else:

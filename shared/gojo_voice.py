@@ -526,6 +526,15 @@ def fail(reason: str) -> str:
     return f"{ICON} <b>That didn't land:</b> {esc(reason)}"
 
 
+def task_aborted(title: str) -> str:
+    """Abort-but-keep: the task is parked, not deleted — still in /tasks."""
+    return (
+        f"{ICON} <b>Aborted.</b> {esc(title)} is parked — not gone. The task is still "
+        "in your list, exactly where you left it. Open it whenever you want to pick it "
+        "back up."
+    )
+
+
 # ── Button labels ───────────────────────────────────────────────────────────────
 
 BTN_PUBLISH_NOW = "🚀 Publish Now"
@@ -535,6 +544,7 @@ BTN_EDIT_CAPTION = "✏️ Edit Caption"
 BTN_CANCEL = "✗ Cancel"
 
 BTN_TASKS = "📋 My Titles"
+BTN_OPEN_TASKS = "📋 Open Tasks"
 BTN_HOME = "⇐ Home"
 BTN_BACK = "⇐ Back"
 BTN_SETTINGS = "⚙️ Settings"
