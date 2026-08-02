@@ -525,7 +525,7 @@ def register(client: Client, container: Container) -> None:
         # Cancel button on it throughout.
         steps = [("Set channel title", "active"),
                  ("Set channel description", "todo")]
-        cancel_kb = keyboard([[(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))]])
+        cancel_kb = keyboard([(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))])
 
         prog = None
         if prompt_msg_id:
