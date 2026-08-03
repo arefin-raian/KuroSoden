@@ -489,18 +489,11 @@ class SenkuPublisher:
         # ── 1. Info card ──
         info_caption, info_default = await svc._build_info_card(meta)
         if info_caption:
-            # Prefer the FIRST generated thumbnail across the whole franchise —
-            # TV seasons first, then extras. A movie-only / OVA-only franchise has
-            # an EMPTY tv list (Takopi: tv=0 extras=1), so keying only off the
-            # first TV entry left the pinned info card on the AniList poster while
-            # the actual entry card correctly used the generated thumbnail. Walk
-            # every entry in confirmed order and take the first bridged render.
-            info_gen = None
-            for _entry in (*franchise["tv"], *franchise["extras"]):
-                info_gen = _gen(_entry)
-                if info_gen:
-                    break
-            info_image = svc._pick_card_image(info_gen, info_default, meta)
+            # The info card NEVER uses a generated entry thumbnail — those are for
+            # the per-entry season/movie cards only. Its image is AcuteBot's card
+            # (primary), else the metadata banner/poster (AniList/MAL/TMDB) that
+            # _build_info_card already resolved — preferring an English backdrop.
+            info_image = svc._pick_card_image(None, info_default, meta)
             posts.append({
                 "post_type": "info_card", "order": order,
                 "caption": info_caption,

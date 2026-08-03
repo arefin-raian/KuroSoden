@@ -402,7 +402,9 @@ class ThumbnailRenderService:
             score = 0.0
         score = max(0.0, min(100.0, score))
         dashoffset = round(_RING_CIRCUMFERENCE * (1 - score / 100), 2)
-        score_text = f"{int(round(score))}%" if score else "—"
+        # The template already prints a literal "%" after {{ANILIST_SCORE}}, so the
+        # value here must be the bare number — otherwise it renders "86%%".
+        score_text = f"{int(round(score))}" if score else "—"
 
         rating_text = ""
         if tmdb_rating not in (None, "", 0):

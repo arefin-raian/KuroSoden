@@ -26,6 +26,12 @@
     .font-body-system {
       font-family: 'Inter', sans-serif;
     }
+
+    /* Subtle text shadow so ratings / branding stay legible over a busy
+       backdrop — enough to be visible, not a heavy glow. */
+    .thumb-shadow {
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.85), 0 0 2px rgba(0, 0, 0, 0.6);
+    }
   </style>
 </head>
 
@@ -44,9 +50,9 @@
     <!-- MIDDLE TO BOTTOM WRAPPER SECTION -->
     <div class="relative z-20 w-full mt-auto flex flex-col gap-5 item-center">
 
-      <div class="relative z-20 flex items-center gap-2 text-xs font-normal opacity-90 tracking-wide">
+      <div class="relative z-20 flex items-center gap-2 text-sm font-bold opacity-90 tracking-wide">
         <img src="{{FLAG_IMAGE}}" alt="flag" class="w-7 h-5 object-cover rounded-xs shadow-[0_0_2px_rgba(0,0,0,0.3)]" />
-        <span class="text-white/95">{{BRAND_NAME}}</span>
+        <span class="text-white/95 thumb-shadow">{{BRAND_NAME}}</span>
       </div>
       
       <!-- 2. GIGANTIC MOVIE TITLE LOGO IMAGE INTERCHANGE -->
@@ -139,15 +145,15 @@
 
       <!-- TMDB BOX METRIC -->
       <div class="text-center flex flex-col items-center gap-0.5">
-        <div class="text-2xl font-bold text-white tracking-wide">{{TMDB_RATING}}</div>
-        <div class="text-[11px] font-medium tracking-wider text-white">TMDB</div>
+        <div class="text-2xl font-bold text-white tracking-wide thumb-shadow">{{TMDB_RATING}}</div>
+        <div class="text-[11px] font-medium tracking-wider text-white thumb-shadow">TMDB</div>
       </div>
 
       <!-- ANILIST SCORE GAUGE RING -->
       <div class="flex flex-col items-center gap-2">
         <!-- 🚀 SVG DONUT CHART WITH PERFECT 82% TRACK FILL AND TRANSPARENT CENTER -->
         <div class="relative w-[96px] h-[96px] flex items-center justify-center">
-          <svg class="w-full h-full -rotate-90" viewBox="0 0 100 100">
+          <svg class="w-full h-full -rotate-90 drop-shadow-[0_2px_6px_rgba(0,0,0,0.7)]" viewBox="0 0 100 100">
             <!-- Inactive track background layer -->
             <circle cx="50" cy="50" r="42" stroke="rgba(255, 255, 255, 0.4)" stroke-width="12" fill="transparent" />
             <!-- Active white progress track layer (82% of 2 * PI * 42 = ~216.4) -->
@@ -156,10 +162,10 @@
           </svg>
           <!-- Absolute centered overlay container for rating label text -->
           <div class="absolute inset-0 flex items-center justify-center">
-            <span class="text-[22px] font-bold text-white tracking-tight">{{ANILIST_SCORE}}%</span>
+            <span class="text-[22px] font-black text-white tracking-tight thumb-shadow">{{ANILIST_SCORE}}%</span>
           </div>
         </div>
-        <div class="text-[14px] font-normal tracking-wide text-white whitespace-nowrap mt-1">Anilist Rating</div>
+        <div class="text-[14px] font-normal tracking-wide text-white whitespace-nowrap mt-1 thumb-shadow">Anilist Rating</div>
       </div>
 
     </div>
