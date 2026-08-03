@@ -76,12 +76,26 @@ def _entry(aid: int, score: float | None, fmt: str = "TV") -> FranchiseEntry:
     )
 
 
+def _entry_eps(aid: int, score: float | None, episodes: int | None,
+               fmt: str = "TV") -> FranchiseEntry:
+    return FranchiseEntry(
+        anilist_id=aid, format=fmt, english_title=f"Entry {aid}",
+        titles=[f"Entry {aid}"], score=score, episodes=episodes,
+    )
+
+
 @pytest.mark.asyncio
-async def test_episodes_use_tv_season_sum_not_pack_max():
-    """franchise_totals.episodes (TV seasons only) overrides the pack-derived count."""
+async def test_episodes_are_total_of_all_entries():
+    """EPISODES = Σ episodes of EVERY entry (seasons + movies + OVAs), per spec —
+    NOT a TV-only sum and NOT the pack-derived max."""
     anilist = _FakeAnilist(
         totals=FranchiseTotals(seasons=3, movies=2, episodes=64),
-        entries={1: _entry(1, 8.0)},
+        entries={
+            1: _entry_eps(1, 8.0, 12, "TV"),
+            2: _entry_eps(2, 8.0, 12, "TV"),
+            3: _entry_eps(3, 7.5, 1, "MOVIE"),   # extras COUNT now
+            4: _entry_eps(4, 7.0, 2, "OVA"),
+        },
     )
     svc = MainChannelService.__new__(MainChannelService)
     svc._c = _FakeContainer(anilist)
@@ -89,8 +103,8 @@ async def test_episodes_use_tv_season_sum_not_pack_max():
 
     await svc._apply_franchise_facts("anilist:100", facts)
 
-    assert facts.episodes == "64"          # season sum, NOT the "12" pack max
-    assert anilist.totals_calls == [100]
+    assert facts.episodes == "27"          # 12+12+1+2, NOT the "12" pack max
+    assert anilist.walk_calls == [100]
 
 
 @pytest.mark.asyncio
@@ -110,7 +124,8 @@ async def test_rating_is_average_of_all_franchise_scores():
 
     await svc._apply_franchise_facts("anilist:100", facts)
 
-    assert facts.rating == "8.0"           # (8+9+7)/3, None dropped
+    # (8+9+7)/3 = 8.0 on the 0-10 scale → a rounded whole-number percent.
+    assert facts.rating == "80%"
 
 
 @pytest.mark.asyncio

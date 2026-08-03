@@ -44,14 +44,35 @@ class InviteLinkService:
             )
         return self._pool
 
-    async def mint_for_channel(self, chat_id: int) -> str | None:
-        """Mint a fresh private invite link for ``chat_id`` via the owning userbot.
+    def _bot_client(self):
+        """The Gojo (publisher) client, else the NekoFetch admin client.
 
-        Returns the ``t.me/+…`` link, or None if minting failed (best-effort — the
-        caller falls back to the public username link). ``creates_join_request`` is
-        left off so the link admits members directly, matching the public channel's
-        open-join behaviour.
-        """
+        A BOT that is an admin of the channel can mint invite links itself via
+        ``create_chat_invite_link`` — no userbot needed. Gojo is an admin of both
+        the distribution channels and the index channel, so it's the preferred
+        minter; the NekoFetch admin client is the fallback."""
+        pm = getattr(self._c, "pipeline_manager", None)
+        gojo = getattr(pm, "gojo", None) if pm else None
+        return gojo or getattr(self._c, "admin_client", None)
+
+    async def mint_for_chat(self, chat_id: int) -> str | None:
+        """Mint a fresh private invite link for ANY chat we administer.
+
+        Tries the Gojo BOT first (bots can create invite links where they're
+        admin — no userbot dependency), then the userbot pool as a fallback.
+        Returns the ``t.me/+…`` link or None (best-effort). Used for both the
+        distribution channel and the index channel."""
+        bot = self._bot_client()
+        if bot is not None:
+            try:
+                link = await bot.create_chat_invite_link(chat_id)
+                url = getattr(link, "invite_link", None)
+                if url:
+                    log.info("invitelink.minted", chat_id=chat_id, via="bot")
+                    return url
+            except Exception as exc:  # noqa: BLE001 — fall back to userbot
+                log.warning("invitelink.mint.bot_failed",
+                            chat_id=chat_id, error=str(exc))
         try:
             link = await self._userbot().execute(
                 lambda c: c.create_chat_invite_link(chat_id)
@@ -63,8 +84,16 @@ class InviteLinkService:
         if not url:
             log.warning("invitelink.mint.empty", chat_id=chat_id)
             return None
-        log.info("invitelink.minted", chat_id=chat_id)
+        log.info("invitelink.minted", chat_id=chat_id, via="userbot")
         return url
+
+    async def mint_for_channel(self, chat_id: int) -> str | None:
+        """Mint a fresh private invite link for a distribution ``chat_id``.
+
+        Bot-first (Gojo), userbot fallback — see :meth:`mint_for_chat`. Returns the
+        ``t.me/+…`` link, or None if minting failed (best-effort — the caller falls
+        back to the public username link)."""
+        return await self.mint_for_chat(chat_id)
 
     async def ensure_for_bot(self, bot_id: str) -> str | None:
         """Ensure the distribution *channel* row ``bot_id`` has an invite link.

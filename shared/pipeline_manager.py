@@ -48,6 +48,7 @@ class PipelineManager:
     def __init__(self, container: Container) -> None:
         self._c = container
         self._clients: dict[str, Any] = {}  # name → Pyrogram Client
+        self._admin_nf: Any = None                 # NekoFetch admin bot client
         self._conn_watchdog_task: asyncio.Task | None = None
         self._scheduler = None
         self._worker = None                       # DownloadWorker instance
@@ -152,8 +153,18 @@ class PipelineManager:
         # ── Connection watchdog ───────────────────────────────────────────────
         self._conn_watchdog_task = asyncio.create_task(self._connection_watchdog())
 
-        # Global admin_client fallback — Gojo is the primary publisher/index actor.
-        self._c.admin_client = self.gojo or next(iter(self._clients.values()), None)  # type: ignore[attr-defined]
+        # ── NekoFetch admin client (ADMIN_BOT_TOKEN) ──────────────────────────
+        # NekoFetch is the account that actually POSTED the index-channel messages,
+        # so it's the only bot that can EDIT them. Gojo (the publisher) gets
+        # MESSAGE_ID_INVALID / author-required trying to edit posts it didn't send.
+        # Start a dedicated NekoFetch client so IndexChannelService._client_call can
+        # fall back from Gojo → NekoFetch (see its _FALLBACK_ERRORS). Distinct from
+        # every pipeline bot so the fallback is a REAL second identity, not Gojo
+        # again. Falls back to Gojo only if the admin token is absent.
+        await self._start_admin_client()
+        self._c.admin_client = (  # type: ignore[attr-defined]
+            self._admin_nf or self.gojo or next(iter(self._clients.values()), None)
+        )
 
         await self._preflight_channels()
 
@@ -238,6 +249,44 @@ class PipelineManager:
             log.info("kuro-soden.bot.started", bot=name)
         except Exception as exc:
             log.error("kuro-soden.bot.start_failed", bot=name, error=str(exc))
+
+    async def _start_admin_client(self) -> None:
+        """Start the NekoFetch admin bot (ADMIN_BOT_TOKEN) as the edit-fallback client.
+
+        NekoFetch is the identity that POSTED the index-channel messages, so it's
+        the only bot that can EDIT them; Gojo gets MESSAGE_ID_INVALID / author-
+        required on posts it didn't send. Kept OUT of ``self._clients`` (not a
+        pipeline stage, no handlers) with a distinct Pyrogram session name so it
+        never collides with a bot. Best-effort: a missing token / failed start
+        leaves ``_admin_nf`` None and the caller falls back to Gojo."""
+        import os
+
+        from pyrogram import Client
+
+        env = getattr(self._c, "env", None)
+        token = (
+            (str(getattr(env, "admin_bot_token", "") or "").strip() if env else "")
+            or os.getenv("ADMIN_BOT_TOKEN", "").strip()
+        )
+        if not token:
+            log.warning("kuro-soden.admin_client.token_missing",
+                        hint="Set ADMIN_BOT_TOKEN in .env so the index edit-fallback "
+                             "can use NekoFetch's token")
+            return
+        try:
+            client = Client(
+                name="kurosoden-nekofetch",
+                api_id=self._c.env.telegram_api_id,
+                api_hash=self._c.env.telegram_api_hash,
+                bot_token=token,
+                no_updates=True,  # edit-only helper — never handles updates
+            )
+            await client.start()
+            self._admin_nf = client
+            log.info("kuro-soden.admin_client.started")
+        except Exception as exc:  # noqa: BLE001 — fall back to Gojo on any failure
+            log.error("kuro-soden.admin_client.start_failed", error=str(exc))
+            self._admin_nf = None
 
     def _token_from_config(self, env_var: str) -> str:
         """Read pipeline bot tokens from EnvSettings, where .env is actually loaded."""
@@ -380,6 +429,12 @@ class PipelineManager:
             try:
                 await client.stop()
                 log.info("kuro-soden.bot.stopped", bot=name)
+            except Exception:
+                pass
+        if self._admin_nf is not None:
+            try:
+                await self._admin_nf.stop()
+                log.info("kuro-soden.admin_client.stopped")
             except Exception:
                 pass
         log.info("kuro-soden.pipeline.stopped")

@@ -38,9 +38,11 @@ _DEFAULT_TEMPLATE = _TEMPLATE_DIR / "index.html"
 _OUTPUT_DIR = _REPO_ROOT / "data" / "thumbnails"
 
 # The template's native design ratio (matches the reference browser render at
-# 1366×641). device_scale_factor=2 doubles the output resolution for crisp text.
+# 1366×641). device_scale_factor=3 triples the output resolution for high-quality
+# export (→ 4098×1923 physical pixels). WEBP quality=95 for near-lossless output.
 _THUMBNAIL_WIDTH = 1366
 _THUMBNAIL_HEIGHT = 641
+_THUMBNAIL_SCALE = 3   # device_scale_factor — increase for higher export resolution
 _SYNOPSIS_MAX_CHARS = 300
 
 # The SVG score ring: r=42 → circumference = 2·π·42 ≈ 263.89. dashoffset is the
@@ -445,7 +447,7 @@ class ThumbnailRenderService:
         try:
             context = await browser.new_context(
                 viewport={"width": _THUMBNAIL_WIDTH, "height": _THUMBNAIL_HEIGHT},
-                device_scale_factor=2,
+                device_scale_factor=_THUMBNAIL_SCALE,
             )
             page = await context.new_page()
             file_url = output_html.absolute().as_uri()
@@ -463,7 +465,7 @@ class ThumbnailRenderService:
             from PIL import Image
 
             with Image.open(BytesIO(png_bytes)) as im:
-                im.save(output_path, format="WEBP", quality=90, method=6)
+                im.save(output_path, format="WEBP", quality=95, method=6)
             log.info("thumbnail.rendered", path=str(output_path), title=title)
             return output_path
         except Exception as exc:

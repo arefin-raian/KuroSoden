@@ -22,6 +22,7 @@ from nekofetch.core.logging import get_logger
 from nekofetch.core.parsing import clean_anilist_id
 from nekofetch.domain.enums import AudioType
 from nekofetch.infrastructure.database.postgres.models import (
+    BotContentPost,
     ChannelPost,
     DistributionBot,
     StoragePack,
@@ -32,6 +33,21 @@ from nekofetch.ui import templates
 log = get_logger(__name__)
 
 _RES_ORDER = {"360p": 360, "480p": 480, "540p": 540, "720p": 720, "1080p": 1080}
+
+
+def _avg_score_pct(scores: list[float]) -> str:
+    """Average AniList scores → a plain 2-digit percent like ``"82%"``.
+
+    AniList entry scores are on a 0-10 scale here (e.g. 8.7). The main-channel
+    RATING is the average of EVERY franchise entry's score, shown as a rounded
+    whole-number percent (no decimals) per spec. A value already on a 0-100
+    scale (defensive) is used as-is."""
+    vals = [float(s) for s in scores if s is not None]
+    if not vals:
+        return "—"
+    avg = sum(vals) / len(vals)
+    pct = avg if avg > 10 else avg * 10  # 0-10 → 0-100; leave a 0-100 value alone
+    return f"{int(round(pct))}%"
 
 
 def _collapse(text: str | None) -> str:
@@ -66,7 +82,7 @@ class PublicationFacts:
     languages: str = "—"
     genres: str = "—"
     overview: str = "—"
-    rating: str = "—"                   # franchise-average AniList score, e.g. "8.4"
+    rating: str = "—"                   # franchise-average AniList score, e.g. "82%"
     poster_url: str | None = None
     backdrop_url: str | None = None   # TMDB English 16:9 backdrop for the post photo
     bot_username: str | None = None
@@ -200,6 +216,36 @@ class MainChannelService:
             log.debug("mainchannel.thumbnail_lookup.failed",
                       anime=anime_doc_id, error=str(exc))
 
+        # 1b. Manual (Senku wizard) publish path never populates the thumbnail-
+        #     channel workflow map the orchestrator reads — it stores the admin's
+        #     rendered thumbnail as the season/movie card image in BotContentPost.
+        #     So when the orchestrator has nothing, use the FIRST season/movie
+        #     card's image (order-ascending; the info card at order 0 is skipped)
+        #     — that is the exact same generated render the entry card shows, which
+        #     is what the main post must mirror instead of the AniList poster.
+        if not facts.backdrop_url and facts.anime_doc_id_bot:
+            try:
+                async with session_scope(self._c.pg_sessionmaker) as session:
+                    row = (
+                        await session.execute(
+                            select(BotContentPost)
+                            .where(
+                                BotContentPost.bot_id == facts.anime_doc_id_bot,
+                                BotContentPost.post_type.in_(
+                                    ("season_card", "movie_card")),
+                                BotContentPost.image_url.is_not(None),
+                            )
+                            .order_by(BotContentPost.order.asc())
+                        )
+                    ).scalars().first()
+                if row and row.image_url:
+                    facts.backdrop_url = row.image_cached_url or row.image_url
+                    log.info("mainchannel.thumbnail.from_content_post",
+                             anime=anime_doc_id, url=facts.backdrop_url)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("mainchannel.content_post_thumb.failed",
+                          anime=anime_doc_id, error=str(exc))
+
         # 2. TMDB metadata for the post photo + overview (best-effort).
         # TMDB descriptions cover the entire franchise, not a single season.
         # Prefer the prefetched tmdb.json (backdrop/overview cached at
@@ -287,19 +333,24 @@ class MainChannelService:
             walk = (blob or {}).get("franchise")
             if walk:
                 vals = list(walk.values()) if isinstance(walk, dict) else list(walk)
-                # Episodes = Σ TV/TV_SHORT-season episodes (matches franchise_totals).
-                tv_eps = sum(
+                # Episodes = Σ episodes of EVERY entry (seasons + movies + OVAs +
+                # ONAs + specials) — the franchise TOTAL, per spec. A single-ONA
+                # franchise (Takopi) has 0 TV episodes, so a TV-only sum wrongly
+                # fell back to the pack count.
+                total_eps = sum(
                     (e.get("episodes") or 0)
                     for e in vals
-                    if isinstance(e, dict) and e.get("format") in ("TV", "TV_SHORT")
+                    if isinstance(e, dict)
                 )
-                if tv_eps:
-                    facts.episodes = str(tv_eps)
+                if total_eps:
+                    facts.episodes = str(total_eps)
+                # Rating = average of every entry's AniList score, as a plain
+                # 2-digit percent (scores are 0-10 here → ×10, rounded to int).
                 scores = [e.get("score") for e in vals
                           if isinstance(e, dict) and e.get("score") is not None]
                 if scores:
-                    facts.rating = f"{sum(scores) / len(scores):.1f}"
-                if tv_eps or scores:
+                    facts.rating = _avg_score_pct(scores)
+                if total_eps or scores:
                     return
         except Exception as exc:  # noqa: BLE001 — cache miss → live below
             log.debug("mainchannel.franchise_cache.failed",
@@ -316,23 +367,19 @@ class MainChannelService:
             return
         root_id = int(raw_id)
 
-        # Episodes = Σ TV-season episodes only (continuity chain).
-        try:
-            totals = await anilist.franchise_totals(root_id)
-            if totals.episodes:
-                facts.episodes = str(totals.episodes)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("mainchannel.franchise_totals.failed",
-                      anime=anime_doc_id, error=str(exc))
-
-        # Rating = average of every franchise entry's AniList score.
+        # Episodes = Σ episodes of EVERY entry, and Rating = average of every
+        # entry's AniList score (plain 2-digit percent). One walk supplies both.
         try:
             entries = await anilist.walk_franchise_full(root_id)
-            scores = [e.score for e in entries.values() if e.score is not None]
+            vals = list(entries.values())
+            total_eps = sum((getattr(e, "episodes", 0) or 0) for e in vals)
+            if total_eps:
+                facts.episodes = str(total_eps)
+            scores = [e.score for e in vals if e.score is not None]
             if scores:
-                facts.rating = f"{sum(scores) / len(scores):.1f}"
+                facts.rating = _avg_score_pct(scores)
         except Exception as exc:  # noqa: BLE001
-            log.debug("mainchannel.franchise_scores.failed",
+            log.debug("mainchannel.franchise_walk.failed",
                       anime=anime_doc_id, error=str(exc))
 
     def _caption(self, f: PublicationFacts) -> str:
@@ -349,7 +396,11 @@ class MainChannelService:
         from nekofetch.services.index_channel_service import IndexChannelService
 
         row: list[InlineKeyboardButton] = []
-        index_url = await IndexChannelService(self._c).entry_link(f.title)
+        idx_svc = IndexChannelService(self._c)
+        # Index button → the INDEX CHANNEL's own private invite link (per spec).
+        # Fall back to a deep-link to the exact letter section if minting fails, so
+        # the button is never dead.
+        index_url = await idx_svc.channel_invite() or await idx_svc.entry_link(f.title)
         if index_url:
             row.append(InlineKeyboardButton(self.cfg.index_button_text, url=index_url))
         # Download target preference (per the operator's explicit ask): a private

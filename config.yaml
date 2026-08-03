@@ -211,7 +211,7 @@ acquisition:
 # Variables: {title} {tag} {episodes} {qualities} {languages} {genres} {overview}
 main_channel:
   enabled: true
-  channel_id: -1004230173919
+  channel_id: -1002026477147
   caption_template: |-
     <blockquote><b>{title}『 </b>#{tag} <b>』</b></blockquote>
 

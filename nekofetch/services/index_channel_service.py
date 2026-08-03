@@ -775,6 +775,42 @@ class IndexChannelService:
             ),
         ]])
 
+    async def channel_invite(self) -> str | None:
+        """Return a private invite link to the INDEX CHANNEL itself.
+
+        The main-channel post's Index button points here (per spec: "the index
+        button, which is the index channel's link"). Minted once by the Gojo bot
+        (bots can create invite links where they're admin) and cached in Redis so
+        we don't mint a fresh link on every publish. Best-effort → None on failure,
+        and the caller falls back to a deep-link to the letter section."""
+        if not self._active() or not self.cfg.channel_id:
+            return None
+        key = f"nf:index:invite:{self.cfg.channel_id}"
+
+        # Cached link (best-effort — a Redis miss/blip just re-mints).
+        try:
+            from nekofetch.core.redis_safe import safe_redis_get
+
+            cached = await safe_redis_get(self._c.redis, key,
+                                          label="index.invite.get")
+            if cached:
+                return cached.decode() if isinstance(cached, bytes) else str(cached)
+        except Exception:  # noqa: BLE001
+            pass
+
+        from nekofetch.services.invite_link_service import InviteLinkService
+
+        link = await InviteLinkService(self._c).mint_for_chat(self.cfg.channel_id)
+        if link:
+            try:
+                from nekofetch.core.redis_safe import safe_redis_set
+
+                await safe_redis_set(self._c.redis, key, link,
+                                     label="index.invite.set")
+            except Exception:  # noqa: BLE001
+                pass
+        return link
+
     async def entry_link(self, title: str) -> str | None:
         """Return a t.me link to the index post containing ``title``."""
         if not self._active():
