@@ -16,7 +16,11 @@ from __future__ import annotations
 
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from nekofetch.services.backup_service import _markup_to_rows, _rows_to_markup
+from nekofetch.services.backup_service import (
+    BackupService,
+    _markup_to_rows,
+    _rows_to_markup,
+)
 from kurosoden.shared.image_backup import BackupImage
 
 
@@ -77,3 +81,34 @@ def test_backup_image_prefers_catbox_then_telegraph_then_imgbb_then_source():
 
     empty = BackupImage(source_url="")
     assert empty.primary is None
+
+
+# ── {BOT_QUAL…} resolution on restore (deep-link vs root) ────────────────────────
+
+def test_resolve_quals_deeplinks_anchored_id_to_restored_message():
+    """An anchored {BOT_QUAL#id:…} whose id is in msg_by_id links to that
+    restored card's message; without the id it degrades to the channel root."""
+    handle = "aot_channel"
+    msg_by_id = {555: 4242}
+
+    # Anchored + known id → deep-link to the restored season card message.
+    out = BackupService._resolve_quals(
+        "S2: {BOT_QUAL#555:480p  720p}", handle, msg_by_id,
+    )
+    assert 'href="https://t.me/aot_channel/4242"' in out
+    assert ">480p  720p<" in out
+
+    # Anchored but unknown id → channel-root link (best we can do).
+    out2 = BackupService._resolve_quals(
+        "S9: {BOT_QUAL#999:1080p}", handle, msg_by_id,
+    )
+    assert 'href="https://t.me/aot_channel"' in out2 and ">1080p<" in out2
+
+    # Legacy unanchored form still resolves to the channel root.
+    out3 = BackupService._resolve_quals("{BOT_QUAL:720p}", handle, msg_by_id)
+    assert 'href="https://t.me/aot_channel"' in out3 and ">720p<" in out3
+
+
+def test_resolve_quals_without_handle_collapses_to_label():
+    out = BackupService._resolve_quals("{BOT_QUAL#555:480p}", None, {555: 1})
+    assert out == "480p"

@@ -517,6 +517,11 @@ class BotContentPost(Base, PKMixin, TimestampMixin):
     button_data: Mapped[dict | None] = mapped_column(JSONB)  # structured button layout
     is_pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     tg_message_id: Mapped[int | None] = mapped_column(BigInteger)  # legacy single-broadcast slot
+    # AniList id of the entry this card shows (season/movie cards). Lets a
+    # ban-restore rebuild the watch guide's {BOT_QUAL#id:…} quality deep-links —
+    # each restored season card is remapped to its fresh message id by id. NULL
+    # for the info card / watch guide / footer (no single entry).
+    anilist_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
 
 
 class BotDelivery(Base, PKMixin, TimestampMixin):

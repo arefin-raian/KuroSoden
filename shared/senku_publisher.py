@@ -745,6 +745,9 @@ class SenkuPublisher:
                     button_data=it.get("button_data"),
                     is_pinned=bool(it.get("is_pinned")),
                     tg_message_id=it.get("tg_message_id"),
+                    # Carry the entry id so a ban-restore can remap this card's
+                    # {BOT_QUAL#id:…} deep-links to its fresh message id.
+                    anilist_id=it.get("anilist_id"),
                 ))
 
     def _reorder_franchise(

@@ -384,6 +384,9 @@ class BackupService:
                 "image_url": durable or None,
                 "button_data": p.button_data,
                 "is_pinned": bool(p.is_pinned),
+                # Entry id (season/movie cards) so restore can remap the watch
+                # guide's {BOT_QUAL#id:…} deep-links to the fresh message ids.
+                "anilist_id": p.anilist_id,
                 # A divider sticker precedes every card except the first, matching
                 # the distribution app's ``_send_posts`` choreography.
                 "divider_before": bool(i > 0 and divider),
@@ -614,10 +617,16 @@ class BackupService:
 
         fmt = self._c.config.post_format
         # Resolve the new channel's @handle so watch-guide quality deep-links
-        # ({BOT_QUAL:...}) point at the fresh channel; fall back to plain text.
+        # ({BOT_QUAL…}) point at the fresh channel; fall back to plain text.
         handle = await self._resolve_handle(client, new_chat_id)
 
         divider = self._divider()
+        # entry anilist_id → freshly-posted message id, filled as season/movie
+        # cards restore. Cards are stored in send order (season cards precede the
+        # watch guide), so by the time the guide's caption resolves every entry it
+        # references already has a new id → its {BOT_QUAL#id:…} quality links jump
+        # to the restored season card, not the channel root.
+        msg_by_id: dict[int, int] = {}
         for card in cards:
             try:
                 if card.get("divider_before") and divider:
@@ -626,7 +635,9 @@ class BackupService:
                     except Exception as exc:  # noqa: BLE001
                         log.debug("restore.dist.divider_failed", error=str(exc))
 
-                caption = self._resolve_quals(card.get("caption") or "", handle)
+                caption = self._resolve_quals(
+                    card.get("caption") or "", handle, msg_by_id,
+                )
                 markup = build_audio_keyboard(card.get("button_data"), fmt)
                 image = card.get("image_url")
                 if image:
@@ -639,6 +650,9 @@ class BackupService:
                         new_chat_id, caption,
                         reply_markup=markup, parse_mode=ParseMode.HTML,
                     )
+                aid = card.get("anilist_id")
+                if aid is not None:
+                    msg_by_id[int(aid)] = sent.id
                 if card.get("is_pinned"):
                     try:
                         await client.pin_chat_message(
