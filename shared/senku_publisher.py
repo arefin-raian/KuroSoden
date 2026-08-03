@@ -121,11 +121,21 @@ class SenkuPublisher:
         **not** re-render or repost the whole channel, and we never touch the
         main channel.
 
-        Choreography (mirrors the publish tail): delete the trailing footer
-        message and the divider right before it, send ``divider → new card``
-        for each new entry, then ``divider → footer`` again — and rewrite the
-        tail of :class:`ChannelLayout` to match. The pinned info card and watch
-        guide are left exactly where they are.
+        Choreography (season auto-update): the watch guide is a franchise-wide
+        summary, so a new season must *rebuild* it — not leave a stale one mid
+        channel. We strip the watch-guide post and everything after it (its
+        surrounding dividers + the footer), then re-emit the tail fresh:
+
+            … <last existing card>
+            → divider → new season card [→ divider → next new card …]
+            → divider → watch guide (regenerated, re-pinned)
+            → divider → footer
+
+        The regenerated guide's quality links deep-link to each season's card
+        message (existing cards' ids come from the saved layout, new ones from
+        this run), and :class:`ChannelLayout` is rewritten to match. The pinned
+        info card up top is left exactly where it is; the "pinned" service notice
+        from re-pinning the guide is swept.
 
         ``new_anilist_ids`` restricts the update to those entries (the update
         checker knows which entry just finished). When ``None`` we reconcile:
@@ -176,18 +186,19 @@ class SenkuPublisher:
             if item["anilist_id"] is not None
         }
 
-        # 2. Build cards for the new entries (reusing publish's builders).
-        new_cards = await self._build_update_cards(
+        # 2. Build cards for the new entries AND regenerate the franchise-wide
+        #    watch guide (it now covers the new season).
+        new_cards, guide_caption = await self._build_update_cards(
             anime_doc_id, new_anilist_ids, already,
         )
         if not new_cards:
             log.info("senku.update.nothing", anime=anime_doc_id)
             return {"appended": 0, "chat_id": chat_id}
 
-        # 3. Re-choreograph the tail: drop old footer (+ its leading divider),
-        #    append each new card behind a divider, then divider + footer.
+        # 3. Re-choreograph the tail: strip the old watch guide + everything
+        #    after it, re-emit new card(s) → guide (re-pinned) → footer.
         appended = await self._append_and_refooter(
-            client, chat_id, bot_id, layout, new_cards,
+            client, chat_id, bot_id, layout, new_cards, guide_caption,
         )
         log.info("senku.update.done", anime=anime_doc_id, chat_id=chat_id,
                  appended=appended)
@@ -196,19 +207,23 @@ class SenkuPublisher:
     async def _build_update_cards(
         self, anime_doc_id: str, new_anilist_ids: list[int] | None,
         already: set[int],
-    ) -> list[dict]:
-        """Build the post dicts for entries not yet present in the channel.
+    ) -> tuple[list[dict], str | None]:
+        """Build post dicts for new entries + the regenerated watch guide.
 
-        Reuses the same card builders as :meth:`_build_posts`. Only entries that
-        (a) have finished packs and (b) aren't already in the layout are built;
-        when ``new_anilist_ids`` is given, we additionally restrict to that set.
+        Returns ``(new_cards, guide_caption)``. Reuses the same card builders as
+        :meth:`_build_posts`. Only entries that (a) have finished packs and (b)
+        aren't already in the layout are built; when ``new_anilist_ids`` is given,
+        we additionally restrict to that set. The watch guide is rebuilt over the
+        FULL franchise (existing + new seasons) so the season auto-update reposts a
+        current guide; ``guide_caption`` is ``None`` only if the guide couldn't be
+        built (then the tail keeps whatever guide was there).
         """
         from nekofetch.services.bot_content import BotContentService
 
         svc = BotContentService(self._c)
         packs = await svc._load_packs(anime_doc_id)
         if not packs:
-            return []
+            return [], None
         meta = await svc._gather_metadata(anime_doc_id)
         walked = await svc._walk_franchise(anime_doc_id, meta)
 
@@ -286,24 +301,37 @@ class SenkuPublisher:
                 "pinned": False,
                 "anilist_id": aid,
             })
-        return cards
+
+        # Regenerate the franchise-wide watch guide so it now covers the new
+        # season. Built over the FULL walk (existing + new) in release order; its
+        # {BOT_QUAL#id:…} anchors are resolved to each season's card message by
+        # _append_and_refooter (existing ids from the saved layout, new ones from
+        # the cards we just built).
+        guide_caption = svc._build_franchise_watch_guide(meta, packs, walked)
+        return cards, guide_caption
 
     async def _append_and_refooter(
         self, client, chat_id: int, bot_id: int,
         layout: list[dict], new_cards: list[dict],
+        guide_caption: str | None = None,
     ) -> int:
-        """Delete *only* the trailing footer, append cards, re-post the footer.
+        """Strip the watch-guide tail, re-emit new cards → guide → footer.
 
-        The divider that already sits right before the footer stays put — it's
-        correctly placed, so deleting and re-sending the same sticker in the
-        same spot would be pointless churn. We keep it and slot the new cards in
-        after it, each followed by its own divider, then re-post the footer:
+        The watch guide summarises the whole franchise, so a new season must
+        rebuild it rather than leave a stale one mid-channel. We delete the old
+        watch-guide post and everything after it (its dividers + the footer),
+        keeping the body up to the last existing card, then re-emit:
 
-            … <kept divider> card₁ <divider> card₂ … <divider> footer
+            <body> → divider → newcard₁ [→ divider → newcard₂ …]
+                   → divider → watch guide (re-pinned) → divider → footer
 
-        Rewrites this channel's :class:`ChannelLayout` to reflect the new tail.
-        Best-effort on Telegram calls (a failed delete/send is logged, never
-        aborts), so a partial update still leaves a consistent saved layout.
+        The regenerated ``guide_caption`` (built over the full franchise) has its
+        ``{BOT_QUAL#id:…}`` anchors resolved to each season's card message — ids
+        for cards already in the channel come from ``layout``, ids for the cards
+        we post here are collected as we go. Falls back to the old footer-only
+        choreography when no guide was rebuilt (``guide_caption`` is None) or the
+        channel has no tracked guide (older layout). Best-effort on every Telegram
+        call, so a partial update still leaves a consistent saved layout.
         """
         from sqlalchemy import delete
         from pyrogram.enums import ParseMode
@@ -320,26 +348,60 @@ class SenkuPublisher:
         except Exception:  # noqa: BLE001
             handle = None
 
-        # Find the trailing footer. We delete only the footer message; the
-        # divider before it is left in place (the new cards go after it).
-        footer_idx = next(
+        # Seed the id→message map with the season cards ALREADY in the channel so
+        # the regenerated guide can deep-link them; new cards add to it below.
+        msg_by_id: dict[int, int] = {
+            int(it["anilist_id"]): it["tg_message_id"]
+            for it in layout
+            if it.get("anilist_id") is not None and it.get("tg_message_id")
+        }
+
+        # Locate the watch guide. Everything from it onward (guide, trailing
+        # dividers, footer) is stripped and re-emitted; the body keeps every card
+        # + the info card up top. When there's no guide tracked (older channel),
+        # fall back to stripping just the footer so we still append cleanly.
+        guide_idx = next(
             (i for i in range(len(layout) - 1, -1, -1)
-             if layout[i]["kind"] == "footer"),
+             if layout[i].get("kind") == "watch_guide"),
             None,
         )
-        if footer_idx is not None:
-            footer_post = layout[footer_idx]
-            body = layout[:footer_idx]  # keeps the pre-footer divider
-            fmid = footer_post.get("tg_message_id")
-            if fmid:
-                try:
-                    await client.delete_messages(chat_id, fmid)
-                except Exception as exc:  # noqa: BLE001 — stale id, already gone
-                    log.warning("senku.update.delete_failed", mid=fmid, error=str(exc))
+        if guide_idx is not None and guide_caption:
+            # Strip from the guide onward, plus a divider immediately before it
+            # (it belonged to the guide section — we re-emit a fresh one). Both the
+            # body cut and the deleted tail start at ``cut`` so that leading divider
+            # is actually removed from Telegram, not just dropped from the layout.
+            cut = guide_idx
+            if cut > 0 and layout[cut - 1].get("kind") == "divider":
+                cut -= 1
+            body = layout[:cut]
+            tail = layout[cut:]
         else:
-            # No footer tracked — append after everything, then add a footer.
-            body = list(layout)
-            footer_post = None
+            # No guide to rebuild — keep the classic footer-only tail rewrite.
+            footer_idx = next(
+                (i for i in range(len(layout) - 1, -1, -1)
+                 if layout[i].get("kind") == "footer"),
+                None,
+            )
+            if footer_idx is not None:
+                body = layout[:footer_idx]
+                tail = layout[footer_idx:]
+            else:
+                body = list(layout)
+                tail = []
+
+        # Delete the stripped tail messages (guide/dividers/footer). We re-pin the
+        # new guide later, so dropping the old pinned guide here is intentional.
+        for item in tail:
+            mid = item.get("tg_message_id")
+            if not mid:
+                continue
+            try:
+                await client.delete_messages(chat_id, mid)
+            except Exception as exc:  # noqa: BLE001 — stale id, already gone
+                log.warning("senku.update.delete_failed", mid=mid, error=str(exc))
+
+        # Preserve the old footer's content for the re-post (text/image from config).
+        footer_post = next((it for it in tail if it.get("kind") == "footer"), None)
 
         new_layout = list(body)
         appended = 0
@@ -354,7 +416,9 @@ class SenkuPublisher:
 
         async def _send_card(post: dict) -> None:
             nonlocal appended
-            caption = self._resolve_caption(post.get("caption") or "", handle, fmt)
+            caption = self._resolve_caption(
+                post.get("caption") or "", handle, fmt, msg_by_id,
+            )
             markup = build_audio_keyboard(post.get("button_data"), fmt)
             image = post.get("image")
             try:
@@ -372,28 +436,46 @@ class SenkuPublisher:
                 log.warning("senku.update.card_failed",
                             post_type=post.get("post_type"), error=str(exc))
                 return
+            aid = post.get("anilist_id")
+            if aid is not None:
+                msg_by_id[int(aid)] = msg.id
             new_layout.append({
                 "kind": post.get("post_type") or "season_card",
                 "tg_message_id": msg.id,
-                "anilist_id": post.get("anilist_id"),
+                "anilist_id": aid,
                 "is_pinned": False,
             })
             appended += 1
 
-        # A divider only needs to *lead* the first new card when the body
-        # doesn't already end in one — the footer path keeps the pre-footer
-        # divider, but the no-footer path ends on a card and needs a separator.
+        # A divider only needs to *lead* the first new card when the body doesn't
+        # already end in one (e.g. the body ends on an existing season card).
         need_leading_divider = bool(body) and body[-1].get("kind") != "divider"
         for i, post in enumerate(new_cards):
             if (i == 0 and need_leading_divider) or i > 0:
                 await _emit_divider()
             await _send_card(post)
 
+        # Re-emit the watch guide (pinned) — now that every card it references has
+        # a message id, its quality links deep-link to the right season cards.
+        if guide_caption:
+            await _emit_divider()
+            try:
+                gcap = self._resolve_caption(guide_caption, handle, fmt, msg_by_id)
+                gmsg = await client.send_message(
+                    chat_id, gcap, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                await self._pin_silently(client, chat_id, gmsg.id)
+                new_layout.append({"kind": "watch_guide", "tg_message_id": gmsg.id,
+                                   "anilist_id": None, "is_pinned": True})
+            except Exception as exc:  # noqa: BLE001 — guide is best-effort
+                log.warning("senku.update.guide_failed", error=str(exc))
+
         # Divider + re-posted footer (reuse the old footer's text/image).
         await _emit_divider()
         footer_caption, footer_image = await self._footer_content(footer_post)
         try:
-            caption = self._resolve_caption(footer_caption, handle, fmt)
+            caption = self._resolve_caption(footer_caption, handle, fmt, msg_by_id)
             if footer_image:
                 fmsg = await client.send_photo(
                     chat_id, footer_image, caption=caption, parse_mode=ParseMode.HTML,
@@ -820,6 +902,11 @@ class SenkuPublisher:
         posted = 0
         pinned_ids: list[int] = []
         layout: list[dict] = []
+        # anilist_id → message id, filled as season/extra cards post. The watch
+        # guide is emitted LAST, so by the time we resolve its {BOT_QUAL#id:…}
+        # placeholders every entry it references already has a message id here —
+        # each quality then deep-links to that entry's own card.
+        msg_by_id: dict[int, int] = {}
 
         # Resolve a public handle for {BOT_QUAL} links. In a channel these point
         # at the channel itself (deep-linking to messages fails in private chat).
@@ -836,7 +923,9 @@ class SenkuPublisher:
                     layout.append({"kind": "divider", "tg_message_id": div,
                                    "anilist_id": None, "is_pinned": False})
 
-            caption = self._resolve_caption(post.get("caption") or "", handle, fmt)
+            caption = self._resolve_caption(
+                post.get("caption") or "", handle, fmt, msg_by_id,
+            )
             markup = build_audio_keyboard(post.get("button_data"), fmt)
             image = post.get("image")
 
@@ -871,6 +960,10 @@ class SenkuPublisher:
                 await self._pin_silently(client, chat_id, msg.id)
                 pinned_ids.append(msg.id)
 
+            aid = post.get("anilist_id")
+            if aid is not None:
+                msg_by_id[int(aid)] = msg.id
+
             layout.append({
                 "kind": post.get("post_type") or "season_card",
                 "tg_message_id": msg.id,
@@ -889,20 +982,44 @@ class SenkuPublisher:
 
         return posted, pinned_ids, layout
 
-    def _resolve_caption(self, caption: str, handle: str | None, fmt) -> str:
-        """Resolve ``{BOT_QUAL:...}`` links + premium emoji in a channel caption."""
+    def _resolve_caption(
+        self, caption: str, handle: str | None, fmt,
+        msg_by_id: dict[int, int] | None = None,
+    ) -> str:
+        """Resolve ``{BOT_QUAL…}`` links + premium emoji in a channel caption.
+
+        Two placeholder forms are honoured:
+          * ``{BOT_QUAL#<anilist_id>:LABEL}`` — anchored to a specific entry. If
+            ``msg_by_id`` maps that id to a posted message, the label links to
+            ``t.me/<handle>/<msg_id>`` (jumps to that season's card); otherwise it
+            degrades to the channel-root link.
+          * ``{BOT_QUAL:LABEL}`` — unanchored; links to the channel root.
+        Without a ``handle`` every placeholder collapses to its bare label.
+        """
         import re
 
         if not caption:
             return caption
-        if handle:
-            caption = re.sub(
-                r"\{BOT_QUAL:([^}]+)\}",
-                rf'<a href="https://t.me/{handle}">\1</a>',
-                caption,
-            )
-        else:
-            caption = re.sub(r"\{BOT_QUAL:([^}]+)\}", r"\1", caption)
+        msg_by_id = msg_by_id or {}
+
+        def _sub(m: re.Match) -> str:
+            aid_raw, label = m.group(1), m.group(2)
+            if not handle:
+                return label
+            mid = None
+            if aid_raw:
+                try:
+                    mid = msg_by_id.get(int(aid_raw))
+                except (TypeError, ValueError):
+                    mid = None
+            if mid:
+                href = f"https://t.me/{handle}/{mid}"
+            else:
+                href = f"https://t.me/{handle}"
+            return f'<a href="{href}">{label}</a>'
+
+        # ``#<id>`` group is optional so the legacy unanchored form still matches.
+        caption = re.sub(r"\{BOT_QUAL(?:#(\d+))?:([^}]+)\}", _sub, caption)
         return resolve_premium_emoji(caption, fmt)
 
     @staticmethod

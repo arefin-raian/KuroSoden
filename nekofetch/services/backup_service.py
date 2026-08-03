@@ -542,23 +542,38 @@ class BackupService:
             return None
 
     @staticmethod
-    def _resolve_quals(caption: str, handle: str | None) -> str:
-        """Expand ``{BOT_QUAL:…}`` placeholders (mirrors the distribution app).
+    def _resolve_quals(
+        caption: str, handle: str | None,
+        msg_by_id: dict[int, int] | None = None,
+    ) -> str:
+        """Expand ``{BOT_QUAL…}`` placeholders (mirrors the distribution app).
 
-        With a channel handle each becomes a ``t.me/<handle>`` link; without one
-        the placeholder collapses to its bare label so no dead link is posted.
+        Honours both the anchored ``{BOT_QUAL#<id>:LABEL}`` and legacy
+        ``{BOT_QUAL:LABEL}`` forms. With ``msg_by_id`` an anchored id links to
+        ``t.me/<handle>/<msg_id>``; otherwise an anchored/plain placeholder links
+        to the channel root. Without a handle it collapses to the bare label.
         """
         import re
 
         if not caption:
             return caption
-        if handle:
-            return re.sub(
-                r"\{BOT_QUAL:([^}]+)\}",
-                rf'<a href="https://t.me/{handle}">\1</a>',
-                caption,
-            )
-        return re.sub(r"\{BOT_QUAL:([^}]+)\}", r"\1", caption)
+        msg_by_id = msg_by_id or {}
+
+        def _sub(m: re.Match) -> str:
+            aid_raw, label = m.group(1), m.group(2)
+            if not handle:
+                return label
+            mid = None
+            if aid_raw:
+                try:
+                    mid = msg_by_id.get(int(aid_raw))
+                except (TypeError, ValueError):
+                    mid = None
+            href = (f"https://t.me/{handle}/{mid}" if mid
+                    else f"https://t.me/{handle}")
+            return f'<a href="{href}">{label}</a>'
+
+        return re.sub(r"\{BOT_QUAL(?:#(\d+))?:([^}]+)\}", _sub, caption)
 
     async def restore_distribution_channel(
         self, anime_doc_id: str, new_chat_id: int,

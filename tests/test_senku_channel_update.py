@@ -62,13 +62,20 @@ class _FakeClient:
         self.photos.append(caption)
         return _FakeMsg(self._next_id)
 
-    async def send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
+    async def send_message(self, chat_id, text, reply_markup=None, parse_mode=None,
+                           disable_web_page_preview=None):
         self._next_id += 1
         self.messages.append(text)
         return _FakeMsg(self._next_id)
 
     async def delete_messages(self, chat_id, mid):
         self.deleted.append(mid)
+
+    async def get_messages(self, chat_id, mid):
+        return None
+
+    async def pin_chat_message(self, chat_id, mid, disable_notification=None):
+        return None
 
 
 def _container(sessionmaker):
@@ -126,9 +133,9 @@ async def test_update_no_channel_is_noop(sessionmaker, session):
     assert client.stickers == [] and client.photos == [] and client.messages == []
 
 
-# ── _append_and_refooter: full choreography + layout rewrite ──────────────────
+# ── _append_and_refooter: season auto-update rebuilds the guide tail ──────────
 
-async def test_append_and_refooter_swaps_footer_and_records_layout(sessionmaker, session):
+async def test_append_and_refooter_rebuilds_guide_tail_and_records_layout(sessionmaker, session):
     pub = SenkuPublisher(_container(sessionmaker))
     client = _FakeClient()
 
@@ -155,27 +162,61 @@ async def test_append_and_refooter_swaps_footer_and_records_layout(sessionmaker,
 
     appended = await pub._append_and_refooter(
         client, -100123, ch.id, layout_dicts, new_cards,
+        "Watch guide (regenerated)",
     )
 
     assert appended == 1
-    # Only the old footer (7) is deleted; the pre-footer divider (6) stays put
-    # — it's already correctly placed, so the new card slots in after it.
-    assert client.deleted == [7]
+    # The guide (5), its leading divider (4), the trailing divider (6) and the
+    # footer (7) are all stripped — the whole guide tail is rebuilt.
+    assert set(client.deleted) == {4, 5, 6, 7}
 
     rows = await _layout_kinds(sessionmaker, ch.id)
     kinds = [r.kind for r in rows]
-    # Body kept through the pre-footer divider, then: new season card · divider · footer.
+    # Body kept through the last existing card, then: new card · div · guide · div · footer.
     assert kinds == [
-        "info_card", "divider", "season_card", "divider", "watch_guide",
-        "divider", "season_card", "divider", "footer",
+        "info_card", "divider", "season_card",
+        "divider", "season_card", "divider", "watch_guide", "divider", "footer",
     ]
-    # The kept divider (id 6) is reused, not re-sent, so it precedes the new card.
-    kept_divider = rows[5]
-    assert kept_divider.kind == "divider" and kept_divider.tg_message_id == 6
-    # Footer is last, and the new season card carries its anilist id.
-    assert rows[-1].kind == "footer"
+    # The new season card carries its anilist id and precedes the fresh guide.
     assert any(r.kind == "season_card" and r.anilist_id == 102 for r in rows)
-    # The pinned guide id is preserved untouched.
+    # The regenerated guide is freshly posted (new id) and re-pinned.
+    guide = next(r for r in rows if r.kind == "watch_guide")
+    assert guide.tg_message_id not in {5} and guide.is_pinned is True
+    assert rows[-1].kind == "footer"
+
+
+async def test_append_falls_back_to_footer_only_without_guide(sessionmaker, session):
+    """No regenerated guide (guide_caption=None): keep the classic footer swap."""
+    pub = SenkuPublisher(_container(sessionmaker))
+    client = _FakeClient()
+
+    layout = [
+        ("info_card", 1, None, True),
+        ("divider", 2, None, False),
+        ("season_card", 3, 101, False),
+        ("divider", 4, None, False),
+        ("watch_guide", 5, None, True),
+        ("divider", 6, None, False),
+        ("footer", 7, None, False),
+    ]
+    ch = await _make_channel(session, chat_id=-100124, anime_doc_id="anilist:11", layout=layout)
+    layout_dicts = [
+        {"kind": k, "tg_message_id": m, "anilist_id": a, "is_pinned": p}
+        for k, m, a, p in layout
+    ]
+    new_cards = [{
+        "post_type": "season_card", "caption": "Season 2",
+        "image": None, "button_data": None, "pinned": False, "anilist_id": 102,
+    }]
+
+    appended = await pub._append_and_refooter(
+        client, -100124, ch.id, layout_dicts, new_cards, None,
+    )
+
+    assert appended == 1
+    # Guide preserved; only the old footer (7) is swapped.
+    assert client.deleted == [7]
+    rows = await _layout_kinds(sessionmaker, ch.id)
     guide = next(r for r in rows if r.kind == "watch_guide")
     assert guide.tg_message_id == 5 and guide.is_pinned is True
 

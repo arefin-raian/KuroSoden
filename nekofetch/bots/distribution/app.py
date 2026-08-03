@@ -125,18 +125,21 @@ def build_distribution_bot(
                     pass
 
             markup = _build_buttons(post)
-            # Replace {BOT_QUAL:...} placeholders with t.me/{username} links.
-            # Falls back to plain text when the bot has no username.
+            # Replace {BOT_QUAL…} placeholders with t.me/{username} links. In a
+            # private bot chat message deep-linking is unavailable, so an anchored
+            # {BOT_QUAL#<id>:…} is treated like the plain form — the ``#<id>`` group
+            # is optional in the pattern and simply dropped. Falls back to plain
+            # text when the bot has no username.
             caption_text = post.caption or ""
             if caption_text:
                 if bot_uname:
                     caption_text = _re.sub(
-                        r'\{BOT_QUAL:([^}]+)\}',
+                        r'\{BOT_QUAL(?:#\d+)?:([^}]+)\}',
                         rf'<a href="https://t.me/{bot_uname}">\1</a>',
                         caption_text,
                     )
                 else:
-                    caption_text = _re.sub(r'\{BOT_QUAL:([^}]+)\}', r'\1', caption_text)
+                    caption_text = _re.sub(r'\{BOT_QUAL(?:#\d+)?:([^}]+)\}', r'\1', caption_text)
             try:
                 # Prefer the catbox-cached URL (set at generate time) so the
                 # bot doesn't hammer TMDB/AniList CDNs on every /start; fall

@@ -937,6 +937,20 @@ class BotContentService:
 
     # ── content builders ─────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _qual_placeholder(qual_str: str, anilist_id: int | None) -> str:
+        """Wrap a quality string in a ``{BOT_QUAL…}`` placeholder.
+
+        When ``anilist_id`` is known the placeholder is *anchored* to that entry
+        (``{BOT_QUAL#<id>:…}``) so a channel sender can deep-link the qualities to
+        that entry's own card message; without an id (mapping-built entry) it
+        falls back to the plain ``{BOT_QUAL:…}`` form that resolves to the channel
+        root. Both forms are recognised by every resolver.
+        """
+        if anilist_id is not None:
+            return f"{{BOT_QUAL#{anilist_id}:{qual_str}}}"
+        return f"{{BOT_QUAL:{qual_str}}}"
+
     def _build_franchise_watch_guide(
         self, meta: dict, packs: list[StoragePack], franchise: dict,
     ) -> str | None:
@@ -981,10 +995,13 @@ class BotContentService:
                     key=lambda r: _RES_ORDER.get(r, 9999),
                 ) if ep else []
                 qual_str = "  ".join(quals) if quals else "480p  720p  1080p"
-                # Wrap qualities in a placeholder so the distribution bot can
-                # replace them with t.me/{username} links at serving time
-                # (deep-linking to messages doesn't work in private chats).
-                qual_str = f"{{BOT_QUAL:{qual_str}}}"
+                # Wrap qualities in a placeholder the sender resolves at serving
+                # time. In a CHANNEL we anchor to this entry's own card message
+                # (``{BOT_QUAL#<anilist_id>:…}`` → t.me/<handle>/<msg_id>) so tapping
+                # a quality jumps to the exact season card; in a private bot chat
+                # (no message deep-linking) the anchor is stripped and it collapses
+                # to the bot's t.me/<username> root.
+                qual_str = self._qual_placeholder(qual_str, entry.anilist_id)
                 season_lines = self._render(
                     self._c.config.post_format.watch_guide_season_line,
                     M.BOT_WATCH_GUIDE_SEASON,
@@ -1006,7 +1023,7 @@ class BotContentService:
                     key=lambda r: _RES_ORDER.get(r, 9999),
                 ) if ep else []
                 qual_str = "  ".join(quals) if quals else "480p  720p  1080p"
-                qual_str = f"{{BOT_QUAL:{qual_str}}}"
+                qual_str = self._qual_placeholder(qual_str, entry.anilist_id)
                 label = extra_labels.get(entry.anilist_id, entry.format)
                 season_lines = self._render(
                     self._c.config.post_format.watch_guide_extra_line,

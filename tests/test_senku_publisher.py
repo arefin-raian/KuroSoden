@@ -258,7 +258,8 @@ class _FakeClient:
         self.photos.append(caption)
         return _FakeMsg(self._next_id)
 
-    async def send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
+    async def send_message(self, chat_id, text, reply_markup=None, parse_mode=None,
+                           disable_web_page_preview=None):
         self._next_id += 1
         self.messages.append(text)
         return _FakeMsg(self._next_id)
@@ -307,6 +308,39 @@ async def test_send_posts_dividers_pins_and_qual(pub):
     # {BOT_QUAL:720p} resolved to a link on the channel handle.
     assert any('href="https://t.me/aot_channel"' in c and ">720p<" in c
                for c in client.photos)
+
+
+@pytest.mark.asyncio
+async def test_send_posts_guide_qual_deeplinks_to_season_card(pub):
+    """An anchored {BOT_QUAL#<id>:…} in the guide links to that season's card
+    message (t.me/<handle>/<msg_id>) — not the bare channel root.
+
+    The season card is posted BEFORE the guide, so its message id is known by the
+    time the guide caption resolves."""
+    client = _FakeClient()
+
+    class _Cfg:
+        class bot:
+            divider_sticker_id = "DIV"
+        post_format = PostFormatConfig()
+    pub._c.config = _Cfg()
+
+    posts = [
+        {"post_type": "season_card", "caption": "S2 card", "image": "u1",
+         "button_data": None, "pinned": False, "anilist_id": 555},
+        {"post_type": "watch_guide",
+         "caption": "S2: {BOT_QUAL#555:480p  720p}", "image": None,
+         "button_data": None, "pinned": True},
+    ]
+    posted, pinned, layout = await pub._send_posts(client, -100123, posts)
+
+    assert posted == 2
+    # The season card's message id (from the layout) is what the guide links to.
+    season_mid = next(it["tg_message_id"] for it in layout
+                      if it["kind"] == "season_card")
+    guide_text = client.messages[-1]
+    assert f'href="https://t.me/aot_channel/{season_mid}"' in guide_text
+    assert ">480p  720p<" in guide_text
 
 
 @pytest.mark.asyncio
