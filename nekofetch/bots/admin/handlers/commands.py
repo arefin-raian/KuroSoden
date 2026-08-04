@@ -26,6 +26,8 @@ _COMMAND_KEYS = (
     ("cleardownloads", M.CMD_CLEARDOWNLOADS),
     ("resetoverrides", M.CMD_RESETOVERRIDES),
     ("checkupdates", M.CMD_CHECKUPDATES),
+    ("recovermain", M.CMD_RECOVERMAIN),
+    ("recoverindex", M.CMD_RECOVERINDEX),
 )
 
 
@@ -178,6 +180,94 @@ def register(client: Client, container: Container) -> None:
             f"Failed: {result['failed']}",
             parse_mode=ParseMode.HTML,
         )
+
+    @client.on_message(filters.command("recovermain"))
+    async def _recover_main(_: Client, message: Message) -> None:
+        """Restore the main channel onto a fresh channel after a ban.
+
+        Usage: /recovermain <new_channel_id>
+        The operator creates the new channel first, then passes its numeric id
+        (e.g. -1001234567890) here. The command restores every backed-up post
+        verbatim, re-points config, and triggers a re-publish so Download invite
+        links refresh to the new channel.
+        """
+        if not _is_owner(message):
+            await message.reply(t(M.OWNER_ONLY), parse_mode=ParseMode.HTML)
+            return
+        parts = message.text.split()
+        if len(parts) < 2:
+            await message.reply(
+                "<b>Usage:</b> <code>/recovermain &lt;new_channel_id&gt;</code>\n\n"
+                "Restores every backed-up main-channel post onto the fresh channel, "
+                "re-points config, and refreshes Download invite links.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            new_id = int(parts[1])
+        except ValueError:
+            await message.reply("Channel id must be numeric (e.g. -1001234567890).")
+            return
+
+        from nekofetch.services.backup_service import BackupService
+
+        status = await message.reply("🔄 Restoring main channel…", parse_mode=ParseMode.HTML)
+        try:
+            stats = await BackupService(container).restore_to_channel(new_id)
+            await status.edit_text(
+                f"✅ <b>Main channel restored</b>\n\n"
+                f"<b>Total:</b> {stats.total}\n"
+                f"<b>Restored:</b> {stats.restored}\n"
+                f"<b>Failed:</b> {stats.failed}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            log.error("recovermain.failed", error=str(exc))
+            await status.edit_text(f"❌ Restore failed: {str(exc)[:300]}", parse_mode=ParseMode.HTML)
+
+    @client.on_message(filters.command("recoverindex"))
+    async def _recover_index(_: Client, message: Message) -> None:
+        """Restore the index channel onto a fresh channel after a ban.
+
+        Usage: /recoverindex <new_channel_id> [<new_username>]
+        The operator creates the new channel first (with a public @handle for
+        deep-links), then passes its numeric id here. The command restores every
+        index section in order, remaps section message ids, and re-points config.
+        """
+        if not _is_owner(message):
+            await message.reply(t(M.OWNER_ONLY), parse_mode=ParseMode.HTML)
+            return
+        parts = message.text.split()
+        if len(parts) < 2:
+            await message.reply(
+                "<b>Usage:</b> <code>/recoverindex &lt;new_channel_id&gt; [&lt;username&gt;]</code>\n\n"
+                "Restores the index channel onto the fresh channel, remaps section "
+                "message ids, and re-points config.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            new_id = int(parts[1])
+        except ValueError:
+            await message.reply("Channel id must be numeric (e.g. -1001234567890).")
+            return
+        new_username = parts[2].lstrip("@") if len(parts) > 2 else None
+
+        from nekofetch.services.backup_service import BackupService
+
+        status = await message.reply("🔄 Restoring index channel…", parse_mode=ParseMode.HTML)
+        try:
+            stats = await BackupService(container).restore_index(new_id, new_username=new_username)
+            await status.edit_text(
+                f"✅ <b>Index channel restored</b>\n\n"
+                f"<b>Total:</b> {stats.total}\n"
+                f"<b>Restored:</b> {stats.restored}\n"
+                f"<b>Failed:</b> {stats.failed}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            log.error("recoverindex.failed", error=str(exc))
+            await status.edit_text(f"❌ Restore failed: {str(exc)[:300]}", parse_mode=ParseMode.HTML)
 
     @client.on_message(filters.command("resetoverrides"))
     async def _reset_overrides(_: Client, message: Message) -> None:

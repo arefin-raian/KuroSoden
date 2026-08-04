@@ -186,6 +186,8 @@
   "cmd_resetoverrides": "Clear saved config overrides so config.yaml wins (admin)",
   "cmd_cleardownloads": "Clear all active/stuck downloads (owner)",
   "cmd_checkupdates": "Check AniList for new seasons/entries of published anime (owner)",
+  "cmd_recovermain": "Restore the main channel onto a fresh channel after a ban (owner)",
+  "cmd_recoverindex": "Restore the index channel onto a fresh channel after a ban (owner)",
   "bot_desc_placeholder": "📺 {title}\n\n<i>Placeholder description — to be updated.</i>",
   "reload_done": "✅  <b>Reloaded {count} strings</b> from\n<code>{path}</code>",
   "overrides_cleared": "✅  <b>Cleared {count} config overrides.</b>\n<i>config.yaml is authoritative again after the next restart.</i>",

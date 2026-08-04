@@ -709,6 +709,8 @@ class M:
     BTN_BATCH = "btn_batch"
     CMD_CHECKBANS = "cmd_checkbans"
     CMD_CHECKUPDATES = "cmd_checkupdates"
+    CMD_RECOVERMAIN = "cmd_recovermain"
+    CMD_RECOVERINDEX = "cmd_recoverindex"
     CMD_BATCH = "cmd_batch"
     HELP_CMD_BATCH = "help_cmd_batch"
     HELP_CAP_BATCH = "help_cap_batch"
