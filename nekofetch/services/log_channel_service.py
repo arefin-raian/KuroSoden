@@ -727,8 +727,9 @@ class LogChannelService:
 
         kb = InlineKeyboardMarkup([
             [_btn(M.ADMIN_BTN_TELEGRAM, "staff", "rsource", code, "telegram"),
-             _btn(M.ADMIN_BTN_WEBSITE, "staff", "rsource", code, "website"),
-             _btn(M.ADMIN_BTN_TORRENT, "staff", "rsource", code, "torrent")],
+             _btn(M.ADMIN_BTN_WEBSITE, "staff", "rsource", code, "website")],
+            [_btn(M.ADMIN_BTN_TORRENT, "staff", "rsource", code, "torrent"),
+             _btn(M.ADMIN_BTN_DDL, "staff", "rsource", code, "ddl")],
             [_btn(M.ADMIN_BTN_REJECT, "staff", "rreject", code)],
         ])
         try:

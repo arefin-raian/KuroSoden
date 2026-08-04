@@ -44,6 +44,7 @@ STATE_MANUAL = STATE_MANUAL_COMP  # legacy alias for the entry-point transition
 STATE_TORRENT = "staff:torrent_pick"
 STATE_TORRENT_PROVIDE = "staff:torrent_provide"
 STATE_TORRENT_MAP = "staff:torrent_map"
+STATE_DDL_PROVIDE = "staff:ddl_provide"
 STATE_PROVIDE = "staff:await_provide"   # admin is sending a file for a stuck episode
 
 # Franchise flow states
@@ -577,7 +578,8 @@ def register(client: Client, container: Container) -> None:
         kb = keyboard(
             [(L(M.ADMIN_BTN_TELEGRAM), cb("staff", "rsource", code, "telegram")),
              (L(M.ADMIN_BTN_WEBSITE), cb("staff", "rsource", code, "website"))],
-            [(L(M.ADMIN_BTN_TORRENT), cb("staff", "rsource", code, "torrent"))],
+            [(L(M.ADMIN_BTN_TORRENT), cb("staff", "rsource", code, "torrent")),
+             (L(M.ADMIN_BTN_DDL), cb("staff", "rsource", code, "ddl"))],
             [(L(M.ADMIN_BTN_REJECT), cb("staff", "rreject", code))],
             [(L(M.BTN_BACK), cb("staff", "requests", 0))],
         )
@@ -698,6 +700,25 @@ def register(client: Client, container: Container) -> None:
             screen = franchise_map_selection(mapping, backdrop_url=backdrop_url)
             from nekofetch.ui.screens import send_screen
             await send_screen(client, q.message.chat.id, screen, old_msg=q.message)
+            return
+
+        if chosen_source == "ddl":
+            # DDL is provide-only — there's nothing to search, so skip the
+            # search/provide mode chooser and prompt for the archive link(s)
+            # directly. Mirrors the torrent "provide" branch of _torrent_mode.
+            await q.answer()
+            kb = keyboard([(L(M.BTN_BACK), _source_back_cb(code))])
+            card = await show(client, q.message,
+                              L(M.DDL_PROVIDE_PROMPT, title=title), kb)
+            # Re-entering the provide screen is an explicit "start over" — drop any
+            # stale duplicate-guard claim so a fresh link is accepted immediately.
+            await _release_torrent_provide(code)
+            await fsm.set(q.from_user.id, STATE_DDL_PROVIDE,
+                          code=code, title=title,
+                          prompt_chat_id=card.chat.id, prompt_message_id=card.id)
+            await _arm_reply(container.redis, card.chat.id,
+                             STATE_DDL_PROVIDE, code=code, title=title,
+                             prompt_chat_id=card.chat.id, prompt_message_id=card.id)
             return
 
         # Torrent: present a mode choice — search Nyaa or provide a magnet/.torrent.
@@ -1123,6 +1144,86 @@ def register(client: Client, container: Container) -> None:
             data.get("title", ""),
         )
 
+    # ── DDL provide: direct-link handler ──────────────────────────────────
+    # group 13 (not 12): the torrent magnet handler in group 12 also matches
+    # `filters.text`, and Pyrogram runs only the first matching handler per
+    # group. A separate group lets BOTH run — the magnet handler early-returns
+    # for an http(s) link, and this one early-returns for a magnet — so the two
+    # provide flows never shadow each other.
+
+    @client.on_message(filters.text & ~filters.command(["start"]), group=13)
+    async def _ddl_link_reply(client: Client, message: Message) -> None:
+        """Receive a direct download link from the admin in STATE_DDL_PROVIDE."""
+        text = (message.text or "").strip()
+        # Accept one or more whitespace/newline-separated http(s) links; the DDL
+        # ref carries an `archives` list so a single message can seed several.
+        urls = [tok for tok in text.split()
+                if tok.startswith(("http://", "https://"))]
+        if not urls:
+            return  # not a direct link — let other handlers try
+
+        state, data, via_channel = await _resolve_reply_flow(
+            message, STATE_DDL_PROVIDE,
+        )
+        if state is None:
+            return
+
+        code = data.get("code")
+        title = data.get("title", "")
+        if not code:
+            return
+
+        # Double-submission guard (shared per-code claim with the torrent flow —
+        # only one provide flow is ever active for a request at a time).
+        if not await _claim_torrent_provide(code):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            log.info("ddl_link.duplicate_dropped", code=code)
+            return
+
+        # Delete the admin's message (direct links are long / noisy).
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        ddl_ref = json.dumps({
+            "archives": [{"url": u, "season": None} for u in urls],
+            "title": title,
+            "code": code,
+        })
+
+        # Consume the awaited-reply flow now the duplicate guard has let this
+        # link through — clears the per-user FSM / disarms the channel marker.
+        if via_channel:
+            await _finish_channel_reply(message, data)
+        elif message.from_user:
+            await fsm.clear(message.from_user.id)
+
+        user_id = message.from_user.id if message.from_user else 0
+
+        # Retrieve the stored prompt card so we edit it in place.
+        prompt_chat_id = data.get("prompt_chat_id", message.chat.id)
+        prompt_message_id = data.get("prompt_message_id")
+        try:
+            prompt_msg = await client.get_messages(prompt_chat_id, prompt_message_id) if prompt_message_id else None
+        except Exception:
+            prompt_msg = None
+
+        if prompt_msg:
+            ack = await show(client, prompt_msg, L(M.DDL_LINK_ACK), None)
+        else:
+            ack = await client.send_message(
+                message.chat.id, L(M.DDL_LINK_ACK), parse_mode=ParseMode.HTML,
+            )
+
+        # No mapping preview — the archive contents are unknown until it's fetched
+        # and extracted (DdlSource.get_episodes handles that). Enqueue directly.
+        await _torrent_enqueue(ack, user_id, code, ddl_ref, title,
+                               source_name="ddl")
+
     # ── torrent mapping: build + show mapping before enqueue ──────────────
 
     async def _show_torrent_mapping(
@@ -1200,14 +1301,19 @@ def register(client: Client, container: Container) -> None:
         source_ref: str,
         title: str,
         torrent_mapping_dict: dict | None = None,
+        source_name: str = "nyaa",
     ) -> None:
-        """Common enqueue path for all torrent flows."""
+        """Common enqueue path for all torrent/DDL flows.
+
+        ``source_name`` is the plugin the request is bound to — ``"nyaa"`` for
+        torrents (the default) or ``"ddl"`` for direct-link archives.
+        """
         from nekofetch.services.queue_service import QueueService
         from nekofetch.services.request_service import RequestService
 
         try:
             await RequestService(container).update_source_ref(
-                code, "nyaa", source_ref,
+                code, source_name, source_ref,
             )
             if torrent_mapping_dict:
                 req = await RequestService(container).get(code)
@@ -2254,7 +2360,8 @@ def register(client: Client, container: Container) -> None:
                             (L(M.ADMIN_BTN_TELEGRAM), cb("staff", "rsource", code, "telegram")),
                             (L(M.ADMIN_BTN_WEBSITE), cb("staff", "rsource", code, "website")),
                         ],
-                        [(L(M.ADMIN_BTN_TORRENT), cb("staff", "rsource", code, "torrent"))],
+                        [(L(M.ADMIN_BTN_TORRENT), cb("staff", "rsource", code, "torrent")),
+                         (L(M.ADMIN_BTN_DDL), cb("staff", "rsource", code, "ddl"))],
                         [(L(M.ADMIN_BTN_REJECT), cb("staff", "rreject", code))],
                         ))
         await q.answer()
