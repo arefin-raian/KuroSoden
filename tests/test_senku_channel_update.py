@@ -24,6 +24,7 @@ from sqlalchemy import select
 
 from nekofetch.core.config import PostFormatConfig
 from nekofetch.infrastructure.database.postgres.models import (
+    BotContentPost,
     ChannelLayout,
     DistributionBot,
 )
@@ -299,6 +300,111 @@ async def test_append_multiple_entries_interleaves_dividers(sessionmaker, sessio
     assert rows[4].kind == "season_card" and rows[4].anilist_id == 102
     assert rows[6].kind == "movie_card" and rows[6].anilist_id == 103
     assert rows[-1].kind == "footer"
+
+
+# ── P0: _reconcile_content_posts keeps the ban-restore backup current ─────────
+
+async def _content_rows(sessionmaker, bot_id):
+    async with sessionmaker() as s:
+        rows = (
+            await s.execute(
+                select(BotContentPost)
+                .where(BotContentPost.bot_id == bot_id)
+                .order_by(BotContentPost.order)
+            )
+        ).scalars().all()
+    return rows
+
+
+async def test_update_reconciles_bot_content_posts_with_new_season(sessionmaker, session):
+    """After a season auto-update, BotContentPost (the ban-restore backup source)
+    must include the new season card + the regenerated guide — not the stale
+    S1-only snapshot. This is the P0 data-loss fix."""
+    pub = SenkuPublisher(_container(sessionmaker))
+    client = _FakeClient()
+
+    layout = [
+        ("info_card", 1, None, True),
+        ("divider", 2, None, False),
+        ("season_card", 3, 101, False),
+        ("divider", 4, None, False),
+        ("watch_guide", 5, None, True),
+        ("divider", 6, None, False),
+        ("footer", 7, None, False),
+    ]
+    ch = await _make_channel(session, chat_id=-100900, anime_doc_id="anilist:9", layout=layout)
+
+    # Seed the PRE-update BotContentPost snapshot: S1 card + guide + footer only.
+    session.add_all([
+        BotContentPost(bot_id=ch.id, post_type="season_card", order=0,
+                       caption="Season 1", anilist_id=101, tg_message_id=3),
+        BotContentPost(bot_id=ch.id, post_type="watch_guide", order=1,
+                       caption="Old guide", is_pinned=True, tg_message_id=5),
+        BotContentPost(bot_id=ch.id, post_type="footer", order=2,
+                       caption="Join!", tg_message_id=7),
+    ])
+    await session.commit()
+
+    layout_dicts = [
+        {"kind": k, "tg_message_id": m, "anilist_id": a, "is_pinned": p}
+        for k, m, a, p in layout
+    ]
+    new_cards = [{
+        "post_type": "season_card", "caption": "Season 2",
+        "image": None, "button_data": None, "pinned": False, "anilist_id": 102,
+    }]
+
+    await pub._append_and_refooter(
+        client, -100900, ch.id, layout_dicts, new_cards,
+        "Watch guide (regenerated with S2)",
+    )
+
+    rows = await _content_rows(sessionmaker, ch.id)
+    by_type = {}
+    for r in rows:
+        by_type.setdefault(r.post_type, []).append(r)
+
+    # Both seasons now present as content cards (backup source no longer stale).
+    season_ids = {r.anilist_id for r in by_type.get("season_card", [])}
+    assert season_ids == {101, 102}
+    # Exactly one guide + one footer, and the guide carries the regenerated text.
+    assert len(by_type.get("watch_guide", [])) == 1
+    assert "regenerated with S2" in by_type["watch_guide"][0].caption
+    assert len(by_type.get("footer", [])) == 1
+    # Content revision bumped so returning /start users get the new set.
+    async with sessionmaker() as s:
+        bot = await s.get(DistributionBot, ch.id)
+    assert (bot.content_revision or 0) >= 1
+
+
+async def test_reconcile_content_posts_dedupes_on_rerun(sessionmaker, session):
+    """A retried update (same new card twice) must not double-insert the card."""
+    pub = SenkuPublisher(_container(sessionmaker))
+    ch = DistributionBot(
+        name="Ch", username="c", anime_doc_id="anilist:9b",
+        encrypted_token="fake", enabled=True, is_channel=True, chat_id=-100901,
+    )
+    session.add(ch)
+    await session.commit()
+    session.add(BotContentPost(bot_id=ch.id, post_type="season_card", order=0,
+                               caption="S1", anilist_id=101, tg_message_id=3))
+    await session.commit()
+
+    new_content = [{"post_type": "season_card", "caption": "S2",
+                    "image": None, "button_data": None,
+                    "anilist_id": 102, "tg_message_id": 30}]
+    # Run twice — the second run should be a no-op for the S2 card.
+    for _ in range(2):
+        await pub._reconcile_content_posts(
+            ch.id, new_content, guide_caption="G", guide_mid=40,
+            footer_caption="F", footer_image=None, footer_mid=50,
+        )
+
+    rows = await _content_rows(sessionmaker, ch.id)
+    season_102 = [r for r in rows if r.anilist_id == 102]
+    assert len(season_102) == 1  # not doubled
+    assert sum(1 for r in rows if r.post_type == "watch_guide") == 1
+    assert sum(1 for r in rows if r.post_type == "footer") == 1
 
 
 # ── _persist_channel: idempotent anchor + layout snapshot ─────────────────────

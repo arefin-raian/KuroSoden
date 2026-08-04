@@ -238,6 +238,9 @@ class BotContentService:
                 image_url=image_str,
                 image_cached_url=cached_url,
                 button_data=buttons,
+                # Carry the entry id so a ban-restore can remap this card's
+                # {BOT_QUAL#id:…} deep-links to its fresh message id.
+                anilist_id=entry.anilist_id,
             ))
             order += 1
 
@@ -278,6 +281,9 @@ class BotContentService:
                 image_url=image_str,
                 image_cached_url=cached_url_extra,
                 button_data=buttons,
+                # Carry the entry id so a ban-restore can remap this card's
+                # {BOT_QUAL#id:…} deep-links to its fresh message id.
+                anilist_id=entry.anilist_id,
             ))
             order += 1
 

@@ -202,6 +202,18 @@ class SenkuPublisher:
         )
         log.info("senku.update.done", anime=anime_doc_id, chat_id=chat_id,
                  appended=appended)
+
+        # 4. Refresh the wipe-proof backup so a later ban restores the NEW season
+        #    too. _append_and_refooter rewrote BotContentPost; snapshot it now.
+        #    Best-effort — a capture hiccup must never fail the update.
+        if appended:
+            try:
+                from nekofetch.services.backup_service import BackupService
+
+                await BackupService(self._c).record_distribution_channel(anime_doc_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("senku.update.backup_failed",
+                            anime=anime_doc_id, error=str(exc))
         return {"appended": appended, "chat_id": chat_id}
 
     async def _build_update_cards(
@@ -404,6 +416,10 @@ class SenkuPublisher:
         footer_post = next((it for it in tail if it.get("kind") == "footer"), None)
 
         new_layout = list(body)
+        # Freshly-posted content cards (season/movie), captured so the ban-restore
+        # backup (built from BotContentPost, not ChannelLayout) picks up the new
+        # season. Guide + footer content are captured separately below.
+        new_content: list[dict] = []
         appended = 0
 
         async def _emit_divider() -> None:
@@ -445,6 +461,18 @@ class SenkuPublisher:
                 "anilist_id": aid,
                 "is_pinned": False,
             })
+            # Snapshot the card CONTENT for the ban-restore backup. The raw
+            # (unresolved) caption is stored so {BOT_QUAL#id:…} re-resolves against
+            # whatever handle a restored channel later gets.
+            new_content.append({
+                "post_type": post.get("post_type") or "season_card",
+                "caption": post.get("caption") or "",
+                "image": post.get("image"),
+                "button_data": post.get("button_data"),
+                "anilist_id": aid,
+                "is_pinned": False,
+                "tg_message_id": msg.id,
+            })
             appended += 1
 
         # A divider only needs to *lead* the first new card when the body doesn't
@@ -457,6 +485,7 @@ class SenkuPublisher:
 
         # Re-emit the watch guide (pinned) — now that every card it references has
         # a message id, its quality links deep-link to the right season cards.
+        guide_mid: int | None = None
         if guide_caption:
             await _emit_divider()
             try:
@@ -466,6 +495,7 @@ class SenkuPublisher:
                     disable_web_page_preview=True,
                 )
                 await self._pin_silently(client, chat_id, gmsg.id)
+                guide_mid = gmsg.id
                 new_layout.append({"kind": "watch_guide", "tg_message_id": gmsg.id,
                                    "anilist_id": None, "is_pinned": True})
             except Exception as exc:  # noqa: BLE001 — guide is best-effort
@@ -474,6 +504,7 @@ class SenkuPublisher:
         # Divider + re-posted footer (reuse the old footer's text/image).
         await _emit_divider()
         footer_caption, footer_image = await self._footer_content(footer_post)
+        footer_mid: int | None = None
         try:
             caption = self._resolve_caption(footer_caption, handle, fmt, msg_by_id)
             if footer_image:
@@ -484,6 +515,7 @@ class SenkuPublisher:
                 fmsg = await client.send_message(
                     chat_id, caption, parse_mode=ParseMode.HTML,
                 )
+            footer_mid = fmsg.id
             new_layout.append({"kind": "footer", "tg_message_id": fmsg.id,
                                "anilist_id": None, "is_pinned": False})
         except Exception as exc:  # noqa: BLE001 — footer is best-effort
@@ -501,7 +533,128 @@ class SenkuPublisher:
                     anilist_id=item.get("anilist_id"),
                     is_pinned=bool(item.get("is_pinned")),
                 ))
+
+        # Reconcile BotContentPost so the ban-restore backup (built from these
+        # rows, NOT ChannelLayout) includes the new season card + regenerated
+        # guide. Without this, a post-update ban would restore the STALE pre-update
+        # snapshot (missing the new season). Content-only cards are appended /
+        # updated in place; the guide + footer rows are rewritten. Best-effort:
+        # a reconcile hiccup must never fail an otherwise-successful update.
+        try:
+            await self._reconcile_content_posts(
+                bot_id, new_content,
+                guide_caption=guide_caption, guide_mid=guide_mid,
+                footer_caption=footer_caption, footer_image=footer_image,
+                footer_mid=footer_mid,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("senku.update.content_reconcile_failed",
+                        bot_id=bot_id, error=str(exc))
         return appended
+
+    async def _reconcile_content_posts(
+        self, bot_id: int, new_content: list[dict], *,
+        guide_caption: str | None, guide_mid: int | None,
+        footer_caption: str | None, footer_image: str | None,
+        footer_mid: int | None,
+    ) -> None:
+        """Fold an incremental update's new cards into the ``BotContentPost`` set.
+
+        The ban-restore backup (:meth:`BackupService.record_distribution_channel`)
+        reads ``BotContentPost`` in ``order``, so after a season auto-update those
+        rows must reflect the appended season card(s) + the regenerated watch
+        guide — otherwise a later ban restores the pre-update channel.
+
+        Strategy: keep the existing info/season/movie cards (they're unchanged),
+        append the new content cards after them, then rewrite the single watch
+        guide + footer rows to the freshly-posted versions. Content revision is
+        bumped so returning /start users get the new set too.
+        """
+        from sqlalchemy import select
+
+        from nekofetch.infrastructure.database.postgres.models import (
+            BotContentPost,
+            DistributionBot,
+        )
+        from nekofetch.infrastructure.database.postgres.session import session_scope
+
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            rows = (
+                await session.execute(
+                    select(BotContentPost)
+                    .where(BotContentPost.bot_id == bot_id)
+                    .order_by(BotContentPost.order)
+                )
+            ).scalars().all()
+
+            # Split existing rows: keep content/info cards as-is; the guide + footer
+            # are rewritten (their content changed / message ids moved).
+            kept = [r for r in rows
+                    if r.post_type not in ("watch_guide", "footer")]
+            existing_guide = next(
+                (r for r in rows if r.post_type == "watch_guide"), None)
+            existing_footer = next(
+                (r for r in rows if r.post_type == "footer"), None)
+            known_ids = {r.anilist_id for r in kept if r.anilist_id is not None}
+
+            order = len(kept)
+            # Append genuinely-new content cards (dedupe on anilist_id so a
+            # re-run — e.g. a retried update — doesn't double-insert).
+            for it in new_content:
+                aid = it.get("anilist_id")
+                if aid is not None and aid in known_ids:
+                    continue
+                session.add(BotContentPost(
+                    bot_id=bot_id,
+                    post_type=it.get("post_type") or "season_card",
+                    order=order,
+                    caption=it.get("caption") or "",
+                    image_url=it.get("image"),
+                    image_cached_url=it.get("image"),
+                    button_data=it.get("button_data"),
+                    is_pinned=bool(it.get("is_pinned")),
+                    tg_message_id=it.get("tg_message_id"),
+                    anilist_id=aid,
+                ))
+                if aid is not None:
+                    known_ids.add(aid)
+                order += 1
+
+            # Rewrite the watch guide row (regenerated over the full franchise).
+            if guide_caption:
+                if existing_guide is not None:
+                    existing_guide.caption = guide_caption
+                    existing_guide.order = order
+                    existing_guide.tg_message_id = guide_mid
+                    existing_guide.is_pinned = True
+                else:
+                    session.add(BotContentPost(
+                        bot_id=bot_id, post_type="watch_guide", order=order,
+                        caption=guide_caption, is_pinned=True,
+                        tg_message_id=guide_mid,
+                    ))
+                order += 1
+
+            # Rewrite the footer row (re-posted, new message id).
+            if existing_footer is not None:
+                existing_footer.order = order
+                existing_footer.tg_message_id = footer_mid
+                if footer_caption:
+                    existing_footer.caption = footer_caption
+                if footer_image:
+                    existing_footer.image_url = footer_image
+                    existing_footer.image_cached_url = footer_image
+            elif footer_caption:
+                session.add(BotContentPost(
+                    bot_id=bot_id, post_type="footer", order=order,
+                    caption=footer_caption, image_url=footer_image,
+                    image_cached_url=footer_image, tg_message_id=footer_mid,
+                ))
+
+            bot_row = await session.get(DistributionBot, bot_id)
+            if bot_row is not None:
+                bot_row.content_revision = (bot_row.content_revision or 0) + 1
+            await session.commit()
 
     async def _footer_content(self, footer_post: dict | None) -> tuple[str, str | None]:
         """Resolve the footer caption + image for a re-posted footer.

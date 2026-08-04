@@ -694,6 +694,13 @@ class BotConfig(BaseModel):
     # above. Off = the job never fires on the scheduler (manual command still works).
     monthly_update_check_enabled: bool = True
     monthly_ban_check_enabled: bool = True
+    # Periodic wipe-proof backup refresh (main-channel posts + index sections).
+    # Publish-time capture only refreshes the titles being published; a footer
+    # edit, index reshuffle, or manual channel tweak between publishes would
+    # otherwise not reach the ban-restore snapshot until the next publish. This
+    # scheduled job re-runs backup_all + record_index so the snapshot stays
+    # current. Set to 0 to disable (manual /backup always remains available).
+    periodic_backup_hours: int = 24
     # Restore pacing for a whole-channel main-channel restore (Change Main). 0 posts
     # as fast as the API allows; a positive ``restore_batch_size`` posts that many
     # then sleeps ``restore_batch_delay_seconds`` before the next batch — gentler on

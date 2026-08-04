@@ -359,9 +359,15 @@ class PublishingService:
                 from nekofetch.services.bot_orchestrator import BotOrchestratorService
 
                 await BotOrchestratorService(self._c).ensure_bot_for_anime(anime_doc_id)
-                # Snapshot the freshly-generated channel pack into a wipe-proof
-                # backup so a later ban can restore it verbatim. Best-effort — a
-                # capture hiccup must never fail an otherwise-successful publish.
+
+            # Snapshot the channel pack into a wipe-proof backup so a later ban can
+            # restore it verbatim. Decoupled from auto_create_on_publish: a channel
+            # may already exist (manual Senku wizard, or auto-create off) and MUST
+            # still be backed up — otherwise its only safety net is the stale
+            # pre-wipe capture at recreate time. record_distribution_channel is a
+            # no-op when no channel/content exists, so this is safe to always call.
+            # Best-effort — a capture hiccup must never fail a good publish.
+            if self._c.config.features.distribution_bots:
                 try:
                     from nekofetch.services.backup_service import BackupService
 

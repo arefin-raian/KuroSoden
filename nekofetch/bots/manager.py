@@ -380,6 +380,27 @@ class BotManager:
         except Exception as exc:
             log.error("bots.full_check.scheduled_run.failed", error=str(exc))
 
+    async def _periodic_backup(self) -> None:
+        """Scheduled wipe-proof snapshot refresh (main-channel posts + index).
+
+        Publish-time capture only touches the titles being published, so edits
+        made between publishes (footer rewrites, index reshuffles, manual tweaks)
+        wouldn't reach the ban-restore snapshot until the next publish. This job
+        re-runs the main-channel + index backup so a ban is always recoverable
+        from a current snapshot. Best-effort — a hiccup never crashes the loop.
+        """
+        log.info("periodic_backup.run.start")
+        try:
+            from nekofetch.services.backup_service import BackupService
+
+            bsvc = BackupService(self._c)
+            stats = await bsvc.backup_all()
+            await bsvc.record_index()
+            log.info("periodic_backup.run.done",
+                     posts=stats.posts, backed_up=stats.backed_up)
+        except Exception as exc:  # noqa: BLE001
+            log.error("periodic_backup.run.failed", error=str(exc))
+
     async def _check_shift_afk(self) -> None:
         from nekofetch.services.shift_service import ShiftService
         shift = ShiftService(self._c)
@@ -685,6 +706,17 @@ class BotManager:
                 update_check_seconds, ucs.check_all, id="update-check",
             )
             log.info("update_check.scheduled", interval_days=update_check_days)
+
+        # Periodic wipe-proof backup refresh (main-channel posts + index sections).
+        # Publish-time capture only touches the titles being published; this keeps
+        # the ban-restore snapshot current for edits made between publishes.
+        backup_hours = getattr(self._c.config.bot, "periodic_backup_hours", 24)
+        backup_seconds = backup_hours * 3600
+        if backup_seconds > 0:
+            self._scheduler.every(
+                backup_seconds, self._periodic_backup, id="periodic-backup",
+            )
+            log.info("periodic_backup.scheduled", interval_hours=backup_hours)
 
         self._scheduler.start()
         log.info("bots.scheduler.started")
