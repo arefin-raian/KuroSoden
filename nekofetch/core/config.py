@@ -493,7 +493,7 @@ class MainChannelConfig(BaseModel):
         "<b>⌬ QUALITY :</b> {qualities}\n"
         "<b>⌬ LANGUAGE :</b> {languages}\n"
         "<b>⌬ GENRE :</b> {genres}\n\n"
-        "<blockquote><b>‣ OverView :</b> {overview}</blockquote>"
+        "<blockquote expandable><b>‣ OverView :</b> {overview}</blockquote>"
     )
     index_button_text: str = "ɪɴᴅᴇx"
     download_button_text: str = "ᴅᴏᴡɴʟᴏᴀᴅ"

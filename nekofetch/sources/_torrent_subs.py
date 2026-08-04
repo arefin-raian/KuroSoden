@@ -95,12 +95,45 @@ def _brand_dialogue_line(start_ms: int, end_ms: int) -> str:
     )
 
 
-def brand_ass_text(ass_text: str, video_ms: int | None = None) -> tuple[str, int]:
+def extract_ass_cues(ass_text: str) -> list[Cue]:
+    """Return the dialogue cues (timing only) of an ASS ``[Events]`` section.
+
+    Used to POOL the cues of every subtitle track before choosing branding
+    windows, so a gap we pick is silent in *all* tracks — not just the one we
+    happen to be branding. Returns ``[]`` for input with no usable ``[Events]``.
+    """
+    text = ass_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    events_idx = next(
+        (i for i, ln in enumerate(lines) if ln.strip().lower() == "[events]"), -1
+    )
+    if events_idx == -1:
+        return []
+    events_body: list[str] = []
+    for ln in lines[events_idx + 1:]:
+        if ln.strip().startswith("[") and ln.strip().endswith("]"):
+            break
+        events_body.append(ln)
+    return _existing_cues(events_body)
+
+
+def brand_ass_text(
+    ass_text: str,
+    video_ms: int | None = None,
+    *,
+    windows: list[tuple[int, int]] | None = None,
+) -> tuple[str, int]:
     """Inject branding cues into an existing ASS, preserving everything else.
 
     Returns ``(new_ass_text, brand_count)``. Idempotent: if our ``AXWBrand`` style
     is already present the text is returned unchanged (count 0), so re-processing
     an already-branded file never stacks duplicate cues.
+
+    ``windows`` — pre-computed ``(start_ms, end_ms)`` branding slots. When the
+    caller has POOLED the cues of every subtitle track (see
+    :func:`brand_torrent_subtitles`) it passes the shared windows here so the same
+    silent-in-all-tracks slots are stamped into each track. When ``None`` the
+    windows are derived from THIS track's own cues (the standalone/file path).
 
     The parse is line-oriented and forgiving — it keeps the three ASS sections in
     order, appends the brand style at the end of ``[V4+ Styles]`` and the brand
@@ -131,8 +164,9 @@ def brand_ass_text(ass_text: str, video_ms: int | None = None) -> tuple[str, int
             break
         events_body.append(ln)
 
-    cues = _existing_cues(events_body)
-    windows = branding_windows(cues, video_ms)
+    if windows is None:
+        cues = _existing_cues(events_body)
+        windows = branding_windows(cues, video_ms)
     if not windows:
         return ass_text, 0
 
@@ -235,8 +269,9 @@ async def brand_torrent_subtitles(
 
     with tempfile.TemporaryDirectory() as tmp:
         tmpd = Path(tmp)
-        # 1. Extract + brand each TEXT subtitle track to its own .ass.
-        branded_ass: dict[int, Path] = {}  # sub-relative index -> branded .ass
+        # 1. Extract every TEXT subtitle track to its own .ass first (no branding
+        #    yet). We need ALL tracks' cues in hand before choosing windows.
+        extracted: dict[int, tuple[Path, str]] = {}  # rel index -> (path, raw text)
         for tr in sub_tracks:
             if not is_text_sub(tr.get("codec", "")):
                 continue
@@ -253,7 +288,24 @@ async def brand_torrent_subtitles(
                 continue
             try:
                 raw = ass_out.read_text(encoding="utf-8", errors="replace")
-                new_text, cues = brand_ass_text(raw, video_ms)
+            except Exception:  # noqa: BLE001 — a bad track shouldn't sink the remux
+                continue
+            extracted[rel] = (ass_out, raw)
+
+        # 2. POOL every track's cues and pick the branding windows ONCE, so each
+        #    slot is subtitle-free across ALL tracks (a gap in one track that has
+        #    dialogue in another is never chosen). Every track then gets the SAME
+        #    windows stamped in, keeping the on-screen branding in lockstep.
+        pooled_cues: list[Cue] = []
+        for _path, raw in extracted.values():
+            pooled_cues.extend(extract_ass_cues(raw))
+        shared_windows = branding_windows(pooled_cues, video_ms)
+
+        # 3. Brand each extracted track with the shared windows.
+        branded_ass: dict[int, Path] = {}  # sub-relative index -> branded .ass
+        for rel, (ass_out, raw) in extracted.items():
+            try:
+                new_text, cues = brand_ass_text(raw, video_ms, windows=shared_windows)
                 if cues:
                     ass_out.write_text(new_text, encoding="utf-8")
                     result["total_cues"] += cues
@@ -261,7 +313,7 @@ async def brand_torrent_subtitles(
             except Exception:  # noqa: BLE001 — a bad track shouldn't sink the remux
                 continue
 
-        # 2. Remux: video + audio copied; each subtitle stream either replaced by
+        # 4. Remux: video + audio copied; each subtitle stream either replaced by
         #    its branded .ass input, or copied from the source when not branded.
         cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", str(src)]
         for rel in sorted(branded_ass):
@@ -280,7 +332,7 @@ async def brand_torrent_subtitles(
         # Preserve attachments (fonts!) so styled .ass renders correctly.
         cmd += ["-map", "0:t?", "-c:t", "copy"]
 
-        # 3. Per-track TITLE metadata (torrent rule: original title + 〘 handle 〙).
+        # 5. Per-track TITLE metadata (torrent rule: original title + 〘 handle 〙).
         for out_i, tr in enumerate(sub_tracks):
             if brand_subtitle_title is not None:
                 title = brand_subtitle_title(tr.get("title", ""), out_i + 1)

@@ -93,3 +93,71 @@ def test_container_title_unchanged():
     # Idempotent — never double-brands.
     once = brand_container_title("Takopi's Original Sin")
     assert brand_container_title(once) == once
+
+
+# ── pooled subtitle-gap windows (multi-track) ───────────────────────────────
+def _ass(dialogues: list[tuple[int, int]]) -> str:
+    """Build a minimal ASS whose [Events] holds the given (start_ms,end_ms) cues."""
+    from nekofetch.sources._subs import _ms_to_ass
+
+    lines = [
+        "[Script Info]", "Title: x", "",
+        "[V4+ Styles]", "Format: Name", "Style: Default,Arial", "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for s, e in dialogues:
+        lines.append(f"Dialogue: 0,{_ms_to_ass(s)},{_ms_to_ass(e)},Default,,0,0,0,,x")
+    return "\n".join(lines)
+
+
+def test_pooled_windows_avoid_gap_occupied_in_another_track():
+    """A middle gap that's silent in track A but occupied in track B must NOT be
+    chosen once the tracks' cues are pooled — the whole point of the multi-sub fix.
+    """
+    from nekofetch.sources._subs import Cue, branding_windows
+    from nekofetch.sources._torrent_subs import extract_ass_cues
+
+    video_ms = 600_000  # 10-minute episode
+    # Track A: dialogue only early; its own middle 250-350s window is wide-open.
+    track_a = _ass([(5_000, 8_000)])
+    # Track B: fills that exact middle window with continuous dialogue.
+    track_b = _ass([(250_000, 350_000)])
+
+    # Per-track (the OLD behaviour) A would happily brand inside 250-350s.
+    a_only = branding_windows(extract_ass_cues(track_a), video_ms)
+    assert any(250_000 <= s < 350_000 for s, _e in a_only)
+
+    # Pooled (the FIX): B's dialogue blocks that slot, so no window lands in it.
+    pooled = extract_ass_cues(track_a) + extract_ass_cues(track_b)
+    shared = branding_windows(pooled, video_ms)
+    assert shared, "still expect early/mid/late windows from the union"
+    for s, e in shared:
+        assert not (s < 350_000 and e > 250_000), \
+            f"window {(s, e)} overlaps track B's 250-350s dialogue"
+
+
+def test_pooled_windows_are_stamped_identically_into_every_track():
+    """Both tracks receive the SAME shared windows, so branding stays in lockstep."""
+    from nekofetch.sources._subs import branding_windows
+    from nekofetch.sources._torrent_subs import brand_ass_text, extract_ass_cues
+
+    video_ms = 600_000
+    track_a = _ass([(5_000, 8_000), (250_000, 253_000)])
+    track_b = _ass([(9_000, 12_000), (400_000, 403_000)])
+    shared = branding_windows(
+        extract_ass_cues(track_a) + extract_ass_cues(track_b), video_ms
+    )
+
+    out_a, na = brand_ass_text(track_a, video_ms, windows=shared)
+    out_b, nb = brand_ass_text(track_b, video_ms, windows=shared)
+    assert na == nb == len(shared)
+    # The injected brand Dialogue timestamps match between the two tracks.
+    def _brand_stamps(text: str) -> list[str]:
+        return sorted(
+            ln.split(",", 3)[1] + "-" + ln.split(",", 3)[2]
+            for ln in text.splitlines()
+            if ln.startswith("Dialogue:") and "AXWBrand" in ln
+        )
+    assert _brand_stamps(out_a) == _brand_stamps(out_b)
+
