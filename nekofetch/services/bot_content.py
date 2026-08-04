@@ -1330,12 +1330,21 @@ class BotContentService:
         if not bot_usernames:
             return {}
 
+        # One bot per ENTRY, not per pack. Pick a single file-store bot here so
+        # every quality of this entry is served by the SAME bot and the
+        # round-robin counter advances exactly once per entry. That yields strict
+        # per-entry rotation — entry 1 → bot A, entry 2 → bot B, entry 3 → bot C,
+        # entry 4 → bot A … — so the bots end up with an even number of entries
+        # each. Picking per pack drifted the rotation by each entry's pack count
+        # (an entry with 3 qualities advanced the counter 3×), which is why two
+        # consecutive entries could land on the same bot.
+        bot = await pick_fstore_bot_rr(self._c.redis, bot_usernames)
+        if bot is None:
+            return {}
+
         links: dict[str, str] = {}
         for pack in packs:
             file_ids = pack.file_message_ids or []
-            bot = await pick_fstore_bot_rr(self._c.redis, bot_usernames)
-            if bot is None:
-                continue
             # A pack is the FULL message range in the database channel:
             #   header/caption → file 1 … file N → end sticker
             # (see StoragePack layout). Tapping a quality button must deliver the

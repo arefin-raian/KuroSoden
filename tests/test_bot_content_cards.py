@@ -136,3 +136,83 @@ def test_custom_duration_format_is_honoured():
     caption, _ = svc._build_season_card(
         {"title": "X", "duration_min": 95, "entry_episodes": 1}, season=1, packs=packs)
     assert caption == "1시간 35분"
+
+
+# ── file-store bot rotation: one bot per ENTRY, strict round-robin ────────────
+
+import pytest
+
+
+class _FakeRedis:
+    """Minimal async Redis stub: monotonic INCR + no-op EXPIRE (round-robin)."""
+
+    def __init__(self):
+        self._counters: dict[str, int] = {}
+
+    async def incr(self, key):
+        self._counters[key] = self._counters.get(key, 0) + 1
+        return self._counters[key]
+
+    async def expire(self, key, ttl):
+        return True
+
+
+@dataclass
+class _FstorePack:
+    """StoragePack stand-in with the fields ``_generate_fstore_links`` reads."""
+    resolution: str
+    audio: AudioType = AudioType.SUBBED
+    channel_id: int = -1001234567890
+    header_message_id: int = 100
+    end_message_id: int = 110
+    start_message_id: int = 100
+    file_message_ids: tuple[int, ...] = (101, 102, 103)
+
+
+class _FstoreCfg:
+    def __init__(self, bots):
+        self.post_format = PostFormatConfig()
+        self.bot = type("B", (), {"filestore_bots": bots})()
+        self.storage_channel = type("S", (), {"enabled": True})()
+
+
+class _FstoreContainer:
+    def __init__(self, bots, redis):
+        self.config = _FstoreCfg(bots)
+        self.redis = redis
+
+
+def _bot_of(link: str) -> str:
+    # https://t.me/<bot>?start=...
+    return link.split("t.me/", 1)[1].split("?", 1)[0]
+
+
+@pytest.mark.asyncio
+async def test_fstore_one_bot_per_entry_and_rotates_across_entries():
+    """Every quality of one entry shares ONE bot; consecutive entries cycle
+    Killua → Makise → Ulquiorra → Killua… so each bot gets an even share."""
+    bots = ["Killua", "Makise", "Ulquiorra"]
+    svc = BotContentService(_FstoreContainer(bots, _FakeRedis()))
+
+    def _three_packs():
+        return [_FstorePack("480p"), _FstorePack("720p"), _FstorePack("1080p")]
+
+    seen = []
+    for _ in range(4):  # four entries
+        links = await svc._generate_fstore_links(_three_packs())
+        used = {_bot_of(v) for v in links.values()}
+        # All three qualities of this entry are served by exactly one bot.
+        assert len(used) == 1, f"entry spread across {used}"
+        seen.append(used.pop())
+
+    # Strict per-entry rotation, wrapping after the third bot.
+    assert seen == ["Killua", "Makise", "Ulquiorra", "Killua"]
+
+
+@pytest.mark.asyncio
+async def test_fstore_single_bot_config_still_works():
+    """A single configured bot serves every entry (no rotation needed)."""
+    svc = BotContentService(_FstoreContainer(["OnlyBot"], _FakeRedis()))
+    links = await svc._generate_fstore_links([_FstorePack("480p"), _FstorePack("720p")])
+    assert {_bot_of(v) for v in links.values()} == {"OnlyBot"}
+
