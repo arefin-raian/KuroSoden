@@ -1330,20 +1330,29 @@ class BotContentService:
         if not bot_usernames:
             return {}
 
-        # One bot per ENTRY, not per pack. Pick a single file-store bot here so
-        # every quality of this entry is served by the SAME bot and the
-        # round-robin counter advances exactly once per entry. That yields strict
-        # per-entry rotation — entry 1 → bot A, entry 2 → bot B, entry 3 → bot C,
-        # entry 4 → bot A … — so the bots end up with an even number of entries
-        # each. Picking per pack drifted the rotation by each entry's pack count
-        # (an entry with 3 qualities advanced the counter 3×), which is why two
-        # consecutive entries could land on the same bot.
-        bot = await pick_fstore_bot_rr(self._c.redis, bot_usernames)
-        if bot is None:
-            return {}
+        # Rotation mode (Senku Settings → bot.fstore_rotation):
+        #   per_entry — pick ONE bot here so every quality of this entry is served
+        #               by the SAME bot and the round-robin counter advances exactly
+        #               once per entry. Strict per-entry rotation: entry 1 → bot A,
+        #               entry 2 → bot B, entry 3 → bot C, entry 4 → bot A … so the
+        #               bots end up with an even number of entries each.
+        #   per_pack  — pick a fresh bot per pack (inside the loop) so each quality
+        #               rotates to the next bot; one entry's links can span several.
+        rotation = getattr(self._c.config.bot, "fstore_rotation", "per_entry")
+        per_entry = rotation != "per_pack"
+        entry_bot = None
+        if per_entry:
+            entry_bot = await pick_fstore_bot_rr(self._c.redis, bot_usernames)
+            if entry_bot is None:
+                return {}
 
         links: dict[str, str] = {}
         for pack in packs:
+            # per_entry → the one bot picked above; per_pack → a fresh bot per pack.
+            bot = entry_bot if per_entry else await pick_fstore_bot_rr(
+                self._c.redis, bot_usernames)
+            if bot is None:
+                continue
             file_ids = pack.file_message_ids or []
             # A pack is the FULL message range in the database channel:
             #   header/caption → file 1 … file N → end sticker

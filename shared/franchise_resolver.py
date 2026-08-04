@@ -203,3 +203,82 @@ async def resolve_franchise(
 
     log.info("resolve.miss", query=query)
     return None
+
+
+def _franchise_key(title: str) -> frozenset:
+    """A franchise-identity key: the title's meaningful words with season/part
+    markers stripped, so "Attack on Titan" and "Attack on Titan Season 2" collapse
+    to the same key while "Attack No.1" stays distinct."""
+    from nekofetch.providers.metadata.series import _token_is_marker
+    from nekofetch.sources.telegram.matching import normalize_words
+
+    words = normalize_words(title)
+    core = frozenset(w for w in words if not _token_is_marker(w))
+    return core or frozenset(words)
+
+
+async def resolve_franchise_candidates(
+    container: Any, query: str, *, limit: int = 25,
+) -> list[dict]:
+    """Return the DISTINCT franchises a query could mean, for the batch picker.
+
+    Groups AniList's search page (``search_candidates``) into franchises by
+    collapsing seasons/arcs of the same title (:func:`_franchise_key`), keeping the
+    most-popular installment as each franchise's representative. Ordering follows
+    the search ranking (best match first). Each item is a light dict
+    ``{title, anilist_id, format}``.
+
+    Falls back to the single-best :func:`resolve_franchise` chain (acutebot → TMDB)
+    when AniList returns no page — so a title AniList can't page still yields one
+    candidate rather than nothing.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    candidates: list[dict] = []
+    search_candidates = getattr(container.anilist, "search_candidates", None)
+    if search_candidates is not None:
+        try:
+            candidates = await search_candidates(query, limit=max(limit, 10))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("resolve.candidates.page_failed", query=query,
+                      error=str(exc)[:200])
+            candidates = []
+
+    # Group by franchise identity, keeping the most-popular representative and the
+    # order of first appearance (search rank).
+    grouped: dict[frozenset, dict] = {}
+    order: list[frozenset] = []
+    for c in candidates:
+        title = c.get("title") or query
+        key = _franchise_key(title)
+        cur = grouped.get(key)
+        if cur is None:
+            grouped[key] = c
+            order.append(key)
+        elif (c.get("popularity") or 0) > (cur.get("popularity") or 0):
+            grouped[key] = c
+
+    franchises = [
+        {
+            "title": grouped[k].get("title") or query,
+            "anilist_id": str(grouped[k]["id"]) if grouped[k].get("id") else None,
+            "format": grouped[k].get("format"),
+        }
+        for k in order
+    ][:limit]
+
+    if franchises:
+        return franchises
+
+    # No AniList page — fall back to the single-best resolver so a match found only
+    # via @acutebot/TMDB still shows up as one franchise the admin can approve.
+    single = await resolve_franchise(container, query)
+    if single:
+        return [{
+            "title": single.get("title") or query,
+            "anilist_id": single.get("anilist_id"),
+            "format": single.get("format"),
+        }]
+    return []

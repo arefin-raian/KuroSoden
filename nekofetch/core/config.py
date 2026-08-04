@@ -664,6 +664,7 @@ class BotConfig(BaseModel):
             "(e.g. KiloxBot, MarkySayBot)"
         ),
     )
+    fstore_rotation: str = "per_entry"  # "per_entry" | "per_pack"
     # Footer shown on the last post of every distribution bot.
     footer_image_url: str = ""   # URL or Telegram file_id; empty = no image
     footer_text: str = ""        # override the built-in bot_footer template (empty = use en.json)

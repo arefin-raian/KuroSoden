@@ -108,7 +108,7 @@ EMITTED_CALLBACKS = [
     # reused NekoFetch review board (pending screen's "Open Review Board")
     "staff|requests|0",
     # batch flow
-    "batch|new", "batch|nav|1", "batch|toggle|2", "batch|commit", "batch|cancel",
+    "batch|new", "batch|fpage|0|1", "batch|fpick|0|2", "batch|commit", "batch|cancel",
     # management control plane
     "mg|roster", "mg|adm|500", "mg|addlist", "mg|addid|500", "mg|rm|500",
     "mg|bot|500|levi", "mg|wt|500|1", "mg|av|500", "mg|brk|500", "mg|endbrk|500",

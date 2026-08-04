@@ -170,15 +170,16 @@ class _FstorePack:
 
 
 class _FstoreCfg:
-    def __init__(self, bots):
+    def __init__(self, bots, rotation="per_entry"):
         self.post_format = PostFormatConfig()
-        self.bot = type("B", (), {"filestore_bots": bots})()
+        self.bot = type("B", (), {"filestore_bots": bots,
+                                  "fstore_rotation": rotation})()
         self.storage_channel = type("S", (), {"enabled": True})()
 
 
 class _FstoreContainer:
-    def __init__(self, bots, redis):
-        self.config = _FstoreCfg(bots)
+    def __init__(self, bots, redis, rotation="per_entry"):
+        self.config = _FstoreCfg(bots, rotation)
         self.redis = redis
 
 
@@ -207,6 +208,19 @@ async def test_fstore_one_bot_per_entry_and_rotates_across_entries():
 
     # Strict per-entry rotation, wrapping after the third bot.
     assert seen == ["Killua", "Makise", "Ulquiorra", "Killua"]
+
+
+@pytest.mark.asyncio
+async def test_fstore_per_pack_rotates_each_quality():
+    """With rotation=per_pack, each quality pack advances the round-robin, so a
+    single entry's three qualities land on three DIFFERENT bots in order."""
+    bots = ["Killua", "Makise", "Ulquiorra"]
+    svc = BotContentService(
+        _FstoreContainer(bots, _FakeRedis(), rotation="per_pack"))
+    packs = [_FstorePack("480p"), _FstorePack("720p"), _FstorePack("1080p")]
+    links = await svc._generate_fstore_links(packs)
+    used = [_bot_of(links[f"{p.resolution}_{p.audio.value}"]) for p in packs]
+    assert used == ["Killua", "Makise", "Ulquiorra"]
 
 
 @pytest.mark.asyncio

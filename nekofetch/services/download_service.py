@@ -971,6 +971,45 @@ class DownloadWorker:
                 label="download.request_source_abort",
                 ex=300,
             )
+        # Immediately dismiss any in-flight naming/caption confirm for THIS job so a
+        # dead source attempt (the admin tapped "Change source") can't surface its
+        # filename/caption card late into the NEXT source's flow. The confirm gate's
+        # block-poll is abort-aware, but tearing the state down here also disarms the
+        # chat reply marker so a stray "Edit" reply can't match, and wakes a gate
+        # that's mid-wait at once instead of on the next 3s tick.
+        try:
+            await self._teardown_naming_confirm(job_id)
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort, never fatal
+            log.debug("download.source_abort.confirm_teardown_failed",
+                      job_id=job_id, error=str(exc))
+
+    async def _teardown_naming_confirm(self, job_id: int) -> None:
+        """Clear a job's naming/caption confirm Redis state + disarm the chat reply
+        marker. Used on source-abort so nothing from the abandoned attempt lingers:
+        the awaiting flags flip off (a blocked ``confirm()`` poll wakes and bails),
+        stale value/card refs are dropped, the confirm-hold is released so the live
+        card refresher isn't wedged, and the chat marker is disarmed so a late
+        ``Edit`` reply can't re-arm the dead gate."""
+        redis = self._c.redis
+        if redis is None:
+            return
+        from nekofetch.services import naming_confirm as nc
+        for kind in ("name", "caption"):
+            for key in (nc.await_key(job_id, kind), nc.value_key(job_id, kind),
+                        f"nf:job:{job_id}:{kind}_card"):
+                await safe_redis_delete(redis, key, label="source_abort.confirm_clear")
+        await safe_redis_delete(redis, f"nf:job:{job_id}:confirm_hold",
+                                label="source_abort.hold_clear")
+        try:
+            from kurosoden.bots.levi.handlers.progress_monitor import _load_msg_ref
+
+            from nekofetch.bots.channel_reply import disarm as _disarm
+            ref = await _load_msg_ref(self._c, job_id)
+            if ref:
+                await _disarm(redis, ref[0])
+        except Exception as exc:  # noqa: BLE001 — disarm is best-effort
+            log.debug("download.source_abort.disarm_failed",
+                      job_id=job_id, error=str(exc))
 
     # ── Cancel-whole-job flag ────────────────────────────────────────────────────
     @staticmethod
@@ -1013,6 +1052,7 @@ class DownloadWorker:
     # ── startup recovery / resume ────────────────────────────────────────────────
     async def _finalize_source_aborted(self, job_id: int) -> None:
         """Stop this job but leave the request alive for another source pick."""
+        folder = None
         async with session_scope(self._c.pg_sessionmaker) as session:
             job = await session.get(DownloadJob, job_id)
             title = code = ""
@@ -1023,10 +1063,28 @@ class DownloadWorker:
                 if req is not None:
                     req.status = RequestStatus.APPROVED
                     title, code = req.anime_title, req.code
+                    folder = _safe_folder(req)
         if self._c.progress:
             await self._c.progress.delete(job_id)
         await self._clear_skip(job_id)
         await self._clear_source_abort(job_id)
+        # Dismiss the dead attempt entirely: clear any in-flight naming/caption
+        # confirm state (so no stale card can fire) and purge whatever this source
+        # saved locally, so nothing from the abandoned source bleeds into the next
+        # one. The prefetched metadata lives under a separate ``meta/`` tree and is
+        # left untouched, so re-sourcing costs no extra provider calls.
+        await self._teardown_naming_confirm(job_id)
+        if folder:
+            import shutil
+            work_dir = Path(self._c.env.storage_path) / "work" / folder
+            try:
+                if work_dir.exists():
+                    await asyncio.to_thread(shutil.rmtree, work_dir, ignore_errors=True)
+                    log.info("download.source_aborted.purged_local",
+                             job_id=job_id, folder=folder)
+            except Exception as exc:  # noqa: BLE001 — purge is best-effort
+                log.debug("download.source_aborted.purge_failed",
+                          job_id=job_id, folder=folder, error=str(exc))
         log.info("download.source_aborted", job_id=job_id)
         from nekofetch.services.log_channel_service import LogChannelService
         await LogChannelService(self._c).event(

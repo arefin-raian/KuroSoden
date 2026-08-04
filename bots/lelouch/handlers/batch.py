@@ -40,8 +40,16 @@ from nekofetch.ui.components import cb, keyboard, lock_buttons
 from nekofetch.ui.progress import SPINNER, animate_until
 from nekofetch.ui.screens import Screen, card, send_screen
 
+from nekofetch.bots.admin.handlers.requests import (
+    _media_to_franchise_dict,
+    apply_franchise_totals,
+    enrich_with_tmdb,
+)
 from kurosoden.shared import lelouch_voice as V
-from kurosoden.shared.franchise_resolver import resolve_franchise
+from kurosoden.shared.franchise_resolver import (
+    resolve_franchise,
+    resolve_franchise_candidates,
+)
 from kurosoden.shared.work_service import WorkService
 
 import structlog
@@ -50,7 +58,11 @@ log = structlog.get_logger(__name__)
 
 # ── FSM states ────────────────────────────────────────────────────────────────
 STATE_BATCH_PROMPT = "lelouch_batch:await_titles"
-STATE_BATCH_REVIEW = "lelouch_batch:review"
+STATE_BATCH_SELECT = "lelouch_batch:select"    # picking a franchise for an ambiguous title
+STATE_BATCH_CONFIRM = "lelouch_batch:confirm"  # final approval card, ready to commit
+
+# Franchises shown per page in the selection menu (user spec: 5 per page).
+_FR_PAGE = 5
 
 # Commands the batch text handler must never swallow.
 _RESERVED = ["start", "help", "myrequests", "admin", "settings", "batch", "cleardatabase"]
@@ -172,32 +184,212 @@ def register(client: Client, container: Container) -> None:
             return
         await _resolve(message, titles)
 
+    async def _hydrate(cand: dict, query: str) -> dict | None:
+        """Turn a lightweight franchise candidate ({title, anilist_id, format})
+        into a full, slimmed franchise dict — the same shape the single-request
+        flow stages (``_media_to_franchise_dict`` → totals → TMDB backdrop)."""
+        aid = cand.get("anilist_id")
+        fr: dict | None = None
+        if aid:
+            try:
+                media = await container.anilist._fetch_full(int(aid))
+            except (ValueError, TypeError):
+                media = None
+            except Exception as exc:  # noqa: BLE001
+                log.warning("lelouch.batch.hydrate_failed",
+                            aid=aid, error=str(exc)[:200])
+                media = None
+            if media is not None:
+                fr = _media_to_franchise_dict(media)
+        if fr is None:
+            # No AniList id (acutebot/TMDB candidate) — resolve by title instead.
+            try:
+                fr = await resolve_franchise(container, cand.get("title") or query)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("lelouch.batch.hydrate_by_title_failed",
+                            title=cand.get("title"), error=str(exc)[:200])
+                fr = None
+        if fr is None:
+            return None
+        # The picked franchise's display title always wins as the entry title.
+        fr["title"] = cand.get("title") or fr.get("title") or query
+        try:
+            await apply_franchise_totals(container, fr)
+        except Exception as exc:  # noqa: BLE001 — totals are best-effort
+            log.debug("lelouch.batch.totals_failed", error=str(exc)[:200])
+        try:
+            backdrop = await enrich_with_tmdb(
+                container, fr, fr.get("english") or fr["title"])
+            fr["_backdrop_url"] = backdrop
+        except Exception as exc:  # noqa: BLE001 — art is decorative
+            log.debug("lelouch.batch.tmdb_failed", error=str(exc)[:200])
+        fr["_query"] = query
+        return fr
+
     async def _resolve(src: Message, titles: list[str]) -> None:
-        """Resolve every title, then open the review carousel."""
+        """Resolve each title to its franchise(s):
+
+          • exactly one franchise  → auto-approve (hydrated straight away);
+          • several franchises      → queued for a selection menu (one per title);
+          • none                    → set aside as skipped.
+
+        Then open the franchise selection menu (if any title was ambiguous) or go
+        straight to the approval card."""
         user_id = src.from_user.id
 
         def _frame(f: str) -> str:
             return f"{V.batch_processing(len(titles))}\n\n{f}"
 
-        async def _run() -> tuple[list[dict], list[str]]:
-            resolved: list[dict] = []
+        async def _run() -> tuple[list[dict], list[dict], list[str]]:
+            resolved: list[dict] = []      # finished franchise dicts (auto-approved)
+            pending: list[dict] = []       # {query, candidates} awaiting a pick
             skipped: list[str] = []
             for title in titles:
                 try:
-                    fr = await resolve_franchise(container, title)
+                    cands = await resolve_franchise_candidates(container, title)
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("lelouch.batch.resolve_failed",
+                    log.warning("lelouch.batch.candidates_failed",
                                 title=title, error=str(exc)[:200])
-                    fr = None
-                if fr:
-                    fr["_query"] = title
-                    resolved.append(_slim(fr))
-                else:
+                    cands = []
+                if not cands:
                     skipped.append(title)
-            return resolved, skipped
+                elif len(cands) == 1:
+                    fr = await _hydrate(cands[0], title)
+                    if fr:
+                        resolved.append(_slim(fr))
+                    else:
+                        skipped.append(title)
+                else:
+                    pending.append({"query": title, "candidates": cands})
+            return resolved, pending, skipped
 
         msg = await src.reply(_frame(SPINNER[0]), parse_mode=ParseMode.HTML)
-        resolved, skipped = await animate_until(msg, _run(), _frame)
+        resolved, pending, skipped = await animate_until(msg, _run(), _frame)
+
+        if not resolved and not pending:
+            await fsm.clear(user_id)
+            await send_screen(
+                client, msg.chat.id,
+                card(V.batch_none_found(skipped), image=_art(), bot_name=BOT,
+                     buttons=[[(V.BTN_HOME, cb(BOT, "home"))]]),
+                old_msg=msg,
+            )
+            return
+
+        await fsm.set(
+            user_id, STATE_BATCH_SELECT,
+            resolved=resolved,
+            pending=pending,
+            pending_index=0,
+            page=0,
+            skipped=skipped,
+        )
+        if pending:
+            await _render_select(msg, user_id)
+        else:
+            await _render_approval(msg, user_id)
+
+    # ── Franchise selection menu (one ambiguous title at a time) ───────────────
+    async def _render_select(msg: Message, user_id: int) -> None:
+        _, data = await fsm.get(user_id)
+        pending = data.get("pending", [])
+        idx = data.get("pending_index", 0)
+        if idx >= len(pending):
+            # Every ambiguous title has been settled → the approval card.
+            await _render_approval(msg, user_id)
+            return
+
+        page = max(0, data.get("page", 0))
+        cur = pending[idx]
+        query = cur.get("query", "")
+        cands = cur.get("candidates", [])
+        total_pages = max(1, (len(cands) + _FR_PAGE - 1) // _FR_PAGE)
+        page = min(page, total_pages - 1)
+        window = cands[page * _FR_PAGE:(page + 1) * _FR_PAGE]
+
+        caption = V.batch_choose_franchise(query, idx + 1, len(pending))
+        rows: list[list[tuple[str, str]]] = []
+        for i, cand in enumerate(window):
+            abs_i = page * _FR_PAGE + i
+            fmt = cand.get("format")
+            label = cand.get("title") or query
+            if fmt:
+                label = f"{label} · {fmt}"
+            rows.append([(label[:60], cb("batch", "fpick", idx, abs_i))])
+
+        # Pagination only when it's needed (> one page): paired arrows side by
+        # side, same style. Otherwise just a Cancel button (user spec).
+        if total_pages > 1:
+            nav: list[tuple[str, str]] = []
+            if page > 0:
+                nav.append((V.BTN_FR_PREV, cb("batch", "fpage", idx, page - 1)))
+            if page < total_pages - 1:
+                nav.append((V.BTN_FR_NEXT, cb("batch", "fpage", idx, page + 1)))
+            if nav:
+                rows.append(nav)
+        rows.append([(V.BTN_BATCH_CANCEL, cb("batch", "cancel"))])
+
+        await send_screen(client, msg.chat.id,
+                          card(caption, image=_art(), bot_name=BOT, buttons=rows),
+                          old_msg=msg)
+
+    @client.on_callback_query(filters.regex(r"^batch\|fpage\|"))
+    async def _fpage(_: Client, q: CallbackQuery) -> None:
+        if not _staff(q):
+            await q.answer(V.UNKNOWN_ACTION, show_alert=True)
+            return
+        await q.answer()
+        parts = q.data.split("|")
+        page = int(parts[-1])
+        await fsm.update(q.from_user.id, page=page)
+        await _render_select(q.message, q.from_user.id)
+
+    @client.on_callback_query(filters.regex(r"^batch\|fpick\|"))
+    async def _fpick(_: Client, q: CallbackQuery) -> None:
+        if not _staff(q):
+            await q.answer(V.UNKNOWN_ACTION, show_alert=True)
+            return
+        await lock_buttons(q)
+        user_id = q.from_user.id
+        parts = q.data.split("|")
+        title_idx = int(parts[2])
+        cand_idx = int(parts[3])
+        _, data = await fsm.get(user_id)
+        pending = data.get("pending", [])
+        if title_idx >= len(pending):
+            await q.answer()
+            await _render_select(q.message, user_id)
+            return
+        cur = pending[title_idx]
+        cands = cur.get("candidates", [])
+        chosen = cands[cand_idx] if 0 <= cand_idx < len(cands) else None
+
+        resolved = data.get("resolved", [])
+        skipped = list(data.get("skipped", []))
+        if chosen is not None:
+            fr = await _hydrate(chosen, cur.get("query", ""))
+            if fr:
+                resolved.append(_slim(fr))
+            else:
+                skipped.append(cur.get("query", "?"))
+        else:
+            skipped.append(cur.get("query", "?"))
+
+        await fsm.update(
+            user_id,
+            resolved=resolved,
+            skipped=skipped,
+            pending_index=title_idx + 1,
+            page=0,
+        )
+        await q.answer()
+        await _render_select(q.message, user_id)
+
+    # ── Approval card (single row: commit / stand down) ────────────────────────
+    async def _render_approval(msg: Message, user_id: int) -> None:
+        _, data = await fsm.get(user_id)
+        resolved = data.get("resolved", [])
+        skipped = data.get("skipped", [])
 
         if not resolved:
             await fsm.clear(user_id)
@@ -209,77 +401,22 @@ def register(client: Client, container: Container) -> None:
             )
             return
 
-        # Everyone starts approved — the admin skips the ones they don't want,
-        # which is faster for the common "yes, all of these" batch.
-        await fsm.set(
-            user_id, STATE_BATCH_REVIEW,
-            resolved=resolved,
-            approved=[True] * len(resolved),
-            skipped=skipped,
-            index=0,
-        )
-        await _render_review(msg, user_id)
+        # Move to the confirm state so a stray text message can't re-enter select.
+        await fsm.set(user_id, STATE_BATCH_CONFIRM,
+                      resolved=resolved, skipped=skipped)
 
-    # ── Review carousel ───────────────────────────────────────────────────────
-    async def _render_review(msg: Message, user_id: int) -> None:
-        _, data = await fsm.get(user_id)
-        resolved = data.get("resolved", [])
-        approved = data.get("approved", [])
-        idx = max(0, min(data.get("index", 0), len(resolved) - 1))
-        total = len(resolved)
-        fr = resolved[idx]
-        title = fr.get("title") or fr.get("_query") or "Unknown"
-        is_on = bool(approved[idx]) if idx < len(approved) else True
-
-        caption = V.batch_review(title, _franchise_detail(fr),
-                                 idx + 1, total, is_on)
-
-        # Row 1: toggle approve/rescind for THIS item.
-        toggle = ((V.BTN_BATCH_UNDO, cb("batch", "toggle", idx)) if is_on
-                  else (V.BTN_BATCH_YES, cb("batch", "toggle", idx)))
-        rows = [[toggle]]
-        # Row 2: prev / next paging (only shown when there's more than one).
-        if total > 1:
-            nav = []
-            if idx > 0:
-                nav.append((V.BTN_PREV, cb("batch", "nav", idx - 1)))
-            if idx < total - 1:
-                nav.append((V.BTN_NEXT, cb("batch", "nav", idx + 1)))
-            if nav:
-                rows.append(nav)
-        # Row 3: commit / cancel.
-        rows.append([(V.BTN_BATCH_DONE, cb("batch", "commit")),
-                     (V.BTN_BATCH_CANCEL, cb("batch", "cancel"))])
-
-        image = fr.get("_backdrop_url") or fr.get("banner_url") or _art()
+        entries = [
+            (fr.get("title") or fr.get("_query") or "Unknown", _franchise_detail(fr))
+            for fr in resolved
+        ]
+        caption = V.batch_approval_summary(entries)
+        # ONE row, two buttons: commit-and-send-down + stand down.
+        rows = [[(V.BTN_BATCH_DONE, cb("batch", "commit")),
+                 (V.BTN_BATCH_CANCEL, cb("batch", "cancel"))]]
+        image = resolved[0].get("_backdrop_url") or resolved[0].get("banner_url") or _art()
         await send_screen(client, msg.chat.id,
                           card(caption, image=image, bot_name=BOT, buttons=rows),
                           old_msg=msg)
-
-    @client.on_callback_query(filters.regex(r"^batch\|nav\|"))
-    async def _nav(_: Client, q: CallbackQuery) -> None:
-        if not _staff(q):
-            await q.answer(V.UNKNOWN_ACTION, show_alert=True)
-            return
-        await q.answer()
-        idx = int(q.data.split("|")[-1])
-        await fsm.update(q.from_user.id, index=idx)
-        await _render_review(q.message, q.from_user.id)
-
-    @client.on_callback_query(filters.regex(r"^batch\|toggle\|"))
-    async def _toggle(_: Client, q: CallbackQuery) -> None:
-        if not _staff(q):
-            await q.answer(V.UNKNOWN_ACTION, show_alert=True)
-            return
-        idx = int(q.data.split("|")[-1])
-        _, data = await fsm.get(q.from_user.id)
-        approved = data.get("approved", [])
-        if idx < len(approved):
-            approved[idx] = not approved[idx]
-            await fsm.update(q.from_user.id, approved=approved, index=idx)
-        await q.answer("Rescinded." if idx < len(approved) and not approved[idx]
-                       else "Approved.")
-        await _render_review(q.message, q.from_user.id)
 
     @client.on_callback_query(filters.regex(r"^batch\|commit$"))
     async def _commit(_: Client, q: CallbackQuery) -> None:
@@ -290,18 +427,13 @@ def register(client: Client, container: Container) -> None:
         user_id = q.from_user.id
         _, data = await fsm.get(user_id)
         resolved = data.get("resolved", [])
-        approved = data.get("approved", [])
         skipped = list(data.get("skipped", []))
 
-        keep: list[dict] = []
-        for i, fr in enumerate(resolved):
-            if i < len(approved) and approved[i]:
-                keep.append({
-                    "anime_title": fr.get("title") or fr.get("_query"),
-                    "franchise_data": fr,
-                })
-            else:
-                skipped.append(fr.get("title") or fr.get("_query") or "?")
+        keep: list[dict] = [
+            {"anime_title": fr.get("title") or fr.get("_query"),
+             "franchise_data": fr}
+            for fr in resolved
+        ]
 
         await fsm.clear(user_id)
 

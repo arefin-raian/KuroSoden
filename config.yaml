@@ -274,6 +274,11 @@ bot:
   health_check_interval_minutes: 60
   delivery_retention_days: 7
   avatar_source: tmdb             # tmdb | anilist
+  # File-store bot rotation across a request's download links:
+  #   per_entry — one bot serves ALL quality packs of an anime; the next anime
+  #               rotates to the next bot (even share per anime). [default]
+  #   per_pack  — each quality (480p/720p/1080p) rotates to the next bot.
+  fstore_rotation: per_entry      # per_entry | per_pack
   # Telegram profile text overrides (empty = built-in AniXWeebs branding block).
   description_text: ""            # /setdescription (512-char cap)
   about_text: ""                  # /setabouttext   (120-char cap)

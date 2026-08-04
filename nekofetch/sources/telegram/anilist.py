@@ -463,6 +463,54 @@ class AnilistClient:
         ranked.sort(key=rank, reverse=True)
         return ranked[0].get("id")
 
+    async def search_candidates(self, query: str, *, limit: int = 25) -> list[dict]:
+        """Return up to ``limit`` search-page candidates as lightweight dicts
+        ``{id, title, format, popularity}``, matching-title first then by
+        popularity.
+
+        Unlike :meth:`search` (which resolves the single best match), this exposes
+        the whole page so a caller can group the hits into distinct *franchises*
+        for a picker (the batch flow's "which franchise did you mean?" menu).
+        """
+        data = await self._post(_PAGE_QUERY, {"search": query})
+        media = (data or {}).get("Page", {}).get("media", [])
+        if not media:
+            return []
+
+        norm_query = query.strip().lower()
+
+        def primary_titles(m: dict) -> list[str]:
+            t = m.get("title", {})
+            return [x for x in (t.get("romaji"), t.get("english"), t.get("native")) if x]
+
+        def all_titles(m: dict) -> list[str]:
+            return primary_titles(m) + list(m.get("synonyms") or [])
+
+        def rank(m: dict) -> tuple[int, float, int]:
+            exact = any(t.strip().lower() == norm_query for t in primary_titles(m))
+            titles = all_titles(m)
+            fuzzy = max((1.0 if title_matches(query, t, threshold=0.85) else 0.0)
+                        for t in titles) if titles else 0.0
+            return (1 if exact else 0, fuzzy, m.get("popularity") or 0)
+
+        def matches(m: dict) -> bool:
+            return any(title_matches(query, t, threshold=0.85) for t in all_titles(m))
+
+        ranked = [m for m in media if matches(m)] or media
+        ranked.sort(key=rank, reverse=True)
+
+        out: list[dict] = []
+        for m in ranked[:limit]:
+            t = m.get("title", {})
+            title = t.get("english") or t.get("romaji") or t.get("native") or query
+            out.append({
+                "id": m.get("id"),
+                "title": title,
+                "format": m.get("format"),
+                "popularity": m.get("popularity") or 0,
+            })
+        return out
+
     async def search(self, query: str) -> AnilistMedia | None:
         """Resolve ``query`` to a full AnilistMedia with relation breakdown.
 

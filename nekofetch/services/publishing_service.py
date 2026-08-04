@@ -7,16 +7,30 @@ distribution bot.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 from sqlalchemy import select
 
 from nekofetch.core.container import Container
 from nekofetch.core.exceptions import NotFound
+from nekofetch.core.logging import get_logger
 from nekofetch.domain.enums import RequestStatus
 from nekofetch.infrastructure.database.postgres.models import DownloadJob, MediaFile, Request
 from nekofetch.infrastructure.database.postgres.session import session_scope
 from nekofetch.infrastructure.repositories.request_repo import RequestRepository
+
+_log = get_logger(__name__)
+
+# One admin's ENTIRE pack set (every season/resolution/audio for a request) must
+# reach the storage channel as ONE contiguous run — the fstore delivery range and
+# the pack layout (header → files → end sticker) depend on messages NOT being
+# interleaved with another request's upload. All four bots share one process, so a
+# module-level asyncio mutex fully serializes concurrent ``upload_to_storage``
+# calls: the second admin's upload waits until the first request's whole pack set
+# has shipped. (Downloads still run concurrently; only the channel-posting step is
+# serialized, and that step is I/O-bound serial sends anyway.)
+_STORAGE_UPLOAD_LOCK = asyncio.Lock()
 
 
 def _as_int(value) -> int | None:
@@ -90,12 +104,28 @@ class PublishingService:
         )
 
     async def upload_to_storage(self, code: str, *, on_progress=None) -> int:
+        """Serialize the whole pack-set upload so concurrent admin uploads never
+        interleave in the storage channel (see ``_STORAGE_UPLOAD_LOCK``). Delegates
+        the actual work to :meth:`_upload_to_storage_locked` while holding the lock."""
+        if _STORAGE_UPLOAD_LOCK.locked():
+            _log.info("storage.upload.lock.waiting", code=code)
+        async with _STORAGE_UPLOAD_LOCK:
+            _log.info("storage.upload.lock.acquired", code=code)
+            try:
+                return await self._upload_to_storage_locked(code, on_progress=on_progress)
+            finally:
+                _log.info("storage.upload.lock.released", code=code)
+
+    async def _upload_to_storage_locked(self, code: str, *, on_progress=None) -> int:
         """Upload a request's processed files to the storage (DB) channel as packs.
 
         This is **automatic** — it runs straight after processing, independent of
         the main-channel publish/approval gate. Putting verified files into the
         database channel is just part of the pipeline; "publishing" (posting to the
         main channel, index, etc.) is a separate, deliberate action.
+
+        Always invoked under ``_STORAGE_UPLOAD_LOCK`` via :meth:`upload_to_storage`
+        so one request's entire pack set ships before another admin's begins.
         """
         from pathlib import Path
 

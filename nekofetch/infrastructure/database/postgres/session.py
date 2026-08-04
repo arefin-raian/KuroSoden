@@ -120,6 +120,16 @@ async def create_all(engine) -> None:
         from kurosoden.shared import admin_assignment  # noqa: F401
     except Exception:  # noqa: BLE001
         pass
+    # Same story for the admin-marshalled work-item queue: ``WorkItem`` lives in
+    # shared/work_service.py, outside the nekofetch models package, so it only
+    # registers on ``Base.metadata`` if we import it here BEFORE create_all runs.
+    # Without this the table is never emitted and the batch commit crashes with
+    # ``relation "work_items" does not exist`` (main.py imports it, but only after
+    # container.startup() has already run create_all).
+    try:  # optional: only present in the Kuro Sōden layout
+        from kurosoden.shared import work_service  # noqa: F401
+    except Exception:  # noqa: BLE001
+        pass
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

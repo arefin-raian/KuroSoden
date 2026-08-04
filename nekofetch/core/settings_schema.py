@@ -600,6 +600,14 @@ FIELD_DOCS: dict[str, FieldDoc] = {
         desc="Fstore file-delivery bot usernames, comma-separated. Alternated for load-sharing "
              "and ban resilience.",
         example="KiloxBot, MarkySayBot"),
+    "bot.fstore_rotation": FieldDoc(
+        desc="How the file-store bots are alternated across download links.",
+        option_notes={
+            "per_entry": "One bot serves ALL quality packs of a single anime entry; "
+                         "the next entry rotates to the next bot (even share per anime).",
+            "per_pack": "Each quality pack (480p/720p/1080p) rotates to the next bot, "
+                        "so one entry's links can span several bots.",
+        }),
     "bot.footer_image_url": FieldDoc(
         desc="Image on every distribution bot's footer post — URL or file_id (empty = none).",
         example="https://files.catbox.moe/example.png"),

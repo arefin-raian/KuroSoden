@@ -223,6 +223,18 @@ class ResilientMetadataClient:
         # Both public APIs missed — try the @acutebot userbot tier if armed.
         return await self._acute_search(query)
 
+    async def search_candidates(self, query: str, *, limit: int = 25) -> "list[dict]":
+        """Search-page candidates for the franchise picker. AniList-only: the
+        grouping-into-franchises step just needs id/title/format, and a MAL page
+        shape differs — on any AniList miss/error we return an empty list and the
+        caller falls back to the single-best resolver."""
+        try:
+            return await self.anilist.search_candidates(query, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("resilient.search_candidates.failed",
+                      query=query, error=str(exc)[:200])
+            return []
+
     async def _fetch_full(self, media_id: int) -> "AnilistMedia | None":
         """Fetch full media data by ID.
 

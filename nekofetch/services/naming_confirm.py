@@ -37,6 +37,7 @@ from nekofetch.core.logging import get_logger
 from nekofetch.core.redis_safe import (
     safe_redis_delete,
     safe_redis_get,
+    safe_redis_mget,
     safe_redis_set,
 )
 
@@ -50,6 +51,13 @@ _POLL_INTERVAL_S = 3.0
 _AWAIT_KEY = "nf:job:{job_id}:await_{kind}"        # "1" while worker is blocked
 _VALUE_KEY = "nf:job:{job_id}:{kind}_value"        # admin's edited text (or "__use__")
 _DONE_KEY = "nf:job:{job_id}:{kind}_confirmed"     # once-per-job guard
+
+# Job control flags the confirm gate must watch so an abandoned source attempt
+# (admin tapped "Change source") or a cancelled job never keeps blocking — and
+# never surfaces its name/caption card late into the NEXT source's flow. These
+# mirror DownloadWorker._source_abort_key / _cancel_key exactly.
+_ABORT_KEY = "nf:job:{job_id}:source_abort"
+_CANCEL_KEY = "nf:job:{job_id}:cancel"
 
 _USE_DEFAULT = "__use__"          # sentinel the handler writes for the "Use it" tap
 
@@ -243,6 +251,17 @@ class NamingConfirm:
             self._c.redis, done_key(job_id, kind),
             label="naming_confirm.already"))
 
+    async def _abandoned(self, job_id: int) -> bool:
+        """True when this job's source attempt was aborted ("Change source") or the
+        whole job cancelled — the gate must stop waiting immediately so the dead
+        attempt's card never lands in the next source's flow."""
+        vals = await safe_redis_mget(
+            self._c.redis,
+            [_ABORT_KEY.format(job_id=job_id), _CANCEL_KEY.format(job_id=job_id)],
+            label="naming_confirm.abandoned",
+        )
+        return bool(vals[0]) or bool(vals[1])
+
     async def _mark_confirmed(self, job_id: int, kind: str) -> None:
         if self._c.redis:
             await safe_redis_set(
@@ -271,6 +290,12 @@ class NamingConfirm:
         if redis is None or levi is None or chat_id is None:
             # No interactive channel — accept the default silently.
             await self._mark_confirmed(job_id, kind)
+            return default_text
+        # Already abandoned before we could show the card ("Change source" fired
+        # while a slower earlier gate was in flight) → never post a card for a dead
+        # source attempt. The download loop's own abort check tears the job down.
+        if await self._abandoned(job_id):
+            log.info("naming_confirm.aborted_preshow", job=job_id, kind=kind)
             return default_text
 
         from nekofetch.bots.channel_reply import arm as _arm
@@ -318,11 +343,20 @@ class NamingConfirm:
             f"{chat_id}:{card_id}", label="naming_confirm.cardref",
             ex=_CONFIRM_TIMEOUT_S + 60)
 
-        # ── block-poll the awaiting flag ──
+        # ── block-poll the awaiting flag (abort/cancel-aware) ──
+        # When the source attempt is abandoned ("Change source") or the job is
+        # cancelled, stop waiting immediately — the dead attempt's card must not
+        # land in the next source's flow. On abort/cancel, the finalize teardown
+        # (download_service._finalize_source_aborted / _finalize_cancelled) clears
+        # the card message + state once we exit here.
         loops = int(_CONFIRM_TIMEOUT_S / _POLL_INTERVAL_S)
         result = default_text
         for _ in range(loops):
             await asyncio.sleep(_POLL_INTERVAL_S)
+            # Break immediately if this job was abandoned.
+            if await self._abandoned(job_id):
+                log.info("naming_confirm.aborted", job=job_id, kind=kind)
+                break
             still = await safe_redis_get(redis, await_key(job_id, kind),
                                          label="naming_confirm.poll")
             if not still:

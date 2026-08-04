@@ -190,6 +190,36 @@ def batch_confirm_kicker(index: int, total: int) -> str:
     return f"<i>Reviewing {index} of {total} — approve, skip, or finish.</i>"
 
 
+def batch_choose_franchise(query: str, index: int, total: int) -> str:
+    """Franchise-selection card: several distinct franchises answer to one name."""
+    tail = (f"<i>Line {index} of {total} awaiting a name.</i>"
+            if total > 1 else "<i>Pick the one you mean.</i>")
+    return (
+        f"{ICON} <b>Several banners answer to “{esc(query)}”.</b>\n\n"
+        "These are separate <b>franchises</b> — not seasons of one line. Choose the "
+        "one you want brought in; its seasons and films come with it.\n\n"
+        f"{tail}"
+    )
+
+
+def batch_approval_summary(entries: list[tuple[str, str]]) -> str:
+    """Final approval card: every resolved franchise, ready to commit.
+
+    ``entries`` is a list of (title, detail) pairs — one per franchise the admin
+    settled on (auto-approved singles + picked ambiguous ones)."""
+    n = len(entries)
+    plural = "franchises" if n != 1 else "franchise"
+    lines = [f"{ICON} <b>The line is ready.</b>\n",
+             f"<b>{n}</b> {plural} settled and approved for the line:\n"]
+    for title, detail in entries[:20]:
+        lines.append(f"✓ <b>{esc(title)}</b>\n   <i>{esc(detail)}</i>")
+    if n > 20:
+        lines.append(f"<i>…and {n - 20} more.</i>")
+    lines.append("\n<b>Verdict</b> : ✓ <b>approved for the line</b>")
+    lines.append("<i>Commit to send them down, or stand the batch down.</i>")
+    return "\n".join(lines)
+
+
 def batch_review(title: str, detail: str, index: int, total: int,
                  approved: bool) -> str:
     """Per-item review card in the batch carousel."""
@@ -466,10 +496,13 @@ BTN_RECHECK = "↻ Check again"
 BTN_BATCH_YES = "✓ This is it"
 BTN_BATCH_UNDO = "↶ Rescind"
 BTN_BATCH_SKIP = "✗ Skip"
-BTN_BATCH_DONE = "⚑ Commit the line"
+BTN_BATCH_DONE = "⚑ Commit the line & send down"
 BTN_BATCH_CANCEL = "✗ Stand down"
 BTN_PREV = "◀"
 BTN_NEXT = "▶"
+# Franchise-picker pager — paired arrows, one facing each way, in the same style.
+BTN_FR_PREV = "◀ Prev"
+BTN_FR_NEXT = "Next ▶"
 
 BTN_REQUEST = "🎬 Request Anime"
 BTN_MY_REQUESTS = "📥 My Requests"
