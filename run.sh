@@ -60,7 +60,7 @@ fi
 # --- run ----------------------------------------------------
 echo "[Kuro Sōden] Starting 4-bot pipeline..."
 echo "[Kuro Sōden]   🎭 Lelouch    🡆 Request intake"
-echo "[Kuro Sōden]   ⚔️  Levi       🡆 Download delegation"
+echo "[Kuro Sōden]   🪖 Levi       🡆 Download delegation"
 echo "[Kuro Sōden]   🧪 Senku      🡆 Distribution"
 echo "[Kuro Sōden]   🔮 Gojo       🡆 Publishing"
 echo ""

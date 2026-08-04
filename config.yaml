@@ -220,7 +220,7 @@ main_channel:
     <b>⌬ LANGUAGE :</b> {languages}
     <b>⌬ GENRE :</b> {genres}
 
-    <blockquote><b>‣ OverView :</b> {overview}</blockquote>
+    <blockquote expandable><b>‣ OverView :</b> {overview}</blockquote>
   index_button_text: "Iɴᴅᴇx"
   download_button_text: "Dᴏᴡɴʟᴏᴀᴅ"
 
