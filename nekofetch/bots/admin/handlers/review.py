@@ -1366,10 +1366,12 @@ def register(client: Client, container: Container) -> None:
         parts = q.data.split("|")
         code = parts[2]
         priority = [p for p in parts[3:] if p]
-        if len(priority) < 2:
+        if not priority:
             await q.answer(L(M.ERR_GENERIC), show_alert=True)
             return
         primary = priority[0]
+        # A single source stays single (only that site is queried); a multi-source
+        # list becomes a ">"-joined priority chain (cross-source dual acquisition).
         priority_str = ">".join(priority)
         # Ack before the slow enqueue/progress-card work — see _torrent_queue for
         # why: answering after the TTL expires raises QueryIdInvalid.

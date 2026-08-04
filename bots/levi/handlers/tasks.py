@@ -138,14 +138,21 @@ def _coverage_line(cov, expected: int | None) -> str:
     coverage = f"{total} ep"
     if expected:
         coverage = f"{total}/{expected} ep"
-    if expected and total < expected:
-        verdict = "partial"
-    elif dual >= (expected or total or 1):
-        verdict = "dual-ready"
+    # The verdict answers ONE question: can this source give us a dual-audio pack?
+    #   • native dual track covering the run        → already dual
+    #   • separate sub AND dub tracks both present   → can be MADE dual (merge)
+    #   • only one language                          → single track (no dual)
+    # (Short of AniList's count → also flag it's partial.)
+    if dual >= (expected or total or 1) and dual:
+        verdict = "dual ✓ (native)"
     elif sub and dub:
-        verdict = "backup pair"
+        verdict = "dual-capable (sub+dub → merge)"
+    elif dub:
+        verdict = "single track · dub only"
     else:
-        verdict = "single track"
+        verdict = "single track · sub only"
+    if expected and total < expected:
+        verdict = f"{verdict} · partial ({total}/{expected})"
     return f"• <b>{_source_label(cov.source)}</b> — {coverage} · {audio} · <i>{verdict}</i>"
 
 
@@ -408,11 +415,11 @@ def register(client: Client, container: Container) -> None:
         )
         kb = keyboard(
             [(V.BTN_SRC_KICKASS,
-              cb("staff", "rsiteprio", code, "kickassanime", "miruro", "anikoto")),
+              cb("staff", "rsiteprio", code, "kickassanime")),
              (V.BTN_SRC_ANIKOTO,
-              cb("staff", "rsiteprio", code, "anikoto", "miruro", "kickassanime"))],
-            [("🅼 Miruro",
-              cb("staff", "rsiteprio", code, "miruro", "anikoto", "kickassanime")),
+              cb("staff", "rsiteprio", code, "anikoto"))],
+            [("Miruro",
+              cb("staff", "rsiteprio", code, "miruro")),
              (V.BTN_SRC_ANIZONE, cb("levi", "anizone", code))],
             [(V.BTN_BACK, cb("levi", "sources", code))],
         )

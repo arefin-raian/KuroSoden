@@ -220,9 +220,9 @@ BTN_SETTINGS = "⚙️ Settings"
 BTN_HELP = "❔ How it works"
 
 BTN_SRC_TELEGRAM = "✈️ Telegram (manual)"
-BTN_SRC_KICKASS = "🅰️ KickAss Anime"
-BTN_SRC_ANIKOTO = "🅱️ AniKoto"
-BTN_SRC_ANIZONE = "🅾️ AniZone"
+BTN_SRC_KICKASS = "KickAss Anime"
+BTN_SRC_ANIKOTO = "AniKoto"
+BTN_SRC_ANIZONE = "AniZone"
 BTN_SRC_TORRENT = "🧲 Torrent"
 BTN_SRC_DDL = "🔗 Direct Link (DDL)"
 
