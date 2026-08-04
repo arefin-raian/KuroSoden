@@ -1,4 +1,7 @@
 --index-url https://pypi.org/simple
+# NOTE: rar/7z extraction for the DDL source needs the 7-Zip *binary* (there is no
+# reliable pip package). The launchers (run.sh / run.bat) auto-install it; .zip
+# archives need no external tooling. See nekofetch/sources/_archive.py.
 pyrofork>=2.3.0
 sqlalchemy[asyncio]>=2.0.30
 asyncpg>=0.29.0

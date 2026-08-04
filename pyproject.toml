@@ -6,6 +6,8 @@ requires-python = ">=3.12"
 readme = "README.md"
 
 dependencies = [
+    # NOTE: the DDL source's rar/7z extraction needs the 7-Zip *binary* (no reliable
+    # pip package exists). run.sh / run.bat auto-install it; .zip needs no tooling.
     "pyrofork>=2.3.0",
     "sqlalchemy[asyncio]>=2.0.30",
     "asyncpg>=0.29.0",

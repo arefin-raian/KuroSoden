@@ -85,6 +85,7 @@ def build_default_registry() -> SourceRegistry:
     """Register all built-in authorized sources."""
     from nekofetch.sources.anikoto import AnikotoSource
     from nekofetch.sources.anizone import AnizoneSource
+    from nekofetch.sources.ddl import DdlSource
     from nekofetch.sources.kickassanime import KickAssAnimeSource
     from nekofetch.sources.local import LocalFileSource
     from nekofetch.sources.miruro import MiruroSource
@@ -98,5 +99,6 @@ def build_default_registry() -> SourceRegistry:
     registry.register(AnizoneSource)
     registry.register(MiruroSource)
     registry.register(NyaaSource)
+    registry.register(DdlSource)
     registry.register(TelegramSource)
     return registry

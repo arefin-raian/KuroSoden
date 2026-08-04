@@ -533,6 +533,7 @@ class SourcesConfig(BaseModel):
     enabled: list[str] = Field(
         default_factory=lambda: [
             "local", "telegram", "anikoto", "anizone", "kickassanime", "miruro", "nyaa",
+            "ddl",
         ]
     )
     default: str = "telegram"

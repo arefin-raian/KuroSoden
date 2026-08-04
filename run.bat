@@ -71,6 +71,39 @@ if not exist "%PW_MARKER%" (
     )
 )
 
+REM --- ensure a 7-Zip binary is available (DDL rar/7z extraction) ----------
+REM DDL archive links unpack .rar/.7z via the 7-Zip CLI (stdlib handles .zip).
+REM The source locates 7z.exe on PATH or under tools\, so we make sure one of
+REM those holds it: reuse an existing install, else winget it, then copy the
+REM binary (+ its DLL) into tools\. Non-fatal - only rar/7z DDL links need it.
+set "SEVENZIP_MARKER=%VENV_DIR%\.7zip-ready"
+if not exist "%SEVENZIP_MARKER%" (
+    where 7z.exe >nul 2>&1
+    if not errorlevel 1 (
+        echo ready>"%SEVENZIP_MARKER%"
+    ) else if exist "tools\7z.exe" (
+        echo ready>"%SEVENZIP_MARKER%"
+    ) else if exist "%ProgramFiles%\7-Zip\7z.exe" (
+        echo [Kuro Soden] Bundling installed 7-Zip into tools\ ...
+        if not exist "tools" mkdir "tools"
+        copy /Y "%ProgramFiles%\7-Zip\7z.exe" "tools\" >nul
+        copy /Y "%ProgramFiles%\7-Zip\7z.dll" "tools\" >nul 2>&1
+        echo ready>"%SEVENZIP_MARKER%"
+    ) else (
+        echo [Kuro Soden] Installing 7-Zip via winget ^(for DDL rar/7z extraction^) ...
+        winget install -e --id 7zip.7zip --accept-source-agreements --accept-package-agreements >nul 2>&1
+        if exist "%ProgramFiles%\7-Zip\7z.exe" (
+            if not exist "tools" mkdir "tools"
+            copy /Y "%ProgramFiles%\7-Zip\7z.exe" "tools\" >nul
+            copy /Y "%ProgramFiles%\7-Zip\7z.dll" "tools\" >nul 2>&1
+            echo ready>"%SEVENZIP_MARKER%"
+        ) else (
+            echo [Kuro Soden] NOTE: couldn't auto-install 7-Zip. DDL .rar/.7z links need it
+            echo [Kuro Soden]       ^(.zip works without it^). Install from https://www.7-zip.org
+        )
+    )
+)
+
 REM --- sanity: secrets file -----------------------------------
 if not exist ".env" (
     echo [Kuro Soden] WARNING: .env not found.

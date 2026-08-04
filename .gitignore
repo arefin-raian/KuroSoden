@@ -46,6 +46,10 @@ Thumbs.db
 # Vendored third-party downloader (own repo/secrets) — not part of Kuro Soden
 Leech-main/
 
+# Auto-installed CLI binaries (aria2c, 7-Zip 7zz/7z.exe) dropped here by the
+# launchers — machine-specific, never committed.
+tools/
+
 # ── Planning scratch files (local only; not part of the shipped repo) ────────
 PLAN.md
 PLAN_SENKU.md

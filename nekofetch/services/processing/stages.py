@@ -765,7 +765,9 @@ def _lang_display(lang: str) -> str:
 # need us to (a) derive the lower resolution tiers (EncodeStage), and (b) brand
 # subtitle CONTENT + keep original-title track names (BrandingStage). Streaming
 # sources acquire each quality natively and are mux-branded at assembly time.
-_TORRENT_SOURCES = frozenset({"nyaa"})
+# DDL joins this set: archives arrive as loose files that need the same
+# derive-tiers + subtitle-branding treatment as a torrent download.
+_TORRENT_SOURCES = frozenset({"nyaa", "ddl"})
 
 
 # Corner position expressions, parameterised by per-edge margin (px). ``m`` is

@@ -254,7 +254,7 @@ thumbnail_channel:
 # stays on localhost:8000 the miruro source is treated as unconfigured and is
 # skipped, so kickassanime/anikoto carry the website chain on their own.
 sources:
-  enabled: [local, telegram, anikoto, kickassanime, anizone, miruro, nyaa]
+  enabled: [local, telegram, anikoto, kickassanime, anizone, miruro, nyaa, ddl]
   default: telegram
   miruro:
     api_base_url: http://localhost:8000     # self-hosted Miruro-API endpoint (the API, not the UI site); override via MIRURO_API_BASE_URL
