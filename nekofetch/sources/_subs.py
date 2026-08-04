@@ -331,17 +331,61 @@ def content_signature(cues: list[Cue]) -> str:
     return hashlib.sha1("\n".join(parts).encode("utf-8", "replace")).hexdigest()
 
 
-def process_subtitle(vtt_path: Path, video_ms: int | None = None) -> dict:
+def pooled_branding_windows(
+    cue_lists: list[list[Cue]], video_ms: int | None = None
+) -> list[tuple[int, int]]:
+    """Branding windows chosen from the UNION of several tracks' cues.
+
+    When a release ships multiple subtitle files, a gap that's silent in one
+    track may sit on top of dialogue in another. Pooling every track's (cleaned)
+    cues before picking the three windows guarantees each chosen slot is
+    subtitle-free across ALL tracks, so the same on-screen branding times land in
+    every track without ever covering dialogue.
+    """
+    pooled: list[Cue] = [c for cues in cue_lists for c in cues]
+    return branding_windows(pooled, video_ms)
+
+
+def shared_windows_for_vtts(
+    vtt_paths: list[Path], video_ms: int | None = None
+) -> list[tuple[int, int]]:
+    """Read + clean every VTT and return branding windows common to them all.
+
+    A thin convenience over :func:`pooled_branding_windows` for callers that hold
+    file paths (the streaming mux + the manual-normalize path). Unreadable files
+    are skipped rather than raising, so one bad track never blocks the rest.
+    """
+    cue_lists: list[list[Cue]] = []
+    for p in vtt_paths:
+        try:
+            raw = Path(p).read_text(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 — a bad track shouldn't sink the pool
+            continue
+        cleaned, _ = clean_cues(parse_vtt(raw))
+        cue_lists.append(cleaned)
+    return pooled_branding_windows(cue_lists, video_ms)
+
+
+def process_subtitle(
+    vtt_path: Path,
+    video_ms: int | None = None,
+    *,
+    windows: list[tuple[int, int]] | None = None,
+) -> dict:
     """Clean + style + brand a VTT file in place, and emit an .ass sibling.
 
     ``video_ms`` is the true video duration so the branding can exclude the final
-    3 minutes. Returns metadata incl. a content signature for dedup.
+    3 minutes. ``windows`` — pre-computed branding slots pooled across every
+    subtitle track of the release (see :func:`shared_windows_for_vtts`); pass it
+    so a multi-sub release stamps the SAME silent-in-all-tracks windows into each
+    file. When ``None`` the windows are derived from THIS track's own cues.
+    Returns metadata incl. a content signature for dedup.
     """
     raw = vtt_path.read_text(encoding="utf-8", errors="replace")
     cues = parse_vtt(raw)
     cleaned, removed = clean_cues(cues)
     sig = content_signature(cleaned)
-    brands = branding_windows(cleaned, video_ms)
+    brands = windows if windows is not None else branding_windows(cleaned, video_ms)
 
     # ASS-only policy: emit the styled .ass and drop the source .vtt/.srt so no
     # non-ASS subtitle files linger. Everything downstream muxes the .ass.

@@ -32,7 +32,7 @@ from nekofetch.sources._branding import (
 )
 from nekofetch.sources._hls import find_ffmpeg, find_ffprobe
 from nekofetch.sources._mux import _is_english, iso639_2
-from nekofetch.sources._subs import _TAG_RE, process_subtitle
+from nekofetch.sources._subs import _TAG_RE, process_subtitle, shared_windows_for_vtts
 
 log = get_logger(__name__)
 
@@ -248,8 +248,11 @@ async def normalize_release(src: Path, dest: Path, *, title: str | None = None,
     seen_sigs: set[str] = set()   # dedup identical subtitle tracks
     report: dict = {"audio": [], "subtitles": [], "skipped": []}
 
-    # ---- extract + process each text subtitle ----
-    processed: list[tuple[Path, str, str | None]] = []  # (ass, title, lang)
+    # ---- extract every text subtitle FIRST (no branding yet) ----
+    # We need all tracks' cues in hand before choosing branding windows so the
+    # windows are subtitle-free across ALL tracks (a gap in one track that has
+    # dialogue in another is never chosen). See ``shared_windows_for_vtts``.
+    extracted: list[tuple[dict, Path, str | None, str | None]] = []  # (s, vtt, tag_lang, lang)
     for n, s in enumerate(subs):
         codec = s.get("codec_name", "")
         if codec in _IMAGE_SUB_CODECS or codec not in _TEXT_SUB_CODECS:
@@ -269,7 +272,15 @@ async def normalize_release(src: Path, dest: Path, *, title: str | None = None,
         tmp.append(vtt)
         tag_lang = _norm_lang(s.get("tags", {}).get("language"))
         lang = tag_lang or detect_language(vtt.read_text(encoding="utf-8", errors="replace"))
-        meta = process_subtitle(vtt, video_ms)
+        extracted.append((s, vtt, tag_lang, lang))
+
+    # Pool every extracted track's cues → one shared set of branding windows.
+    shared_windows = shared_windows_for_vtts([v for _s, v, _t, _l in extracted], video_ms)
+
+    # ---- process each subtitle with the shared windows ----
+    processed: list[tuple[Path, str, str | None]] = []  # (ass, title, lang)
+    for s, vtt, tag_lang, lang in extracted:
+        meta = process_subtitle(vtt, video_ms, windows=shared_windows)
         ass = Path(meta["ass"])
         tmp.append(ass)
         sig = meta.get("signature")

@@ -29,7 +29,7 @@ from nekofetch.sources._branding import (
     is_meaningful_track_name,
 )
 from nekofetch.sources._hls import find_ffmpeg, find_ffprobe
-from nekofetch.sources._subs import process_subtitle
+from nekofetch.sources._subs import process_subtitle, shared_windows_for_vtts
 
 log = get_logger(__name__)
 
@@ -259,12 +259,17 @@ async def assemble_final(
     # True video duration so branding can skip the final 3 minutes.
     video_ms = _probe_duration_ms(video)
 
+    # Pool every subtitle's cues FIRST so the branding windows are subtitle-free
+    # across ALL tracks — a gap in one track that has dialogue in another is never
+    # chosen, and each track gets the SAME on-screen branding times.
+    shared_windows = shared_windows_for_vtts([vtt for _n, _l, vtt in subtitles], video_ms)
+
     sub_inputs: list[tuple[Path, str, str]] = []
     sub_meta: list[dict] = []
     seen_sigs: dict[str, str] = {}  # signature -> label already kept
     for name, lang, vtt in subtitles:
         try:
-            meta = process_subtitle(vtt, video_ms)
+            meta = process_subtitle(vtt, video_ms, windows=shared_windows)
             sig = meta.get("signature")
             if sig and sig in seen_sigs:
                 # Identical to an already-kept track -> drop the duplicate.
