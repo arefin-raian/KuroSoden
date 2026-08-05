@@ -204,8 +204,9 @@ class DownloadsConfig(BaseModel):
     # Phase 4: for admin-driven multi-source sources (ddl / torrent), after a
     # download round pause the job (before publish) and prompt for more links
     # while the franchise still has missing seasons/episodes, instead of shipping
-    # an incomplete series. Off by default until the full loop is wired.
-    multi_source_coverage: bool = False
+    # an incomplete series. The full loop (worker gate + admin intake + publish-
+    # anyway bypass) is wired; flip to False to disable the gate entirely.
+    multi_source_coverage: bool = True
 
 
 class ProcessingConfig(BaseModel):

@@ -252,6 +252,8 @@ class M:
     CC_BTN_RETRY_EPS = "cc_btn_retry_eps"
     CC_BTN_SWITCH_SRC = "cc_btn_switch_src"
     CC_BTN_PROVIDE = "cc_btn_provide"
+    CC_BTN_PROVIDE_LINKS = "cc_btn_provide_links"
+    CC_BTN_PUBLISH_ANYWAY = "cc_btn_publish_anyway"
     CC_BTN_SWITCH_CONFIRM = "cc_btn_switch_confirm"
     TOAST_RETRY_QUEUED = "toast_retry_queued"
     ATTN_RETRYING = "attn_retrying"

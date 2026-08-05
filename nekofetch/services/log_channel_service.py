@@ -883,13 +883,9 @@ class LogChannelService:
         summary = "; ".join(parts) or "—"
 
         buttons = [
-            [InlineKeyboardButton(t(M.CC_BTN_PROVIDE_LINKS)
-                                  if hasattr(M, "CC_BTN_PROVIDE_LINKS")
-                                  else "🔗 Provide link(s)",
+            [InlineKeyboardButton(t(M.CC_BTN_PROVIDE_LINKS),
                                   callback_data=cb("staff", "amore", code))],
-            [InlineKeyboardButton(t(M.CC_BTN_PUBLISH_ANYWAY)
-                                  if hasattr(M, "CC_BTN_PUBLISH_ANYWAY")
-                                  else "✅ Publish what we have",
+            [InlineKeyboardButton(t(M.CC_BTN_PUBLISH_ANYWAY),
                                   callback_data=cb("staff", "amoredone", code))],
         ]
         text = (

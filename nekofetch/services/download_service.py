@@ -716,6 +716,11 @@ class DownloadWorker:
         """
         if not getattr(self._c.config.downloads, "multi_source_coverage", False):
             return False
+        # Admin chose "publish what we have": consume the one-shot bypass the
+        # amoredone handler set and finalize even though coverage is incomplete.
+        if await self._consume_publish_anyway(code):
+            log.info("download.coverage.publish_anyway", job_id=job_id, code=code)
+            return False
         try:
             async with session_scope(self._c.pg_sessionmaker) as session:
                 job = await session.get(DownloadJob, job_id)
@@ -759,6 +764,22 @@ class DownloadWorker:
             log.warning("download.coverage.card_failed", job_id=job_id,
                         code=code, error=str(exc))
         return True
+
+    async def _consume_publish_anyway(self, code: str) -> bool:
+        """Check + consume a one-shot 'publish anyway' bypass flag that the
+        amoredone handler sets so a paused job can finalize despite incomplete
+        coverage. Returns True (bypass set, now consumed) or False."""
+        if not self._c.redis:
+            return False
+        key = f"nf:coverage:bypass:{code}"
+        try:
+            val = await self._c.redis.get(key)
+            if val:
+                await self._c.redis.delete(key)
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     async def _reconstruct_franchise_mapping(self, req):
         """Rebuild the request's :class:`FranchiseMapping` (per-season episode

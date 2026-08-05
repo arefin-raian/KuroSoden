@@ -15,7 +15,7 @@ from nekofetch.domain.enums import AudioType, ContentKind, JobStatus
 from nekofetch.services.franchise_flow import FranchiseMapping, MappingEntry
 
 
-def _worker(sessionmaker, *, enabled=True):
+def _worker(sessionmaker, *, enabled=True, redis=None):
     from types import SimpleNamespace
     from nekofetch.services.download_service import DownloadWorker
 
@@ -24,8 +24,24 @@ def _worker(sessionmaker, *, enabled=True):
                                   multi_source_coverage=enabled),
     )
     container = SimpleNamespace(config=cfg, pg_sessionmaker=sessionmaker,
-                                progress=None, redis=None)
+                                progress=None, redis=redis)
     return DownloadWorker(container)
+
+
+class _FakeRedis:
+    """Minimal async redis stub supporting the get/set/delete the gate uses."""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, val, ex=None):
+        self.store[key] = val
+
+    async def delete(self, key):
+        self.store.pop(key, None)
 
 
 def _mapping(*entries: MappingEntry) -> FranchiseMapping:
@@ -130,3 +146,24 @@ async def test_gate_pauses_when_season_missing(session, sessionmaker, monkeypatc
             select(DownloadJob).where(DownloadJob.id == job.id)
         )).scalar_one()
         assert row.status == JobStatus.PAUSED
+
+
+async def test_publish_anyway_bypass_proceeds(session, sessionmaker, monkeypatch):
+    """The 'publish what we have' bypass lets an incomplete franchise finalize
+    (gate returns False) and consumes the one-shot flag."""
+    from tests.helpers import _create_request
+
+    redis = _FakeRedis()
+    req = await _create_request(session, code="REQ-C5", source="ddl")
+    job = await _job_for(session, req)
+    await _add_files(session, req, [(1, e) for e in range(1, 13)])  # S2 missing
+    worker = _worker(sessionmaker, redis=redis)
+    await _run(worker, monkeypatch, _mapping(_season(1, 12), _season(2, 12)))
+
+    # Admin pressed "Publish what we have" → bypass flag is set.
+    await redis.set(f"nf:coverage:bypass:{req.code}", "1")
+
+    paused = await worker._maybe_pause_for_coverage(job.id, req.code, "Test")
+    assert paused is False
+    # One-shot: the flag is consumed so a later round re-pauses normally.
+    assert f"nf:coverage:bypass:{req.code}" not in redis.store

@@ -46,6 +46,7 @@ STATE_TORRENT_PROVIDE = "staff:torrent_provide"
 STATE_TORRENT_MAP = "staff:torrent_map"
 STATE_DDL_PROVIDE = "staff:ddl_provide"
 STATE_PROVIDE = "staff:await_provide"   # admin is sending a file for a stuck episode
+STATE_MISSING_SOURCE = "staff:await_more_links"  # admin is sending more links to fill coverage gaps
 
 # Franchise flow states
 STATE_FRANCHISE_MAP = "staff:franchise:map"
@@ -391,7 +392,7 @@ def register(client: Client, container: Container) -> None:
         await _arm_reply(container.redis, message.chat.id, state, **data)
 
     async def _resolve_reply_flow(
-        message: Message, expected_state: str,
+        message: Message, *expected_states: str,
     ) -> tuple[str | None, dict, bool]:
         """Locate the awaited-reply flow behind an incoming text message.
 
@@ -405,20 +406,21 @@ def register(client: Client, container: Container) -> None:
           reply. Only Telegram channel admins can post as the channel, so the
           marker's existence is itself the authorisation.
 
+        Accepts one or more ``expected_states``; the first that matches wins.
         Returns ``(state, data, via_channel)``. ``state`` is ``None`` when this
         message isn't the awaited reply (so the handler bails untouched).
         """
         # 1) Named sender → per-user FSM, permission-checked.
         if message.from_user:
             state, data = await fsm.get(message.from_user.id)
-            if state == expected_state:
+            if state in expected_states:
                 user = getattr(message, "nf_user", None)
                 if user and auth.has_permission(user, Permission.QUEUE_DOWNLOADS):
                     return state, data, False
                 return None, {}, False  # wrong person — not their reply
         # 2) Anonymous / channel post → chat-scoped marker.
         state, data = await _peek_reply(container.redis, message.chat.id)
-        if state == expected_state:
+        if state in expected_states:
             return state, data, True
         return None, {}, False
 
@@ -865,15 +867,18 @@ def register(client: Client, container: Container) -> None:
 
     @client.on_message(filters.text & ~filters.command(["start"]), group=12)
     async def _torrent_magnet_reply(client: Client, message: Message) -> None:
-        """Receive a magnet link from the admin in STATE_TORRENT_PROVIDE."""
+        """Receive a magnet link in STATE_TORRENT_PROVIDE or STATE_MISSING_SOURCE."""
         text = (message.text or "").strip()
         if not text.startswith("magnet:"):
             return  # not a magnet link — let other handlers try
 
         state, data, via_channel = await _resolve_reply_flow(
-            message, STATE_TORRENT_PROVIDE,
+            message, STATE_TORRENT_PROVIDE, STATE_MISSING_SOURCE,
         )
-        if state is None:
+        if state not in (STATE_TORRENT_PROVIDE, STATE_MISSING_SOURCE):
+            return
+        # A magnet only tops up a torrent request; a ddl top-up wants http links.
+        if state == STATE_MISSING_SOURCE and (data.get("source") or "") == "ddl":
             return
 
         code = data.get("code")
@@ -1017,9 +1022,12 @@ def register(client: Client, container: Container) -> None:
             return  # not a torrent file
 
         state, data, via_channel = await _resolve_reply_flow(
-            message, STATE_TORRENT_PROVIDE,
+            message, STATE_TORRENT_PROVIDE, STATE_MISSING_SOURCE,
         )
-        if state is None:
+        if state not in (STATE_TORRENT_PROVIDE, STATE_MISSING_SOURCE):
+            return
+        # A .torrent only tops up a torrent request, never a ddl one.
+        if state == STATE_MISSING_SOURCE and (data.get("source") or "") == "ddl":
             return
 
         code = data.get("code")
@@ -1054,7 +1062,11 @@ def register(client: Client, container: Container) -> None:
         from pathlib import Path
         work = Path(container.env.storage_path) / "work" / code
         work.mkdir(parents=True, exist_ok=True)
-        torrent_path = work / ".provided.torrent"
+        # Content-address the stored .torrent so a coverage top-up (a SECOND
+        # torrent for the same request) doesn't clobber the first one's file.
+        import hashlib as _hashlib
+        _digest = _hashlib.sha1(raw_bytes).hexdigest()[:12]
+        torrent_path = work / f".provided-{_digest}.torrent"
         torrent_path.write_bytes(raw_bytes)
 
         # Build source_ref that points to the local .torrent file. Classify the
@@ -1153,7 +1165,7 @@ def register(client: Client, container: Container) -> None:
 
     @client.on_message(filters.text & ~filters.command(["start"]), group=13)
     async def _ddl_link_reply(client: Client, message: Message) -> None:
-        """Receive a direct download link from the admin in STATE_DDL_PROVIDE."""
+        """Receive direct download links in STATE_DDL_PROVIDE or STATE_MISSING_SOURCE."""
         text = (message.text or "").strip()
         # Accept one or more whitespace/newline-separated http(s) links; the DDL
         # ref carries an `archives` list so a single message can seed several.
@@ -1163,9 +1175,12 @@ def register(client: Client, container: Container) -> None:
             return  # not a direct link — let other handlers try
 
         state, data, via_channel = await _resolve_reply_flow(
-            message, STATE_DDL_PROVIDE,
+            message, STATE_DDL_PROVIDE, STATE_MISSING_SOURCE,
         )
-        if state is None:
+        if state not in (STATE_DDL_PROVIDE, STATE_MISSING_SOURCE):
+            return
+        # http links only top up a ddl request; a torrent top-up wants a magnet.
+        if state == STATE_MISSING_SOURCE and (data.get("source") or "") == "nyaa":
             return
 
         code = data.get("code")
@@ -1189,11 +1204,24 @@ def register(client: Client, container: Container) -> None:
         except Exception:
             pass
 
-        ddl_ref = json.dumps({
-            "archives": [{"url": u, "season": None} for u in urls],
-            "title": title,
-            "code": code,
-        })
+        # Build or append to the DDL ref. For STATE_MISSING_SOURCE, merge with
+        # what the request already has; for STATE_DDL_PROVIDE, start fresh.
+        if state == STATE_MISSING_SOURCE:
+            from nekofetch.services.request_service import RequestService
+            req = await RequestService(container).get(code)
+            existing_ref = json.loads(req.source_ref) if req.source_ref else {}
+            existing_archives = existing_ref.get("archives", [])
+            ddl_ref = json.dumps({
+                "archives": existing_archives + [{"url": u, "season": None} for u in urls],
+                "title": title or existing_ref.get("title", ""),
+                "code": code,
+            })
+        else:
+            ddl_ref = json.dumps({
+                "archives": [{"url": u, "season": None} for u in urls],
+                "title": title,
+                "code": code,
+            })
 
         # Consume the awaited-reply flow now the duplicate guard has let this
         # link through — clears the per-user FSM / disarms the channel marker.
@@ -1784,6 +1812,169 @@ def register(client: Client, container: Container) -> None:
         try:
             await q.message.edit_text(
                 L(M.ATTN_PROVIDE_PROMPT, eps=", ".join(map(str, eps)) or "—"),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+    # ── missing-source recovery: Provide more links / Publish what we have ────
+
+    async def _load_missing(code: str) -> dict | None:
+        import json
+        if not container.redis:
+            return None
+        raw = await container.redis.get(f"nf:missing:{code}")
+        return json.loads(raw) if raw else None
+
+    @client.on_callback_query(filters.regex(r"^staff\|amore\|"))
+    async def _missing_more(_: Client, q: CallbackQuery) -> None:
+        """Admin chose 'Provide link(s)' — show backdrop + prompt for more DDL/torrent links."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        code = q.data.split("|", 2)[2]
+        missing = await _load_missing(code)
+        if not missing:
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+
+        from nekofetch.services.request_service import RequestService
+        req = await RequestService(container).get(code)
+        title = missing.get("title") or req.anime_title
+        source = (missing.get("source") or "").lower()
+
+        await q.answer()
+
+        # Render the backdrop card with a Telegraph mapping guide.
+        backdrop = await _anime_backdrop(container, req)
+
+        # Build a Telegraph season-mapping article for the missing content so the
+        # admin sees WHICH seasons are still needed (not just episode numbers).
+        telegraph_url = await _build_mapping_guide(req, missing)
+
+        prompt_text = (
+            f"🧩 <b>{title}</b> — provide more links\n"
+            f"<code>{code}</code>\n\n"
+        )
+
+        # Summarize what's still missing (mirroring the card the worker posted).
+        grouped = {int(s): eps for s, eps in missing.get("missing", {}).items()}
+        empty = missing.get("empty_seasons", [])
+        parts = []
+        for season in sorted(grouped):
+            eps = grouped[season]
+            if season in empty:
+                parts.append(f"S{season} (all {len(eps)})")
+            else:
+                from nekofetch.services.log_channel_service import _summarize_runs
+                parts.append(f"S{season} eps {_summarize_runs(eps)}")
+        summary = "; ".join(parts) or "—"
+
+        prompt_text += f"Still missing: <b>{summary}</b>.\n\n"
+
+        if source == "ddl":
+            prompt_text += (
+                "Reply with http(s) direct-download links (one or more, separated by "
+                "whitespace/newlines). Archives will be fetched + extracted and added "
+                "to what we already have."
+            )
+        else:  # nyaa / torrent
+            prompt_text += (
+                "Reply with a magnet: link, http(s) torrent link, or upload a .torrent "
+                "file. The new torrent's episodes will be added to what we already have."
+            )
+
+        if telegraph_url:
+            prompt_text += f'\n\n<a href="{telegraph_url}">📋 Season mapping guide</a>'
+
+        kb = keyboard(
+            [(L(M.CC_BTN_PUBLISH_ANYWAY), cb("staff", "amoredone", code))],
+        )
+
+        card = await show(client, q.message, prompt_text, kb, image=backdrop)
+
+        # Arm the reply flow: DDL/magnet/file handlers will detect STATE_MISSING_SOURCE.
+        await _release_torrent_provide(code)  # clear any stale duplicate guard
+        await fsm.set(q.from_user.id, STATE_MISSING_SOURCE,
+                      code=code, title=title, source=source,
+                      prompt_chat_id=card.chat.id, prompt_message_id=card.id)
+        await _arm_reply(container.redis, card.chat.id,
+                         STATE_MISSING_SOURCE, code=code, title=title, source=source,
+                         prompt_chat_id=card.chat.id, prompt_message_id=card.id)
+
+    async def _build_mapping_guide(req, missing: dict) -> str | None:
+        """Build a Telegraph article showing the franchise's season structure so the
+        admin sees which seasons exist and which are still missing. Returns the page
+        URL, or None when no Telegraph token is configured / the call fails."""
+        try:
+            token = container.config.thumbnail_channel.telegraph_access_token
+            if not token:
+                return None
+
+            franchise = req.franchise_data or {}
+            title = franchise.get("title") or req.anime_title
+
+            from nekofetch.providers.metadata.telegraph_client import TelegraphClient
+            telegraph = TelegraphClient(token)
+
+            from nekofetch.services.log_channel_service import _summarize_runs
+
+            # Build simple DOM nodes: heading + season list.
+            content = [
+                {"tag": "h3", "children": [f"{title} — Season Structure"]},
+                {"tag": "p", "children": ["Seasons still needing content:"]},
+            ]
+
+            grouped = {int(s): eps for s, eps in missing.get("missing", {}).items()}
+            empty = missing.get("empty_seasons", [])
+            for season in sorted(grouped):
+                eps = grouped[season]
+                label = f"Season {season}"
+                if season in empty:
+                    label += f" — all {len(eps)} episodes missing ❌"
+                else:
+                    label += f" — eps {_summarize_runs(eps)} still needed ⚠️"
+                content.append({"tag": "p", "children": [label]})
+
+            result = await telegraph._call(
+                "createPage",
+                title=f"{title} — Seasons",
+                author_name="NekoFetch",
+                content=content,
+            )
+            await telegraph.close()
+            return result.get("url") or (
+                f"https://telegra.ph/{result.get('path', '')}"
+                if result.get("path") else None
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("missing.telegraph.failed", code=getattr(req, "code", "?"))
+            return None
+
+    @client.on_callback_query(filters.regex(r"^staff\|amoredone\|"))
+    async def _missing_done(_: Client, q: CallbackQuery) -> None:
+        """Admin chose 'Publish what we have' — set bypass flag + re-enqueue to finalize."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        code = q.data.split("|", 2)[2]
+        await lock_buttons(q)
+
+        # Set one-shot bypass flag so the gate lets this finalize despite gaps.
+        if container.redis:
+            await container.redis.set(f"nf:coverage:bypass:{code}", "1", ex=300)
+
+        from nekofetch.services.queue_service import QueueService
+        try:
+            job_id = await QueueService(container).enqueue(code)
+            await _spawn_progress_card(job_id, q.from_user.id)
+        except Exception:
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+
+        await fsm.clear(q.from_user.id)
+        await q.answer("Publishing with what we have…")
+        try:
+            await q.message.edit_text(
+                "✅ Finalizing the release with downloaded content.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:

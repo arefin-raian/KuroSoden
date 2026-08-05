@@ -504,6 +504,8 @@
   "cc_btn_retry_eps": "🔁 Retry episodes",
   "cc_btn_switch_src": "🔀 Switch source",
   "cc_btn_provide": "📥 Provide file",
+  "cc_btn_provide_links": "🔗 Provide link(s)",
+  "cc_btn_publish_anyway": "✅ Publish what we have",
   "cc_btn_switch_confirm": "✔ Switch to {alt} & retry",
   "toast_retry_queued": "Re-queued the stuck episodes.",
   "attn_retrying": "🔁 <b>Re-queued</b> episodes {eps} — back in the download queue.",
