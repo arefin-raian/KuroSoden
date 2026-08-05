@@ -54,6 +54,19 @@ _BRAND_BASE_MARGIN_V = 60
 _BRAND_BASE_MARGIN_LR = 50
 _BRAND_MIN_FONTSIZE = 8  # never scale below legibility
 
+# Dialogue restyle constants — Noto Sans Bold reference style (OFL-licensed).
+# Base values match a readable bold humanist sans at ~6.94% frame height (similar
+# visual weight to Sonny Boy's Gandhi Sans Bold but legally bundleable).
+_DIALOG_STYLE_NAME = "AXWDialog"
+_DIALOG_REF_RES_Y = 1080
+_DIALOG_BASE_FONTSIZE = 75
+_DIALOG_BASE_OUTLINE = 3.375
+_DIALOG_BASE_SHADOW = 0
+_DIALOG_BASE_MARGIN_V = 45
+_DIALOG_BASE_MARGIN_LR = 225
+_DIALOG_FONT_NAME = "Noto Sans"
+_DIALOG_BOLD = -1  # ASS Bold flag
+
 
 def _parse_play_res_y(lines: list[str]) -> int | None:
     """Read ``PlayResY`` from an ASS ``[Script Info]`` block (None if absent)."""
@@ -194,6 +207,7 @@ def brand_ass_text(
     video_ms: int | None = None,
     *,
     windows: list[tuple[int, int]] | None = None,
+    normalize_dialogue: bool = True,
 ) -> tuple[str, int]:
     """Inject branding cues into an existing ASS, preserving everything else.
 
@@ -207,11 +221,20 @@ def brand_ass_text(
     silent-in-all-tracks slots are stamped into each track. When ``None`` the
     windows are derived from THIS track's own cues (the standalone/file path).
 
+    ``normalize_dialogue`` — when True (default), plain dialogue lines are
+    restyled to use a bold readable font (Noto Sans Bold). Positioned
+    signs/songs/OP/ED are never touched. Set False to disable normalization.
+
     The parse is line-oriented and forgiving — it keeps the three ASS sections in
     order, appends the brand style at the end of ``[V4+ Styles]`` and the brand
     cues at the end of ``[Events]``. Malformed input (no ``[Events]``) is returned
     unchanged rather than raising, so one odd track never sinks the remux.
     """
+    # Apply dialogue restyle first (if enabled) so both the brand AND the dialog
+    # style are present in the final output.
+    if normalize_dialogue:
+        ass_text, _restyled = restyle_dialogue(ass_text)
+
     if _BRAND_STYLE_NAME in ass_text:
         return ass_text, 0
 
@@ -285,6 +308,170 @@ def brand_ass_text(
         out[insert_at:insert_at] = brand_lines
 
     return "\n".join(out), len(brand_lines)
+
+
+def _dialog_style_line(lines: list[str]) -> str:
+    """Build the ``AXWDialog`` style line scaled to THIS script's resolution.
+
+    Reference style: Noto Sans Bold at 75pt / 1080 PlayResY (≈6.94% frame height),
+    matching Sonny Boy's visual weight but with an OFL-licensed font we can bundle.
+    """
+    play_res_y = _parse_play_res_y(lines)
+    if not play_res_y or play_res_y <= 0:
+        # Fallback: use the median of existing styles
+        med = _median_style_fontsize(lines)
+        play_res_y = _DIALOG_REF_RES_Y if not med else int(med * _DIALOG_REF_RES_Y / _DIALOG_BASE_FONTSIZE)
+
+    k = play_res_y / _DIALOG_REF_RES_Y
+    fs = max(8, int(_DIALOG_BASE_FONTSIZE * k))
+    outline = round(_DIALOG_BASE_OUTLINE * k, 2)
+    shadow = round(_DIALOG_BASE_SHADOW * k, 2)
+    margin_v = max(2, int(_DIALOG_BASE_MARGIN_V * k))
+    margin_lr = max(2, int(_DIALOG_BASE_MARGIN_LR * k))
+
+    # ASS Style format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour,
+    # OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY,
+    # Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+    return (
+        f"Style: {_DIALOG_STYLE_NAME},{_DIALOG_FONT_NAME},{fs},&H00FFFFFF,&H000000FF,"
+        f"&H00000000,&H00000000,{_DIALOG_BOLD},0,0,0,100,100,0,0,1,{outline},{shadow},2,"
+        f"{margin_lr},{margin_lr},{margin_v},1"
+    )
+
+
+def _is_dialogue_line(text: str, style: str) -> bool:
+    """Classify an event line as plain dialogue (true) or signs/songs/positioned (false).
+
+    Plain dialogue is ANY event that:
+      - has NO positioning tags (\\pos \\move \\org \\clip \\iclip)
+      - has NO rotation/drawing tags (\\frz \\frx \\fry \\p[1-9])
+      - has NO karaoke tags (\\k \\kf \\ko \\K)
+      - does NOT use a non-bottom alignment (\\an4-9, \\an[^123])
+      - does NOT have a style name matching sign/song patterns
+
+    Everything else (positioned signs, OP/ED, karaoke, typesetting) stays on its
+    original style — we never touch them.
+    """
+    text_lower = text.lower()
+
+    # Positioning / clipping / drawing / rotation tags
+    positioned_tags = (
+        r"\pos", r"\move", r"\org", r"\clip", r"\iclip",
+        r"\frz", r"\frx", r"\fry", r"\p1", r"\p2", r"\p3", r"\p4",
+    )
+    for tag in positioned_tags:
+        if tag in text_lower:
+            return False
+
+    # Karaoke tags
+    if r"\k" in text_lower or r"\K" in text_lower:
+        return False
+
+    # Non-bottom alignment (\\an4-9 means middle/top rows)
+    if r"\an" in text_lower:
+        import re
+        # Extract all \an<digit> tags
+        for m in re.finditer(r"\\an(\d)", text_lower):
+            align = int(m.group(1))
+            if align not in (1, 2, 3):  # bottom row only
+                return False
+
+    # Style name patterns (case-insensitive)
+    style_lower = style.lower()
+    sign_patterns = [
+        "sign", "op", "ed", "song", "title", "karaoke", "romaji", "kanji",
+        "note", "credit", "insert", "logo", "caption", "typeset", "ts",
+    ]
+    for pattern in sign_patterns:
+        if pattern in style_lower:
+            return False
+
+    return True
+
+
+def restyle_dialogue(ass_text: str) -> tuple[str, int]:
+    """Inject a bold readable dialogue style and reassign plain dialogue lines to it.
+
+    Returns ``(new_ass_text, restyled_count)``. Idempotent: if the ``AXWDialog``
+    style is already present, the text is returned unchanged (count 0).
+
+    **What this does:**
+    1. Adds one new style (``AXWDialog``) scaled to the script's PlayResY.
+    2. For each ``Dialogue:`` event, checks if it's plain dialogue (no positioning,
+       no karaoke, no sign/song style name). If plain, rewrites ONLY the Style field
+       to ``AXWDialog``. Inline tags (``\\i1``, ``\\fs``, colors) are preserved.
+    3. Positioned signs, OP/ED, karaoke, and any event with a sign/song style name
+       are left completely untouched.
+
+    **Safety:**
+    - A plain, unpositioned bottom "note" can only be re-fonted, never mis-placed.
+    - Real signs/songs are always marked with positioning or style names, so they're
+      never restyled.
+    - Inline overrides (per-line ``\\fs``, ``\\c``, etc.) still win, so a source's
+      own intent is preserved within dialogue.
+    """
+    if _DIALOG_STYLE_NAME in ass_text:
+        return ass_text, 0
+
+    text = ass_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+
+    # Locate section headers
+    styles_idx = events_idx = -1
+    for i, ln in enumerate(lines):
+        low = ln.strip().lower()
+        if low.startswith("[v4") and low.endswith("styles]"):
+            styles_idx = i
+        elif low == "[events]":
+            events_idx = i
+
+    if events_idx == -1:
+        return ass_text, 0  # not a usable ASS
+
+    # 1. Inject the AXWDialog style at the end of [V4+ Styles]
+    out: list[str] = []
+    if styles_idx != -1:
+        last_style = styles_idx
+        for i in range(styles_idx + 1, len(lines)):
+            s = lines[i].strip()
+            if s.startswith("[") and s.endswith("]"):
+                break
+            if s.startswith("Style:"):
+                last_style = i
+
+        dialog_style = _dialog_style_line(lines)
+        for i, ln in enumerate(lines):
+            out.append(ln)
+            if i == last_style and styles_idx != -1:
+                out.append(dialog_style)
+    else:
+        out = list(lines)
+
+    # 2. Restyle plain dialogue events
+    restyled = 0
+    ev_i = next((i for i, ln in enumerate(out) if ln.strip().lower() == "[events]"), -1)
+    if ev_i == -1:
+        return "\n".join(out), 0
+
+    for i in range(ev_i + 1, len(out)):
+        ln = out[i]
+        if not ln.startswith("Dialogue:"):
+            continue
+
+        # Dialogue: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+        parts = ln.split(",", 9)
+        if len(parts) < 10:
+            continue
+
+        style = parts[3].strip()
+        text = parts[9]
+
+        if _is_dialogue_line(text, style):
+            parts[3] = _DIALOG_STYLE_NAME
+            out[i] = ",".join(parts)
+            restyled += 1
+
+    return "\n".join(out), restyled
 
 
 def brand_subtitle_file(ass_path, video_ms: int | None = None) -> int:

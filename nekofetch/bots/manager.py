@@ -66,7 +66,20 @@ class BotManager:
             except Exception as exc:  # never let a fleet-wide error block startup
                 log.error("bots.distribution.load_failed", error=str(exc))
 
-        await self._start_background_workers()
+        # Background workers (download loop + scheduler sweeps) must NEVER take
+        # the fleet down. A bad import or a service constructor that throws in
+        # here used to propagate out of start(), tearing down the event loop and
+        # every already-started bot with nothing useful in the logs (the reported
+        # "Gojo/all bots dead, logs empty" after a scheduled-post push). Degrade
+        # instead: the bots stay up; only the affected sweeps are missing.
+        try:
+            await self._start_background_workers()
+        except Exception as exc:  # noqa: BLE001 — never let workers kill the fleet
+            log.error("bots.background_workers.failed", error=str(exc), exc_info=True)
+            tracker = getattr(self._c, "startup_tracker", None)
+            if tracker:
+                tracker.service_fail("background_workers")
+                tracker.add_error(f"Background workers failed to start: {exc}")
 
         # Start ban-detection health check.
         self._start_ban_health_check()
