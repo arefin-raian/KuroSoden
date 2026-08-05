@@ -465,6 +465,74 @@ def register(client: Client, container: Container) -> None:
             await q.answer()
             return
 
+        # ── Bridge work_items → real Request rows + Levi assignments ──
+        # Batch creates work_items (WRK-N codes), but Levi's task list reads
+        # AdminAssignment rows (which key on Request.code). The single-request path
+        # creates a Request (QUEUED) + calls assign(code, "levi") so the work is
+        # visible. Batch must do the same: create a Request row per work item and
+        # assign each to levi, so tasks actually appear on the download board.
+        try:
+            from nekofetch.core.constants import REQUEST_PREFIX
+            from nekofetch.domain.enums import DownloadScope, RequestStatus
+            from nekofetch.infrastructure.database.postgres.models import Request
+            from nekofetch.infrastructure.database.postgres.session import session_scope
+            from nekofetch.infrastructure.repositories.request_repo import RequestRepository
+            from kurosoden.shared.admin_assignment import AdminAssignmentEngine
+
+            from kurosoden.shared.management_service import ManagementService
+            from kurosoden.shared.owner_seed import _owner_id
+
+            assignment = AdminAssignmentEngine(container.pg_sessionmaker)
+            codes: list[str] = []
+            async with session_scope(container.pg_sessionmaker) as session:
+                repo = RequestRepository(session)
+                for keep_data in keep:
+                    title = (keep_data.get("anime_title")
+                             or keep_data.get("title") or "").strip()
+                    if not title:
+                        continue  # mirror add_batch's skip so codes stay aligned
+                    seq = await repo.next_sequence()
+                    code = f"{REQUEST_PREFIX}-{seq}"
+                    fr = keep_data.get("franchise_data") or {}
+                    aid = fr.get("anilist_id")
+                    req = Request(
+                        code=code,
+                        user_id=user_id,
+                        anime_doc_id=f"{aid}" if aid else None,
+                        anime_title=title,
+                        source="",  # batch has no source yet (admin picks later)
+                        source_ref="",
+                        scope=DownloadScope.ENTIRE_SERIES.value,
+                        season=None,
+                        episodes=None,
+                        franchise_data=fr,
+                        status=RequestStatus.QUEUED,
+                    )
+                    await repo.add(req)
+                    codes.append(code)
+                await session.flush()
+
+            # Assign each real request to levi so it appears in the download task
+            # list. Done outside the creation session so each assign gets its own
+            # transaction (matching the single-request path) and one failure never
+            # rolls back the others.
+            for code in codes:
+                try:
+                    result = await assignment.assign(code, "levi")
+                    if result is None:
+                        # No qualifying admin (off-hours/on-break); fall back to the
+                        # owner so the task is always visible, never silently dropped.
+                        owner = _owner_id(container)
+                        if owner is not None:
+                            await ManagementService(container.pg_sessionmaker).reassign(
+                                code, "levi", owner
+                            )
+                except Exception as exc:  # noqa: BLE001 — recovery sweep still catches it
+                    log.warning("lelouch.batch.assign_failed",
+                                code=code, error=str(exc)[:200])
+        except Exception as exc:  # noqa: BLE001 — batch still shows success; the recovery sweep picks up unassigned items
+            log.error("lelouch.batch.bridge_failed", error=str(exc)[:300])
+
         await send_screen(
             client, q.message.chat.id,
             card(V.batch_done(len(created), skipped), image=_art(), bot_name=BOT,

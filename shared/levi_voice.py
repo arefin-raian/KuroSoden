@@ -61,6 +61,21 @@ def tasks_title(count: int) -> str:
     return f"{ICON} <b>{count} {n}</b> on your detail. Pick one and let's move."
 
 
+def idle_nudge(admin_name: str, pending: int) -> str:
+    """Nudge an idle admin who has download tasks waiting. Levi's voice — clipped,
+    no ceremony, allergic to wasted motion. (Moved off Lelouch, who runs intake;
+    the work waiting here is download detail, so Levi owns the reminder.)"""
+    who = esc(admin_name) or "soldier"
+    n = "tasks" if pending != 1 else "task"
+    verb = "are" if pending != 1 else "is"
+    return (
+        f"{ICON} <b>{who}. The board's not clearing itself.</b>\n\n"
+        f"There {verb} <b>{pending}</b> {n} on your detail and you've gone still. "
+        f"I don't need excuses — I need motion.\n\n"
+        "<i>Pick one. Run it down. We don't waste time here.</i>"
+    )
+
+
 # ── Request card (the job) ────────────────────────────────────────────────────
 
 def request_card(title: str, code: str, requester: str | None = None) -> str:

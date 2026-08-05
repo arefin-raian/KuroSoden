@@ -48,7 +48,8 @@ class FakeClient:
 
 class FakePipelineManager:
     def __init__(self, client):
-        self.lelouch = client
+        # Levi owns the idle nudge (download detail); idle_reminder reads mgr.levi.
+        self.levi = client
 
 
 class FakeContainer:

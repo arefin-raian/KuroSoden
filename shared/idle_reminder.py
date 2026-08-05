@@ -6,9 +6,10 @@ Runs on the pipeline scheduler. Each tick it:
   3. Finds admins who are available, on-shift, off-break, and holding **zero**
      active tasks (:meth:`ManagementService.idle_admins` — the working-hours and
      break rules live there, so an off-clock admin is never roused).
-  4. DMs each such admin one Lelouch-voiced nudge, rate-limited so the same
+  4. DMs each such admin one Levi-voiced nudge, rate-limited so the same
      person isn't pinged more than once per :data:`_NUDGE_COOLDOWN` seconds
-     (tracked in Redis, best-effort).
+     (tracked in Redis, best-effort). Levi owns this reminder because the work
+     waiting is download detail — his board, his voice.
 
 Suppressed entirely while an admin is actively working (they hold a task) — the
 point is to wake the idle, not to hound the busy.
@@ -20,7 +21,7 @@ from typing import Any
 
 from nekofetch.core.logging import get_logger
 
-from kurosoden.shared import lelouch_voice as V
+from kurosoden.shared import levi_voice as V
 from kurosoden.shared.management_service import ManagementService
 from kurosoden.shared.request_gate import get_mode
 
@@ -86,9 +87,9 @@ def make_idle_nudge_job(container: Any):
                 return
 
             mgr = getattr(container, "pipeline_manager", None)
-            client = getattr(mgr, "lelouch", None) if mgr else None
+            client = getattr(mgr, "levi", None) if mgr else None
             if client is None:
-                return  # request bot not running — nothing to send through
+                return  # download bot not running — nothing to send through
 
             sent = 0
             for admin in idle:
@@ -102,11 +103,11 @@ def make_idle_nudge_job(container: Any):
                     await _mark_nudged(container, admin.telegram_id)
                     sent += 1
                 except Exception as exc:  # noqa: BLE001 — one bad DM never stops the rest
-                    log.warning("lelouch.idle_nudge.dm_failed",
+                    log.warning("levi.idle_nudge.dm_failed",
                                 admin=admin.telegram_id, error=str(exc)[:200])
             if sent:
-                log.info("lelouch.idle_nudge.sent", nudged=sent, pending=pending)
+                log.info("levi.idle_nudge.sent", nudged=sent, pending=pending)
         except Exception as exc:  # noqa: BLE001 — a scheduler job must never crash the loop
-            log.warning("lelouch.idle_nudge.tick_failed", error=str(exc)[:200])
+            log.warning("levi.idle_nudge.tick_failed", error=str(exc)[:200])
 
     return _tick
