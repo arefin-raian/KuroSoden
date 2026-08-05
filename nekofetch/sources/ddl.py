@@ -32,7 +32,7 @@ from nekofetch.core.exceptions import NotFound
 from nekofetch.core.logging import get_logger
 from nekofetch.domain.enums import AudioType
 from nekofetch.sources._archive import extract_archive
-from nekofetch.sources._torrent import order_episodes
+from nekofetch.sources._torrent import group_variants, order_episodes
 from nekofetch.sources.base import (
     AnimeDetails,
     AnimeSource,
@@ -143,48 +143,71 @@ class DdlSource(AnimeSource):
         if not pooled:
             return []
 
-        # Keep EVERY quality (no prefer_resolution collapse) so each tier downloads.
+        # Keep EVERY quality (no prefer_resolution collapse) and group per real
+        # (season, episode) so a multi-quality pack becomes ONE episode with a
+        # sibling file per tier — get_variants expands them, the worker downloads
+        # each, and EncodeStage fills only genuinely-missing tiers.
         ordered = order_episodes(pooled)
+        groups = group_variants(ordered)
         episodes: list[Episode] = []
-        for e in ordered:
-            audio = _audio_from_name(f"{title} {e['name']}")
+        for g in groups:
+            primary = g["files"][0]  # highest resolution
+            audio = _audio_from_name(f"{title} {primary['name']}")
             episodes.append(
                 Episode(
                     source_ref=json.dumps({
-                        "path": e["path"],
-                        "name": e["name"],
-                        "length": e["length"],
-                        "resolution": e.get("resolution"),
+                        "files": g["files"],
+                        # Back-compat single-file fields (primary = highest res).
+                        "path": primary["path"],
+                        "name": primary["name"],
+                        "length": primary["length"],
+                        "resolution": primary.get("resolution"),
                         "audio_kind": audio.value,
-                        "season": e["season"],
-                        "episode": e.get("episode"),
-                        "kind": e["kind"],
+                        "season": g["season"],
+                        "episode": g["episode"],
+                        "kind": g["kind"],
                     }),
-                    season=e["season"],
-                    number=e["seq"],
-                    title=e["name"],
+                    season=g["season"],
+                    number=g["number"],
+                    title=primary["name"],
                 )
             )
         return episodes
 
     async def get_variants(self, episode_ref: str) -> list[VideoVariant]:
+        """One VideoVariant per resolution this episode ships. Each variant's ref
+        points at its OWN extracted file so ``download`` copies the right one."""
         e = _parse_ref(episode_ref)
-        path = Path(e["path"])
         kind = e.get("audio_kind")
         audio = {
             "multi": AudioType.MULTI,
             "dual_audio": AudioType.DUAL_AUDIO,
             "dubbed": AudioType.DUBBED,
         }.get(kind, AudioType.SUBBED)
-        return [
-            VideoVariant(
-                source_ref=episode_ref,
-                resolution=e.get("resolution") or "1080p",
-                audio=audio,
-                container=path.suffix.lstrip("."),
-                size_bytes=e.get("length"),
+        base = {k: v for k, v in e.items() if k != "files"}
+        files = e.get("files") or [{
+            "path": e.get("path"), "name": e.get("name"),
+            "length": e.get("length"), "resolution": e.get("resolution"),
+        }]
+        variants: list[VideoVariant] = []
+        for f in files:
+            ref = {
+                **base,
+                "path": f.get("path"),
+                "name": f.get("name"),
+                "length": f.get("length"),
+                "resolution": f.get("resolution"),
+            }
+            variants.append(
+                VideoVariant(
+                    source_ref=json.dumps(ref),
+                    resolution=f.get("resolution") or "1080p",
+                    audio=audio,
+                    container=Path(f.get("name") or "").suffix.lstrip("."),
+                    size_bytes=f.get("length"),
+                )
             )
-        ]
+        return variants
 
     async def download(
         self,

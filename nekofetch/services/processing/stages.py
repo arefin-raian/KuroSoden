@@ -1326,15 +1326,19 @@ class ThumbnailStage(Stage):
 
 
 class EncodeStage(Stage):
-    """Derive lower-resolution renditions (720p / 480p) from each torrent file.
+    """Derive only the lower-resolution renditions a source did NOT already ship.
 
-    Torrents deliver one file per episode (we download only the 1080p variant),
-    so to ship the standard three-quality packs we transcode the lower tiers
-    ourselves. Runs AFTER rename/brand/metadata/watermark so every rendition
-    inherits the final name and branding, and BEFORE store so the new files are
-    marked processed and uploaded alongside the source. Video is re-encoded
-    (x264 CRF); all audio tracks, subtitles and metadata are copied, so
-    dual-audio and branding survive. Streaming sources are skipped entirely.
+    Sources now download every quality they provide (nyaa/ddl no longer collapse
+    to 1080p-only), so encoding is a gap-filler, not a blanket down-transcode:
+    for each (season, episode, audio) unit we skip any ``encode_heights`` tier
+    already present on disk and derive only the genuinely-missing ones from the
+    highest present file. Net: 1080+720 shipped → encode 480 only; 720 only →
+    encode 480; all three shipped → encode nothing. Runs AFTER
+    rename/brand/metadata/watermark so every rendition inherits the final name
+    and branding, and BEFORE store so the new files are marked processed and
+    uploaded alongside the source. Video is re-encoded (x264 CRF); all audio
+    tracks, subtitles and metadata are copied, so dual-audio and branding
+    survive. Streaming sources are skipped entirely.
     """
 
     stage = ProcessingStage.ENCODE
@@ -1374,6 +1378,19 @@ class EncodeStage(Stage):
             r = (f.resolution or "").rstrip("p")
             return int(r) if r.isdigit() else 0
 
+        # Resolution-reversal: sources now DOWNLOAD every quality they provide, so
+        # a tier we already have on disk must NOT be re-derived by encoding — that
+        # was the "great mistake" (encode 720/480 from 1080 even when the release
+        # already shipped them). Build the set of heights already present for each
+        # (season, episode, audio) unit; the encode loop skips any target tier
+        # that's in it. Net: 1080+720 present → encode 480 only; 720 only → encode
+        # 480; all three present → encode nothing.
+        present: dict[tuple, set[int]] = {}
+        for f in on_disk:
+            h = _res_h(f)
+            if h > 0:
+                present.setdefault((f.season, f.episode, f.audio), set()).add(h)
+
         max_h = max((_res_h(f) for f in on_disk), default=0)
         sources = [f for f in on_disk if _res_h(f) == max_h and max_h > 0]
         if not sources:
@@ -1402,9 +1419,13 @@ class EncodeStage(Stage):
             enc_threads = max(2, cores // jobs)
         # Every (file, height) pair is one encode — count them all so the bar
         # advances per rendition, not per file (a single file with 2 tiers used
-        # to jump 0→50→100 with a long silent gap between).
+        # to jump 0→50→100 with a long silent gap between). Skip any tier
+        # already present on disk (the reversal: don't re-derive what we
+        # downloaded).
         total_units = sum(
-            1 for f in sources for h in heights if f"{h}p" != (f.resolution or "1080p")
+            1 for f in sources for h in heights
+            if f"{h}p" != (f.resolution or "1080p")
+            and h not in present.get((f.season, f.episode, f.audio), set())
         ) or 1
         done_units = 0
         await _push_stage_progress(self.c, ctx, "Encoding", 0.0, file_index=0, file_total=n)
@@ -1428,6 +1449,12 @@ class EncodeStage(Stage):
                 label = f"{height}p"
                 if label == src_res:
                     continue  # never "downscale" to the same tier
+                # Reversal: this tier was already downloaded for this unit —
+                # skip encoding it (that's the whole point of downloading every
+                # provided quality instead of transcoding down from 1080p).
+                if height in present.get((f.season, f.episode, f.audio), set()):
+                    ctx.notes.append(f"encode {label}: already downloaded — skipped")
+                    continue
                 await _push_stage_progress(
                     self.c, ctx, f"Encoding {label}", 0.0,
                     file_index=i + 1, file_total=n,

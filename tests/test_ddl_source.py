@@ -50,7 +50,9 @@ async def test_extract_archive_zip_returns_only_videos(tmp_path: Path) -> None:
 
 async def test_get_episodes_keeps_every_quality(tmp_path: Path, monkeypatch) -> None:
     # Episode 1 ships in both 1080p and 720p; episode 2 only in 1080p. The reversed
-    # encode logic wants ALL of them downloaded (no collapse to one file/episode).
+    # encode logic wants ALL qualities available for download — but as ONE episode
+    # per real (season, episode), each exposing a VideoVariant per tier (the
+    # anikoto model), NOT one episode per file (which would corrupt numbering).
     archive = _make_zip(
         tmp_path / "pack.zip",
         [
@@ -79,13 +81,20 @@ async def test_get_episodes_keeps_every_quality(tmp_path: Path, monkeypatch) -> 
     })
     episodes = await src.get_episodes(ref)
 
-    # No collapse: all three files survive as distinct episodes.
-    assert len(episodes) == 3
-    resolutions = sorted(
-        json.loads(e.source_ref)["resolution"] for e in episodes
-    )
-    assert resolutions == ["1080p", "1080p", "720p"]
+    # Grouped: two real episodes, numbered by episode (not a global file seq).
+    assert len(episodes) == 2
+    assert {e.number for e in episodes} == {1, 2}
     assert all(e.season == 1 for e in episodes)
+
+    by_number = {e.number: e for e in episodes}
+    # Ep1 keeps BOTH qualities as distinct variants; ep2 keeps its one.
+    ep1_variants = await src.get_variants(by_number[1].source_ref)
+    ep2_variants = await src.get_variants(by_number[2].source_ref)
+    assert sorted(v.resolution for v in ep1_variants) == ["1080p", "720p"]
+    assert sorted(v.resolution for v in ep2_variants) == ["1080p"]
+    # Each variant points at its OWN extracted file (distinct paths per tier).
+    ep1_paths = {json.loads(v.source_ref)["path"] for v in ep1_variants}
+    assert len(ep1_paths) == 2
 
 
 async def test_registry_activates_and_resolves_ddl() -> None:

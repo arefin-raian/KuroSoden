@@ -27,7 +27,7 @@ import httpx
 
 from nekofetch.core.logging import get_logger
 from nekofetch.domain.enums import AudioType
-from nekofetch.sources._torrent import order_episodes, torrent_files
+from nekofetch.sources._torrent import group_variants, order_episodes, torrent_files
 from nekofetch.sources.base import (
     AnimeDetails,
     AnimeSource,
@@ -245,7 +245,14 @@ class NyaaSource(AnimeSource):
             log.warning("nyaa.torrent.parse_failed", error=str(exc))
             return []
 
-        ordered = order_episodes(files, prefer_resolution=1080)
+        # Keep EVERY resolution (no 1080p-only collapse) and group the release's
+        # files into one entry per real (season, episode) so a multi-quality
+        # torrent downloads each tier and only encodes what's genuinely missing.
+        # ``group_variants`` uses the parsed episode NUMBER (not the global seq)
+        # as ``number`` — so ep1's 1080p+720p stay a single episode instead of
+        # becoming episodes 1 and 2.
+        ordered = order_episodes(files)
+        groups = group_variants(ordered)
         episodes: list[Episode] = []
         ep_ref_base = {}
         if r.get("torrent_url"):
@@ -287,30 +294,41 @@ class NyaaSource(AnimeSource):
         if release_name:
             ep_ref_base["release_name"] = release_name
 
-        for e in ordered:
+        for g in groups:
             label = {"movie": "Movie", "ova": "OVA", "special": "Special",
-                     "extra": "Extra"}.get(e["kind"], f"Ep. {e.get('episode') or e['seq']}")
+                     "extra": "Extra"}.get(g["kind"], f"Ep. {g['number']}")
+            primary = g["files"][0]
             episodes.append(
                 Episode(
                     source_ref=json.dumps({
                         **ep_ref_base,
-                        "file_index": e["index"],
-                        "path": e["path"],
-                        "name": e["name"],
-                        "length": e["length"],
-                        "resolution": e.get("resolution"),
-                        "kind": e["kind"],
-                        "season": e["season"],
+                        # Per-resolution files for this episode; get_variants emits
+                        # one VideoVariant per entry so every tier downloads.
+                        "files": g["files"],
+                        # Back-compat single-file fields (primary = highest res)
+                        # for any consumer that still reads a flat ref.
+                        "file_index": primary["index"],
+                        "path": primary["path"],
+                        "name": primary["name"],
+                        "length": primary["length"],
+                        "resolution": primary.get("resolution"),
+                        "kind": g["kind"],
+                        "season": g["season"],
+                        "episode": g["episode"],
                     }),
-                    season=e["season"],
-                    number=e["seq"],
-                    title=f"{label} — {e['name']}",
+                    season=g["season"],
+                    number=g["number"],
+                    title=f"{label} — {primary['name']}",
                 )
             )
         return episodes
 
     async def get_variants(self, episode_ref: str) -> list[VideoVariant]:
-        """One variant: the torrent file itself (transcodes happen post-download)."""
+        """One VideoVariant per resolution this episode ships. Multi-quality
+        releases expose every tier here so the worker downloads them all and
+        EncodeStage only fills genuinely-missing tiers. Each variant's
+        ``source_ref`` points at its OWN file (file_index/path/name/length) so
+        ``download`` fetches the right one."""
         e = json.loads(episode_ref)
         # Map the derived audio kind to the domain enum. ``audio_kind`` is set by
         # get_episodes (multi/dual/single); fall back to the legacy dual_audio
@@ -322,15 +340,35 @@ class NyaaSource(AnimeSource):
             audio = AudioType.DUAL_AUDIO
         else:
             audio = AudioType.SUBBED
-        return [
-            VideoVariant(
-                source_ref=episode_ref,
-                resolution=e.get("resolution") or "1080p",
-                audio=audio,
-                container=Path(e["name"]).suffix.lstrip("."),
-                size_bytes=e.get("length"),
+
+        # Shared fields every per-file variant ref inherits (torrent locator +
+        # audio signal); only the file-specific keys differ per tier.
+        base = {k: v for k, v in e.items() if k != "files"}
+        files = e.get("files") or [{
+            "index": e.get("file_index"), "path": e.get("path"),
+            "name": e.get("name"), "length": e.get("length"),
+            "resolution": e.get("resolution"),
+        }]
+        variants: list[VideoVariant] = []
+        for f in files:
+            ref = {
+                **base,
+                "file_index": f.get("index"),
+                "path": f.get("path"),
+                "name": f.get("name"),
+                "length": f.get("length"),
+                "resolution": f.get("resolution"),
+            }
+            variants.append(
+                VideoVariant(
+                    source_ref=json.dumps(ref),
+                    resolution=f.get("resolution") or "1080p",
+                    audio=audio,
+                    container=Path(f.get("name") or "").suffix.lstrip("."),
+                    size_bytes=f.get("length"),
+                )
             )
-        ]
+        return variants
 
     async def download(
         self,

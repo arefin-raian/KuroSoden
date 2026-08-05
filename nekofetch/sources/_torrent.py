@@ -342,3 +342,49 @@ def order_episodes(files: list[dict], *, prefer_resolution: int | None = None) -
     for seq, e in enumerate(ordered, start=1):
         e["seq"] = seq
     return ordered
+
+
+def group_variants(ordered: list[dict]) -> list[dict]:
+    """Collapse an :func:`order_episodes` list into one entry per logical episode,
+    keeping EVERY resolution as a sibling ``file`` (the download-all-qualities
+    policy — we download each tier and encode only what's genuinely missing).
+
+    Numbered episodes group by ``(season, episode)`` so a multi-quality release
+    (e.g. ep1 in both 1080p and 720p) becomes a SINGLE episode with two files —
+    NOT two episodes with a corrupted ``seq``-based number. Movies / specials /
+    OVAs / extras (no episode number) stay individual, keyed by their unique
+    ``seq`` so distinct extras never merge.
+
+    Each returned dict carries ``season``, ``episode`` (real number or ``None``),
+    ``number`` (the episode number, or ``seq`` for unnumbered), ``kind`` and
+    ``files`` = ``[{index, path, name, length, resolution}, …]`` ordered
+    highest-resolution first (so ``files[0]`` is the natural "primary"/encode
+    source and the best single-file representative for callers that want one).
+    """
+    from collections import OrderedDict
+
+    groups: "OrderedDict[tuple, dict]" = OrderedDict()
+    for e in ordered:
+        if e.get("episode") is not None:
+            key = ("ep", e["season"], e["episode"])
+            number = e["episode"]
+        else:
+            key = ("x", e["seq"])  # movies/extras never merge
+            number = e["seq"]
+        g = groups.get(key)
+        if g is None:
+            g = {"season": e["season"], "episode": e.get("episode"),
+                 "number": number, "kind": e["kind"], "files": []}
+            groups[key] = g
+        g["files"].append({
+            "index": e.get("index"),
+            "path": e.get("path"),
+            "name": e["name"],
+            "length": e.get("length"),
+            "resolution": e.get("resolution"),
+        })
+    for g in groups.values():
+        g["files"].sort(
+            key=lambda f: _resolution_rank(f.get("resolution")), reverse=True
+        )
+    return list(groups.values())
