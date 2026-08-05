@@ -37,6 +37,17 @@ STATE_IDX_SLOT_CAPTION = "gojo:await_idx_slot_caption"
 STATE_IDX_SLOT_IMAGE = "gojo:await_idx_slot_image"
 STATE_IDX_SLOT_BUTTONS = "gojo:await_idx_slot_buttons"
 
+# Every command Gojo registers. The FSM free-text consumer MUST exclude all of
+# them, or it swallows command messages (they're `filters.text` too) before the
+# dedicated command handlers run — the reported "/start doesn't respond" bug.
+# Levi and Senku already exclude their full command list; Gojo previously only
+# excluded /cancel, so /start (registered in app.py after this handler) and every
+# command registered below line 705 (/publish, /recover, /help) were shadowed.
+GOJO_RESERVED = [
+    "start", "tasks", "publish", "recover", "schedule", "updates",
+    "bancheck", "stats", "settings", "help", "cancel", "footer", "backup",
+]
+
 
 def _publish_keyboard(code: str):
     """The review card's action row — publish now / silent / schedule / edit."""
@@ -702,7 +713,7 @@ def register(client: Client, container: Container) -> None:
         await _render_updates_review(note, deduped)
 
     # ── FSM text consumer — caption edit + schedule time ──────────────────────
-    @client.on_message(filters.text & filters.private & ~filters.command(["cancel"]))
+    @client.on_message(filters.text & filters.private & ~filters.command(GOJO_RESERVED))
     async def _fsm_text(_: Client, message: Message) -> None:
         if not message.from_user:
             return

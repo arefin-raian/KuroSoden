@@ -55,7 +55,7 @@ def _schedule_card(scheduled: list, tz_name: str | None) -> Screen:
         label = (s.anime_title or s.request_code)[:30]
         btn_rows.append([(label, cb("gojo", "sched_manage", str(s.id)))])
 
-    return Screen(caption=caption, image=pick_artwork("gojo"), buttons=keyboard(*btn_rows))
+    return Screen(caption=caption, image=pick_artwork("gojo"), keyboard=keyboard(*btn_rows))
 
 
 def _manage_card(sched_post, tz_name: str | None) -> Screen:
@@ -82,7 +82,7 @@ def _manage_card(sched_post, tz_name: str | None) -> Screen:
         [("« Back", cb("gojo", "sched_list"))],
     )
 
-    return Screen(caption=caption, image=pick_artwork("gojo"), buttons=buttons)
+    return Screen(caption=caption, image=pick_artwork("gojo"), keyboard=buttons)
 
 
 async def _admin_tz(container: Container, admin_id: int) -> str | None:
