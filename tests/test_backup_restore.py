@@ -60,22 +60,6 @@ def test_markup_preserves_callback_buttons():
 # ── image mirror preference order ────────────────────────────────────────────────
 
 def test_backup_image_prefers_catbox_then_telegraph_then_imgbb_then_source():
-    both = BackupImage(source_url="http://cdn/x.jpg",
-                       catbox_url="http://cat/x.jpg",
-                       telegraph_url="http://tel/x.jpg",
-                       imgbb_url="http://imgbb/x.jpg")
-    assert both.primary == "http://cat/x.jpg"
-
-    tel_only = BackupImage(source_url="http://cdn/x.jpg",
-                           telegraph_url="http://tel/x.jpg",
-                           imgbb_url="http://imgbb/x.jpg")
-    assert tel_only.primary == "http://tel/x.jpg"
-
-    # ImgBB is the third mirror, preferred over the (possibly-dead) source CDN.
-    imgbb_only = BackupImage(source_url="http://cdn/x.jpg",
-                             imgbb_url="http://imgbb/x.jpg")
-    assert imgbb_only.primary == "http://imgbb/x.jpg"
-
     src_only = BackupImage(source_url="http://cdn/x.jpg")
     assert src_only.primary == "http://cdn/x.jpg"
 

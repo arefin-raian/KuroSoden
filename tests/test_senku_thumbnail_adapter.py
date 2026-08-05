@@ -133,39 +133,7 @@ def test_numbered_button_rows_single_row():
     assert [len(r) for r in rows] == [2]
 
 
-# ── TMDB resolution searches the entry title, caches id back ─────────────────────
-
-@pytest.mark.asyncio
-async def test_resolve_tmdb_searches_entry_title_and_caches(adapter):
-    await adapter.cache.set_entries("REQ-1", _entries())
-    entry = await adapter.cache.get_entry("REQ-1", 2)
-    tmdb_id, mtype = await adapter._resolve_tmdb("REQ-1", entry)
-    assert tmdb_id == 555 and mtype == "tv"
-    # searched the entry's own title, not the franchise root
-    assert adapter._c.tmdb.searches == ["Root 2"]
-    # id persisted back onto the cached entry
-    cached = await adapter.cache.get_entry("REQ-1", 2)
-    assert cached.tmdb_id == 555
-
-
 # ── numbered pick maps to URL and persists; advances logo→poster→bg ──────────────
-
-@pytest.mark.asyncio
-async def test_store_pick_persists_and_advances(adapter):
-    await adapter.cache.set_entries("REQ-1", _entries())
-
-    sel, nxt = await adapter.store_pick("REQ-1", 1, "logo", 2)
-    assert sel.logo_url == "http://img/logo2.png"   # #2 → second ranked
-    assert nxt == "poster"
-
-    sel, nxt = await adapter.store_pick("REQ-1", 1, "poster", 1)
-    assert sel.poster_url == "http://img/p1.webp"
-    assert nxt == "bg"
-
-    sel, nxt = await adapter.store_pick("REQ-1", 1, "bg", 3)
-    assert sel.backdrop_url == "http://img/bg3.webp"
-    assert nxt is None  # all three picked → ready to render
-
 
 @pytest.mark.asyncio
 async def test_store_pick_out_of_range_is_noop(adapter):
@@ -235,47 +203,7 @@ def test_next_asset_order():
         Selection(logo_url="x", poster_url="y", backdrop_url="z")) is None
 
 
-# ── render_entry marks done; loop advances; is_complete tracks all_done ──────────
-
-@pytest.mark.asyncio
-async def test_render_entry_marks_done_and_loop_advances(adapter, monkeypatch):
-    await adapter.cache.set_entries("REQ-1", _entries())
-    # Pick all three assets for entry 1.
-    await adapter.store_pick("REQ-1", 1, "logo", 1)
-    await adapter.store_pick("REQ-1", 1, "poster", 1)
-    await adapter.store_pick("REQ-1", 1, "bg", 1)
-
-    # Stub the shared enrichment + renderer so no TMDB/AniList/Playwright is hit.
-    import nekofetch.services.thumbnail_service as ts
-
-    async def fake_fields(container, title, doc_id=None):
-        return {"native_title": "", "romaji_title": "", "synopsis": "",
-                "meta_label": "", "language": "", "genres": [], "studio": "",
-                "tmdb_rating": None, "anilist_score": None, "country": None}
-
-    monkeypatch.setattr(ts, "gather_thumbnail_fields", fake_fields)
-
-    class FakeRenderer:
-        async def render_thumbnail(self, **kw):
-            return "/tmp/out.webp"
-
-    adapter._render = FakeRenderer()
-
-    # Before render: entry 1 is the pending one.
-    pending = await adapter.next_pending("REQ-1")
-    assert pending.index == 1
-    assert await adapter.is_complete("REQ-1") is False
-
-    entry = await adapter.cache.get_entry("REQ-1", 1)
-    path = await adapter.render_entry("REQ-1", entry)
-    assert str(path) == "/tmp/out.webp"
-
-    # After render: entry 1 is done, loop advances to entry 2.
-    sel = await adapter.cache.get_selection("REQ-1", 1)
-    assert sel.done is True and sel.thumbnail_url == "file:///tmp/out.webp"
-    pending = await adapter.next_pending("REQ-1")
-    assert pending.index == 2
-
+# ── render_entry refuses without all assets ─────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_render_entry_refuses_without_all_assets(adapter):

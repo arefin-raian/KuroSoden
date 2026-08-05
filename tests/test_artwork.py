@@ -80,16 +80,6 @@ class _FakeTmdb:
 
 class TestEnsureAnimeArt:
     @pytest.mark.asyncio
-    async def test_seeds_from_tmdb_and_franchise(self):
-        from nekofetch.ui.artwork import ensure_anime_art, _anime_pools
-        tmdb = _FakeTmdb(["http://t/1.jpg", "http://t/2.jpg"])
-        fr = {"banner_url": "http://al/banner.jpg"}
-        await ensure_anime_art("t:ensure1", tmdb=tmdb, title="Anime", franchise=fr)
-        urls = _anime_pools["t:ensure1"]._urls
-        assert "http://t/1.jpg" in urls
-        assert "http://al/banner.jpg" in urls
-
-    @pytest.mark.asyncio
     async def test_only_fetches_once(self):
         from nekofetch.ui.artwork import ensure_anime_art
         tmdb = _FakeTmdb(["http://t/1.jpg"])

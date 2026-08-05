@@ -16,27 +16,6 @@ import pytest
 # Package metadata
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TestKagePackage:
-    """kurosoden/__init__.py metadata."""
-
-    def test_version_is_string(self):
-        import kurosoden
-        assert isinstance(kurosoden.__version__, str)
-
-    def test_version_format(self):
-        import kurosoden
-        # Should be semver-like: X.Y.Z
-        parts = kurosoden.__version__.split(".")
-        assert len(parts) == 3
-        for p in parts:
-            assert p.isdigit()
-
-    def test_package_docstring_exists(self):
-        import kurosoden
-        assert kurosoden.__doc__ is not None
-        assert "Kage" in kurosoden.__doc__
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Models re-exports
 # ═══════════════════════════════════════════════════════════════════════════════

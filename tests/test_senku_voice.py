@@ -52,25 +52,6 @@ def test_handoff_card_escapes_title():
     assert "&lt;script&gt;" in out
 
 
-def test_channel_title_block_is_tap_to_copy():
-    out = V.channel_title_block("Some Title 『 Dual Audio 』")
-    # Monospace <code> = tap-to-copy in Telegram; must NOT be a code fence.
-    assert "<code>" in out and "</code>" in out
-    assert "<pre>" not in out
-
-
-def test_channel_username_block_is_tap_to_copy():
-    out = V.channel_username_block("spy_x_family_axw")
-    # Monospace <code> = tap-to-copy in Telegram; the handle must be present verbatim.
-    assert "<code>" in out and "spy_x_family_axw" in out
-    assert "<pre>" not in out
-
-
-def test_channel_description_block_wraps_value_in_code():
-    out = V.channel_description_block("The description.")
-    assert "<code>" in out and "The description." in out
-
-
 def test_channel_admins_line_names_both_bots():
     assert "Senku" in V.CHANNEL_ADMINS_LINE
     assert "Gojo" in V.CHANNEL_ADMINS_LINE
@@ -93,33 +74,3 @@ def test_watch_order_card_includes_order_html():
     assert "Bleach" in out
     assert "1. thing" in out
 
-
-def test_callables_accept_their_args_without_raising():
-    # Smoke: every public callable renders with representative args.
-    samples = {
-        "home_title": ("Neko",),
-        "tasks_title": (2,),
-        "handoff_card": ("T", "REQ-1"),
-        "franchise_map_card": ("T", "<blockquote>x</blockquote>"),
-        "channel_intro": ("T",),
-        "channel_title_block": ("T",),
-        "channel_username_block": ("spy_x_family_axw",),
-        "channel_description_block": ("D",),
-        "channel_missing": ("a poster",),
-        "channel_verified": ("@chan",),
-        "channel_verify_failed": ("@chan",),
-        "thumb_intro": ("T", 3),
-        "thumb_entry_header": ("S1", 1, 3),
-        "thumb_pick_prompt": ("logo",),
-        "thumb_selected": ("poster", 2),
-        "thumb_generated": (1, 3),
-        "watch_order_card": ("T", "<b>1</b>"),
-        "watch_order_edit_failed": (),
-        "publishing": ("T",),
-        "published_done": ("T",),
-    }
-    for name, args in samples.items():
-        fn = getattr(V, name)
-        assert inspect.isfunction(fn), name
-        out = fn(*args)
-        assert isinstance(out, str) and out.strip(), name

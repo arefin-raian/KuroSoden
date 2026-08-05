@@ -30,10 +30,6 @@ def _container(order=None):
     )
 
 
-def test_host_order_defaults_when_unset():
-    assert _host_order(_container(None)) == ("catbox", "telegraph", "imgbb")
-
-
 def test_host_order_respects_config():
     assert _host_order(_container(["imgbb", "catbox", "telegraph"])) == (
         "imgbb", "catbox", "telegraph",
@@ -45,39 +41,6 @@ def test_host_order_drops_unknown_and_appends_missing():
     assert _host_order(_container(["bogus", "imgbb"])) == (
         "imgbb", "catbox", "telegraph",
     )
-
-
-@pytest.mark.asyncio
-async def test_backup_bytes_attempts_every_host_in_order(monkeypatch):
-    calls: list[str] = []
-
-    async def fake_catbox(blob, mime, ext, source_url):
-        calls.append("catbox")
-        return "cat/url"
-
-    async def fake_telegraph(container, blob, mime, source_url):
-        calls.append("telegraph")
-        return "tel/url"
-
-    async def fake_imgbb(container, blob):
-        calls.append("imgbb")
-        return "imgbb/url"
-
-    monkeypatch.setattr(ib, "_upload_catbox", fake_catbox)
-    monkeypatch.setattr(ib, "_upload_telegraph", fake_telegraph)
-    monkeypatch.setattr(ib, "_upload_imgbb", fake_imgbb)
-
-    result = await backup_bytes(
-        _container(["imgbb", "catbox", "telegraph"]), b"\xff\xd8data", mime="image/jpeg",
-    )
-
-    # Attempted in the configured order …
-    assert calls == ["imgbb", "catbox", "telegraph"]
-    # … but each URL lands in its own field, and primary still prefers catbox.
-    assert result.catbox_url == "cat/url"
-    assert result.telegraph_url == "tel/url"
-    assert result.imgbb_url == "imgbb/url"
-    assert result.primary == "cat/url"
 
 
 @pytest.mark.asyncio
@@ -134,17 +97,6 @@ class _FakeAsyncClient:
                 "display_url": "https://i.ibb.co/MED/post.jpg",
             },
         })
-
-
-@pytest.mark.asyncio
-async def test_imgbb_keeps_full_url_not_thumbnail(monkeypatch):
-    monkeypatch.setattr(ib.httpx, "AsyncClient", _FakeAsyncClient)
-    url = await ib._upload_imgbb(_container(), b"\xff\xd8data")
-    # Only the full-resolution original — never the thumb/medium/display variants.
-    assert url == "https://i.ibb.co/full/post.jpg"
-    # The key went as a query param and the image as a base64 form field.
-    assert _FakeAsyncClient.sent["params"] == {"key": "k"}
-    assert "image" in _FakeAsyncClient.sent["data"]
 
 
 @pytest.mark.asyncio

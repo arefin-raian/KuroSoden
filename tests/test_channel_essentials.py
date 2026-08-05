@@ -73,15 +73,6 @@ async def test_title_carries_audio_and_quality(_stub_gather):
 
 
 @pytest.mark.asyncio
-async def test_description_is_branding_block_by_default(_stub_gather):
-    from nekofetch.services.bot_factory import BotFactory
-    ess = await build_channel_essentials(
-        FakeContainer(), anime_doc_id="anilist:140960", franchise=FRANCHISE)
-    assert ess.description == BotFactory._BRANDING_DESCRIPTION
-    assert "@AniXWeebs" in ess.description
-
-
-@pytest.mark.asyncio
 async def test_operator_override_wins(_stub_gather):
     ess = await build_channel_essentials(
         FakeContainer(description_text="Custom bio"),

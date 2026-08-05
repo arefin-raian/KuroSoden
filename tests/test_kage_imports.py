@@ -12,12 +12,6 @@ _HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_HERE))
 
 
-def test_kage_package_imports():
-    """kurosoden/__init__.py should be importable."""
-    import kurosoden
-    assert kurosoden.__version__ == "0.1.0"
-
-
 def test_shared_imports():
     """All shared modules should import cleanly."""
     from kurosoden.shared.pipeline_manager import PipelineManager

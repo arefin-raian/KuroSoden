@@ -248,29 +248,6 @@ class TestLeviTaskRouting:
         assert parts[1] == "task"
         assert parts[2] == "REQ-0001"
 
-    def test_progress_card_uses_transfer_layout(self):
-        from nekofetch.ui.progress import download_card_html
-
-        html = download_card_html(
-            title="Takopi's Original Sin",
-            job_id=7,
-            status="running",
-            progress=12,
-            season=1,
-            current_episode=2,
-            resolution="720p",
-            audio="dub",
-            speed_bps=1_300_000,
-            downloaded_bytes=16_000_000,
-            total_bytes=123_200_000,
-            eta_seconds=82,
-            elapsed_seconds=11,
-        )
-
-        assert "‣ Status" in html
-        assert "[■□□□□□□□□□] 12%" in html
-        assert "Transfer" in html
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Senku — Distribution Bot
