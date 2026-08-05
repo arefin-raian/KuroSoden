@@ -150,11 +150,26 @@ class RequestService:
         """Re-queue a request for ONLY the given (previously stuck) episode numbers,
         optionally switching to a different source. The download worker filters by
         ``req.episodes``, so a fresh job re-attempts just those episodes without
-        re-downloading the whole series."""
+        re-downloading the whole series.
+
+        When ``new_source`` actually CHANGES the source, any partial artifacts the
+        OLD source already produced — storage packs (their channel messages + rows)
+        and the MediaFile rows of its now-dead jobs, plus stale Redis flags — are
+        purged first. Otherwise a source it half-finished (e.g. a sub-only 360p pack
+        uploaded before the switch) would linger in the DB, and the watch guide,
+        which lists every enabled pack's resolution, would keep advertising a
+        quality that no longer exists in the channel."""
+        purged = {"files": 0, "packs": 0}
+        cleared_job_ids: list[int] = []
         async with session_scope(self._c.pg_sessionmaker) as session:
             req = await RequestRepository(session).get_by_code(code)
             if req is None:
                 raise NotFound(code)
+            switching = bool(new_source and new_source != req.source)
+            if switching:
+                purged, cleared_job_ids = await self._purge_superseded_source(
+                    session, req,
+                )
             req.episodes = sorted(set(episodes)) or None
             if new_source:
                 req.source = new_source
@@ -162,11 +177,116 @@ class RequestService:
             await session.flush()
             title, source = req.anime_title, req.source
             session.expunge(req)
+        # Redis/progress cleanup runs outside the SQL transaction (best-effort).
+        if cleared_job_ids:
+            await self._clear_job_flags(code, cleared_job_ids)
         from nekofetch.services.log_channel_service import LogChannelService
         await LogChannelService(self._c).event(
             "request", "retry", code=code, anime=title, source=source,
         )
+        if purged["packs"] or purged["files"]:
+            await LogChannelService(self._c).event(
+                "admin", "source_switch_purged", code=code, anime=title,
+                files=purged["files"], packs=purged["packs"],
+            )
         return req
+
+    async def _purge_superseded_source(self, session, req) -> tuple[dict, list[int]]:
+        """Delete partial artifacts left by a source we're switching AWAY from.
+
+        Called from :meth:`retry_episodes` when the source actually changes. Only
+        the OLD source's leftovers are removed: storage packs for this anime whose
+        jobs are no longer active (their channel messages are deleted too, so we
+        never orphan uploaded media), plus the MediaFile rows of every cancelled /
+        failed job on this request. The still-active (running / queued) job's files
+        and any pack the new source will build are left untouched. Returns
+        ``({"files", "packs"}, cleared_job_ids)`` — ``cleared_job_ids`` are the
+        dead jobs whose Redis flags the caller should drop.
+        """
+        from sqlalchemy import delete, select
+
+        from nekofetch.core.parsing import clean_anilist_id
+        from nekofetch.domain.enums import JobStatus
+        from nekofetch.infrastructure.database.postgres.models import (
+            DownloadJob,
+            MediaFile,
+            StoragePack,
+        )
+
+        removed_files = 0
+        removed_packs = 0
+
+        # Dead jobs = cancelled / failed attempts on this request (NOT completed —
+        # a completed job's packs are good content we must keep). Their MediaFile
+        # rows are the half-uploaded partials from the old source.
+        jobs = (await session.execute(
+            select(DownloadJob).where(DownloadJob.request_id == req.id)
+        )).scalars().all()
+        dead_job_ids = [
+            j.id for j in jobs
+            if j.status in {JobStatus.CANCELLED, JobStatus.FAILED}
+        ]
+
+        # Storage packs are keyed by anime, not job. A partial pack (like the
+        # 360p sub-only one) left by a dead job must have its row + channel
+        # messages removed so the watch guide stops listing that resolution. We
+        # only drop packs at a resolution that NO surviving job (still-running,
+        # queued, or already-completed) owns — so good content another attempt
+        # produced, or the tier the new source is about to (re)build, is kept.
+        doc_key = req.anime_doc_id or clean_anilist_id(req.source_ref)
+        if dead_job_ids:
+            dead_files = (await session.execute(
+                select(MediaFile).where(MediaFile.job_id.in_(dead_job_ids))
+            )).scalars().all()
+            # Resolutions the dead jobs produced — candidate stale packs.
+            stale_res = {f.resolution for f in dead_files if f.resolution}
+            if doc_key and stale_res:
+                packs = (await session.execute(
+                    select(StoragePack).where(
+                        StoragePack.anime_doc_id == doc_key,
+                        StoragePack.resolution.in_(stale_res),
+                    )
+                )).scalars().all()
+                # Resolutions owned by a SURVIVING job (not cancelled/failed) —
+                # never purge a pack a live or completed job stands behind.
+                surviving_job_ids = [
+                    j.id for j in jobs if j.id not in dead_job_ids
+                ]
+                surviving_res: set[str] = set()
+                if surviving_job_ids:
+                    surviving_files = (await session.execute(
+                        select(MediaFile).where(
+                            MediaFile.job_id.in_(surviving_job_ids)
+                        )
+                    )).scalars().all()
+                    surviving_res = {
+                        f.resolution for f in surviving_files if f.resolution
+                    }
+                for pack in packs:
+                    if pack.resolution in surviving_res:
+                        continue  # a surviving job owns this tier — keep it
+                    await self._purge_pack_messages(pack)
+                    await session.delete(pack)
+                    removed_packs += 1
+
+            # Drop the dead jobs' MediaFile rows + the local files behind them.
+            from pathlib import Path
+            for mf in dead_files:
+                removed_files += 1
+                if mf.local_path:
+                    try:
+                        Path(mf.local_path).unlink(missing_ok=True)
+                    except Exception:  # noqa: BLE001
+                        pass
+            await session.execute(
+                delete(MediaFile).where(MediaFile.job_id.in_(dead_job_ids))
+            )
+            await session.execute(
+                delete(DownloadJob).where(DownloadJob.id.in_(dead_job_ids))
+            )
+
+        return {"files": removed_files, "packs": removed_packs}, dead_job_ids
+
 
     async def update_source_ref(self, code: str, source: str, source_ref: str) -> None:
         """Pin a request to a specific source + native ref (e.g. a chosen torrent)."""
