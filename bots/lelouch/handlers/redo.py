@@ -31,18 +31,15 @@ from nekofetch.core.logging import get_logger
 from nekofetch.services.auth_service import AuthService
 from nekofetch.ui.artwork import (
     key_for_franchise,
-    next_anime_art,
     pick_artwork,
     seed_anime_art,
 )
-from nekofetch.ui.components import cb, lock_buttons
+from nekofetch.ui.components import lock_buttons
 from nekofetch.ui.progress import SPINNER, animate_until
 from nekofetch.ui.screens import (
     Screen,
-    ask_title,
     choose_version,
     confirm_franchise,
-    retry_title,
     send_screen,
 )
 
