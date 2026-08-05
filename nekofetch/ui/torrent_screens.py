@@ -146,6 +146,65 @@ def format_torrent_mapping(mapping) -> str:
     return "\n".join(lines)
 
 
+def mapping_telegraph_nodes(mapping, torrent_name: str = "") -> list:
+    """Full franchise→torrent mapping as Telegraph DOM nodes.
+
+    Unlike :func:`format_torrent_mapping` (a caption-limited summary) this renders
+    the *complete* mapping — every franchise entry with its numbered file line and
+    the specific missing episodes — so an admin can read and verify the whole
+    structure before confirming. Returns a list of node dicts for
+    ``TelegraphClient.createPage``.
+
+    Each episode line is prefixed with the file's 1-based display number, which is
+    the same number the ``<file#> S<season>`` re-mapping grammar expects — so the
+    Telegraph page doubles as the edit key reference.
+    """
+    nodes: list = []
+    if torrent_name:
+        nodes.append({"tag": "h4", "children": [torrent_name]})
+    pct = int(mapping.overall_confidence * 100)
+    nodes.append({"tag": "p", "children": [
+        {"tag": "b", "children": [f"Overall confidence: {pct}%"]},
+    ]})
+
+    display_no = 0
+    for me in mapping.entries:
+        fe = me.franchise_entry
+        header = _entry_header(fe)
+        if not fe.included:
+            nodes.append({"tag": "h4", "children": [f"{header} — excluded"]})
+            display_no += len(me.files)
+            continue
+        exp = f" / {me.expected} expected" if me.expected is not None else ""
+        nodes.append({"tag": "h4", "children": [
+            f"{header}  ({me.actual} files{exp}) {_conf_icon(me.confidence)}",
+        ]})
+        items = []
+        for f in me.files:
+            display_no += 1
+            ep = f"E{f.episode_number:02d}" if f.episode_number is not None else "?"
+            items.append({"tag": "li", "children": [f"#{display_no}  {ep}  {f.filename}"]})
+        if items:
+            nodes.append({"tag": "ul", "children": items})
+
+    missing = getattr(mapping, "all_missing", None) or []
+    if missing:
+        nodes.append({"tag": "h4", "children": ["Missing episodes"]})
+        mi = [{"tag": "li", "children": [
+            f"S{m.season_number:02d}E{m.episode_number:02d}"
+            + (f" — {m.title}" if m.title else "")]} for m in missing]
+        nodes.append({"tag": "ul", "children": mi})
+
+    if mapping.unmatched:
+        nodes.append({"tag": "h4", "children": [
+            f"{len(mapping.unmatched)} unmatched file(s)"]})
+        um = [{"tag": "li", "children": [getattr(u, "filename", str(u))]}
+              for u in mapping.unmatched]
+        nodes.append({"tag": "ul", "children": um})
+
+    return nodes
+
+
 def format_mapping_detail(mapping, page: int = 0, per_page: int = 1) -> str:
     """Detailed per-entry view showing individual file assignments.
 

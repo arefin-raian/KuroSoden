@@ -1307,6 +1307,12 @@ def register(client: Client, container: Container) -> None:
         )
         summary = format_torrent_mapping(tmapping)
 
+        # Full, uncramped mapping on Telegraph — the card caption can only show a
+        # truncated summary (the "unusable" S01 24/12 ‧ S02P2 0/12 view); the
+        # Telegraph page lists every entry with its numbered files + missing eps,
+        # and its file numbers ARE the keys the "Fix Seasons" grammar uses.
+        map_url = await _build_full_mapping_guide(title, tmapping, ordered_files)
+
         await fsm.set(
             user_id, STATE_TORRENT_MAP,
             code=code, ref=source_ref, title=title,
@@ -1321,10 +1327,13 @@ def register(client: Client, container: Container) -> None:
                 for f in ordered_files
             ],
             ep_titles={str(k): v for k, v in ep_titles.items()},
+            map_url=map_url or "",
         )
 
         text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
                  mapping=summary)
+        if map_url:
+            text += f'\n\n<a href="{map_url}">📋 Full mapping (with file numbers)</a>'
         kb = keyboard(
             [(L(M.TORRENT_MAP_BTN_CONFIRM), cb("staff", "rtmapok", code)),
              (L(M.TORRENT_MAP_BTN_DETAIL), cb("staff", "rtmapdet", code, 0))],
@@ -1447,6 +1456,8 @@ def register(client: Client, container: Container) -> None:
 
         text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
                  mapping=summary)
+        if data.get("map_url"):
+            text += f'\n\n<a href="{data["map_url"]}">📋 Full mapping (with file numbers)</a>'
         kb = keyboard(
             [(L(M.TORRENT_MAP_BTN_CONFIRM), cb("staff", "rtmapok", code)),
              (L(M.TORRENT_MAP_BTN_DETAIL), cb("staff", "rtmapdet", code, 0))],
@@ -1569,6 +1580,52 @@ def register(client: Client, container: Container) -> None:
         )
         await show(client, q.message, prompt, kb)
 
+    async def _build_full_mapping_guide(
+        title: str, tmapping, ordered: list[dict],
+    ) -> str | None:
+        """Telegraph page: the COMPLETE franchise→torrent mapping — every entry with
+        its numbered files, expected counts, and missing episodes.
+
+        This is the "Telegraph display" that replaces the cramped confirm-card
+        caption (which truncates for anything past a few seasons). The file numbers
+        shown match the ``<file#> S<season>`` re-mapping grammar, so the page also
+        serves as the edit-key reference. Returns the page URL, or None when no
+        Telegraph token is configured / the call fails (caller falls back to the
+        caption-only card)."""
+        try:
+            token = container.config.thumbnail_channel.telegraph_access_token
+            if not token:
+                return None
+            from nekofetch.providers.metadata.telegraph_client import TelegraphClient
+            from nekofetch.ui.torrent_screens import mapping_telegraph_nodes
+
+            torrent_name = ""
+            for f in ordered:
+                p = f.get("path", "")
+                if "/" in p:
+                    torrent_name = p.split("/")[0]
+                    break
+            content = [
+                {"tag": "p", "children": [
+                    "Reply in chat with lines like  ",
+                    {"tag": "code", "children": ["3 S2"]},
+                    "  to move file #3 to Season 2. File numbers below are the keys."]},
+            ]
+            content += mapping_telegraph_nodes(tmapping, torrent_name)
+            telegraph = TelegraphClient(token)
+            result = await telegraph._call(
+                "createPage", title=f"{title} — Franchise Mapping",
+                author_name="NekoFetch", content=content,
+            )
+            await telegraph.close()
+            return result.get("url") or (
+                f"https://telegra.ph/{result.get('path', '')}"
+                if result.get("path") else None
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("torrent_map.full_guide.failed", title=title)
+            return None
+
     async def _build_season_map_guide(title: str, ordered: list[dict]) -> str | None:
         """Telegraph page: numbered file list with current-season + episode, so the
         admin can reference file numbers when reassigning seasons."""
@@ -1682,15 +1739,25 @@ def register(client: Client, container: Container) -> None:
         # Drop back to STATE_TORRENT_MAP so Confirm/Detail/Toggle work again.
         await _disarm_reply(container.redis, q.message.chat.id)
         data.pop("overrides", None)
-        await fsm.set(q.from_user.id, STATE_TORRENT_MAP, **data)
 
         from nekofetch.ui.torrent_screens import format_torrent_mapping
         from nekofetch.services.torrent_mapping import TorrentMapping
         summary = format_torrent_mapping(
             TorrentMapping.from_dict(data["torrent_mapping"])
         ) if data.get("torrent_mapping") else ""
+        # Regenerate the full Telegraph mapping so its file→season assignments
+        # reflect the overrides just applied (the old page is now stale).
+        if tmapping:
+            fresh_url = await _build_full_mapping_guide(
+                data.get("title", ""), tmapping, data.get("ordered_files") or [])
+            if fresh_url:
+                data["map_url"] = fresh_url
+        await fsm.set(q.from_user.id, STATE_TORRENT_MAP, **data)
+
         text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
                  mapping=summary)
+        if data.get("map_url"):
+            text += f'\n\n<a href="{data["map_url"]}">📋 Full mapping (with file numbers)</a>'
         kb = keyboard(
             [(L(M.TORRENT_MAP_BTN_CONFIRM), cb("staff", "rtmapok", code)),
              (L(M.TORRENT_MAP_BTN_DETAIL), cb("staff", "rtmapdet", code, 0))],
