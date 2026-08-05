@@ -40,6 +40,7 @@ _LELOUCH_USER = [
 _LELOUCH_STAFF = _LELOUCH_USER + [_c("batch", "Batch work (staff)")]
 _LELOUCH_OWNER = _LELOUCH_STAFF + [
     _c("admin", "Command console (owner)"),
+    _c("redo", "Re-process an existing series (owner)"),
     _c("settings", "Configure the request bot (owner)"),
     _c("cleardatabase", "Clear operational database data (owner)"),
 ]

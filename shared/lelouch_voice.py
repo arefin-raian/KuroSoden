@@ -600,3 +600,73 @@ BTN_EDIT_HOURS = "⏰ Hours/day"
 BTN_EDIT_WEEKDAY = "🕒 Weekday slots"
 BTN_EDIT_WEEKEND = "🕒 Weekend slots"
 BTN_VIEW_BOARD = "📋 The Board"
+
+
+# ── Redo (owner-only re-processing) ─────────────────────────────────────────
+
+REDO_ASK_TITLE = (
+    f"{ICON} <b>Order a redo.</b>\n\n"
+    "Name the series to re-process — corrupted files, a bad encode, a branding "
+    "slip. Send the title and I'll find it.\n\n"
+    "<i>This overrides the usual 'already have it' refusal. Use it deliberately.</i>"
+)
+
+REDO_RETRY_TITLE = (
+    f"{ICON} <b>Not that one? Name it again.</b>\n\n"
+    "Send the title of the series you want redone."
+)
+
+
+def redo_confirm(title: str, state_label: str, action: str) -> str:
+    """The 'this is it' card before a redo commits — shows the detected state and
+    exactly what will happen, since a redo is destructive."""
+    return (
+        f"{ICON} <b>{esc(title)}</b>\n\n"
+        f"<b>Current state</b> : {esc(state_label)}\n"
+        f"<b>Plan</b> : {esc(action)}\n\n"
+        "<i>Confirm and the machine turns again. This is the piece you meant?</i>"
+    )
+
+
+def redo_receipt(title: str, state_label: str, action: str) -> str:
+    """Shown after the owner confirms a redo."""
+    return (
+        f"{ICON} <b>Redo set in motion.</b>\n\n"
+        f"<b>{esc(title)}</b>\n"
+        f"<b>State</b> : {esc(state_label)}\n"
+        f"<b>Action</b> : {esc(action)}\n\n"
+        "<i>The line reclaims it. Levi takes it first — the rest follows.</i>"
+    )
+
+
+def redo_task_notice(title: str, stage: str | None) -> str:
+    """DM to the admin who was on a task that's being redone out from under them."""
+    where = f" at the <b>{esc(stage)}</b> stage" if stage else ""
+    return (
+        f"{ICON} <b>Stand down — this one's being redone.</b>\n\n"
+        f"<b>{esc(title)}</b>{where} is being re-processed from the top by the "
+        f"owner's command. Your current task on it is void — drop it, a fresh "
+        f"order is on its way.\n\n"
+        "<i>No fault of yours. The board simply resets this piece.</i>"
+    )
+
+
+def redo_new_seasons_notice(count: int) -> str:
+    """DM to the owner when a redo surfaces season(s) not yet published."""
+    s = "season" if count == 1 else "seasons"
+    return (
+        f"{ICON} <b>New ground spotted.</b>\n\n"
+        f"While planning this redo I found <b>{count}</b> {s} that aren't on the "
+        f"channel yet.\n\n"
+        "<i>The redo handles what's already there. Adding the new "
+        f"{s} is a separate campaign — I'll flag it for the next update pass.</i>"
+    )
+
+
+BTN_REDO_YES = "♻️ Yes — redo this"
+BTN_REDO_NO = "✖️ Not it"
+
+OWNER_ONLY = (
+    f"{ICON} <b>Owner's command only.</b>\n\n"
+    "This order answers to one voice alone."
+)

@@ -182,6 +182,8 @@ def ask_title(*, bot_name: str | None = None) -> Screen:
 def confirm_franchise(
     media_data: dict,
     backdrop_path: str | None = None,
+    *,
+    namespace: str = "series",
 ) -> Screen:
     """Rich franchise confirmation card — the centerpiece of Phase 1.
 
@@ -190,6 +192,11 @@ def confirm_franchise(
     franchise_episodes, franchise_seasons, franchise_movies, franchise_ovas,
     franchise_specials, relations (list of dicts each with relation, format,
     episodes, titles), anilist_url, cover_url, banner_url
+
+    ``namespace`` prefixes the yes/no callbacks (``{namespace}_yes|…`` /
+    ``{namespace}_no``) so a second flow on the same client (e.g. Lelouch's
+    owner ``/redo``) can reuse this card without colliding with the request
+    flow's ``series_yes|`` handler. Defaults to the original ``series``.
     """
     english = _esc(media_data.get("english") or media_data.get("title", "Unknown"))
     romaji = media_data.get("romaji")
@@ -264,8 +271,8 @@ def confirm_franchise(
         kb_rows.append([InlineKeyboardButton(t(M.BTN_READ_MORE), url=read_more_url)])
     kb_rows.append([
         InlineKeyboardButton(t(M.BTN_SERIES_YES),
-                             callback_data=cb("series_yes", str(media_data.get("anilist_id", "")))),
-        InlineKeyboardButton(t(M.BTN_SERIES_NO), callback_data=cb("series_no")),
+                             callback_data=cb(f"{namespace}_yes", str(media_data.get("anilist_id", "")))),
+        InlineKeyboardButton(t(M.BTN_SERIES_NO), callback_data=cb(f"{namespace}_no")),
     ])
     kb = InlineKeyboardMarkup(kb_rows)
 
@@ -281,7 +288,8 @@ def confirm_franchise(
 
 
 def choose_version(query: str, versions: list[dict],
-                  *, bot_name: str | None = None) -> Screen:
+                  *, bot_name: str | None = None,
+                  namespace: str = "ver", neither_ns: str = "series") -> Screen:
     rows = [t(M.VERSION_HEADER, query=_esc(query)), ""]
     width = min(24, max((len(v["title"]) for v in versions), default=0))
     for v in versions:
@@ -289,11 +297,11 @@ def choose_version(query: str, versions: list[dict],
             v.get("format"), v.get("year"),
             f"{v['episodes']} eps" if v.get("episodes") else None) if x)
         rows.append(f"{_esc(v['title'])[:24].ljust(width)} :  <i>{_esc(meta)}</i>")
-    btns = [[(v["title"][:32], cb("ver_pick", v.get("id", i)))]
+    btns = [[(v["title"][:32], cb(f"{namespace}_pick", v.get("id", i)))]
             for i, v in enumerate(versions)]
     # 'Both' folds every adaptation into one combined request; 'Neither' restarts.
-    btns.append([(t(M.BTN_VERSION_BOTH), cb("ver_pick_both")),
-                 (t(M.BTN_VERSION_NEITHER), cb("series_no"))])
+    btns.append([(t(M.BTN_VERSION_BOTH), cb(f"{namespace}_pick_both")),
+                 (t(M.BTN_VERSION_NEITHER), cb(f"{neither_ns}_no"))])
     return Screen(caption="\n".join(rows), image=pick_artwork(bot_name), keyboard=_kb(btns))
 
 

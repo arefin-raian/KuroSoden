@@ -55,6 +55,11 @@ def register_all(client: Client, container: Container) -> None:
 
     register_requests(client, container)
 
+    # ── Lelouch redo handler (owner-only re-processing) ─────────────────
+    from kurosoden.bots.lelouch.handlers.redo import register as register_redo
+
+    register_redo(client, container)
+
     # ── Reused NekoFetch staff review board (owns the ``staff|…`` namespace) ─
     # The pending-requests screen's "Open Review Board" button emits
     # ``staff|requests|0``; app.py assumes those callbacks are already on this
