@@ -239,6 +239,8 @@ def is_text_sub(codec: str) -> bool:
 async def brand_torrent_subtitles(
     src, dest, *, sub_tracks: list[dict], video_ms: int | None = None,
     container_title: str | None = None, brand_subtitle_title=None,
+    audio_tracks: list[dict] | None = None, brand_audio_title=None,
+    lang_display=None,
 ) -> dict:
     """Extract text subs, inject the Telegram cue, remux back into ``dest``.
 
@@ -248,8 +250,16 @@ async def brand_torrent_subtitles(
     pass through by copy). Every subtitle track's TITLE is set to
     ``brand_subtitle_title(original_title, ordinal)`` — for torrents the caller
     passes a helper that keeps the ORIGINAL title (e.g. "Signs & Songs") and adds
-    the ``〘 @AniXWeebs 〙`` handle, instead of a language label. Audio/video are
-    copied as-is; a container-level ENCODED_BY credit is added.
+    the ``〘 @AniXWeebs 〙`` handle, instead of a language label.
+
+    When ``audio_tracks`` + ``brand_audio_title`` are supplied, each AUDIO track's
+    TITLE is branded IN THIS SAME REMUX (``-metadata:s:a:N title=…``). Doing it
+    here — rather than only in a later mkvpropedit pass — means audio branding no
+    longer depends on mkvpropedit being installed: the reported bug where subs
+    came out branded but audio stayed plain ("English"/"Japanese") was exactly a
+    silent mkvpropedit-unavailable fall-through. ``lang_display`` maps a language
+    code to its display word for the audio fallback. Video is copied as-is; a
+    container-level ENCODED_BY credit is added.
 
     Returns a manifest ``{branded_tracks, total_cues, ok}``. Best-effort: on any
     ffmpeg failure it leaves ``dest`` unwritten and reports ``ok=False`` so the
@@ -339,6 +349,18 @@ async def brand_torrent_subtitles(
                 cmd += [f"-metadata:s:s:{out_i}", f"title={title}"]
             if tr.get("lang"):
                 cmd += [f"-metadata:s:s:{out_i}", f"language={tr['lang']}"]
+        # Audio TITLE metadata — branded in-remux so it never depends on a later
+        # mkvpropedit pass (which, when unavailable, silently left audio plain
+        # while subs came out branded). Mirrors the subtitle rule: keep a
+        # meaningful source title, else the language word, else an ordinal.
+        if brand_audio_title is not None:
+            for out_i, tr in enumerate(audio_tracks or []):
+                fb = None
+                if lang_display is not None:
+                    fb = lang_display(tr.get("lang", ""))
+                title = brand_audio_title(
+                    tr.get("title", ""), out_i + 1, fallback_lang=fb)
+                cmd += [f"-metadata:s:a:{out_i}", f"title={title}"]
         if container_title:
             cmd += ["-metadata", f"title={container_title}"]
         # Video credit: container-level ENCODED_BY on the torrent remux.

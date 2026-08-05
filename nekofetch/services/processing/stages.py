@@ -931,6 +931,10 @@ class BrandingStage(Stage):
         if not sub_tracks:
             return False  # no subs → nothing torrent-specific to do here
 
+        # Audio tracks are branded IN the remux below (not just the later
+        # mkvpropedit pass), so a missing mkvpropedit can no longer leave audio
+        # plain while subs come out branded.
+        audio_pre = await _audio_tracks(ffprobe, path) if ffprobe else []
         video_ms = await _probe_duration_ms(ffprobe, path)
         tmp_out = path.with_name(path.stem + ".brand.mkv")
         try:
@@ -938,6 +942,8 @@ class BrandingStage(Stage):
                 path, tmp_out, sub_tracks=sub_tracks, video_ms=video_ms,
                 container_title=branded_title or None,
                 brand_subtitle_title=brand_subtitle_title,
+                audio_tracks=audio_pre, brand_audio_title=brand_audio_title,
+                lang_display=_lang_display,
             )
         except Exception as exc:  # noqa: BLE001 — remux failure is recoverable
             ctx.notes.append(f"branding(torrent): remux error {exc}")
@@ -954,9 +960,11 @@ class BrandingStage(Stage):
             tmp_out.unlink(missing_ok=True)
             return False
 
-        # Audio track names + container title (subtitle titles were set in the
-        # remux). Cheap metadata-only mkvpropedit pass, no second transcode. Keep a
-        # meaningful source audio title (torrent rule), else the language.
+        # Audio track names + container title were already set in the remux above.
+        # This mkvpropedit pass re-affirms them (matroska-native track names) and
+        # is now purely a nice-to-have — if mkvpropedit is unavailable the audio is
+        # STILL branded from the remux, so we just note it instead of losing the
+        # branding silently.
         audio = await _audio_tracks(ffprobe, path)
         tags: list[str] = []
         if branded_title:
@@ -968,7 +976,12 @@ class BrandingStage(Stage):
                 tr.get("title", ""), t,
                 fallback_lang=_lang_display(tr.get("lang", "")))
             tags += ["--edit", f"track:a{t}", "--set", f"name={name}"]
-        await _run("mkvpropedit", str(path), *tags)
+        rc, err = await _run("mkvpropedit", str(path), *tags)
+        if rc != 0:
+            ctx.notes.append(
+                "branding(torrent): audio names set in remux; mkvpropedit "
+                f"re-affirm skipped ({err.strip() or 'mkvpropedit unavailable'})"
+            )
         ctx.notes.append(
             f"branding(torrent): {manifest['branded_tracks']} sub track(s) content-branded "
             f"({manifest['total_cues']} cues) + {audio_count} audio named"
@@ -1092,22 +1105,29 @@ class WatermarkStage(Stage):
             if not f.local_path:
                 continue
             src = Path(f.local_path)
-            # ── "auto" mode: skip the watermark when subtitle branding covered
-            #    this file. A brandable TEXT subtitle track (ASS/SRT/VTT/…) means
-            #    our channel cue was injected there, so the video is left clean;
-            #    only PGS/image-only or sub-less files get the burn. ──
+            # ── "auto" mode: skip the watermark ONLY when subtitle branding
+            #    fully covered this file — i.e. EVERY subtitle track is a
+            #    brandable TEXT track (ASS/SRT/VTT/…) that carries our channel
+            #    cue. If ANY track is a non-brandable image sub (PGS/DVBSUB) — or
+            #    there are no subs at all — branding is only partial, so the file
+            #    still needs the visible burn. (Previously used any(), which
+            #    skipped the burn as soon as a single text sub existed, leaving
+            #    files with mixed text+PGS subs unbranded on the image tracks.)
             if mode == "auto" and ffprobe:
                 subs = await _sub_tracks(ffprobe, src)
-                has_text_sub = any(is_text_sub(t.get("codec", "")) for t in subs)
-                if has_text_sub:
+                fully_branded = bool(subs) and all(
+                    is_text_sub(t.get("codec", "")) for t in subs)
+                if fully_branded:
                     log.info("watermark.auto_skip", file=src.name,
-                             reason="text_subtitle_branded",
+                             reason="all_subs_text_branded",
                              sub_tracks=len(subs))
                     ctx.notes.append(
-                        f"watermark: skipped {src.name} (auto — text subs branded)")
+                        f"watermark: skipped {src.name} (auto — all subs branded)")
                     continue
+                n_text = sum(1 for t in subs if is_text_sub(t.get("codec", "")))
                 log.info("watermark.auto_burn", file=src.name,
-                         reason="no_text_subtitle", sub_tracks=len(subs))
+                         reason="partial_or_no_text_subtitle",
+                         sub_tracks=len(subs), text_subs=n_text)
             # Tag the card with THIS file's identity + "file i of n" as we start
             # it, so the watermark pass walks episode-by-episode like downloads.
             await _push_stage_progress(
