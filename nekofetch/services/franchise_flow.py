@@ -28,10 +28,47 @@ from nekofetch.domain.enums import ContentKind
 
 log = get_logger(__name__)
 
+# Relation types that are NOT part of the canonical continuity and must be
+# dropped from the aggregated fallback mapping — the inverse of the walk's
+# _CONTENT_WALK_RELS allowlist. SPIN_OFF (Chibi Theatre, Junior High),
+# ALTERNATIVE (different adaptations), and SUMMARY (recap/compilation movies)
+# are excluded so the batch/distribution path matches the request pipeline.
+_EXCLUDED_RELATIONS = {"SPIN_OFF", "ALTERNATIVE", "SUMMARY", "CHARACTER", "OTHER"}
+
 
 def _esc(text: str) -> str:
     """HTML-escape text for safe rendering in Telegram messages."""
     return html.escape(text or "", quote=False)
+
+
+def _franchise_entries_from_cache(walk) -> dict | None:
+    """Reconstruct ``{anilist_id: FranchiseEntry}`` from a cached franchise-walk
+    blob (the ``franchise`` key of a prefetched ``anilist.json``), so callers can
+    rebuild the mapping without a live AniList walk.
+
+    Mirrors ``bot_content._franchise_from_cache``: unknown keys are dropped and a
+    malformed entry is skipped rather than crashing the whole read. Returns None
+    when nothing usable could be reconstructed."""
+    from dataclasses import fields as _dc_fields
+
+    from nekofetch.sources.telegram.anilist import FranchiseEntry
+
+    allowed = {f.name for f in _dc_fields(FranchiseEntry)}
+    out: dict = {}
+    values = walk.values() if isinstance(walk, dict) else (walk or [])
+    for raw in values:
+        if not isinstance(raw, dict):
+            continue
+        aid = raw.get("anilist_id")
+        if aid is None:
+            continue
+        try:
+            out[int(aid)] = FranchiseEntry(
+                **{k: v for k, v in raw.items() if k in allowed}
+            )
+        except Exception:  # noqa: BLE001 — skip a bad entry, keep the rest
+            continue
+    return out or None
 
 
 @dataclass
@@ -91,6 +128,16 @@ _SEASON_IN_TITLE = re.compile(r"\bseason\s+(\d+)\b", re.IGNORECASE)
 _PART_IN_TITLE = re.compile(r"\b(?:part|pt|cour)\s*[\.:]?\s*(\d+)\b", re.IGNORECASE)
 # Pattern to detect "Final Season" (implies a new season, may have parts)
 _FINAL_SEASON = re.compile(r"\b(?:the\s+)?final\s+season\b", re.IGNORECASE)
+
+
+def _base_title_key(title: str) -> str:
+    """Normalize a title for continuation matching: strip season/part/final
+    tokens + punctuation so "Vanitas" and "Vanitas Part 2" share a base key."""
+    t = title or ""
+    t = _SEASON_IN_TITLE.sub(" ", t)
+    t = _PART_IN_TITLE.sub(" ", t)
+    t = _FINAL_SEASON.sub(" ", t)
+    return re.sub(r"[^a-z0-9]+", "", t.lower())
 
 
 def _extract_season_info(title: str) -> dict:
@@ -158,6 +205,41 @@ class FranchiseFlowService:
                 franchise_entries, franchise_data, anime_doc_id, root_title,
             )
         return self._build_from_aggregated(franchise_data, anime_doc_id, root_title)
+
+    async def resolve_franchise_entries(
+        self, franchise_data: dict, anime_doc_id: str,
+    ) -> dict | None:
+        """Resolve the AniList franchise-walk entries (``{anilist_id: FranchiseEntry}``)
+        cache-first, so a caller can feed them to :meth:`build_mapping` and get the
+        SAME spin-off/recap-excluding, part-aware mapping the request pipeline uses.
+
+        Order: prefetched ``anilist.json`` → live ``walk_franchise_full`` → None.
+        Returns None when neither is available (caller then gets the aggregated
+        fallback, which is now relation-type-guarded). This is the single source of
+        truth the batch/distribution path was missing — it previously called
+        ``build_mapping`` with no entries and silently used the aggregated fallback,
+        pulling in SPIN_OFF/SUMMARY relations the walk excludes.
+        """
+        entries: dict | None = None
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            blob = await load_cached(
+                self._c, anime_doc_id, "anilist", anime_doc_id=anime_doc_id,
+            )
+            walk = (blob or {}).get("franchise")
+            if walk:
+                entries = _franchise_entries_from_cache(walk)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("franchise.entries.cache_miss", error=str(exc))
+        if not entries:
+            try:
+                aid = franchise_data.get("anilist_id")
+                if aid:
+                    entries = await self._c.anilist.walk_franchise_full(int(aid))
+            except Exception as exc:  # noqa: BLE001
+                log.debug("franchise.entries.walk_failed", error=str(exc))
+        return entries or None
 
     def _build_from_franchise_entries(
         self,
@@ -259,6 +341,20 @@ class FranchiseFlowService:
                     j += 1
                 groups.append((identity, group))
                 i = j
+            elif (
+                m["parsed_part"] is not None
+                and not m["has_final"]
+                and groups
+                and _base_title_key(m["title"])
+                == _base_title_key(mappings[groups[-1][1][-1]]["title"])
+            ):
+                # A season-less "… Part N" whose base title matches the entry that
+                # opened the previous group is a CONTINUATION of that season (e.g.
+                # "Vanitas" → "Vanitas Part 2"). Attach it as the next part of the
+                # SAME season instead of spawning a bogus new sequential season
+                # (which mislabeled Vanitas Part 2 as "S02P2").
+                groups[-1][1].append(i)
+                i += 1
             else:
                 # No season info at all — each entry is its own season
                 groups.append((("sequential", 0), [i]))
@@ -341,6 +437,13 @@ class FranchiseFlowService:
 
         relations = franchise_data.get("relations", [])
         for rel in relations:
+            # Skip non-canonical relations (spin-offs, alternate retellings, and
+            # recap/summary movies) — the same classes the AniList franchise walk
+            # excludes via _CONTENT_WALK_RELS. Without this guard the aggregated
+            # fallback pulled AoT's "No Regrets" OVA and recap movies into the
+            # batch mapping, which the request pipeline correctly leaves out.
+            if (rel.get("relation") or "").upper() in _EXCLUDED_RELATIONS:
+                continue
             fmt = (rel.get("format") or "").upper()
             if fmt not in ("OVA", "MOVIE", "ONA", "SPECIAL"):
                 continue

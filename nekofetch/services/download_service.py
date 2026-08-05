@@ -790,28 +790,12 @@ class DownloadWorker:
         from nekofetch.services.franchise_flow import FranchiseFlowService
 
         franchise = req.franchise_data or {}
-        entries = None
+        ff = FranchiseFlowService(self._c)
         try:
-            from nekofetch.services.metadata_prefetch import load_cached
-
-            blob = await load_cached(
-                self._c, req.anime_doc_id, "anilist",
-                anime_doc_id=req.anime_doc_id,
+            entries = await ff.resolve_franchise_entries(
+                franchise, req.anime_doc_id or "",
             )
-            walk = (blob or {}).get("franchise")
-            if walk:
-                entries = _franchise_entries_from_cache(walk)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("download.coverage.cache_miss", error=str(exc))
-        if not entries:
-            try:
-                aid = franchise.get("anilist_id")
-                if aid:
-                    entries = await self._c.anilist.walk_franchise_full(int(aid))
-            except Exception as exc:  # noqa: BLE001
-                log.debug("download.coverage.walk_failed", error=str(exc))
-        try:
-            return FranchiseFlowService(self._c).build_mapping(
+            return ff.build_mapping(
                 franchise, req.anime_doc_id or "", franchise_entries=entries,
             )
         except Exception as exc:  # noqa: BLE001
@@ -1919,36 +1903,6 @@ def _alternate_source(source: str) -> str | None:
         return None
     primary = present[0]  # first token in a "a>b" chain is the current primary
     return next((w for w in _WEBSITE_SOURCES if w != primary), None)
-
-
-def _franchise_entries_from_cache(walk) -> dict | None:
-    """Reconstruct ``{anilist_id: FranchiseEntry}`` from a cached franchise-walk
-    blob (the ``franchise`` key of a prefetched ``anilist.json``), so coverage
-    can rebuild the per-season episode counts without a live AniList walk.
-
-    Mirrors ``bot_content._franchise_from_cache``: unknown keys are dropped and a
-    malformed entry is skipped rather than crashing the whole read. Returns None
-    when nothing usable could be reconstructed."""
-    from dataclasses import fields as _dc_fields
-
-    from nekofetch.sources.telegram.anilist import FranchiseEntry
-
-    allowed = {f.name for f in _dc_fields(FranchiseEntry)}
-    out: dict = {}
-    values = walk.values() if isinstance(walk, dict) else (walk or [])
-    for raw in values:
-        if not isinstance(raw, dict):
-            continue
-        aid = raw.get("anilist_id")
-        if aid is None:
-            continue
-        try:
-            out[int(aid)] = FranchiseEntry(
-                **{k: v for k, v in raw.items() if k in allowed}
-            )
-        except Exception:  # noqa: BLE001 — skip a bad entry, keep the rest
-            continue
-    return out or None
 
 
 def _safe_anime_doc_id(req) -> str:

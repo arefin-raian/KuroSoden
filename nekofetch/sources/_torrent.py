@@ -116,30 +116,52 @@ def parse_release_meta(name: str) -> dict:
     # episode number — ordered most-specific → least, stop at first hit.
     # Anchored on the STABLE 'E<num>' / 'episode <num>' / separator-number forms
     # rather than any audio/quality keyword (Dual/Sub/Multi vary, these don't).
+    #
+    # NEW: fractional episodes (13.5, 17.5, S01E13.5) are specials/OVAs that air
+    # between main episodes. Detect them BEFORE the integer patterns so ".5" is
+    # captured as a distinct marker, not discarded. Episode 00 (when present) is
+    # either episode 1 (if the pack runs 00-12) or a special; we detect it here
+    # and let the caller decide (torrent_mapping or coverage gate).
     episode = None
-    for pat in (
-        r"\bs\d{1,2}\s*e\s*(\d{1,3})(?:v\d+)?\b",            # S1E12v3 / S01E01 / S1 E 12
-        r"\bseason\s*\d{1,2}\s*episode\s*(\d{1,3})\b",    # Season 1 Episode 1
-        r"\bepisode\s*(\d{1,3})\b",                       # Episode 12
-        r"\bep\s*[._-]?\s*(\d{1,3})\b",                   # EP01 / Ep.1
-        r"(?:^|[\s\-_])e(\d{1,3})\b",                     # - E17 / E17 / _E001
-        r"[\s_]-[\s_]*(\d{1,3})(?:v\d+)?[\s_]*[\(\[]",    # - 24 [Dual] / _-_01_(
-        r"[\s_]-[\s_]*(\d{1,3})(?:v\d+)?(?=[\s_]|$)",     # - 24 / _-_01_
-        r"[\s_](\d{1,3})[\s_]*[\(\[]",                    #  24 (1080p) / _01_(
-        r"#(\d{1,3})\b",                                  # #01
-    ):
-        m = re.search(pat, low)
-        if m:
-            episode = int(m.group(1))
-            break
+    fractional = False  # .5 marker — caller classifies as special/OVA
+
+    # Fractional episodes: 13.5, S01E13.5, - 17.5, etc.
+    frac_m = re.search(r"(?:e\s*|episode\s*|[\s\-_])(\d{1,3})\.5\b", low)
+    if frac_m:
+        episode = int(frac_m.group(1))
+        fractional = True
+    else:
+        # Integer episodes — same patterns as before
+        for pat in (
+            r"\bs\d{1,2}\s*e\s*(\d{1,3})(?:v\d+)?\b",            # S1E12v3 / S01E01 / S1 E 12
+            r"\bseason\s*\d{1,2}\s*episode\s*(\d{1,3})\b",    # Season 1 Episode 1
+            r"\bepisode\s*(\d{1,3})\b",                       # Episode 12
+            r"\bep\s*[._-]?\s*(\d{1,3})\b",                   # EP01 / Ep.1
+            r"(?:^|[\s\-_])e(\d{1,3})\b",                     # - E17 / E17 / _E001
+            r"[\s_]-[\s_]*(\d{1,3})(?:v\d+)?[\s_]*[\(\[]",    # - 24 [Dual] / _-_01_(
+            r"[\s_]-[\s_]*(\d{1,3})(?:v\d+)?(?=[\s_]|$)",     # - 24 / _-_01_
+            r"[\s_](\d{1,3})[\s_]*[\(\[]",                    #  24 (1080p) / _01_(
+            r"#(\d{1,3})\b",                                  # #01
+        ):
+            m = re.search(pat, low)
+            if m:
+                episode = int(m.group(1))
+                break
 
     res = None
     mr = _RES_RE.search(low)
     if mr:
         res = f"{mr.group(1)}p"
 
+    # A fractional episode (13.5) is a between-cours special/OVA — route it out of
+    # the main-episode stream so it lands in a special slot and is only downloaded
+    # when the franchise map actually has one. Keep the integer part (13) so the
+    # caller can slot it as "after episode 13".
+    if fractional and kind == "episode":
+        kind = "special"
+
     return {"kind": kind, "season": season, "episode": episode,
-            "season_explicit": season_explicit,
+            "season_explicit": season_explicit, "fractional": fractional,
             "resolution": res, "base": base}
 
 
@@ -283,6 +305,46 @@ def _collapse_resolution(main: list[dict], prefer: int) -> tuple[list[dict], lis
     return kept, low_only
 
 
+def _resolve_zero_based(main: list[dict], extras: list[dict]) -> list[dict]:
+    """Resolve the episode-00 ambiguity for a main-episode list.
+
+    Two cases when a file numbered ``00`` is present:
+
+    * **Zero-based release** — the numbers form a contiguous run ``0..N`` with no
+      gaps (e.g. 00,01,…,12). Here ``00`` IS the first episode, so every episode
+      is shifted ``+1`` to land on the franchise's 1-based slots (00→ep1, 12→ep13).
+    * **Prologue special** — a ``00`` sits alongside an already-complete ``1..N``
+      run. Then ``00`` is episode 0 / a prologue special; it is moved OUT of the
+      main stream into ``extras`` (mutated in place) so it only downloads when the
+      map has a special slot, and the real episodes keep their numbers.
+
+    Returns the (possibly renumbered / filtered) main list. Files with no detected
+    number are left untouched. ``extras`` is appended to in the prologue case.
+    """
+    numbered = [e for e in main if e.get("episode") is not None]
+    if not numbered or all(e["episode"] != 0 for e in numbered):
+        return main
+
+    nums = sorted({e["episode"] for e in numbered})
+    contiguous_from_zero = nums == list(range(0, len(nums)))
+
+    if contiguous_from_zero:
+        # Zero-based: shift every numbered episode +1 (00 → ep1).
+        for e in numbered:
+            e["episode"] += 1
+        return main
+
+    # Otherwise 00 is a prologue special — reclassify and move it to extras.
+    remaining: list[dict] = []
+    for e in main:
+        if e.get("episode") == 0:
+            e["kind"] = "special"
+            extras.append(e)
+        else:
+            remaining.append(e)
+    return remaining
+
+
 def order_episodes(files: list[dict], *, prefer_resolution: int | None = None) -> list[dict]:
     """Order a release's video files into an EP1..EPN sequence.
 
@@ -314,6 +376,11 @@ def order_episodes(files: list[dict], *, prefer_resolution: int | None = None) -
     main = [e for e in enriched if e["kind"] == "episode"]
     movies = [e for e in enriched if e["kind"] == "movie"]
     extras = [e for e in enriched if e["kind"] in ("special", "ova", "extra")]
+
+    # Resolve episode-00 numbering: a release that runs 00..N is zero-based (00 is
+    # episode 1) and must be shifted +1 so it maps onto the franchise's 1..N slots.
+    # A stray 00 alongside an already-complete 1..N run is a prologue special.
+    main = _resolve_zero_based(main, extras)
 
     # Collapse multi-resolution duplicates for numbered episodes only. Episodes
     # with no detected number (episode is None) are left alone — they'd all share

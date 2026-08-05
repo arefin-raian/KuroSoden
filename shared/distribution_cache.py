@@ -167,7 +167,13 @@ class DistributionCache:
             from nekofetch.services.franchise_flow import FranchiseFlowService
 
             doc_id = franchise.get("anime_doc_id") or code
-            mapping = FranchiseFlowService(self._c).build_mapping(franchise, doc_id)
+            svc = FranchiseFlowService(self._c)
+            # Resolve the real franchise-walk entries first (cache → live walk) so
+            # build_mapping uses the SAME spin-off/recap-excluding, part-aware logic
+            # as the request pipeline. Without entries it silently fell back to the
+            # aggregated path, pulling in spin-offs/summary movies (AoT "No Regrets").
+            entries_walk = await svc.resolve_franchise_entries(franchise, doc_id)
+            mapping = svc.build_mapping(franchise, doc_id, franchise_entries=entries_walk)
         except Exception as exc:  # noqa: BLE001
             log.warning("dist_cache.expand.failed", code=code, error=str(exc))
             return self._entries_from_relations(franchise)
@@ -239,7 +245,8 @@ class DistributionCache:
 
             svc = FranchiseFlowService(self._c)
             doc_id = franchise.get("anime_doc_id") or code
-            mapping = svc.build_mapping(franchise, doc_id)
+            entries_walk = await svc.resolve_franchise_entries(franchise, doc_id)
+            mapping = svc.build_mapping(franchise, doc_id, franchise_entries=entries_walk)
             corrected = svc.parse_mapping_correction(text, mapping)
         except Exception as exc:  # noqa: BLE001
             log.warning("dist_cache.order_edit.failed", code=code, error=str(exc))

@@ -82,3 +82,38 @@ async def test_candidates_empty_page_falls_back_to_single(monkeypatch):
     monkeypatch.setattr(fr, "resolve_franchise", _fake_single)
     out = await fr.resolve_franchise_candidates(_FakeContainer([]), "obscure")
     assert out == [{"title": "Fallback Show", "anilist_id": "77", "format": "TV"}]
+
+
+# ── aggregated-fallback relation-type guard ───────────────────────────────────
+
+def test_aggregated_fallback_excludes_spinoffs_and_recaps():
+    """The aggregated mapping (used when no walk entries are available) must drop
+    SPIN_OFF/ALTERNATIVE/SUMMARY relations, matching the request pipeline. This is
+    the AoT batch bug: "No Regrets" (SPIN_OFF OVA) + a recap MOVIE (SUMMARY) were
+    being pulled into the batch mapping when the single-request path excludes them.
+    """
+    from nekofetch.services.franchise_flow import FranchiseFlowService
+
+    svc = FranchiseFlowService.__new__(FranchiseFlowService)
+    franchise = {
+        "title": "Attack on Titan",
+        "franchise_seasons": 1,
+        "franchise_episodes": 25,
+        "relations": [
+            {"anilist_id": 1, "relation": "SIDE_STORY", "format": "OVA",
+             "title": "AoT: Lost Girls", "episodes": 3},
+            {"anilist_id": 2, "relation": "SPIN_OFF", "format": "OVA",
+             "title": "AoT: No Regrets", "episodes": 2},
+            {"anilist_id": 3, "relation": "SUMMARY", "format": "MOVIE",
+             "title": "AoT: Crimson Bow and Arrow (recap)", "episodes": 1},
+            {"anilist_id": 4, "relation": "ALTERNATIVE", "format": "TV",
+             "title": "Junior High", "episodes": 12},
+        ],
+    }
+    mapping = svc.build_mapping(franchise, "doc")
+    titles = {e.title for e in mapping.entries}
+    # The canonical side-story OVA survives; spin-off/recap/alternate do not.
+    assert "AoT: Lost Girls" in titles
+    assert "AoT: No Regrets" not in titles
+    assert "AoT: Crimson Bow and Arrow (recap)" not in titles
+    assert "Junior High" not in titles
