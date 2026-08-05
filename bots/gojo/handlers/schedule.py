@@ -19,7 +19,7 @@ from pyrogram.types import CallbackQuery, Message
 from kurosoden.shared import gojo_voice as V
 from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
-from nekofetch.core.timefmt import format_scheduled_time
+from nekofetch.core.timefmt import to_tz
 from nekofetch.ui.components import cb, keyboard
 from nekofetch.ui.screens import Screen, send_screen
 from nekofetch.ui.artwork import pick_artwork
