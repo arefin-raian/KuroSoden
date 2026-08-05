@@ -46,11 +46,32 @@ _K_NOTICES = "nf:logcc:notices"
 _K_STICKERS = "nf:logcc:stickers"      # ordered list of layout message ids (cover/intro/dividers)
 _K_REQ_MARKERS = "nf:logcc:reqmarkers"  # {code: {divider, card}} — per-request card+divider ids
 _K_STUCK = "nf:stuck:{code}"           # per-request stuck-episode state for the attention card
+_K_MISSING = "nf:missing:{code}"       # per-request missing-coverage state for the more-links card
 _K_DUTY_BOARD = "nf:logcc:duty_board"      # duty board message id
 
 
 def _sec_key(name: str) -> str:
     return f"nf:logcc:sec:{name}"
+
+
+def _summarize_runs(nums: list[int]) -> str:
+    """Compress a sorted episode list into human run notation.
+
+    ``[1,2,3,7,10,11,12]`` → ``"1–3, 7, 10–12"``. Used by the missing-coverage
+    card so a long gap reads as a range instead of a wall of numbers."""
+    if not nums:
+        return "—"
+    nums = sorted(set(nums))
+    runs: list[str] = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        runs.append(str(start) if start == prev else f"{start}–{prev}")
+        start = prev = n
+    runs.append(str(start) if start == prev else f"{start}–{prev}")
+    return ", ".join(runs)
 
 
 def _reserved_key(name: str) -> str:
@@ -822,6 +843,66 @@ class LogChannelService:
                              reply_markup=InlineKeyboardMarkup(buttons))
         except Exception as exc:  # noqa: BLE001
             log.warning("logcc.attention_card.failed", error=str(exc))
+
+    async def post_missing_source_card(
+        self, *, code: str, title: str, report, source: str,
+    ) -> None:
+        """Persist a request's missing-coverage state and post a "provide more
+        links" card, so an admin-driven multi-source request (ddl / torrent) can
+        be topped up with the seasons/episodes it's still missing before it
+        publishes.
+
+        Like :meth:`post_attention_card`, the Redis state is written FIRST and
+        unconditionally — the admin-side handlers (staff|amore / amoredone) and
+        the backdrop-rich prompt render from it, so a request stays resumable
+        even where the log channel is inactive (Kuro Sōden)."""
+        grouped = report.grouped()
+        missing_state = {
+            "title": title,
+            "source": source,
+            "empty_seasons": report.empty_seasons,
+            # {season: [ep, ...]} of everything still owed.
+            "missing": {str(s): eps for s, eps in grouped.items()},
+        }
+        if self._c.redis:
+            await self._c.redis.set(
+                _K_MISSING.format(code=code), json.dumps(missing_state), ex=86400,
+            )
+
+        if not self._active():
+            return
+
+        # Human summary of the gaps: "S3 (all 12), S1 eps 10–12".
+        parts: list[str] = []
+        for season in sorted(grouped):
+            eps = grouped[season]
+            if season in report.empty_seasons:
+                parts.append(f"S{season} (all {len(eps)})")
+            else:
+                parts.append(f"S{season} eps {_summarize_runs(eps)}")
+        summary = "; ".join(parts) or "—"
+
+        buttons = [
+            [InlineKeyboardButton(t(M.CC_BTN_PROVIDE_LINKS)
+                                  if hasattr(M, "CC_BTN_PROVIDE_LINKS")
+                                  else "🔗 Provide link(s)",
+                                  callback_data=cb("staff", "amore", code))],
+            [InlineKeyboardButton(t(M.CC_BTN_PUBLISH_ANYWAY)
+                                  if hasattr(M, "CC_BTN_PUBLISH_ANYWAY")
+                                  else "✅ Publish what we have",
+                                  callback_data=cb("staff", "amoredone", code))],
+        ]
+        text = (
+            f"🧩 <b>{title}</b> — still missing content\n"
+            f"<code>{code}</code>\n\n"
+            f"Downloaded so far, but the franchise still needs: <b>{summary}</b>.\n"
+            f"Provide more direct/torrent links to fill the gaps, or publish now "
+            f"with what's downloaded."
+        )
+        try:
+            await self._send(text, reply_markup=InlineKeyboardMarkup(buttons))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("logcc.missing_card.failed", error=str(exc))
 
     async def post_failure_card(
         self, *, code: str, title: str, stage: str, error: str

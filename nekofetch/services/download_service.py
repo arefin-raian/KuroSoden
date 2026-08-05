@@ -382,6 +382,12 @@ class DownloadWorker:
 
         if all_failed:
             await self._mark_partial(job_id, all_failed)
+        # Phase 4: for admin-driven multi-source requests (ddl / torrent), if the
+        # franchise still has missing seasons/episodes, PAUSE here and ask for
+        # more links instead of publishing an incomplete series. Fail-open: a
+        # normal / complete / disabled job returns False and finalizes as usual.
+        if await self._maybe_pause_for_coverage(job_id, code, title):
+            return
         await self._finalize_after_qualities(job_id, code, title)
 
     async def _download_episode(self, job_id, req, source, chain, ep, audios, folder,
@@ -692,6 +698,104 @@ class DownloadWorker:
             code=code, title=title, failures=failures, source=source,
             alt_source=_alternate_source(source),
         )
+
+    # ── Phase 4: multi-source coverage gate ─────────────────────────────────
+    _MULTI_SOURCE_PLUGINS = frozenset({"ddl", "nyaa"})
+
+    async def _maybe_pause_for_coverage(
+        self, job_id: int, code: str, title: str,
+    ) -> bool:
+        """After a download round, decide whether the franchise is still missing
+        seasons/episodes and, if so, PAUSE the job and post a "provide more
+        links" card instead of publishing.
+
+        Returns True when the job was paused (caller must NOT finalize), False
+        when the job should finalize normally. Fail-open: any error, a disabled
+        flag, a non-multi-source plugin, or a complete franchise all return False
+        so a normal job is never stranded by this feature.
+        """
+        if not getattr(self._c.config.downloads, "multi_source_coverage", False):
+            return False
+        try:
+            async with session_scope(self._c.pg_sessionmaker) as session:
+                job = await session.get(DownloadJob, job_id)
+                req = await RequestRepository(session).get(job.request_id) if job else None
+                if req is None:
+                    return False
+                source = (req.source or "").lower()
+                if source not in self._MULTI_SOURCE_PLUGINS:
+                    return False
+                mapping = await self._reconstruct_franchise_mapping(req)
+                if mapping is None or not mapping.included_entries:
+                    return False
+                from nekofetch.services.coverage import compute_coverage
+                report = await compute_coverage(session, req, mapping)
+                if report.complete:
+                    return False
+                # Still missing content → pause and hand off to the admin card.
+                job.status = JobStatus.PAUSED
+                req.status = RequestStatus.DOWNLOADING
+        except Exception as exc:  # noqa: BLE001 — never strand a job on a gate error
+            log.warning("download.coverage.gate_failed", job_id=job_id,
+                        code=code, error=str(exc))
+            return False
+
+        log.info("download.coverage.incomplete", job_id=job_id, code=code,
+                 missing=len(report.missing), empty_seasons=report.empty_seasons)
+        # Drop live progress so the paused job leaves ACTIVE TASKS.
+        if self._c.progress:
+            try:
+                await self._c.progress.delete(job_id)
+            except Exception:  # noqa: BLE001
+                pass
+        # Post the missing-season card (best-effort — a card failure must not
+        # lose the pause; the request stays PAUSED and can be resumed manually).
+        try:
+            from nekofetch.services.log_channel_service import LogChannelService
+            await LogChannelService(self._c).post_missing_source_card(
+                code=code, title=title, report=report, source=source,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("download.coverage.card_failed", job_id=job_id,
+                        code=code, error=str(exc))
+        return True
+
+    async def _reconstruct_franchise_mapping(self, req):
+        """Rebuild the request's :class:`FranchiseMapping` (per-season episode
+        counts) without a live AniList walk — prefer the prefetched franchise
+        blob, mirroring ``bot_content._walk_franchise``'s cache-first read. Falls
+        back to a live walk only if the cache is empty, and to ``None`` on any
+        failure (caller treats None as "can't assert missing → don't pause")."""
+        from nekofetch.services.franchise_flow import FranchiseFlowService
+
+        franchise = req.franchise_data or {}
+        entries = None
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            blob = await load_cached(
+                self._c, req.anime_doc_id, "anilist",
+                anime_doc_id=req.anime_doc_id,
+            )
+            walk = (blob or {}).get("franchise")
+            if walk:
+                entries = _franchise_entries_from_cache(walk)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("download.coverage.cache_miss", error=str(exc))
+        if not entries:
+            try:
+                aid = franchise.get("anilist_id")
+                if aid:
+                    entries = await self._c.anilist.walk_franchise_full(int(aid))
+            except Exception as exc:  # noqa: BLE001
+                log.debug("download.coverage.walk_failed", error=str(exc))
+        try:
+            return FranchiseFlowService(self._c).build_mapping(
+                franchise, req.anime_doc_id or "", franchise_entries=entries,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("download.coverage.build_failed", error=str(exc))
+            return None
 
     async def ingest_provided_file(self, code: str, episode: int, src_path) -> None:
         """Ingest an admin-provided file for a stuck episode: record it as a verified
@@ -1794,6 +1898,36 @@ def _alternate_source(source: str) -> str | None:
         return None
     primary = present[0]  # first token in a "a>b" chain is the current primary
     return next((w for w in _WEBSITE_SOURCES if w != primary), None)
+
+
+def _franchise_entries_from_cache(walk) -> dict | None:
+    """Reconstruct ``{anilist_id: FranchiseEntry}`` from a cached franchise-walk
+    blob (the ``franchise`` key of a prefetched ``anilist.json``), so coverage
+    can rebuild the per-season episode counts without a live AniList walk.
+
+    Mirrors ``bot_content._franchise_from_cache``: unknown keys are dropped and a
+    malformed entry is skipped rather than crashing the whole read. Returns None
+    when nothing usable could be reconstructed."""
+    from dataclasses import fields as _dc_fields
+
+    from nekofetch.sources.telegram.anilist import FranchiseEntry
+
+    allowed = {f.name for f in _dc_fields(FranchiseEntry)}
+    out: dict = {}
+    values = walk.values() if isinstance(walk, dict) else (walk or [])
+    for raw in values:
+        if not isinstance(raw, dict):
+            continue
+        aid = raw.get("anilist_id")
+        if aid is None:
+            continue
+        try:
+            out[int(aid)] = FranchiseEntry(
+                **{k: v for k, v in raw.items() if k in allowed}
+            )
+        except Exception:  # noqa: BLE001 — skip a bad entry, keep the rest
+            continue
+    return out or None
 
 
 def _safe_anime_doc_id(req) -> str:
