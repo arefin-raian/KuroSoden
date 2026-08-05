@@ -195,6 +195,7 @@ def build_torrent_mapping(
     franchise: FranchiseMapping,
     *,
     episode_titles: dict[int, list[dict]] | None = None,
+    season_overrides: dict[int, int] | None = None,
 ) -> TorrentMapping:
     """Map torrent files to franchise entries.
 
@@ -205,11 +206,25 @@ def build_torrent_mapping(
     season/part/movie/special.
 
     ``episode_titles`` is an optional dict mapping franchise entry anilist_id to
-    a list of ``{number, title}`` from Jikan. Used for gap detection: when an
-    expected episode number is absent from the torrent files, the gap is flagged
-    with the episode's title.
+    a list of ``{number, title}`` from Jikan. Used both for gap detection (when an
+    expected episode number is absent, the gap is flagged with its title) AND to
+    feed the season-mapping cascade's title-match tier.
+
+    ``season_overrides`` maps ``file_index → season`` — an admin's manual season
+    decision from the mapping card; it wins over every automatic tier.
+
+    Before grouping, every file's season (and episode, for flat absolute-numbered
+    releases) is run through the season-mapping cascade so a franchise with several
+    seasons is no longer collapsed onto S1 by ``parse_release_meta``'s default.
     """
     episode_titles = episode_titles or {}
+
+    # ── season-mapping cascade (auto → MAL titles → absolute → manual) ──────────
+    # Rewrite each file's season/episode from the resolver before the historic
+    # grouping runs. Fail-open: any resolver error leaves the parsed values.
+    ordered_files = _apply_season_resolution(
+        ordered_files, franchise, episode_titles, season_overrides,
+    )
 
     torrent_name = ""
     for f in ordered_files:
@@ -353,6 +368,56 @@ def build_torrent_mapping(
         unmatched=unmatched,
         overall_confidence=overall,
     )
+
+
+def _apply_season_resolution(
+    ordered_files: list[dict],
+    franchise: FranchiseMapping,
+    episode_titles: dict[int, list[dict]],
+    season_overrides: dict[int, int] | None,
+) -> list[dict]:
+    """Run the season-mapping cascade and return copies of ``ordered_files`` with
+    each episode's ``season`` (and ``episode`` for absolute folds) rewritten.
+
+    Extras and unresolved files keep their parsed values. Fail-open: any error
+    returns the input untouched so a resolver bug never breaks the mapping flow.
+    """
+    try:
+        from nekofetch.services.season_resolver import resolve_seasons
+
+        # The resolver keys titles by season_number; ``episode_titles`` is keyed by
+        # anilist_id. Re-key via the franchise entries.
+        id_to_season = {
+            e.anilist_id: e.season_number
+            for e in franchise.entries
+            if e.kind == ContentKind.SEASON and e.anilist_id
+        }
+        titles_by_season: dict[int, list[dict]] = {}
+        for aid, titles in episode_titles.items():
+            sn = id_to_season.get(aid)
+            if sn:
+                titles_by_season.setdefault(sn, []).extend(titles)
+
+        res = resolve_seasons(
+            ordered_files, franchise,
+            titles_by_season=titles_by_season or None,
+            overrides=season_overrides,
+        )
+        by_index = {a.file_index: a for a in res.assignments}
+        out: list[dict] = []
+        for f in ordered_files:
+            a = by_index.get(f.get("index"))
+            if a is None:  # unresolved — keep parsed values as a best-effort
+                out.append(dict(f))
+                continue
+            nf = dict(f)
+            nf["season"] = a.season
+            if a.episode is not None:
+                nf["episode"] = a.episode
+            out.append(nf)
+        return out
+    except Exception:  # noqa: BLE001 — never break mapping on a resolver error
+        return ordered_files
 
 
 def _assign_files(files: list[dict], season: int) -> list[FileAssignment]:

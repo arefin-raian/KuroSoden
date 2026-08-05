@@ -101,11 +101,15 @@ def parse_release_meta(name: str) -> dict:
     elif re.search(_B + r"movie" + _E, low):
         kind = "movie"
 
-    # season — try the most explicit forms first; default 1 if only episodes given
+    # season — try the most explicit forms first; default 1 if only episodes given.
+    # ``season_explicit`` records whether the NAME actually stated a season (vs. the
+    # season-1 default) so the season-mapping cascade knows when to trust it verbatim
+    # instead of falling through to title-match / absolute-numbering resolution.
     season = 1
     ms = (re.search(r"\bs(\d{1,2})\s*e\s*\d", low)        # S1E1 / S01 E01 / S1 E 1
           or re.search(r"\bseason\s*(\d{1,2})\b", low)     # Season 1
           or re.search(r"\bs(\d{1,2})\b", low))            # S2
+    season_explicit = ms is not None
     if ms:
         season = int(ms.group(1))
 
@@ -135,6 +139,7 @@ def parse_release_meta(name: str) -> dict:
         res = f"{mr.group(1)}p"
 
     return {"kind": kind, "season": season, "episode": episode,
+            "season_explicit": season_explicit,
             "resolution": res, "base": base}
 
 

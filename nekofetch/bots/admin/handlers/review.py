@@ -44,6 +44,7 @@ STATE_MANUAL = STATE_MANUAL_COMP  # legacy alias for the entry-point transition
 STATE_TORRENT = "staff:torrent_pick"
 STATE_TORRENT_PROVIDE = "staff:torrent_provide"
 STATE_TORRENT_MAP = "staff:torrent_map"
+STATE_TORRENT_MAP_FIX = "staff:torrent_map_fix"  # admin is reassigning file→season
 STATE_DDL_PROVIDE = "staff:ddl_provide"
 STATE_PROVIDE = "staff:await_provide"   # admin is sending a file for a stuck episode
 STATE_MISSING_SOURCE = "staff:await_more_links"  # admin is sending more links to fill coverage gaps
@@ -1310,6 +1311,16 @@ def register(client: Client, container: Container) -> None:
             user_id, STATE_TORRENT_MAP,
             code=code, ref=source_ref, title=title,
             torrent_mapping=tmapping.to_dict(),
+            # Kept so a manual season override can re-run the cascade + regroup
+            # from the raw files (Phase 5). Trimmed to the fields the resolver +
+            # mapper read, to stay well under Redis value limits.
+            ordered_files=[
+                {k: f.get(k) for k in
+                 ("index", "name", "path", "season", "episode",
+                  "season_explicit", "kind", "seq")}
+                for f in ordered_files
+            ],
+            ep_titles={str(k): v for k, v in ep_titles.items()},
         )
 
         text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
@@ -1317,7 +1328,8 @@ def register(client: Client, container: Container) -> None:
         kb = keyboard(
             [(L(M.TORRENT_MAP_BTN_CONFIRM), cb("staff", "rtmapok", code)),
              (L(M.TORRENT_MAP_BTN_DETAIL), cb("staff", "rtmapdet", code, 0))],
-            [(L(M.TORRENT_MAP_BTN_TOGGLE), cb("staff", "rtmaptgl", code, 0))],
+            [(L(M.TORRENT_MAP_BTN_TOGGLE), cb("staff", "rtmaptgl", code, 0)),
+             (L(M.TORRENT_MAP_BTN_FIX), cb("staff", "rtmapfix", code))],
             [(L(M.BTN_BACK), cb("staff", "rdetail", code))],
         )
         await show(client, msg, text, kb)
@@ -1488,6 +1500,205 @@ def register(client: Client, container: Container) -> None:
         summary = format_torrent_mapping(tmapping)
         text = f"<b>Toggle entries</b>\n\n{summary}"
         await show(client, q.message, text, keyboard(*rows))
+
+    # ── manual season override (Phase 5 cascade fallback) ─────────────────────
+
+    def _rebuild_mapping_from_fsm(data: dict, overrides: dict[int, int] | None):
+        """Re-run build_torrent_mapping from the FSM-cached raw files, applying
+        any manual season overrides. Returns a TorrentMapping (or None)."""
+        from nekofetch.services.franchise_flow import FranchiseMapping
+        from nekofetch.services.torrent_mapping import build_torrent_mapping
+
+        td = data.get("torrent_mapping")
+        ordered = data.get("ordered_files")
+        if not td or not ordered:
+            return None
+        # Reconstruct the franchise from the stored mapping entries (they carry
+        # season_number/part/episodes — everything the cascade + mapper need).
+        from nekofetch.services.torrent_mapping import TorrentMapping
+        prev = TorrentMapping.from_dict(td)
+        franchise = FranchiseMapping(
+            anime_doc_id="", root_title="",
+            entries=[e.franchise_entry for e in prev.entries],
+        )
+        ep_titles = {int(k): v for k, v in (data.get("ep_titles") or {}).items()}
+        return build_torrent_mapping(
+            ordered, franchise, episode_titles=ep_titles,
+            season_overrides=overrides,
+        )
+
+    @client.on_callback_query(filters.regex(r"^staff\|rtmapfix"))
+    async def _torrent_map_fix(_: Client, q: CallbackQuery) -> None:
+        """Enter manual season-mapping: prompt the admin to reassign file seasons.
+
+        Shows a Telegraph guide of the detected file→season ranges (names can be
+        long / numerous — a telegra.ph page reads far better than a chat message)
+        and arms a reply flow that accepts ``<file#> S<season>`` lines.
+        """
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        code = q.data.split("|", 2)[2]
+        _, data = await fsm.get(q.from_user.id)
+        td = data.get("torrent_mapping")
+        ordered = data.get("ordered_files")
+        if not td or not ordered:
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+        await q.answer()
+
+        # Build a Telegraph guide listing each file, its current season, and the
+        # index the admin references when overriding.
+        guide_url = await _build_season_map_guide(data.get("title", ""), ordered)
+
+        # Persist the override-collection state (overrides accumulate across replies).
+        await fsm.set(
+            q.from_user.id, STATE_TORRENT_MAP_FIX,
+            **{**data, "overrides": {},
+               "prompt_chat_id": q.message.chat.id,
+               "prompt_message_id": q.message.id},
+        )
+        await _arm_reply(container.redis, q.message.chat.id,
+                         STATE_TORRENT_MAP_FIX, code=code)
+
+        prompt = L(M.TORRENT_MAP_FIX_PROMPT)
+        if guide_url:
+            prompt += f'\n\n<a href="{guide_url}">📋 File → season guide</a>'
+        kb = keyboard(
+            [(L(M.TORRENT_MAP_FIX_APPLY), cb("staff", "rtmapfixok", code))],
+            [(L(M.BTN_BACK), cb("staff", "rtmapov", code))],
+        )
+        await show(client, q.message, prompt, kb)
+
+    async def _build_season_map_guide(title: str, ordered: list[dict]) -> str | None:
+        """Telegraph page: numbered file list with current-season + episode, so the
+        admin can reference file numbers when reassigning seasons."""
+        try:
+            token = container.config.thumbnail_channel.telegraph_access_token
+            if not token:
+                return None
+            from nekofetch.providers.metadata.telegraph_client import TelegraphClient
+            telegraph = TelegraphClient(token)
+            content = [
+                {"tag": "h3", "children": [f"{title} — File → Season Map"]},
+                {"tag": "p", "children": [
+                    "Reply with lines like  3 S2  to move file #3 to Season 2."]},
+            ]
+            for i, f in enumerate(ordered, start=1):
+                s = f.get("season", 1)
+                ep = f.get("episode")
+                ep_s = f"E{ep:02d}" if isinstance(ep, int) else "E??"
+                content.append({"tag": "p", "children": [
+                    f"#{i}  [S{s} {ep_s}]  {f.get('name', '')}"]})
+            result = await telegraph._call(
+                "createPage", title=f"{title} — Season Map",
+                author_name="NekoFetch", content=content,
+            )
+            await telegraph.close()
+            return result.get("url") or (
+                f"https://telegra.ph/{result.get('path', '')}"
+                if result.get("path") else None
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("season_map.telegraph.failed", title=title)
+            return None
+
+    @client.on_message(filters.text & ~filters.command(["start"]), group=14)
+    async def _torrent_map_fix_reply(_: Client, message: Message) -> None:
+        """Collect ``<file#> S<season>`` override lines while in STATE_TORRENT_MAP_FIX."""
+        text = (message.text or "").strip()
+        # Quick shape gate: at least one "<num> S<num>" token, else let others try.
+        if not re.search(r"\b\d+\s+[sS]\s*\d+\b", text):
+            return
+        state, data, via_channel = await _resolve_reply_flow(
+            message, STATE_TORRENT_MAP_FIX,
+        )
+        if state != STATE_TORRENT_MAP_FIX:
+            return
+
+        overrides = dict(data.get("overrides") or {})
+        ordered = data.get("ordered_files") or []
+        max_idx = len(ordered)
+        applied = []
+        for m in re.finditer(r"\b(\d+)\s+[sS]\s*(\d+)\b", text):
+            file_no = int(m.group(1))
+            season = int(m.group(2))
+            if 1 <= file_no <= max_idx:
+                # Map the 1-based display number to the file's real ``index``.
+                real_index = ordered[file_no - 1].get("index")
+                if real_index is not None:
+                    overrides[real_index] = season
+                    applied.append((file_no, season))
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        data["overrides"] = overrides
+        if message.from_user:
+            await fsm.set(message.from_user.id, STATE_TORRENT_MAP_FIX, **data)
+
+        if not applied:
+            return
+
+        # Re-run the mapping with the accumulated overrides and show the preview.
+        tmapping = _rebuild_mapping_from_fsm(data, {int(k): v for k, v in overrides.items()})
+        prompt_chat_id = data.get("prompt_chat_id", message.chat.id)
+        prompt_message_id = data.get("prompt_message_id")
+        try:
+            prompt_msg = await client.get_messages(prompt_chat_id, prompt_message_id) if prompt_message_id else None
+        except Exception:
+            prompt_msg = None
+
+        from nekofetch.ui.torrent_screens import format_torrent_mapping
+        applied_str = ", ".join(f"#{n}→S{s}" for n, s in applied)
+        body = L(M.TORRENT_MAP_FIX_ACK, applied=applied_str)
+        if tmapping:
+            data["torrent_mapping"] = tmapping.to_dict()
+            if message.from_user:
+                await fsm.set(message.from_user.id, STATE_TORRENT_MAP_FIX, **data)
+            body += "\n\n" + format_torrent_mapping(tmapping)
+
+        code = data.get("code", "")
+        kb = keyboard(
+            [(L(M.TORRENT_MAP_FIX_APPLY), cb("staff", "rtmapfixok", code))],
+            [(L(M.BTN_BACK), cb("staff", "rtmapov", code))],
+        )
+        target = prompt_msg or message
+        await show(client, target, body, kb)
+
+    @client.on_callback_query(filters.regex(r"^staff\|rtmapfixok"))
+    async def _torrent_map_fix_apply(_: Client, q: CallbackQuery) -> None:
+        """Commit the manual overrides: fold them into the mapping + return to overview."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        code = q.data.split("|", 2)[2]
+        _, data = await fsm.get(q.from_user.id)
+        overrides = {int(k): v for k, v in (data.get("overrides") or {}).items()}
+        tmapping = _rebuild_mapping_from_fsm(data, overrides or None)
+        await q.answer()
+        if tmapping:
+            data["torrent_mapping"] = tmapping.to_dict()
+        # Drop back to STATE_TORRENT_MAP so Confirm/Detail/Toggle work again.
+        await _disarm_reply(container.redis, q.message.chat.id)
+        data.pop("overrides", None)
+        await fsm.set(q.from_user.id, STATE_TORRENT_MAP, **data)
+
+        from nekofetch.ui.torrent_screens import format_torrent_mapping
+        from nekofetch.services.torrent_mapping import TorrentMapping
+        summary = format_torrent_mapping(
+            TorrentMapping.from_dict(data["torrent_mapping"])
+        ) if data.get("torrent_mapping") else ""
+        text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
+                 mapping=summary)
+        kb = keyboard(
+            [(L(M.TORRENT_MAP_BTN_CONFIRM), cb("staff", "rtmapok", code)),
+             (L(M.TORRENT_MAP_BTN_DETAIL), cb("staff", "rtmapdet", code, 0))],
+            [(L(M.TORRENT_MAP_BTN_TOGGLE), cb("staff", "rtmaptgl", code, 0)),
+             (L(M.TORRENT_MAP_BTN_FIX), cb("staff", "rtmapfix", code))],
+            [(L(M.BTN_BACK), cb("staff", "rdetail", code))],
+        )
+        await show(client, q.message, text, kb)
 
     @client.on_callback_query(filters.regex(r"^staff\|rsiteprio"))
     async def _site_priority(_: Client, q: CallbackQuery) -> None:
