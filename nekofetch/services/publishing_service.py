@@ -369,6 +369,7 @@ class PublishingService:
         # and STOP — no new bot/channel, no main-channel repost, no index
         # reshuffle (the title is already listed). Everything below (log/stats/
         # notify) still runs so the update is observable.
+        is_redo_relink = bool(fd.get("redo_relink"))
         if is_update_entry:
             try:
                 from kurosoden.shared.senku_publisher import SenkuPublisher
@@ -381,6 +382,25 @@ class PublishingService:
                 from nekofetch.core.logging import get_logger
                 get_logger(__name__).warning(
                     "publish.channel_update.failed",
+                    anime=anime_doc_id, error=str(exc),
+                )
+        elif is_redo_relink:
+            # Redo-relink branch: the owner triggered a redo of an already-
+            # published title, so the channel/posts are kept but the storage
+            # packs were re-downloaded/encoded. Regenerate the quality button
+            # links (480p/720p/1080p) from the FRESH packs and edit them into
+            # the existing season cards in place. No new channel, no main-
+            # channel repost, no card re-render.
+            try:
+                from kurosoden.shared.senku_publisher import SenkuPublisher
+
+                await SenkuPublisher(self._c).relink_packs_in_place(
+                    self._c.admin_client, anime_doc_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — never fail a redo publish
+                from nekofetch.core.logging import get_logger
+                get_logger(__name__).warning(
+                    "publish.redo_relink.failed",
                     anime=anime_doc_id, error=str(exc),
                 )
         else:

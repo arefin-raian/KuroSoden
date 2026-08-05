@@ -216,6 +216,160 @@ class SenkuPublisher:
                             anime=anime_doc_id, error=str(exc))
         return {"appended": appended, "chat_id": chat_id}
 
+    async def relink_packs_in_place(
+        self, client, anime_doc_id: str,
+    ) -> dict:
+        """Re-point a published channel's quality buttons at freshly-redone packs.
+
+        The owner's ``/redo`` of an ALREADY-PUBLISHED title keeps every post
+        (channel, cards, watch guide, footer, main-channel post) but re-downloads
+        and re-encodes the storage packs. Their Fstore message ranges therefore
+        changed, so the old quality buttons now deep-link to deleted packs. This
+        regenerates the button links from the NEW packs and edits them into each
+        existing season/movie card *in place* — captions, images and layout are
+        left untouched, so users see the same channel with working downloads.
+
+        For each ``ChannelLayout`` season/movie card (has ``anilist_id`` +
+        ``tg_message_id``) we rebuild ``button_data`` from the fresh packs the
+        same way the full publish does (``_build_season_buttons`` → new Fstore
+        links), edit the message's reply markup, and update the matching
+        ``BotContentPost.button_data`` so a later ban-restore ships the new links
+        too. Best-effort per card — one failure never sinks the rest.
+
+        Returns ``{"relinked": n, "chat_id": id}``. A no-op (no channel, no cards
+        with packs) returns ``relinked=0`` and never raises.
+        """
+        from sqlalchemy import select
+
+        from nekofetch.infrastructure.database.postgres.models import (
+            BotContentPost,
+            ChannelLayout,
+            DistributionBot,
+        )
+        from nekofetch.infrastructure.database.postgres.session import session_scope
+        from nekofetch.services.bot_content import BotContentService
+
+        # 1. Resolve the durable channel anchor + its card layout.
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            bot = (
+                await session.execute(
+                    select(DistributionBot).where(
+                        DistributionBot.anime_doc_id == anime_doc_id,
+                        DistributionBot.is_channel.is_(True),
+                    )
+                )
+            ).scalar_one_or_none()
+            if bot is None or not bot.chat_id:
+                log.info("senku.relink.no_channel", anime=anime_doc_id)
+                return {"relinked": 0, "chat_id": None}
+            bot_id = bot.id
+            chat_id = int(bot.chat_id)
+            cards = (
+                await session.execute(
+                    select(ChannelLayout)
+                    .where(
+                        ChannelLayout.channel_bot_id == bot_id,
+                        ChannelLayout.kind.in_(("season_card", "movie_card")),
+                        ChannelLayout.anilist_id.is_not(None),
+                        ChannelLayout.tg_message_id.is_not(None),
+                    )
+                    .order_by(ChannelLayout.seq)
+                )
+            ).scalars().all()
+            card_rows = [
+                {"anilist_id": int(r.anilist_id), "tg_message_id": r.tg_message_id}
+                for r in cards
+            ]
+        if not card_rows:
+            log.info("senku.relink.no_cards", anime=anime_doc_id)
+            return {"relinked": 0, "chat_id": chat_id}
+
+        # 2. Load the FRESH packs + franchise walk, and map each entry's anilist
+        #    id to its packs exactly as the full publish does (TV by season index,
+        #    extras by entry_id / legacy season=None).
+        svc = BotContentService(self._c)
+        packs = await svc._load_packs(anime_doc_id)
+        if not packs:
+            log.info("senku.relink.no_packs", anime=anime_doc_id)
+            return {"relinked": 0, "chat_id": chat_id}
+        meta = await svc._gather_metadata(anime_doc_id)
+        walked = await svc._walk_franchise(anime_doc_id, meta)
+        tv = list(walked.get("tv", []))
+
+        packs_by_aid: dict[int, list] = {}
+        for entry in walked.get("all", []):
+            aid = getattr(entry, "anilist_id", None)
+            if aid is None:
+                continue
+            if entry in tv:
+                season = tv.index(entry) + 1
+                entry_packs = [p for p in packs if p.season == season]
+            else:
+                entry_packs = [
+                    p for p in packs
+                    if (p.entry_id is not None and p.entry_id == aid)
+                    or (p.entry_id is None and p.season is None)
+                ]
+            if entry_packs:
+                packs_by_aid[int(aid)] = entry_packs
+
+        fmt = self._c.config.post_format
+        relinked = 0
+
+        # 3. Per card: rebuild buttons from fresh packs, edit reply markup, and
+        #    sync the stored BotContentPost.button_data. Best-effort per card.
+        for row in card_rows:
+            aid = row["anilist_id"]
+            mid = row["tg_message_id"]
+            entry_packs = packs_by_aid.get(aid)
+            if not entry_packs:
+                log.debug("senku.relink.no_packs_for_entry", anime=anime_doc_id, aid=aid)
+                continue
+            try:
+                buttons = await svc._build_season_buttons(entry_packs)
+            except Exception as exc:  # noqa: BLE001 — one card's build must not sink all
+                log.warning("senku.relink.build_failed", aid=aid, error=str(exc))
+                continue
+            if not buttons:
+                continue
+            markup = build_audio_keyboard(buttons, fmt)
+            try:
+                await client.edit_message_reply_markup(chat_id, mid, reply_markup=markup)
+            except Exception as exc:  # noqa: BLE001 — stale/identical markup, keep going
+                log.warning("senku.relink.edit_failed", aid=aid, mid=mid, error=str(exc))
+                continue
+
+            # Sync the stored button_data so a ban-restore ships the new links.
+            try:
+                async with session_scope(self._c.pg_sessionmaker) as session:
+                    posts = (
+                        await session.execute(
+                            select(BotContentPost).where(
+                                BotContentPost.bot_id == bot_id,
+                                BotContentPost.anilist_id == aid,
+                            )
+                        )
+                    ).scalars().all()
+                    for p in posts:
+                        p.button_data = buttons
+            except Exception as exc:  # noqa: BLE001 — link edit already succeeded
+                log.warning("senku.relink.post_sync_failed", aid=aid, error=str(exc))
+            relinked += 1
+
+        # 4. Refresh the wipe-proof backup so a later ban restores the new links.
+        if relinked:
+            try:
+                from nekofetch.services.backup_service import BackupService
+
+                await BackupService(self._c).record_distribution_channel(anime_doc_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("senku.relink.backup_failed",
+                            anime=anime_doc_id, error=str(exc))
+
+        log.info("senku.relink.done", anime=anime_doc_id, chat_id=chat_id,
+                 relinked=relinked, cards=len(card_rows))
+        return {"relinked": relinked, "chat_id": chat_id}
+
     async def _build_update_cards(
         self, anime_doc_id: str, new_anilist_ids: list[int] | None,
         already: set[int],
