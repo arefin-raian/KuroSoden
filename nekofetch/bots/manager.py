@@ -622,8 +622,11 @@ class BotManager:
         # pending row via the normal PublishingService path.
         from nekofetch.services.schedule_service import ScheduleService
 
+        async def _sweep_scheduled_posts():
+            return await ScheduleService(self._c).sweep_due(client=self._admin)
+
         self._scheduler.every(
-            60, ScheduleService(self._c).sweep_due, id="scheduled-post-sweep",
+            60, _sweep_scheduled_posts, id="scheduled-post-sweep",
         )
         log.info("bots.schedule_sweep.scheduled", interval_seconds=60)
 

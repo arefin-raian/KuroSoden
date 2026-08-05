@@ -18,11 +18,13 @@ def register_all(client: Client, container: Container) -> None:
     from nekofetch.bots.middleware import install_auth_middleware
     from nekofetch.ui.components import cb
     from kurosoden.bots.gojo.handlers.tasks import register as register_tasks
+    from kurosoden.bots.gojo.handlers.schedule import register as register_schedule
     from kurosoden.shared.settings_ui import register_settings
     from kurosoden.shared.timezone_ui import register_timezone_ui
 
     install_auth_middleware(client, container, staff_only_bot="gojo")
     register_tasks(client, container)
+    register_schedule(client, container)
 
     # Per-admin timezone picker. This stays outside owner-only settings because
     # it changes how each admin reads scheduled-post times, not bot configuration.
