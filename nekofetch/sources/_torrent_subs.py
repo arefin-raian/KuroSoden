@@ -39,12 +39,84 @@ log = get_logger(__name__)
 # own "Brand"/"Sign" styles.
 _BRAND_STYLE_NAME = "AXWBrand"
 
-# Style line for the injected branding cue. Mirrors the streaming _subs Brand
-# style (Trebuchet MS, bold, outline+shadow) but under our namespaced name.
-_BRAND_STYLE_LINE = (
-    f"Style: {_BRAND_STYLE_NAME},Trebuchet MS,72,&H00FFFFFF,&H000000FF,"
-    "&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,3.6,2,2,50,50,60,1"
-)
+# The brand style's metrics were authored against a 1080-tall script (matching a
+# typical modern fansub where a size-72 cue reads at a tasteful ~6.7% of frame
+# height). But an ASS font size is expressed in the script's OWN PlayResY units —
+# so the same "72" renders at 72/288 ≈ 25% of the frame on a 384×288 script (the
+# giant-tag bug seen on Orb/Bisco) and 72/1080 ≈ 6.7% on a 1080 script (Sonny
+# Boy, correct). Everything below is therefore scaled by PlayResY/1080 so the
+# brand always occupies the SAME fraction of the screen, whatever the script res.
+_BRAND_REF_RES_Y = 1080
+_BRAND_BASE_FONTSIZE = 72
+_BRAND_BASE_OUTLINE = 3.6
+_BRAND_BASE_SHADOW = 2
+_BRAND_BASE_MARGIN_V = 60
+_BRAND_BASE_MARGIN_LR = 50
+_BRAND_MIN_FONTSIZE = 8  # never scale below legibility
+
+
+def _parse_play_res_y(lines: list[str]) -> int | None:
+    """Read ``PlayResY`` from an ASS ``[Script Info]`` block (None if absent)."""
+    for ln in lines:
+        s = ln.strip()
+        if s.lower().startswith("playresy:"):
+            try:
+                return int(s.split(":", 1)[1].strip())
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def _median_style_fontsize(lines: list[str]) -> float | None:
+    """Median font size across the file's own ``Style:`` rows (field index 2).
+
+    Used as a fallback size reference when ``PlayResY`` is absent — matching the
+    brand to the file's real text size keeps it proportional even when the script
+    resolution is unknown."""
+    sizes: list[float] = []
+    for ln in lines:
+        s = ln.strip()
+        if not s.lower().startswith("style:"):
+            continue
+        fields = s.split(":", 1)[1].split(",")
+        if len(fields) > 2:
+            try:
+                sizes.append(float(fields[2].strip()))
+            except ValueError:
+                continue
+    if not sizes:
+        return None
+    sizes.sort()
+    n = len(sizes)
+    return sizes[n // 2] if n % 2 else (sizes[n // 2 - 1] + sizes[n // 2]) / 2
+
+
+def _brand_style_line(lines: list[str]) -> str:
+    """Build the ``AXWBrand`` style line scaled to THIS script's resolution.
+
+    Primary signal is ``PlayResY`` (font size is in those units). When it's absent
+    we fall back to the file's own median style font size so the brand still tracks
+    the real subtitle size instead of ballooning. Outline, shadow, and margins are
+    scaled by the same factor so the whole cue stays proportional."""
+    play_res_y = _parse_play_res_y(lines)
+    if play_res_y and play_res_y > 0:
+        fs = round(_BRAND_BASE_FONTSIZE * play_res_y / _BRAND_REF_RES_Y)
+    else:
+        med = _median_style_fontsize(lines)
+        # Our base 72 ≈ a 1080 script's ~75 default, so a file's own median size is
+        # already the right target when we can't trust PlayResY.
+        fs = round(med) if med else _BRAND_BASE_FONTSIZE
+    fs = max(_BRAND_MIN_FONTSIZE, int(fs))
+    k = fs / _BRAND_BASE_FONTSIZE
+    outline = round(_BRAND_BASE_OUTLINE * k, 2)
+    shadow = round(_BRAND_BASE_SHADOW * k, 2)
+    margin_v = max(2, round(_BRAND_BASE_MARGIN_V * k))
+    margin_lr = max(2, round(_BRAND_BASE_MARGIN_LR * k))
+    return (
+        f"Style: {_BRAND_STYLE_NAME},Trebuchet MS,{fs},&H00FFFFFF,&H000000FF,"
+        f"&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,{outline},{shadow},2,"
+        f"{margin_lr},{margin_lr},{margin_v},1"
+    )
 
 
 def _ms_to_ass(ms: int) -> str:
@@ -185,10 +257,11 @@ def brand_ass_text(
                 break
             if s.startswith("Style:"):
                 last_style = i
+        brand_style_line = _brand_style_line(lines)
         for i, ln in enumerate(lines):
             out.append(ln)
             if i == last_style and styles_idx != -1:
-                out.append(_BRAND_STYLE_LINE)
+                out.append(brand_style_line)
     else:
         out = list(lines)
 
