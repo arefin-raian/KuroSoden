@@ -486,6 +486,17 @@ def register(client: Client, container: Container) -> None:
             codes: list[str] = []
             async with session_scope(container.pg_sessionmaker) as session:
                 repo = RequestRepository(session)
+                # ``user_id`` here is a TELEGRAM id, but ``Request.user_id`` FKs
+                # ``users.id`` (the internal PK). Resolve/create the submitter's
+                # User row once and use its ``.id`` — passing the telegram id
+                # straight through violates the FK, so every batched Request INSERT
+                # fails and the work items never surface on Levi's board.
+                from nekofetch.infrastructure.repositories.user_repo import (
+                    UserRepository,
+                )
+                submitter = await UserRepository(session).get_or_create(
+                    user_id, username=None, first_name=None)
+                await session.flush()
                 for keep_data in keep:
                     title = (keep_data.get("anime_title")
                              or keep_data.get("title") or "").strip()
@@ -497,7 +508,7 @@ def register(client: Client, container: Container) -> None:
                     aid = fr.get("anilist_id")
                     req = Request(
                         code=code,
-                        user_id=user_id,
+                        user_id=submitter.id,
                         anime_doc_id=f"{aid}" if aid else None,
                         anime_title=title,
                         source="",  # batch has no source yet (admin picks later)

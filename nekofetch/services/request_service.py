@@ -721,6 +721,142 @@ class RequestService:
         return {"title": title, "old_code": code, "new_code": new_code,
                 "user_id": snap["user_id"]}
 
+    async def purge_all_for_anime(
+        self, anime_doc_id: str, *, keep_channel: bool,
+    ) -> dict:
+        """Wipe an anime's operational data by ``anime_doc_id`` — for the redo flow.
+
+        Unlike :meth:`delete_request` (which works off a single request code), a
+        redo targets an *anime* that may span several request rows (the original
+        request, an earlier redo, update-entries…). This gathers every request for
+        the doc id and tears each one down with the shared helpers, then clears the
+        per-anime rows those helpers don't touch.
+
+        ``keep_channel`` is the published-vs-not switch:
+
+        * ``True`` (PUBLISHED redo) — delete only the storage packs (channel
+          messages + rows), MediaFiles + local files, DownloadJobs, work dirs, and
+          Redis job flags. The distribution channel, its posts (``ChannelLayout`` /
+          ``BotContentPost``), the main-channel ``ChannelPost``, and the backups are
+          LEFT INTACT so the fresh packs can be relinked into the existing season
+          cards. The Request rows are kept too (reused as the redo tickets).
+        * ``False`` (in-progress / absent redo) — everything above PLUS the
+          distribution ``DistributionBot`` (cascades to ChannelLayout /
+          BotContentPost / BotDelivery), ``ChannelPost``, ``PublishedPostBackup``,
+          ``ChannelContentBackup``, ``ScheduledPost``, ``WorkItem`` rows, the
+          Request rows themselves, and the Senku ``DistributionCache`` — a full wipe
+          so the redo starts from a clean slate.
+
+        Returns a summary dict of what was removed. Best-effort throughout: a
+        missing optional table never aborts the wipe.
+        """
+        from sqlalchemy import select
+
+        from nekofetch.services.download_service import _safe_folder
+
+        codes: list[str] = []
+        job_ids: list[int] = []
+        work_folders: list[str] = []
+        totals = {"files": 0, "packs": 0, "requests": 0}
+
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            reqs = (await session.execute(
+                select(Request).where(Request.anime_doc_id == anime_doc_id)
+            )).scalars().all()
+            for req in reqs:
+                codes.append(req.code)
+                work_folders.append(_safe_folder(req))
+                summary = await self._purge_request_rows(session, req)
+                job_ids.extend(summary["job_ids"])
+                totals["files"] += summary["files"]
+                totals["packs"] += summary["packs"]
+                await self._clear_assignments(session, req.code)
+            totals["requests"] = len(reqs)
+
+            if not keep_channel:
+                await self._purge_channel_rows(session, anime_doc_id, codes)
+                for req in reqs:
+                    await session.delete(req)
+            await session.flush()
+
+        for folder in work_folders:
+            await self._prune_work_dir(folder)
+        for code in codes:
+            await self._clear_job_flags(code, job_ids)
+
+        if not keep_channel:
+            await self._clear_distribution_cache(codes)
+
+        from nekofetch.services.log_channel_service import LogChannelService
+        await LogChannelService(self._c).event(
+            "admin", "anime_purged", anime=anime_doc_id,
+            keep_channel=keep_channel, **totals,
+        )
+        return {"anime_doc_id": anime_doc_id, "codes": codes,
+                "keep_channel": keep_channel, **totals}
+
+    async def _purge_channel_rows(
+        self, session, anime_doc_id: str, codes: list[str],
+    ) -> None:
+        """Delete the per-anime channel/publish rows a full wipe must clear.
+
+        Only called for ``keep_channel=False``. Deleting the ``DistributionBot``
+        cascades to ChannelLayout / BotContentPost / BotDelivery (FK ondelete
+        CASCADE); the rest key on ``anime_doc_id`` or ``request_code`` with no FK,
+        so they're deleted explicitly. Each delete is guarded so an absent optional
+        table (or a legacy row shape) never aborts the wipe."""
+        from sqlalchemy import delete
+
+        from nekofetch.infrastructure.database.postgres.models import (
+            ChannelContentBackup,
+            ChannelPost,
+            DistributionBot,
+            PublishedPostBackup,
+            ScheduledPost,
+        )
+
+        by_doc = [ChannelPost, PublishedPostBackup, DistributionBot]
+        for model in by_doc:
+            try:
+                await session.execute(
+                    delete(model).where(model.anime_doc_id == anime_doc_id)
+                )
+            except Exception:  # noqa: BLE001 — optional/legacy table
+                pass
+        # ChannelContentBackup keys the anime by ``channel_key``.
+        try:
+            await session.execute(
+                delete(ChannelContentBackup).where(
+                    ChannelContentBackup.channel_key == anime_doc_id)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # ScheduledPost + WorkItem key on the request code(s).
+        if codes:
+            try:
+                await session.execute(
+                    delete(ScheduledPost).where(ScheduledPost.request_code.in_(codes))
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            from kurosoden.shared.work_service import WorkItem
+            await session.execute(
+                delete(WorkItem).where(WorkItem.anime_doc_id == anime_doc_id)
+            )
+        except Exception:  # noqa: BLE001 — work_items optional
+            pass
+
+    async def _clear_distribution_cache(self, codes: list[str]) -> None:
+        """Drop the Senku transient working set (Redis) for each redo code."""
+        try:
+            from kurosoden.shared.distribution_cache import DistributionCache
+            cache = DistributionCache(self._c)
+            for code in codes:
+                await cache.clear(code)
+        except Exception:  # noqa: BLE001 — cache optional/absent
+            pass
+
     async def _telegram_id_for(self, user_id) -> int | None:
         """Resolve a DB user_id → their telegram id for a user-facing DM."""
         if user_id is None:
