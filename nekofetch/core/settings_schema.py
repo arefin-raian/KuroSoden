@@ -267,6 +267,9 @@ FIELD_DOCS: dict[str, FieldDoc] = {
         desc="Run the metadata-editing stage during processing."),
     "processing.branding": FieldDoc(
         desc="Run the branding stage (group tag, watermark text) during processing."),
+    "processing.subtitle_dialogue_normalize": FieldDoc(
+        desc="Restyle plain subtitle dialogue to a bold, embedded readable font. "
+             "Signs, songs, OP/ED, and positioned lines are never touched."),
     "processing.thumbnail": FieldDoc(
         desc="Run the thumbnail-generation stage during processing."),
     "processing.require_approval_before_publish": FieldDoc(

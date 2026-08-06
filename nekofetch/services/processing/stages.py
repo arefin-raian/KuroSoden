@@ -944,6 +944,8 @@ class BrandingStage(Stage):
                 brand_subtitle_title=brand_subtitle_title,
                 audio_tracks=audio_pre, brand_audio_title=brand_audio_title,
                 lang_display=_lang_display,
+                normalize_dialogue=getattr(
+                    self.c.config.processing, "subtitle_dialogue_normalize", True),
             )
         except Exception as exc:  # noqa: BLE001 — remux failure is recoverable
             ctx.notes.append(f"branding(torrent): remux error {exc}")

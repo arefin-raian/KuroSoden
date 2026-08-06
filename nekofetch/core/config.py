@@ -214,6 +214,10 @@ class ProcessingConfig(BaseModel):
     rename: bool = True
     metadata: bool = True
     branding: bool = True
+    # Restyle plain dialogue lines in torrent subtitles to a bold, embedded,
+    # readable house font (Noto Sans Bold) — signs/songs/OP-ED/karaoke and any
+    # positioned event are never touched. Off reverts to the source's own fonts.
+    subtitle_dialogue_normalize: bool = True
     thumbnail: bool = True
     # Torrent sources deliver a single (1080p) file per episode; derive the
     # lower quality tiers (720p / 480p) ourselves via ffmpeg so every release

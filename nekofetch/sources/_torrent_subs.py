@@ -67,6 +67,71 @@ _DIALOG_BASE_MARGIN_LR = 225
 _DIALOG_FONT_NAME = "Noto Sans"
 _DIALOG_BOLD = -1  # ASS Bold flag
 
+# The bundled font faces that back _DIALOG_FONT_NAME. Embedded into the remux so
+# the styled dialogue renders identically on a device that doesn't have the font
+# installed (otherwise the player substitutes a thinner face). OFL-licensed —
+# see resources/fonts/subtitle/OFL.txt.
+_DIALOG_FONT_FILES = ("NotoSans-Bold.ttf", "NotoSans-BoldItalic.ttf")
+_DIALOG_FONT_MIMETYPE = "application/x-truetype-font"
+
+
+def _bundled_dialogue_fonts() -> list["Path"]:
+    """Absolute paths of the bundled dialogue font faces that exist on disk.
+
+    Resolved relative to the repo root (``resources/fonts/subtitle/``) or the CWD,
+    mirroring the ``tools/`` lookup used elsewhere in this package."""
+    from pathlib import Path
+
+    out: list[Path] = []
+    for base in (Path(__file__).resolve().parents[2], Path.cwd()):
+        subdir = base / "resources" / "fonts" / "subtitle"
+        if not subdir.is_dir():
+            continue
+        for name in _DIALOG_FONT_FILES:
+            cand = subdir / name
+            if cand.exists() and cand not in out:
+                out.append(cand)
+        if out:
+            break
+    return out
+
+
+async def _source_attachments(src) -> tuple[int, set[str]]:
+    """``(count, lower-cased filenames)`` of attachments already in ``src``.
+
+    Best-effort via ffprobe; returns ``(0, set())`` when ffprobe is unavailable or
+    the probe fails. The count is needed so a newly ``-attach``-ed font's
+    ``-metadata:s:t:N`` index lands past the attachments preserved by
+    ``-map 0:t?`` (which occupy output attachment streams ``t:0..t:count-1``). The
+    filenames let us skip re-attaching a face the source already carries."""
+    import asyncio
+    import json
+
+    from nekofetch.sources._hls import find_ffprobe
+
+    ffprobe = find_ffprobe()
+    if not ffprobe:
+        return 0, set()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe, "-v", "error", "-select_streams", "t",
+            "-show_entries", "stream_tags=filename", "-of", "json", str(src),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return 0, set()
+        data = json.loads(out.decode(errors="replace") or "{}")
+    except Exception:  # noqa: BLE001 — dedup is best-effort
+        return 0, set()
+    streams = data.get("streams", [])
+    names: set[str] = set()
+    for stream in streams:
+        fn = (stream.get("tags") or {}).get("filename")
+        if fn:
+            names.add(fn.lower())
+    return len(streams), names
+
 
 def _parse_play_res_y(lines: list[str]) -> int | None:
     """Read ``PlayResY`` from an ASS ``[Script Info]`` block (None if absent)."""
@@ -500,7 +565,7 @@ async def brand_torrent_subtitles(
     src, dest, *, sub_tracks: list[dict], video_ms: int | None = None,
     container_title: str | None = None, brand_subtitle_title=None,
     audio_tracks: list[dict] | None = None, brand_audio_title=None,
-    lang_display=None,
+    lang_display=None, normalize_dialogue: bool = True,
 ) -> dict:
     """Extract text subs, inject the Telegram cue, remux back into ``dest``.
 
@@ -575,7 +640,9 @@ async def brand_torrent_subtitles(
         branded_ass: dict[int, Path] = {}  # sub-relative index -> branded .ass
         for rel, (ass_out, raw) in extracted.items():
             try:
-                new_text, cues = brand_ass_text(raw, video_ms, windows=shared_windows)
+                new_text, cues = brand_ass_text(
+                    raw, video_ms, windows=shared_windows,
+                    normalize_dialogue=normalize_dialogue)
                 if cues:
                     ass_out.write_text(new_text, encoding="utf-8")
                     result["total_cues"] += cues
@@ -601,6 +668,22 @@ async def brand_torrent_subtitles(
         cmd += ["-c:v", "copy", "-c:a", "copy", "-c:s", "copy"]
         # Preserve attachments (fonts!) so styled .ass renders correctly.
         cmd += ["-map", "0:t?", "-c:t", "copy"]
+
+        # Embed the bundled dialogue font faces so the restyled dialogue renders
+        # identically on devices that lack the font (otherwise the player
+        # substitutes a thinner face). Dedupe against attachments the source
+        # already carries so we never create duplicate font records. The metadata
+        # index starts past the preserved attachments (t:0..t:count-1 from the
+        # -map 0:t? copy above) so it tags the right (newly attached) stream.
+        if normalize_dialogue:
+            attach_count, existing_attachments = await _source_attachments(src)
+            attach_i = attach_count
+            for font in _bundled_dialogue_fonts():
+                if font.name.lower() in existing_attachments:
+                    continue
+                cmd += ["-attach", str(font),
+                        f"-metadata:s:t:{attach_i}", f"mimetype={_DIALOG_FONT_MIMETYPE}"]
+                attach_i += 1
 
         # 5. Per-track TITLE metadata (torrent rule: original title + 〘 handle 〙).
         for out_i, tr in enumerate(sub_tracks):
