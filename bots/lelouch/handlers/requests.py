@@ -94,7 +94,7 @@ async def _seed_anime_art(container: Container, franchise: dict,
 
 STATE_NAME = "req:await_name"
 STATE_FRANCHISE = "req:franchise"
-LELOUCH_COMMANDS = ["start", "help", "myrequests", "admin", "settings", "batch", "cleardatabase"]
+LELOUCH_COMMANDS = ["start", "help", "myrequests", "admin", "settings", "batch", "cleardatabase", "redo"]
 
 
 # ── Registration ─────────────────────────────────────────────────────────────

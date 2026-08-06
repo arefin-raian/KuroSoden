@@ -1560,6 +1560,11 @@ class DownloadWorker:
 
     async def _record_file(self, job_id, req, ep, variant, dest, result) -> None:
         actual_path = result.get("path") or str(dest)
+        # Determine season_part from franchise structure so split seasons
+        # (e.g. Vanitas S1 eps 1-12 + S1P2 eps 13-24) name/pack correctly.
+        season_part = _map_episode_to_part(
+            ep.number, ep.season, req.franchise_data or {}
+        )
         async with session_scope(self._c.pg_sessionmaker) as session:
             # Drop any stale orphan row for this exact unit before inserting — a
             # re-download on resume (file was gone from disk, never uploaded)
@@ -1582,6 +1587,7 @@ class DownloadWorker:
                     job_id=job_id,
                     anime_doc_id=_safe_anime_doc_id(req),
                     season=ep.season,
+                    season_part=season_part,
                     episode=ep.number,
                     resolution=variant.resolution,
                     audio=variant.audio,
@@ -1931,6 +1937,49 @@ def _safe_folder(req) -> str:
 
     base = _safe_anime_doc_id(req) or "work"
     return re.sub(r"[^\w.\-]+", "_", str(base)).strip("_") or "work"
+
+
+def _map_episode_to_part(episode_num: int, season_num: int, franchise_data: dict) -> int | None:
+    """Map an episode number to its season_part based on franchise structure.
+
+    Returns the part number (1, 2, 3...) if the episode belongs to a multi-part season,
+    or None if the season has no parts.
+
+    Example: Vanitas Season 1 has 24 episodes split into Season 1 (eps 1-12) and
+    Season 1 Part 2 (eps 13-24). Episode 15 → part 2.
+    """
+    if not franchise_data:
+        return None
+
+    # Check if franchise has entries with part info
+    entries = franchise_data.get("entries", [])
+    if not entries:
+        return None
+
+    # Find all entries matching this season number
+    season_entries = [
+        e for e in entries
+        if e.get("kind") == "season" and e.get("season_number") == season_num
+    ]
+
+    if len(season_entries) <= 1:
+        # Single entry for this season, no parts
+        return None
+
+    # Multiple entries for same season — they have parts.
+    # Sort by part number and calculate episode boundaries.
+    season_entries.sort(key=lambda e: e.get("season_part") or 1)
+
+    episode_count = 0
+    for entry in season_entries:
+        part_episodes = entry.get("episodes") or 12  # fallback to 12 if not specified
+        episode_count += part_episodes
+
+        if episode_num <= episode_count:
+            return entry.get("season_part")
+
+    # Episode beyond known boundaries — assign to last part
+    return season_entries[-1].get("season_part")
 
 
 def _audio_for_language(language: str) -> AudioType | None:

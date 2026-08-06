@@ -187,49 +187,86 @@ class StatsService:
     # ── compute ───────────────────────────────────────────────────────────────
 
     async def compute(self) -> dict:
-        """Compute the full stats snapshot.
+        """Compute the full stats snapshot from authoritative DB signals.
 
-        Source of truth for "published" is the index channel — scrapes its
-        letter posts and cross-references against StoragePack + canonical names.
+        **Total series**: distinct `anime_doc_id` in `StoragePack`.
+        **Published**: series with a `ChannelPost.main_message_id` (live in the
+        main channel).
+        **Indexed**: series whose title-letter has a *posted* ``IndexSection``.
+        The index channel lists every ``StoragePack`` title per letter (see
+        ``IndexChannelService._titles_for_letter``), so a series is in the index
+        as soon as its letter section is live — independent of whether it has a
+        main-channel card. This is why published (6) and indexed (7) can differ.
+        **Not indexed**: Total - Indexed (NOT total - published; the owner reads
+        this as "how many are missing from the index").
+
+        The old `compute()` scraped the index channel and fuzzy-matched titles
+        against a canonical-names map — fragile and returned published=0 when
+        the scrape failed. This DB-driven version reads the authoritative signals
+        that the publish/index flows write, eliminating the scrape entirely.
         """
-        all_series = await self._all_series()
-        indexed_titles = await self._fetch_index_channel_titles()
-        cm = _load_canonical_map()
+        from nekofetch.infrastructure.database.postgres.models import (
+            ChannelPost,
+            IndexSection,
+        )
+        from nekofetch.services.index_channel_service import IndexChannelService
 
-        # Build normalized set of indexed titles (both raw + canonical forms)
-        indexed_norm: set[str] = set()
-        for t_ in indexed_titles:
-            indexed_norm.add(t_.lower().strip())
-            matched = self._match_canonical_name(t_, cm)
-            if matched:
-                indexed_norm.add(matched.lower().strip())
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            # Total series = distinct anime_doc_id in StoragePack. We dedup in
+            # Python (dict keyed by doc_id) rather than SQL DISTINCT because one
+            # anime_doc_id can carry inconsistent titles across packs (e.g.
+            # "The Case Study of Vanitas" vs "Vanitas no Carte") — a
+            # SELECT DISTINCT on (doc_id, title) would return one row per title
+            # variant and over-count the series.
+            all_series_rows = (
+                await session.execute(
+                    select(StoragePack.anime_doc_id, StoragePack.anime_title)
+                )
+            ).all()
+            all_series = {doc_id: title for doc_id, title in all_series_rows}
 
-        # Determine which series are published (found in index channel)
-        published_set: set[str] = set()
-        for doc_id, db_title in all_series.items():
-            check = db_title.lower().strip()
-            if check in indexed_norm:
-                published_set.add(doc_id)
-                continue
-            matched = self._match_canonical_name(db_title, cm)
-            if matched and matched.lower().strip() in indexed_norm:
-                published_set.add(doc_id)
+            # Published = has a main-channel post.
+            published_set = set((
+                await session.execute(
+                    select(ChannelPost.anime_doc_id)
+                    .where(ChannelPost.main_message_id.isnot(None))
+                )
+            ).scalars().all())
+            # Indexed = the series' letter has a *posted* index section. The index
+            # lists StoragePack titles per letter, so membership is decided by the
+            # letter, not a per-series row.
+            posted_letters = set((
+                await session.execute(
+                    select(IndexSection.base_letter).where(
+                        IndexSection.message_id.isnot(None),
+                        IndexSection.base_letter.isnot(None),
+                    )
+                )
+            ).scalars().all())
 
+        catalog_ids = set(all_series)
         total = len(all_series)
-        published_count = len(published_set)
-        not_indexed_count = total - published_count
+        # Intersect with the catalog so published can never exceed total (a stray
+        # ChannelPost without a StoragePack would otherwise skew it).
+        published_count = len(published_set & catalog_ids)
 
-        # Build not_indexed list with official names
-        not_indexed_titles: list[str] = []
-        for doc_id, db_title in all_series.items():
-            if doc_id in published_set:
-                continue
-            matched = self._match_canonical_name(db_title, cm)
-            not_indexed_titles.append(matched or db_title)
+        indexed_titles = [
+            title for title in all_series.values()
+            if IndexChannelService.letter_of(title) in posted_letters
+        ]
+        indexed_count = len(indexed_titles)
+        not_indexed_count = total - indexed_count
+
+        # "Not indexed" titles = series in storage whose letter isn't posted yet.
+        not_indexed_titles = [
+            title for title in all_series.values()
+            if IndexChannelService.letter_of(title) not in posted_letters
+        ]
 
         return {
             "total_series": total,
             "published_series": published_count,
+            "indexed_series": indexed_count,
             "not_indexed_series": not_indexed_count,
             "not_indexed_titles": sorted(set(not_indexed_titles)),
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -256,7 +293,10 @@ class StatsService:
 
         base = await self.compute()
         d: dict = {
-            "main_backups": 0, "dist_backups": 0, "index_backups": 0,
+            # index_items mirrors compute()'s catalog-consistent indexed count so
+            # the dashboard sub-dict never disagrees with the Overview section.
+            "main_backups": 0, "dist_backups": 0,
+            "index_items": base.get("indexed_series", 0),
             "pending_scheduled": 0, "next_scheduled_utc": None,
             "last_update_check": None, "last_ban_check": None,
         }
@@ -271,12 +311,6 @@ class StatsService:
                     (await session.execute(
                         select(func.count()).select_from(ChannelContentBackup)
                         .where(ChannelContentBackup.scope == "distribution")
-                    )).scalar() or 0
-                )
-                d["index_backups"] = int(
-                    (await session.execute(
-                        select(func.count()).select_from(ChannelContentBackup)
-                        .where(ChannelContentBackup.scope == "index")
                     )).scalar() or 0
                 )
                 d["pending_scheduled"] = int(
@@ -362,7 +396,7 @@ class StatsService:
             "<b>Durable backups</b>",
             f"  ⦿ Main-channel posts: <b>{d.get('main_backups', 0)}</b>",
             f"  ⦿ Distribution channels: <b>{d.get('dist_backups', 0)}</b>",
-            f"  ⦿ Index channel: <b>{d.get('index_backups', 0)}</b>",
+            f"  ⦿ Indexed items: <b>{stats.get('indexed_series', d.get('index_items', 0))}</b>",
             "",
             "<b>Scheduling</b>",
             f"  ⦿ Publishes in flight: <b>{d.get('pending_scheduled', 0)}</b>",

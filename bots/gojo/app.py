@@ -38,6 +38,52 @@ GOJO_COMMANDS = [
 
 log = get_logger(__name__)
 
+# ── Home menu: SINGLE source of truth ────────────────────────────────────────
+# Both /start and the `gojo|home` callback render from this so the two menus can
+# never drift (the old bug: /start was missing Index / Change Index / Stats that
+# only appeared after bouncing through Settings).
+_HOME_CAPTION = (
+    "<b>🔮 Gojo Satoru — Publisher</b>\n\n"
+    "<i>\"Throughout heaven and earth, I alone am the honored one.\"</i>\n\n"
+    "I handle the final step:\n"
+    "• Generate main channel posts\n"
+    "• Create franchise thumbnails\n"
+    "• Review and edit captions\n"
+    "• Publish or schedule\n"
+    "• Update the index\n"
+    "• Recover banned channels"
+)
+
+
+def _home_rows(container: Container, obj) -> list[list[tuple[str, str]]]:
+    """The Gojo home keyboard as (label, callback) rows. ``obj`` is a Message or
+    CallbackQuery so the owner-only Settings row is gated identically for both
+    the /start message and the home callback."""
+    from nekofetch.ui.components import cb
+    from kurosoden.shared.access_gate import is_owner
+
+    rows = [
+        [("📋 Tasks", cb("gojo", "tasks")),
+         ("🔮 Publish", cb("gojo", "publish"))],
+        [("📅 Schedule", cb("gojo", "schedule")),
+         ("🛡 Recover", cb("gojo", "recover"))],
+        [("💾 Backup", cb("gojo", "backup")),
+         ("📡 Change Main", cb("gojo", "change_main"))],
+        [("🔎 Check Updates", cb("gojo", "check_updates")),
+         ("🩺 Ban Check", cb("gojo", "check_banned"))],
+        [("🗂 Index", cb("gojo", "index")),
+         ("🆕 Change Index", cb("gojo", "change_index"))],
+        [("📊 Stats", cb("gojo", "stats")),
+         ("✏️ Edit Footer", cb("gojo", "edit_footer"))],
+        [("⚙️ Settings", cb("gojo", "settings")),
+         ("❓ Help", cb("gojo", "help"))],
+    ]
+    if not is_owner(container, obj):
+        # Drop only the owner-only Settings *button*, keeping its row-mate (Help).
+        rows = [[btn for btn in row if "settings" not in btn[1]] for row in rows]
+        rows = [row for row in rows if row]
+    return rows
+
 
 async def publish_commands(client: Client) -> None:
     # Staff-only bot → empty global menu; staff/owner get theirs per-chat on /start.
@@ -84,52 +130,25 @@ def build_gojo(container: Container, token: str) -> Client:
 
         # ¬¬ Home ¬¬
         if action == "home":
-            caption = (
-                "<b>🔮 Gojo Satoru — Publisher</b>\n\n"
-                "<i>\"Throughout heaven and earth, I alone am the honored one.\"</i>\n\n"
-                "I handle the final step:\n"
-                "• Generate main channel posts\n"
-                "• Create franchise thumbnails\n"
-                "• Review and edit captions\n"
-                "• Publish or schedule\n"
-                "• Update the index\n"
-                "• Recover banned channels"
-            )
-            from kurosoden.shared.access_gate import is_owner
+            from nekofetch.ui.components import keyboard as _kb
 
-            rows = [
-                [InlineKeyboardButton("📋 Tasks", callback_data=cb(bot, "tasks")),
-                 InlineKeyboardButton("🔮 Publish", callback_data=cb(bot, "publish"))],
-                [InlineKeyboardButton("📅 Schedule", callback_data=cb(bot, "schedule")),
-                 InlineKeyboardButton("🛡 Recover", callback_data=cb(bot, "recover"))],
-                [InlineKeyboardButton("💾 Backup", callback_data=cb(bot, "backup")),
-                 InlineKeyboardButton("📡 Change Main", callback_data=cb(bot, "change_main"))],
-                [InlineKeyboardButton("🔎 Check Updates", callback_data=cb(bot, "check_updates")),
-                 InlineKeyboardButton("🩺 Ban Check", callback_data=cb(bot, "check_banned"))],
-                [InlineKeyboardButton("🗂 Index", callback_data=cb(bot, "index")),
-                 InlineKeyboardButton("🆕 Change Index", callback_data=cb(bot, "change_index"))],
-                [InlineKeyboardButton("📊 Stats", callback_data=cb(bot, "stats")),
-                 InlineKeyboardButton("✏️ Edit Footer", callback_data=cb(bot, "edit_footer"))],
-                [InlineKeyboardButton("⚙️ Settings", callback_data=cb(bot, "settings"))],
-            ]
-            if not is_owner(container, q):
-                rows = [
-                    row for row in rows
-                    if all("settings" not in (btn.callback_data or "") for btn in row)
-                ]
-            keyboard = InlineKeyboardMarkup(rows)
-            await send_screen(client, q.message.chat.id,
-                              Screen(caption=caption, image=pick_artwork(bot),
-                                     keyboard=keyboard), old_msg=q.message)
+            await send_screen(
+                client, q.message.chat.id,
+                Screen(caption=_HOME_CAPTION, image=pick_artwork(bot),
+                       keyboard=_kb(*_home_rows(container, q))),
+                old_msg=q.message)
             await q.answer()
             return
 
         # ¬¬ Tool panels ¬¬
-        if action in ("tasks", "publish", "recover", "schedule"):
+        # NOTE: "schedule" is intentionally NOT here — the real schedule view
+        # (matching the /schedule command, with a Back button) is registered in
+        # handlers/schedule.py under `gojo|schedule`, which runs before this
+        # fallback and owns that tap.
+        if action in ("tasks", "publish", "recover"):
             titles = {"tasks": "📋 Your Publishing Tasks",
                       "publish": "🔮 Publish Review",
-                      "recover": "🛡 Channel Recovery",
-                      "schedule": "📅 Schedule Publication"}
+                      "recover": "🛡 Channel Recovery"}
             body_map = {
                 "tasks": [
                     "Everything waiting on you to publish, newest first.",
@@ -151,13 +170,6 @@ def build_gojo(container: Container, token: str) -> Client:
                     f"  {BULLET} The banned channel is detected and replaced automatically.",
                     f"  {BULLET} Every button in the main and index channels is repointed.",
                     "<blockquote>You don't rebuild anything by hand — open the affected task.</blockquote>",
-                ],
-                "schedule": [
-                    "Line a title up to publish at a set time.",
-                    "",
-                    f"  {BULLET} Pick a task and a time, and the publisher takes over then.",
-                    f"  {BULLET} Leave it off to publish immediately instead.",
-                    "<blockquote>Scheduling is opt-in — open a task to set a time.</blockquote>",
                 ],
             }
             caption, keyboard = tool_screen(
@@ -206,7 +218,7 @@ def build_gojo(container: Container, token: str) -> Client:
     @client.on_message(filters.command("start"))
     async def _start(_: Client, message: Message) -> None:
         from nekofetch.ui.screens import Screen
-        from nekofetch.ui.components import cb, keyboard
+        from nekofetch.ui.components import keyboard
         from nekofetch.ui.artwork import pick_artwork
         from kurosoden.shared.ui_helpers import send_rich_welcome
         from kurosoden.shared.command_menu import apply_for_user
@@ -215,39 +227,12 @@ def build_gojo(container: Container, token: str) -> Client:
             await apply_for_user(client, container, "gojo",
                                  message.from_user.id, getattr(message, "nf_user", None))
 
-        rows = [
-            [("📋 Tasks", cb("gojo", "tasks")),
-             ("🔮 Publish", cb("gojo", "publish"))],
-            [("📅 Schedule", cb("gojo", "schedule")),
-             ("🛡 Recover", cb("gojo", "recover"))],
-            [("💾 Backup", cb("gojo", "backup")),
-             ("📡 Change Main", cb("gojo", "change_main"))],
-            [("🔎 Check Updates", cb("gojo", "check_updates")),
-             ("🩺 Ban Check", cb("gojo", "check_banned"))],
-            [("✏️ Edit Footer", cb("gojo", "edit_footer"))],
-            [("⚙️ Settings", cb("gojo", "settings")),
-             ("❓ Help", cb("gojo", "help"))],
-        ]
-        from kurosoden.shared.access_gate import is_owner
-        if not is_owner(container, message):
-            rows = [
-                row for row in rows
-                if all("settings" not in data for _label, data in row)
-            ]
+        # Same source of truth as the `gojo|home` callback so the two menus can
+        # never diverge (Index / Change Index / Stats used to be missing here).
         screen = Screen(
-            caption=(
-                "<b>🔮 Gojo Satoru — Publisher</b>\n\n"
-                "<i>\"Throughout heaven and earth, I alone am the honored one.\"</i>\n\n"
-                "I handle the final step:\n"
-                "• Generate main channel posts\n"
-                "• Create franchise thumbnails\n"
-                "• Review and edit captions\n"
-                "• Publish or schedule\n"
-                "• Update the index\n"
-                "• Recover banned channels"
-            ),
+            caption=_HOME_CAPTION,
             image=pick_artwork("gojo"),
-            keyboard=keyboard(*rows),
+            keyboard=keyboard(*_home_rows(container, message)),
         )
         await send_rich_welcome(client, container, message, screen, bot_name="gojo")
 

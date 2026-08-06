@@ -33,6 +33,7 @@ def _schedule_card(scheduled: list, tz_name: str | None) -> Screen:
         return Screen(
             caption="📅 <b>No scheduled posts</b>\n\nYou don't have any posts scheduled right now.",
             image=pick_artwork("gojo"),
+            keyboard=keyboard([("« Back", cb("gojo", "home"))]),
         )
 
     from nekofetch.core.timefmt import to_tz
@@ -49,11 +50,12 @@ def _schedule_card(scheduled: list, tz_name: str | None) -> Screen:
     caption = "\n".join(lines)
     caption += "\n<i>Tap a post below to manage it.</i>"
 
-    # Build buttons — one per scheduled post
+    # Build buttons — one per scheduled post, then a Back-to-home row.
     btn_rows = []
     for s in scheduled:
         label = (s.anime_title or s.request_code)[:30]
         btn_rows.append([(label, cb("gojo", "sched_manage", str(s.id)))])
+    btn_rows.append([("« Back", cb("gojo", "home"))])
 
     return Screen(caption=caption, image=pick_artwork("gojo"), keyboard=keyboard(*btn_rows))
 
@@ -127,7 +129,10 @@ def register(client: Client, container: Container) -> None:
         screen = _schedule_card(list(rows), tz_name)
         await send_screen(client, message.chat.id, screen)
 
-    @client.on_callback_query(filters.regex(r"^gojo\|sched_list$"))
+    # Both the home-menu "📅 Schedule" button (gojo|schedule) and the in-view
+    # "« Back" from a manage card (gojo|sched_list) land on the same list view,
+    # so the button now matches the /schedule command exactly.
+    @client.on_callback_query(filters.regex(r"^gojo\|(?:schedule|sched_list)$"))
     async def _sched_list(_: Client, q: CallbackQuery) -> None:
         if not q.from_user or not q.message:
             await q.answer()
