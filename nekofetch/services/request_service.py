@@ -476,6 +476,13 @@ class RequestService:
             ids.extend(int(m) for m in pack.file_message_ids)
         elif pack.start_message_id and pack.end_message_id:
             ids.extend(range(pack.start_message_id, pack.end_message_id + 1))
+        # The end sticker is stored as end_message_id but is NOT part of
+        # file_message_ids (media only), so the branch above misses it on the
+        # normal upload path — orphaning a sticker in the channel on every
+        # redo/abandon. Append it explicitly; the range branch already covers it,
+        # hence the membership guard.
+        if pack.end_message_id and pack.end_message_id not in ids:
+            ids.append(pack.end_message_id)
         if not ids:
             return
         try:
