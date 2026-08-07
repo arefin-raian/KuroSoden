@@ -238,9 +238,8 @@ class StoragePack(Base, PKMixin, TimestampMixin):
     end_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)     # end sticker / last
     file_message_ids: Mapped[list | None] = mapped_column(JSONB)                # ordered, explicit
     file_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    # Exact HTML caption used for the header message. Persisted so an operator can
-    # edit a pack later without reconstructing the generated title/formatting.
-    header_caption: Mapped[str | None] = mapped_column(Text)
+    # Exact HTML caption used for the header message.
+    caption: Mapped[str | None] = mapped_column(Text)
 
     episode_from: Mapped[int | None] = mapped_column(Integer)
     episode_to: Mapped[int | None] = mapped_column(Integer)
@@ -544,6 +543,8 @@ class BotContentPost(Base, PKMixin, TimestampMixin):
     button_data: Mapped[dict | None] = mapped_column(JSONB)  # structured button layout
     is_pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     tg_message_id: Mapped[int | None] = mapped_column(BigInteger)  # legacy single-broadcast slot
+    # Real season identity for split-season cards; NULL for extras and non-entry cards.
+    season_part: Mapped[int | None] = mapped_column(Integer)
     # AniList id of the entry this card shows (season/movie cards). Lets a
     # ban-restore rebuild the watch guide's {BOT_QUAL#id:…} quality deep-links —
     # each restored season card is remapped to its fresh message id by id. NULL
