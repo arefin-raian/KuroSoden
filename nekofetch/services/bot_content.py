@@ -216,25 +216,36 @@ class BotContentService:
             order += 1
 
         # ── 2. Season cards — TV entries mapped to storage packs by index ──
+        # A split season keeps one season number but has a distinct part. Match
+        # both values so S01P01 and S01P02 become separate cards instead of one
+        # card containing every part's episodes.
         tv_entries = franchise.get("tv", [])
+        identities = self._tv_entry_identities(tv_entries)
         for i, entry in enumerate(tv_entries, start=1):
-            season_packs = [p for p in packs if p.season == i]
+            season, season_part = identities.get(
+                entry.anilist_id, (i, getattr(entry, "season_part", None))
+            )
+            season_packs = self._packs_for_tv_entry(
+                packs, season, entry, season_part=season_part,
+            )
             entry_meta = self._entry_meta(meta, entry)
             # Override the entry's poster with the user-generated thumbnail.
             generated = generated_thumbs.get(entry.anilist_id)
             if generated:
                 entry_meta["poster_url"] = generated
-            caption, image = self._build_season_card(entry_meta, i, season_packs)
+            caption, image = self._build_season_card(
+                entry_meta, season, season_packs, season_part=season_part,
+            )
             buttons = await self._build_season_buttons(season_packs)
             image_str = str(image) if image else None
             cached_url: str | None = None
             if image_str and self._c.config.features.catbox_image_cache:
                 cached_url = await self._upload_card_image(
-                    image_str, "season_card", bot_id=bot_id, order=order, season=i,
+                    image_str, "season_card", bot_id=bot_id, order=order, season=season,
                 )
             posts.append(BotContentPost(
-                bot_id=bot_id, post_type="season_card", season=i,
-                order=order, caption=caption,
+                bot_id=bot_id, post_type="season_card", season=season,
+                season_part=season_part, order=order, caption=caption,
                 image_url=image_str,
                 image_cached_url=cached_url,
                 button_data=buttons,
@@ -458,10 +469,14 @@ class BotContentService:
         extra_entries = franchise.get("extras", []) or []
         out: list[dict] = []
 
+        identities = BotContentService._tv_entry_identities(tv_entries)
         for i, entry in enumerate(tv_entries, start=1):
-            label = f"Season {i:02d}"
-            if getattr(entry, "season_part", None):
-                label += f" Part {entry.season_part}"
+            season, season_part = identities.get(
+                entry.anilist_id, (i, getattr(entry, "season_part", None))
+            )
+            label = f"Season {season:02d}"
+            if season_part:
+                label += f" Part {season_part}"
             out.append({
                 "label": label,
                 "format": "tv",
@@ -911,6 +926,57 @@ class BotContentService:
             log.warning("bot.content.franchise.failed", anime=anime_doc_id, error=str(exc))
             return empty
 
+    @staticmethod
+    def _tv_entry_identities(tv_entries: list) -> dict[int, tuple[int, int | None]]:
+        """Return the real ``(season, part)`` for each TV franchise entry.
+
+        Chronological position is not a season number: a split season has two
+        entries with the same season number. Reuse the canonical franchise
+        mapping parser so cards, packs, thumbnails, and filenames agree.
+        """
+        if not tv_entries:
+            return {}
+        from nekofetch.services.franchise_flow import FranchiseFlowService
+
+        # Some legacy relink/recovery callers only retain ``anilist_id`` and
+        # ``format``. The canonical parser needs title/episode fields, so keep
+        # those callers compatible with chronological fallback identities.
+        if any(not hasattr(entry, "english_title") for entry in tv_entries):
+            return {
+                entry.anilist_id: (
+                    getattr(entry, "season_number", None) or i,
+                    getattr(entry, "season_part", None),
+                )
+                for i, entry in enumerate(tv_entries, start=1)
+                if getattr(entry, "anilist_id", None) is not None
+            }
+
+        mapping = FranchiseFlowService(None).build_mapping(
+            {}, "", {entry.anilist_id: entry for entry in tv_entries}
+        )
+        return {
+            entry.anilist_id: (entry.season_number, entry.season_part)
+            for entry in mapping.entries
+            if entry.kind.value == "season" and entry.anilist_id is not None
+        }
+
+    @staticmethod
+    def _packs_for_tv_entry(
+        packs: list[StoragePack], season: int, entry,
+        *, season_part: int | None | object = None,
+    ) -> list[StoragePack]:
+        """Return only the packs belonging to one TV franchise entry.
+
+        ``season`` is the chronological TV index while ``season_part`` is the
+        optional AniList split marker. Both are part of the storage-pack key.
+        """
+        part = (getattr(entry, "season_part", None)
+                if season_part is None else season_part)
+        return [
+            p for p in packs
+            if p.season == season and getattr(p, "season_part", None) == part
+        ]
+
     def _entry_meta(self, base_meta: dict, entry) -> dict:
         """Merge franchise-level metadata with per-entry AniList data.
 
@@ -973,9 +1039,7 @@ class BotContentService:
 
         tv_entries = franchise.get("tv", [])
         # Build season_num lookup for TV entries.
-        season_map: dict[int, int] = {
-            e.anilist_id: i for i, e in enumerate(tv_entries, start=1)
-        }
+        season_map = self._tv_entry_identities(tv_entries)
         # Number extras by format.
         extra_counts: dict[str, int] = {}
         extra_labels: dict[int, str] = {}
@@ -988,13 +1052,16 @@ class BotContentService:
         for entry in all_entries:
             is_tv = entry.format in _TV_FORMATS
             if is_tv:
-                s_num = season_map.get(entry.anilist_id)
-                if s_num is None:
-                    continue
-                ep = [p for p in packs if p.season == s_num]
+                s_num, season_part = season_map.get(
+                    entry.anilist_id,
+                    (1, getattr(entry, "season_part", None)),
+                )
+                ep = self._packs_for_tv_entry(
+                    packs, s_num, entry, season_part=season_part,
+                )
                 label = f"Season {s_num:02d}"
-                if entry.season_part:
-                    label += f" Part {entry.season_part}"
+                if season_part:
+                    label += f" Part {season_part}"
                 ep_count = max((p.episode_to or p.file_count or 0) for p in ep) if ep else (entry.episodes or 0)
                 quals = sorted(
                     {p.resolution for p in ep if p.resolution},
@@ -1235,7 +1302,10 @@ class BotContentService:
             text = t(key, **kwargs)
         return resolve_premium_emoji(text, self._c.config.post_format)
 
-    def _build_season_card(self, meta: dict, season: int, packs: list[StoragePack]) -> tuple[str, str | None]:
+    def _build_season_card(
+        self, meta: dict, season: int, packs: list[StoragePack],
+        *, season_part: int | None = None,
+    ) -> tuple[str, str | None]:
         """Build a season entry card matching the reference format.
 
         Single-episode entries (movies, one-shot OVAs/specials) render the
@@ -1281,6 +1351,10 @@ class BotContentService:
             for p in packs
         ) or (packs == [] and (effective_eps or 0) <= 1)
 
+        season_label = f"Season {season:02d}"
+        if season_part:
+            season_label += f" Part {season_part}"
+
         if is_movie:
             caption = self._render(
                 fmt.movie_card_template, M.BOT_MOVIE_CARD,
@@ -1292,8 +1366,8 @@ class BotContentService:
         else:
             caption = self._render(
                 fmt.season_card_template, M.BOT_SEASON_CARD,
-                title=title, season=season,
-                episodes=ep_max or "—",
+                title=title, season=season, season_part=season_part or "",
+                season_label=season_label, episodes=ep_max or "—",
                 S="S" if (ep_max or 0) != 1 else "",   # EPISODE vs EPISODES
                 rating=score,
                 language=lang_str,

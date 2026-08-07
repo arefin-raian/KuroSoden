@@ -160,9 +160,9 @@ class SenkuPublisher:
                     select(DistributionBot).where(
                         DistributionBot.anime_doc_id == anime_doc_id,
                         DistributionBot.is_channel.is_(True),
-                    )
+                    ).order_by(DistributionBot.id.desc())
                 )
-            ).scalar_one_or_none()
+            ).scalars().first()
             if bot is None or not bot.chat_id:
                 log.info("senku.update.no_channel", anime=anime_doc_id)
                 return {"appended": 0, "chat_id": None}
@@ -256,9 +256,9 @@ class SenkuPublisher:
                     select(DistributionBot).where(
                         DistributionBot.anime_doc_id == anime_doc_id,
                         DistributionBot.is_channel.is_(True),
-                    )
+                    ).order_by(DistributionBot.id.desc())
                 )
-            ).scalar_one_or_none()
+            ).scalars().first()
             if bot is None or not bot.chat_id:
                 log.info("senku.relink.no_channel", anime=anime_doc_id)
                 return {"relinked": 0, "chat_id": None}
@@ -295,6 +295,7 @@ class SenkuPublisher:
         meta = await svc._gather_metadata(anime_doc_id)
         walked = await svc._walk_franchise(anime_doc_id, meta)
         tv = list(walked.get("tv", []))
+        identities = svc._tv_entry_identities(tv)
 
         packs_by_aid: dict[int, list] = {}
         for entry in walked.get("all", []):
@@ -302,8 +303,12 @@ class SenkuPublisher:
             if aid is None:
                 continue
             if entry in tv:
-                season = tv.index(entry) + 1
-                entry_packs = [p for p in packs if p.season == season]
+                season, season_part = identities.get(
+                    aid, (tv.index(entry) + 1, getattr(entry, "season_part", None))
+                )
+                entry_packs = svc._packs_for_tv_entry(
+                    packs, season, entry, season_part=season_part,
+                )
             else:
                 entry_packs = [
                     p for p in packs
@@ -421,6 +426,7 @@ class SenkuPublisher:
 
         wanted = set(new_anilist_ids or [])
         tv = list(walked.get("tv", []))
+        identities = svc._tv_entry_identities(tv)
         cards: list[dict] = []
 
         for entry in walked.get("all", []):
@@ -435,9 +441,15 @@ class SenkuPublisher:
             if gen:
                 entry_meta["poster_url"] = gen
             if entry.format in _TV_FORMATS:
-                season = (tv.index(entry) + 1) if entry in tv else 1
-                entry_packs = [p for p in packs if p.season == season]
-                caption, image = svc._build_season_card(entry_meta, season, entry_packs)
+                season, season_part = identities.get(
+                    aid, (tv.index(entry) + 1, getattr(entry, "season_part", None))
+                )
+                entry_packs = svc._packs_for_tv_entry(
+                    packs, season, entry, season_part=season_part,
+                )
+                caption, image = svc._build_season_card(
+                    entry_meta, season, entry_packs, season_part=season_part,
+                )
                 buttons = await svc._build_season_buttons(entry_packs)
                 post_type = "season_card"
             else:
@@ -461,6 +473,8 @@ class SenkuPublisher:
                 continue
             cards.append({
                 "post_type": post_type,
+                "season": season if entry.format in _TV_FORMATS else None,
+                "season_part": season_part if entry.format in _TV_FORMATS else None,
                 "caption": caption,
                 "image": await self._cache_image(image),
                 "button_data": buttons,
@@ -613,6 +627,8 @@ class SenkuPublisher:
                 "kind": post.get("post_type") or "season_card",
                 "tg_message_id": msg.id,
                 "anilist_id": aid,
+                "season": post.get("season"),
+                "season_part": post.get("season_part"),
                 "is_pinned": False,
             })
             # Snapshot the card CONTENT for the ban-restore backup. The raw
@@ -620,6 +636,8 @@ class SenkuPublisher:
             # whatever handle a restored channel later gets.
             new_content.append({
                 "post_type": post.get("post_type") or "season_card",
+                "season": post.get("season"),
+                "season_part": post.get("season_part"),
                 "caption": post.get("caption") or "",
                 "image": post.get("image"),
                 "button_data": post.get("button_data"),
@@ -761,6 +779,8 @@ class SenkuPublisher:
                 session.add(BotContentPost(
                     bot_id=bot_id,
                     post_type=it.get("post_type") or "season_card",
+                    season=it.get("season"),
+                    season_part=it.get("season_part"),
                     order=order,
                     caption=it.get("caption") or "",
                     image_url=it.get("image"),
@@ -892,16 +912,25 @@ class SenkuPublisher:
             order += 1
 
         # ── 2. Season cards (confirmed TV order) ──
+        identities = svc._tv_entry_identities(franchise["tv"])
         for i, entry in enumerate(franchise["tv"], start=1):
-            season_packs = [p for p in packs if p.season == i]
+            season, season_part = identities.get(
+                entry.anilist_id, (i, getattr(entry, "season_part", None))
+            )
+            season_packs = svc._packs_for_tv_entry(
+                packs, season, entry, season_part=season_part,
+            )
             entry_meta = svc._entry_meta(meta, entry)
             gen = _gen(entry)
             if gen:
                 entry_meta["poster_url"] = gen
-            caption, image = svc._build_season_card(entry_meta, i, season_packs)
+            caption, image = svc._build_season_card(
+                entry_meta, season, season_packs, season_part=season_part,
+            )
             buttons = await svc._build_season_buttons(season_packs)
             posts.append({
                 "post_type": "season_card", "order": order,
+                "season": season, "season_part": season_part,
                 "caption": caption,
                 "image": await self._cache_image(image),
                 "button_data": buttons, "pinned": False,
@@ -1045,6 +1074,8 @@ class SenkuPublisher:
                 session.add(BotContentPost(
                     bot_id=bot_id,
                     post_type=it.get("post_type") or it.get("kind") or "season_card",
+                    season=it.get("season"),
+                    season_part=it.get("season_part"),
                     order=order,
                     caption=it.get("caption") or "",
                     image_url=it.get("image"),
@@ -1278,6 +1309,8 @@ class SenkuPublisher:
                 "kind": post.get("post_type") or "season_card",
                 "tg_message_id": msg.id,
                 "anilist_id": post.get("anilist_id"),
+                "season": post.get("season"),
+                "season_part": post.get("season_part"),
                 "is_pinned": pinned,
                 # Carry the card CONTENT so _persist_channel can snapshot it into
                 # BotContentPost rows — the manual (wizard) publish path never had

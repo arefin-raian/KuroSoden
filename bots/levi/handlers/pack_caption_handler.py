@@ -51,7 +51,7 @@ def _pack_card(packs) -> tuple[str, list[list[tuple[str, str]]]]:
             p.anime_doc_id, p.season, p.season_part, p.entry_id
         ) == key]
         variants = len(siblings)
-        current = "saved" if any(getattr(p, "header_caption", None) for p in siblings) else "legacy"
+        current = "saved" if any(getattr(p, "caption", None) for p in siblings) else "legacy"
         suffix = f" · {variants} packs" if variants > 1 else ""
         lines.append(f"• <b>{html.escape(label)}</b>{suffix} · <i>{current}</i>")
         rows.append([(label[:48], cb("levi", "packedit", pack.id))])

@@ -31,6 +31,33 @@ LEVI_COMMANDS = [
 log = get_logger(__name__)
 
 
+def _home_rows(container: Container, actor) -> list[list[tuple[str, str]]]:
+    """Single source of truth for Levi's home-screen menu.
+
+    The callback home screen and ``/start`` must expose the same owner-only
+    controls; keeping the rows here prevents one surface drifting from the other.
+    """
+    from kurosoden.shared.access_gate import is_owner
+    from nekofetch.ui.components import cb
+
+    rows = [
+        [("📋 Tasks", cb("levi", "tasks"))],
+        [("🌐 How Sourcing Works", cb("levi", "sources"))],
+        [("🛠 Pack Captions", cb("levi", "packcaptions"))],
+        [("⚙️ Settings", cb("levi", "settings")),
+         ("❓ Help", cb("levi", "help"))],
+    ]
+    if not is_owner(container, actor):
+        rows = [
+            row for row in rows
+            if all(
+                "settings" not in data and "packcaptions" not in data
+                for _label, data in row
+            )
+        ]
+    return rows
+
+
 async def publish_commands(client: Client) -> None:
     # Staff-only bot → empty global menu (a stranger sees nothing). Staff/owner
     # get their menu per-chat on /start via command_menu.apply_for_user.
@@ -70,8 +97,7 @@ def build_levi(container: Container, token: str) -> Client:
     # ── Catch-all menu callback ─────────────────────────────────────────────
     # Inline buttons on /start route to `levi|<action>`. The dispatcher below
     # maps every action to a real screen — no more "Type /X in chat" toasts.
-    from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
-                                InlineKeyboardMarkup)
+    from pyrogram.types import CallbackQuery
     from kurosoden.shared.menu_router import tool_screen
     from nekofetch.ui.components import cb
     from nekofetch.ui.screens import Screen, send_screen
@@ -96,27 +122,12 @@ def build_levi(container: Container, token: str) -> Client:
                 "• Download and process files\n"
                 "• Upload thumbnails and generate headers"
             )
-            from kurosoden.shared.access_gate import is_owner
+            from nekofetch.ui.components import keyboard
 
-            rows = [
-                [InlineKeyboardButton("📋 Tasks", callback_data=cb(bot, "tasks"))],
-                [InlineKeyboardButton("🛠 Pack Captions", callback_data=cb(bot, "packcaptions"))],
-                [InlineKeyboardButton("⚙️ Settings", callback_data=cb(bot, "set", "home")),
-                 InlineKeyboardButton("❓ Help", callback_data=cb(bot, "help"))],
-            ]
-            if not is_owner(container, q):
-                rows = [
-                    row for row in rows
-                    if all(
-                        "set|home" not in (btn.callback_data or "")
-                        and "packcaptions" not in (btn.callback_data or "")
-                        for btn in row
-                    )
-                ]
-            keyboard = InlineKeyboardMarkup(rows)
+            rows = _home_rows(container, q)
             await send_screen(client, q.message.chat.id,
                               Screen(caption=caption, image=pick_artwork(bot),
-                                     keyboard=keyboard), old_msg=q.message)
+                                     keyboard=keyboard(*rows)), old_msg=q.message)
             await q.answer()
             return
 
@@ -195,22 +206,7 @@ def build_levi(container: Container, token: str) -> Client:
             await apply_for_user(client, container, "levi",
                                  message.from_user.id, getattr(message, "nf_user", None))
 
-        rows = [
-            [("📋 Tasks", cb("levi", "tasks"))],
-            [("🌐 How Sourcing Works", cb("levi", "sources"))],
-            [("🛠 Pack Captions", cb("levi", "packcaptions"))],
-            [("⚙️ Settings", cb("levi", "settings")),
-             ("❓ Help", cb("levi", "help"))],
-        ]
-        from kurosoden.shared.access_gate import is_owner
-        if not is_owner(container, message):
-            rows = [
-                row for row in rows
-                if all(
-                    "settings" not in data and "packcaptions" not in data
-                    for _label, data in row
-                )
-            ]
+        rows = _home_rows(container, message)
         screen = Screen(
             caption=(
                 "<b>⚔️ Levi Ackerman — Downloader</b>\n\n"

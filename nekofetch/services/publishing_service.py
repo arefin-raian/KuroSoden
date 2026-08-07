@@ -431,6 +431,30 @@ class PublishingService:
                     "publish.redo_relink.failed",
                     anime=anime_doc_id, error=str(exc),
                 )
+
+            # Task O: the relink only re-points the quality buttons. When the
+            # redo also changed the title's facts (new language line / rating /
+            # display title), refresh the LIVE surfaces — re-render with the SAME
+            # art, push, update captions + backups. Best-effort: a refresh hiccup
+            # never fails the redo publish (buttons are already relinked).
+            try:
+                from kurosoden.shared.redo_service import RedoService
+
+                refreshed = await RedoService(self._c).refresh_metadata(
+                    anime_doc_id, fd,
+                )
+                if not refreshed.relinked_only:
+                    get_logger(__name__).info(
+                        "publish.redo_metadata_refreshed",
+                        anime=anime_doc_id, entries=len(refreshed.changed_entries),
+                        main=refreshed.main_changed, captions=refreshed.captions_updated,
+                        title=refreshed.title_refreshed,
+                    )
+            except Exception as exc:  # noqa: BLE001 — never fail a redo publish
+                get_logger(__name__).warning(
+                    "publish.redo_metadata_refresh.failed",
+                    anime=anime_doc_id, error=str(exc),
+                )
         else:
             # Step 2: Create distribution bot (if auto-create is enabled and feature is on).
             if self._c.config.features.distribution_bots and self._c.config.bot.auto_create_on_publish:

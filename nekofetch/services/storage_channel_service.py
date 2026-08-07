@@ -167,8 +167,8 @@ class StorageChannelService:
             header_message_id=header_id,
             start_message_id=file_ids[0] if file_ids else start_message_id,
             end_message_id=end_message_id,
-            file_message_ids=file_ids,
-            header_caption=header_caption,
+            file_message_ids=file_ids, caption=header_caption,
+
             ingest_method="indexed",
         )
 
@@ -245,8 +245,8 @@ class StorageChannelService:
             end_message_id=end_id,
             file_message_ids=file_ids,
             ingest_method="uploaded",
-            episode_from=episode_from, episode_to=episode_to,
-            header_caption=header_caption,
+            episode_from=episode_from, episode_to=episode_to, caption=header_caption,
+
         )
 
     async def _persist(self, key: PackKey, **fields) -> StoragePack:
@@ -273,7 +273,7 @@ class StorageChannelService:
                 start_message_id=fields["start_message_id"],
                 end_message_id=fields["end_message_id"],
                 file_message_ids=file_ids, file_count=len(file_ids),
-                header_caption=fields.get("header_caption"),
+                caption=fields.get("caption") or fields.get("header_caption"),
                 episode_from=fields.get("episode_from"), episode_to=fields.get("episode_to"),
                 entry_id=key.entry_id,
                 ingest_method=fields.get("ingest_method"),
@@ -312,8 +312,9 @@ class StorageChannelService:
                 existing.file_message_ids = merged
                 existing.file_count = len(merged)
                 existing.end_message_id = fields["end_message_id"]
-                if fields.get("header_caption") is not None:
-                    existing.header_caption = fields["header_caption"]
+                if fields.get("caption") is not None or fields.get("header_caption") is not None:
+                    value = fields.get("caption") or fields.get("header_caption")
+                    existing.caption = value
                 # Keep the original header/start from the first upload.
                 existing.ingest_method = fields.get("ingest_method")
                 pack = existing
@@ -353,7 +354,7 @@ class StorageChannelService:
                 )
             )).scalars().all())
             for pack in siblings:
-                pack.header_caption = clean
+                pack.caption = clean
                 if pack.header_message_id:
                     headers.append((pack.channel_id, pack.header_message_id, pack.id))
             await session.flush()
@@ -382,8 +383,40 @@ class StorageChannelService:
         # Return the selected row's detached, updated representation. It is
         # deliberately reconstructed from the persisted values rather than
         # relying on a session-expunged ORM instance after sibling updates.
-        selected.header_caption = clean
+        selected.caption = clean
+        await self._sync_distribution_backup(selected, clean)
         return selected
+
+    async def _sync_distribution_backup(self, selected: StoragePack, caption: str) -> None:
+        """Update any durable distribution snapshot for this logical entry."""
+        from nekofetch.infrastructure.database.postgres.models import ChannelContentBackup
+
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            row = (await session.execute(
+                select(ChannelContentBackup).where(
+                    ChannelContentBackup.scope == "distribution",
+                    ChannelContentBackup.channel_key == selected.anime_doc_id,
+                )
+            )).scalar_one_or_none()
+            if row is None or not row.cards:
+                return
+            changed = False
+            for card in row.cards:
+                if card.get("kind") not in ("season_card", "movie_card"):
+                    continue
+                same_entry = (
+                    selected.entry_id is not None
+                    and card.get("anilist_id") == selected.entry_id
+                )
+                same_tv_slot = (
+                    card.get("season") == selected.season
+                    and card.get("season_part") == selected.season_part
+                )
+                if same_entry or same_tv_slot:
+                    card["caption"] = caption
+                    changed = True
+            if changed:
+                row.cards = list(row.cards)
 
     async def list_packs(self, *, limit: int = 30) -> list[StoragePack]:
         """Return enabled packs for the Levi caption editor."""
