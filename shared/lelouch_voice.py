@@ -663,6 +663,31 @@ def redo_new_seasons_notice(count: int) -> str:
     )
 
 
+def redo_update_prompt(title: str, season_labels: list[str]) -> str:
+    """K5 prompt — a redo surfaced season(s) the channel doesn't have yet."""
+    ground = ", ".join(season_labels) or "a new season"
+    return (
+        f"{ICON} <b>New ground spotted.</b>\n\n"
+        f"<b>{esc(title)}</b> now has <b>{esc(ground)}</b> that aren't on the "
+        f"channel yet.\n\n"
+        "Include it in this redo? The new season downloads, its card appends "
+        "to the channel, and the main post gets a reply.\n\n"
+        "<i>Say no to redo only what's already published.</i>"
+    )
+
+
+def redo_update_queued(title: str, count: int) -> str:
+    """K5 receipt — the owner chose to include the new season(s)."""
+    s = "season" if count == 1 else "seasons"
+    return (
+        f"{ICON} <b>Included.</b>\n\n"
+        f"<b>{esc(title)}</b>: <b>{count}</b> new {s} queued as an update. The "
+        f"entry downloads, its card appends to the channel, and the main post "
+        f"gets a reply when it lands.\n\n"
+        "<i>The channel grows, not resets.</i>"
+    )
+
+
 BTN_REDO_YES = "♻️ Yes — redo this"
 BTN_REDO_NO = "✖️ Not it"
 

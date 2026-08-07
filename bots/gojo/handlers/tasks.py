@@ -11,6 +11,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import secrets
+from urllib.parse import urlparse
+
+from sqlalchemy import select
+
+from nekofetch.infrastructure.database.postgres.models import DistributionBot
+from nekofetch.infrastructure.database.postgres.session import session_scope
+
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import CallbackQuery, Message
@@ -21,7 +29,7 @@ from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
 from nekofetch.ui.artwork import pick_artwork
 from nekofetch.ui.components import cb, keyboard
-from nekofetch.ui.screens import Screen, send_screen
+from nekofetch.ui.screens import Screen, card, send_screen
 
 log = get_logger(__name__)
 
@@ -36,6 +44,7 @@ STATE_CHANGE_INDEX = "gojo:await_new_index_channel"
 STATE_IDX_SLOT_CAPTION = "gojo:await_idx_slot_caption"
 STATE_IDX_SLOT_IMAGE = "gojo:await_idx_slot_image"
 STATE_IDX_SLOT_BUTTONS = "gojo:await_idx_slot_buttons"
+STATE_RECOVERY_CHANNEL = "gojo:await_recovery_channel"
 
 # Every command Gojo registers. The FSM free-text consumer MUST exclude all of
 # them, or it swallows command messages (they're `filters.text` too) before the
@@ -143,6 +152,365 @@ def _index_slot_actions_markup(order: int):
         [(V.BTN_IDX_MARK_REPURPOSED, cb("gojo", "idx_repurpose", str(order), "on")),
          (V.BTN_IDX_MARK_RESERVED, cb("gojo", "idx_repurpose", str(order), "off"))],
         [(V.BTN_IDX_BACK, cb("gojo", "index")), (V.BTN_HOME, cb("gojo", "home"))],
+    )
+
+
+async def _recovery_admin_ids(container: Container, requester_id: int | None = None) -> list[int]:
+    """List idle Gojo admins in preference order.
+
+    The pool is the source of truth. A configured owner/admin is only a fallback
+    when the pool has no eligible row, so a ban is never silently left unowned.
+    The caller claims one of these ids atomically before sending a handoff.
+    """
+    try:
+        from kurosoden.shared.management_service import ManagementService
+
+        views = await ManagementService(container.pg_sessionmaker).list_admins(stage="gojo")
+        idle = [
+            v.telegram_id for v in views
+            if v.is_available and not v.on_break and v.active_tasks == 0
+        ]
+        if requester_id in idle:
+            idle.remove(requester_id)
+            idle.insert(0, requester_id)
+        if idle:
+            return idle
+    except Exception as exc:  # noqa: BLE001 — configured ids remain a safe fallback
+        log.warning("gojo.recovery.admin_lookup_failed", error=str(exc))
+    fallback = list(getattr(container.env, "admin_ids", []) or [])
+    if requester_id and requester_id not in fallback:
+        fallback.insert(0, requester_id)
+    return fallback
+
+
+_RECOVERY_CLAIM_TTL = 15 * 60
+
+
+async def _claim_recovery_admin(
+    container: Container, admin_id: int, anime_doc_id: str,
+) -> str | None:
+    """Reserve one admin for one recovery FSM using Redis SET NX.
+
+    A human handoff is not an ordinary request assignment, so creating a fake
+    ``AdminAssignment`` would pollute the task board. The short-lived Redis claim
+    gives the same concurrency guarantee without inventing task rows; the FSM's
+    own TTL is the upper bound for the reservation.
+    """
+    redis = getattr(container, "redis", None)
+    token = secrets.token_urlsafe(18)
+    if redis is None:
+        # Small offline/unit-test containers have no Redis. Production FSM-backed
+        # recovery always has Redis, and the fallback keeps helper tests useful.
+        return token
+    key = f"nf:gojo:recovery_claim:{admin_id}"
+    try:
+        acquired = await redis.set(key, token, nx=True, ex=_RECOVERY_CLAIM_TTL)
+        return token if acquired else None
+    except Exception as exc:  # noqa: BLE001 — fail closed, then automatic fallback
+        log.warning("gojo.recovery.claim_failed", admin=admin_id, error=str(exc))
+        return None
+
+
+async def _release_recovery_admin(
+    container: Container, admin_id: int, claim_token: str,
+) -> None:
+    """Release only this workflow's recovery reservation atomically.
+
+    Never delete by admin alone: an expired workflow may be followed by a newer
+    claim. The token comparison and deletion happen in one Redis operation.
+    """
+    redis = getattr(container, "redis", None)
+    if redis is None:
+        return
+    key = f"nf:gojo:recovery_claim:{admin_id}"
+    try:
+        script = (
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end"
+        )
+        await redis.eval(script, 1, key, claim_token)
+    except Exception as exc:  # noqa: BLE001 — TTL remains the safety net
+        log.debug("gojo.recovery.claim_release_failed", admin=admin_id, error=str(exc))
+
+
+async def _recovery_old_chat_id(container: Container, anime_doc_id: str) -> int | None:
+    """Read the current live channel id for same-channel protection."""
+    try:
+        async with session_scope(container.pg_sessionmaker) as session:
+            row = (await session.execute(
+                select(DistributionBot).where(
+                    DistributionBot.anime_doc_id == anime_doc_id,
+                    DistributionBot.enabled.is_(True),
+                ).order_by(DistributionBot.id.desc())
+            )).scalars().first()
+            return int(row.chat_id) if row and row.chat_id else None
+    except Exception as exc:  # noqa: BLE001 — protection is best-effort
+        log.debug("gojo.recovery.old_chat_lookup_failed", error=str(exc))
+        return None
+
+
+async def _recovery_prompt(
+    client: Client,
+    container: Container,
+    fsm: FSM,
+    admin_id: int,
+    anime_doc_id: str,
+    title: str,
+    old_name: str | None,
+    *,
+    claim_token: str | None = None,
+) -> None:
+    """DM one admin with Senku's familiar recovery card and arm its FSM."""
+    from kurosoden.shared import senku_voice as SV
+
+    await fsm.set(
+        admin_id,
+        STATE_RECOVERY_CHANNEL,
+        anime_doc_id=anime_doc_id,
+        title=title,
+        old_name=old_name,
+        old_chat_id=(
+            await _recovery_old_chat_id(container, anime_doc_id)
+        ),
+        claim_token=claim_token,
+    )
+    await send_screen(
+        client,
+        admin_id,
+        card(
+            SV.recovery_channel_prompt(title, old_name),
+            image=pick_artwork("senku"),
+            bot_name="senku",
+            buttons=[
+                [(SV.BTN_RECOVERY_OWN,
+                  cb("gojo", "recovery", "own", anime_doc_id))],
+                [(SV.BTN_RECOVERY_AUTO,
+                  cb("gojo", "recovery", "auto", anime_doc_id))],
+                [(SV.BTN_RECOVERY_CANCEL,
+                  cb("gojo", "recovery", "cancel", anime_doc_id))],
+            ],
+        ),
+    )
+
+
+async def offer_human_recovery(
+    client: Client,
+    container: Container,
+    fsm: FSM,
+    anime_doc_id: str,
+    title: str,
+    *,
+    requester_id: int | None = None,
+) -> int | None:
+    """Offer recovery to one idle admin; return the recipient or ``None``."""
+    ids = await _recovery_admin_ids(container, requester_id)
+    recipient = None
+    claim_token = None
+    for candidate in ids:
+        token = await _claim_recovery_admin(container, candidate, anime_doc_id)
+        if token is not None:
+            recipient = candidate
+            claim_token = token
+            break
+    if recipient is None:
+        return None
+    old_name = None
+    try:
+        async with session_scope(container.pg_sessionmaker) as session:
+            old = (await session.execute(
+                select(DistributionBot).where(
+                    DistributionBot.anime_doc_id == anime_doc_id,
+                    DistributionBot.enabled.is_(True),
+                ).order_by(DistributionBot.id.desc())
+            )).scalars().first()
+            old_name = old.name if old else None
+    except Exception as exc:  # noqa: BLE001 — title is enough for the prompt
+        log.debug("gojo.recovery.old_name_lookup_failed", error=str(exc))
+    try:
+        await _recovery_prompt(
+            client, container, fsm, recipient, anime_doc_id, title, old_name,
+            claim_token=claim_token,
+        )
+    except Exception as exc:  # noqa: BLE001 — automatic recovery remains available
+        await _release_recovery_admin(container, recipient, claim_token or "")
+        log.warning("gojo.recovery.prompt_failed", admin=recipient,
+                    anime=anime_doc_id, error=str(exc)[:200])
+        return None
+    log.info("gojo.recovery.human_offered", anime=anime_doc_id, admin=recipient)
+    return recipient
+
+
+def _recovery_target(raw: str) -> str | int:
+    """Normalize a pasted @handle, t.me URL, or numeric chat id."""
+    value = (raw or "").strip()
+    if value.lstrip("-").isdigit():
+        return int(value)
+    if "t.me/" in value:
+        path = urlparse(value if "://" in value else f"https://{value}").path.strip("/")
+        if path:
+            value = path.rsplit("/", 1)[-1]
+    return value if value.startswith("@") else f"@{value}"
+
+
+def _is_admin_member(member) -> bool:
+    status = getattr(getattr(member, "status", None), "value",
+                     str(getattr(member, "status", "")))
+    return status in {"administrator", "creator"}
+
+
+def _has_recovery_privileges(member) -> bool:
+    """Whether a bot can actually operate the restored channel.
+
+    Telegram's ``administrator`` label alone is not enough: a bot can be an
+    admin with posting/editing/invite rights removed. Creators inherently have
+    the required rights; regular admins must expose every capability used by
+    the restore and cleanup path.
+    """
+    if getattr(getattr(member, "status", None), "value",
+               str(getattr(member, "status", ""))) == "creator":
+        return True
+    if not _is_admin_member(member):
+        return False
+    privileges = getattr(member, "privileges", None)
+    return privileges is not None and all(
+        bool(getattr(privileges, field, False))
+        for field in (
+            "can_change_info", "can_post_messages", "can_edit_messages",
+            "can_delete_messages", "can_invite_users", "can_pin_messages",
+            "can_promote_members",
+        )
+    )
+
+
+async def _promote_recovery_bots(
+    client: Client, container: Container, chat_id: int,
+) -> list[str]:
+    """Add/promote Senku and Gojo when the channel owner gave Gojo admin rights.
+
+    Telegram requires the acting identity to already be an administrator. The
+    recovery card therefore tells the human to add Gojo first; Gojo then fills in
+    Senku and repairs either bot's missing privileges when Telegram permits it.
+    """
+    pm = getattr(container, "pipeline_manager", None)
+    # ``client`` is the Gojo session whose membership was verified by this
+    # handler. Do not substitute ``container.admin_client`` here: in production
+    # that may be the separate admin/userbot session and would make the
+    # promotion happen under an identity the human never authorized.
+    actor = client
+    missing: list[str] = []
+    try:
+        from pyrogram.types import ChatPrivileges
+
+        privileges = ChatPrivileges(
+            can_change_info=True, can_post_messages=True,
+            can_edit_messages=True,            can_delete_messages=True, can_invite_users=True,
+            can_pin_messages=True, can_promote_members=True,
+            can_manage_chat=True,
+
+        )
+    except Exception:  # pragma: no cover - Pyrogram is a runtime dependency
+        privileges = None
+
+    for label in ("Senku", "Gojo"):
+        bot = getattr(pm, label.lower(), None) if pm else None
+        if bot is None:
+            missing.append(label)
+            continue
+        try:
+            me = await bot.get_me()
+            member = await client.get_chat_member(chat_id, me.id)
+            if _has_recovery_privileges(member):
+                continue
+            try:
+                await actor.add_chat_members(chat_id, me.id)
+            except Exception as exc:  # noqa: BLE001 — it may already be a member
+                log.debug("gojo.recovery.bot_add_skipped", bot=label, error=str(exc))
+            await actor.promote_chat_member(chat_id, me.id, privileges=privileges)
+        except Exception as exc:  # noqa: BLE001 — verification below gives the user a retry
+            log.info("gojo.recovery.bot_promote_failed", bot=label, chat=chat_id,
+                     error=str(exc))
+            missing.append(label)
+    return missing
+
+
+async def _verify_recovery_channel(client: Client, container: Container, chat_id: int) -> tuple[bool, str]:
+    """Require the replacement to contain both pipeline bots as admins."""
+    attempted_failures = await _promote_recovery_bots(client, container, chat_id)
+    pm = getattr(container, "pipeline_manager", None)
+    checks: list[tuple[str, object | None]] = [
+        ("Senku", getattr(pm, "senku", None) if pm else None),
+        ("Gojo", getattr(pm, "gojo", None) if pm else None),
+    ]
+    missing: list[str] = list(attempted_failures)
+    for label, bot in checks:
+        if bot is None or label in missing:
+            if label not in missing:
+                missing.append(label)
+            continue
+        try:
+            me = await bot.get_me()
+            member = await client.get_chat_member(chat_id, me.id)
+            if not _has_recovery_privileges(member):
+                missing.append(label)
+        except Exception as exc:  # noqa: BLE001 — an absent bot is not verified
+            log.info("gojo.recovery.bot_not_admin", bot=label, chat=chat_id,
+                     error=str(exc))
+            missing.append(label)
+    if missing:
+        return False, " and ".join(dict.fromkeys(missing)) + " still need admin rights"
+    return True, ""
+
+
+async def _run_human_recovery(
+    client: Client,
+    container: Container,
+    fsm: FSM,
+    admin_id: int,
+    data: dict,
+    raw: str,
+) -> tuple[bool, str]:
+    """Verify, clean notices, and hand a human-created channel to the restore path."""
+    from kurosoden.shared import senku_voice as SV
+
+    target = _recovery_target(raw)
+    try:
+        chat = await client.get_chat(target)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Telegram could not open that channel ({str(exc)[:160]})"
+    chat_id = int(chat.id)
+    old_chat_id = data.get("old_chat_id")
+    if old_chat_id is not None and int(old_chat_id) == chat_id:
+        return False, "that is the old channel, not a replacement"
+    ok, reason = await _verify_recovery_channel(client, container, chat_id)
+    if not ok:
+        return False, reason
+
+    # Use the existing Senku cleanup primitive. It removes the Telegram-generated
+    # title/photo/channel-created notices without inventing another implementation.
+    try:
+        from kurosoden.shared.senku_publisher import SenkuPublisher
+
+        await SenkuPublisher._sweep_service_notices(client, chat_id)
+    except Exception as exc:  # noqa: BLE001 — cleanup is cosmetic, restore is not
+        log.debug("gojo.recovery.notice_sweep_failed", chat=chat_id, error=str(exc))
+
+    from nekofetch.services.bot_orchestrator import BotOrchestratorService
+
+    info = await BotOrchestratorService(container).recover_human_channel(
+        data["anime_doc_id"],
+        chat_id,
+        username=getattr(chat, "username", None),
+        name=getattr(chat, "title", None),
+        client=client,
+    )
+    if info is None:
+        await _release_recovery_admin(container, admin_id, data.get("claim_token", ""))
+        return False, "the replacement could not be registered"
+    await fsm.clear(admin_id)
+    await _release_recovery_admin(container, admin_id, data.get("claim_token", ""))
+
+    return True, SV.recovery_done(
+        f"@{info.username}" if info.username else (info.name or str(chat_id)),
     )
 
 
@@ -580,8 +948,19 @@ def register(client: Client, container: Container) -> None:
         from nekofetch.services.bot_orchestrator import BotOrchestratorService
 
         orch = BotOrchestratorService(container)
+        recovery_fsm = FSM(container.redis, bot="gojo")
         for probe in result.banned:
             if not probe.anime_doc_id:
+                continue
+            recipient = await offer_human_recovery(
+                client, container, recovery_fsm, probe.anime_doc_id,
+                probe.name, requester_id=getattr(reply_to.from_user, "id", None),
+            )
+            if recipient is not None:
+                await reply_to.reply(
+                    f"🔮 Recovery instructions sent privately to admin <code>{recipient}</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
                 continue
             try:
                 info = await orch.recreate_bot(probe.anime_doc_id)
@@ -604,6 +983,74 @@ def register(client: Client, container: Container) -> None:
     async def _cb_check_banned(_: Client, q: CallbackQuery) -> None:
         await q.answer("Probing…")
         await _run_ban_check(q.message)
+
+    # ── Human replacement-channel recovery ───────────────────────────────────
+    @client.on_callback_query(filters.regex(r"^gojo\|recovery\|"))
+    async def _recovery_cb(_: Client, q: CallbackQuery) -> None:
+        if q.from_user is None or q.message is None:
+            await q.answer()
+            return
+        parts = (q.data or "").split("|")
+        action = parts[2] if len(parts) > 2 else ""
+        anime_doc_id = parts[3] if len(parts) > 3 else ""
+        state, data = await fsm.get(q.from_user.id)
+        if state != STATE_RECOVERY_CHANNEL or data.get("anime_doc_id") != anime_doc_id:
+            await q.answer("This recovery offer expired.", show_alert=True)
+            return
+        from kurosoden.shared import senku_voice as SV
+        if action == "cancel":
+            await fsm.clear(q.from_user.id)
+            await _release_recovery_admin(
+                container, q.from_user.id, data.get("claim_token", ""),
+            )
+            await q.answer("Recovery cancelled.")
+            await send_screen(
+                client, q.message.chat.id,
+                card(V.task_aborted(data.get("title", anime_doc_id)),
+                     image=pick_artwork("gojo"), bot_name="gojo",
+                     buttons=[[(V.BTN_HOME, cb("gojo", "home"))]]),
+                old_msg=q.message,
+            )
+            return
+        if action == "own":
+            await q.answer()
+            await send_screen(
+                client, q.message.chat.id,
+                card(SV.recovery_waiting(), image=pick_artwork("senku"),
+                     bot_name="senku",
+                     buttons=[[(V.BTN_CANCEL,
+                                cb("gojo", "recovery", "cancel", anime_doc_id))]]),
+                old_msg=q.message,
+            )
+            return
+        if action == "auto":
+            await q.answer("Rebuilding automatically…")
+            await _release_recovery_admin(
+                container, q.from_user.id, data.get("claim_token", ""),
+            )
+            from nekofetch.services.bot_orchestrator import BotOrchestratorService
+
+            info = await BotOrchestratorService(container).recreate_bot(anime_doc_id)
+            await fsm.clear(q.from_user.id)
+            if info:
+                await send_screen(
+                    client, q.message.chat.id,
+                    card(SV.recovery_done(
+                        f"@{info.username}" if info.username else info.name,
+                    ), image=pick_artwork("senku"), bot_name="senku",
+                         buttons=[[(V.BTN_HOME, cb("gojo", "home"))]]),
+                    old_msg=q.message,
+                )
+            else:
+                await send_screen(
+                    client, q.message.chat.id,
+                    card(SV.recovery_failed(
+                        anime_doc_id, "automatic rebuild did not complete",
+                    ), image=pick_artwork("senku"), bot_name="senku"),
+                    old_msg=q.message,
+                )
+            return
+        await q.answer("Unknown recovery action.", show_alert=True)
 
     # ── Stats — catalog coverage + backup/schedule/maintenance dashboard ──────
     @client.on_callback_query(filters.regex(r"^gojo\|stats$"))
@@ -718,6 +1165,22 @@ def register(client: Client, container: Container) -> None:
         if not message.from_user:
             return
         state, data = await fsm.get(message.from_user.id)
+        if state == STATE_RECOVERY_CHANNEL:
+            raw = (message.text or "").strip()
+            if not raw:
+                return
+            ok, result = await _run_human_recovery(
+                client, container, fsm, message.from_user.id, data, raw,
+            )
+            if ok:
+                await message.reply(result, parse_mode=ParseMode.HTML)
+            else:
+                from kurosoden.shared import senku_voice as SV
+                await message.reply(
+                    SV.recovery_failed(raw, result),
+                    parse_mode=ParseMode.HTML,
+                )
+            return
         code = data.get("request_code")
         if state == STATE_EDIT_CAPTION and code:
             from kurosoden.shared.settings_ui import parse_user_markup
@@ -1025,6 +1488,7 @@ async def _execute_publish(
 async def _recover_channel(
     client: Client, container: Container, message: Message, request_code: str,
 ) -> None:
+
     """Recover a banned or broken distribution channel."""
     from nekofetch.infrastructure.database.postgres.session import session_scope
     from nekofetch.infrastructure.repositories.request_repo import RequestRepository
@@ -1046,12 +1510,24 @@ async def _recover_channel(
 
     await message.reply(
         f"🔄 <b>Starting recovery</b> for <b>{title}</b>...\n\n"
-        "<i>Checking distribution channels...</i>",
+        "<i>Sending the familiar Senku recovery card to an available admin.</i>",
         parse_mode=ParseMode.HTML,
     )
 
+    recovery_fsm = FSM(container.redis, bot="gojo")
+    recipient = await offer_human_recovery(
+        client, container, recovery_fsm, anime_doc_id, title,
+        requester_id=getattr(message.from_user, "id", None),
+    )
+    if recipient is not None:
+        await message.reply(
+            f"🔮 Recovery instructions sent privately to admin <code>{recipient}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     try:
-        # Reuse NekoFetch's BotOrchestratorService for recreation.
+        # Reuse NekoFetch's BotOrchestratorService for automatic fallback.
         from nekofetch.services.bot_orchestrator import BotOrchestratorService
 
         orch = BotOrchestratorService(container)
@@ -1363,7 +1839,6 @@ def make_monthly_bancheck_job(container: Container):
             from nekofetch.services.maintenance_service import MaintenanceService
 
             from nekofetch.core.redis_safe import safe_redis_set
-            from nekofetch.services.bot_orchestrator import BotOrchestratorService
 
             await safe_redis_set(
                 container.redis,
@@ -1374,33 +1849,57 @@ def make_monthly_bancheck_job(container: Container):
             if not result.banned:
                 log.info("gojo.sched.bancheck.clear", checked=result.checked)
                 return
-            orch = BotOrchestratorService(container)
-            recovered: list[str] = []
+
+            mgr = getattr(container, "pipeline_manager", None)
+            gojo = getattr(mgr, "gojo", None) if mgr else None
+            if gojo is None:
+                log.warning("gojo.sched.bancheck.no_client")
+                return
+
+            # Scheduled recovery uses exactly the same human handoff as /bancheck.
+            # This keeps the operator experience consistent and avoids silently
+            # deleting/recreating a channel while nobody has reviewed the failure.
+            recovery_fsm = FSM(container.redis, bot="gojo")
+            handed_off: list[str] = []
+            auto_recovered: list[str] = []
             for probe in result.banned:
                 if not probe.anime_doc_id:
                     continue
                 try:
-                    info = await orch.recreate_bot(probe.anime_doc_id)
+                    recipient = await offer_human_recovery(
+                        gojo, container, recovery_fsm, probe.anime_doc_id,
+                        probe.name,
+                    )
+                    if recipient is not None:
+                        handed_off.append(probe.name)
+                        continue
+                    # No claimable admin: preserve the previous automatic fallback
+                    # so a completely unattended deployment can still self-heal.
+                    from nekofetch.services.bot_orchestrator import BotOrchestratorService
+
+                    info = await BotOrchestratorService(container).recreate_bot(
+                        probe.anime_doc_id,
+                    )
                     if info:
-                        recovered.append(probe.name)
+                        auto_recovered.append(probe.name)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("gojo.sched.bancheck.recover_failed",
                                 anime=probe.anime_doc_id, error=str(exc)[:200])
-            mgr = getattr(container, "pipeline_manager", None)
-            gojo = getattr(mgr, "gojo", None) if mgr else None
-            if gojo is not None:
-                summary = V.bancheck_scheduled_summary(
-                    result.checked, len(result.banned), recovered,
-                )
-                for admin_id in await _gojo_admin_ids(container):
-                    try:
-                        await gojo.send_message(admin_id, summary,
-                                                parse_mode=ParseMode.HTML)
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("gojo.sched.bancheck.dm_failed",
-                                    admin=admin_id, error=str(exc)[:200])
+
+            summary = V.bancheck_scheduled_summary(
+                result.checked, len(result.banned),
+                [*handed_off, *auto_recovered],
+            )
+            for admin_id in await _gojo_admin_ids(container):
+                try:
+                    await gojo.send_message(admin_id, summary,
+                                            parse_mode=ParseMode.HTML)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("gojo.sched.bancheck.dm_failed",
+                                admin=admin_id, error=str(exc)[:200])
             log.info("gojo.sched.bancheck.done", checked=result.checked,
-                     banned=len(result.banned), recovered=len(recovered))
+                     banned=len(result.banned), handed_off=len(handed_off),
+                     recovered=len(auto_recovered))
         except Exception as exc:  # noqa: BLE001 — a scheduler job must never crash the loop
             log.warning("gojo.sched.bancheck.tick_failed", error=str(exc)[:200])
 

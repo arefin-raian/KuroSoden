@@ -109,8 +109,53 @@ def channel_scope_prompt(title: str) -> str:
         "🤖 <b>A user-bot creates it</b> — a pooled user-bot account makes it, sets the "
         "title, description and username itself. You only add the profile photo.\n\n"
         "<blockquote>⚠️ Prefer creating it yourself. Only let a user-bot do it once your "
-        "own account has hit its channel-creation limit — user-bot accounts have a hard "
+        "own account has hit the channel-creation limit — user-bot accounts have a hard "
         "cap too, so we save them for when you're out of room.</blockquote>"
+    )
+
+
+def recovery_channel_prompt(title: str, old_name: str | None = None) -> str:
+    """The normal channel setup card, reworded for a banned-channel replacement.
+
+    Recovery deliberately uses Senku's voice and channel-creation vocabulary so
+    an operator who already knows the normal wizard does not get a second UI to
+    learn. The caller supplies the inline buttons and the recurring artwork.
+    """
+    old = f"\n\n<b>Previous channel:</b> {esc(old_name)}" if old_name else ""
+    return (
+        f"{ICON} <b>Restoring a banned channel</b>{old}\n\n"
+        f"The old distribution channel for <b>{esc(title)}</b> is unavailable. "
+        "Create a <b>public replacement channel</b> (or use the user-bot option), "
+        "add <b>Senku</b> and <b>Gojo</b> as administrators with full rights, set a "
+        "clean profile picture, and remove the Telegram service messages about the "
+        "channel/photo being changed.\n\n"
+        "When that is done, send me the replacement <b>@username</b>, link, or numeric "
+        "ID. I'll verify both bots, restore the saved cards, relink the Download "
+        "buttons, and notify the main post."
+    )
+
+
+def recovery_waiting() -> str:
+    return (
+        f"{ICON} <b>Replacement channel assigned.</b>\n\n"
+        "Create the channel using the recovery card, then send its @username or ID "
+        "back to me. The saved content stays untouched until I verify the new channel."
+    )
+
+
+def recovery_done(handle: str) -> str:
+    return (
+        f"{ICON} <b>Recovery complete.</b>\n\n"
+        f"The replacement <b>{esc(handle)}</b> is verified, restored, and linked into "
+        "the catalog. The old channel was never used for new posts."
+    )
+
+
+def recovery_failed(handle: str, reason: str) -> str:
+    return (
+        f"{ICON} <b>Recovery is not ready.</b>\n\n"
+        f"I couldn't accept <b>{esc(handle)}</b>: {esc(reason)}\n\n"
+        "Add both bots as administrators and send the replacement handle again."
     )
 
 
@@ -517,6 +562,12 @@ BTN_SCOPE_USERBOT = "🤖 Let a user-bot create it"
 BTN_USERBOT_JOIN = "🔗 Join the channel"
 BTN_USERBOT_JOINED = "✅ I've joined"
 BTN_USERBOT_DONE = "✅ Done — I added the photo"
+
+# Human ban-recovery wizard actions. These deliberately live beside the normal
+# channel-creation labels so recovery keeps the same Senku UI language.
+BTN_RECOVERY_OWN = "👤 I'll create the replacement"
+BTN_RECOVERY_AUTO = "🤖 Let a user-bot create it"
+BTN_RECOVERY_CANCEL = "✗ Cancel recovery"
 
 BTN_SHOW_LOGOS = "🔬 Show Logos"
 BTN_SHOW_POSTERS = "🖼 Show Posters"

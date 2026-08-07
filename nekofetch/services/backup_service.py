@@ -199,6 +199,41 @@ class BackupService:
                      mirrored=bool(catbox_url or telegraph_url or imgbb_url))
             return row
 
+    async def update_main_thumbnail(self, anime_doc_id: str, image_path: str) -> bool:
+        """Refresh only the image mirror in the main-post backup.
+
+        The existing caption, buttons, and source message coordinates remain
+        untouched; only the durable image fields are replaced.
+        """
+        from pathlib import Path
+        from kurosoden.shared.image_backup import backup_bytes
+
+        path = Path(image_path)
+        if not path.exists():
+            return False
+        mime = {
+            ".png": "image/png",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }.get(path.suffix.lower(), "image/jpeg")
+        mirrored = await backup_bytes(self._c, path.read_bytes(), mime=mime)
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            row = (await session.execute(
+                select(PublishedPostBackup).where(
+                    PublishedPostBackup.anime_doc_id == anime_doc_id
+                )
+            )).scalar_one_or_none()
+            if row is None:
+                return False
+            # Keep the previous remote source as the final restore fallback;
+            # ``image_source_url`` must never become a local filesystem path.
+            row.image_catbox_url = mirrored.catbox_url or row.image_catbox_url
+            row.image_telegraph_url = mirrored.telegraph_url or row.image_telegraph_url
+            row.image_imgbb_url = mirrored.imgbb_url or row.image_imgbb_url
+            return bool(
+                mirrored.catbox_url or mirrored.telegraph_url or mirrored.imgbb_url
+            )
+
     # ── Restore ──────────────────────────────────────────────────────────────
 
     async def restore_to_channel(
@@ -324,6 +359,25 @@ class BackupService:
             log.warning("backup.index.mirror_url_failed", url=source_url, error=str(exc))
             return source_url
 
+    async def update_main_caption(self, anime_doc_id: str, caption: str) -> bool:
+        """Refresh only the stored caption of a main-post backup.
+
+        The redo metadata refresh (Task O) re-renders the main caption when the
+        episode-count/language line changes; the backup must carry the same text
+        so a later ban-restore reposts the corrected copy verbatim. Media/button
+        fields are left untouched.
+        """
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            row = (await session.execute(
+                select(PublishedPostBackup).where(
+                    PublishedPostBackup.anime_doc_id == anime_doc_id
+                )
+            )).scalar_one_or_none()
+            if row is None:
+                return False
+            row.caption = caption
+        return True
+
     async def record_distribution_channel(
         self, anime_doc_id: str,
     ) -> ChannelContentBackup | None:
@@ -340,13 +394,26 @@ class BackupService:
         Returns the saved row, or ``None`` if there's no channel/content to back up.
         """
         async with session_scope(self._c.pg_sessionmaker) as session:
-            bot = (
+            enabled = (
                 await session.execute(
                     select(DistributionBot)
-                    .where(DistributionBot.anime_doc_id == anime_doc_id)
+                    .where(
+                        DistributionBot.anime_doc_id == anime_doc_id,
+                        DistributionBot.enabled.is_(True),
+                        DistributionBot.is_channel.is_(True),
+                    )
                     .order_by(DistributionBot.id.desc())
                 )
-            ).scalars().first()
+            ).scalars().all()
+            # During human recovery both the old channel and the replacement can
+            # be enabled temporarily. Always snapshot the original/non-recovery
+            # channel first; a partially restored replacement must never overwrite
+            # the durable backup. If the title only has a successful human
+            # replacement, the fallback keeps normal future backups working.
+            bot = next(
+                (row for row in enabled if row.creation_scope != "human_recovery"),
+                enabled[0] if enabled else None,
+            )
             if bot is None:
                 return None
             posts = (
@@ -385,6 +452,8 @@ class BackupService:
                 "image_url": durable or None,
                 "button_data": p.button_data,
                 "is_pinned": bool(p.is_pinned),
+                "season": p.season,
+                "season_part": p.season_part,
                 # Entry id (season/movie cards) so restore can remap the watch
                 # guide's {BOT_QUAL#id:…} deep-links to the fresh message ids.
                 "anilist_id": p.anilist_id,
@@ -417,6 +486,109 @@ class BackupService:
             await session.refresh(row)
             log.info("backup.dist.done", anime=anime_doc_id, cards=len(cards))
             return row
+
+    async def clear_distribution_channel(
+        self, anime_doc_id: str, chat_id: int, *, client=None,
+    ) -> int:
+        """Delete only tracked messages from one human-recovery replacement.
+
+        A failed recovery can leave cards in Telegram even though its database row
+        was disabled. On retry, deleting the tracked layout/content message ids
+        prevents duplicate cards while preserving any unrelated messages the
+        owner may have added to the channel. The next restore recreates the DB
+        layout from the durable backup.
+        """
+        client = client or getattr(self._c, "admin_client", None)
+        if client is None:
+            return 0
+
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            bot = (
+                await session.execute(
+                    select(DistributionBot).where(
+                        DistributionBot.anime_doc_id == anime_doc_id,
+                        DistributionBot.chat_id == chat_id,
+                        DistributionBot.is_channel.is_(True),
+                    ).order_by(DistributionBot.id.desc())
+                )
+            ).scalars().first()
+            if bot is None:
+                return 0
+            layout = (
+                await session.execute(
+                    select(ChannelLayout).where(
+                        ChannelLayout.channel_bot_id == bot.id
+                    )
+                )
+            ).scalars().all()
+            posts = (
+                await session.execute(
+                    select(BotContentPost).where(
+                        BotContentPost.bot_id == bot.id
+                    )
+                )
+            ).scalars().all()
+            message_ids = {
+                int(row.tg_message_id)
+                for row in (*layout, *posts)
+                if row.tg_message_id is not None
+            }
+
+        deleted = 0
+        failed_ids: set[int] = set()
+        for message_id in sorted(message_ids):
+            try:
+                await client.delete_messages(chat_id, message_id)
+                deleted += 1
+            except Exception as exc:  # noqa: BLE001 — retain failed ids for retry
+                failed_ids.add(message_id)
+                log.warning("backup.dist.cleanup_delete_failed",
+                            anime=anime_doc_id, chat=chat_id,
+                            message_id=message_id, error=str(exc))
+
+        # Remove tracking only for messages Telegram confirmed as deleted. Rows for
+        # failed deletions remain durable, so a retry can make another attempt and
+        # the restore path never knowingly duplicates an unremoved message.
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            if deleted:
+                await session.execute(
+                    delete(BotContentPost).where(
+                        BotContentPost.bot_id == bot.id,
+                        BotContentPost.tg_message_id.in_(
+                            message_ids.difference(failed_ids)
+                        ),
+                    )
+                )
+                await session.execute(
+                    delete(ChannelLayout).where(
+                        ChannelLayout.channel_bot_id == bot.id,
+                        ChannelLayout.tg_message_id.in_(
+                            message_ids.difference(failed_ids)
+                        ),
+                    )
+                )
+            # Rows without a Telegram id cannot leave a duplicate message behind;
+            # discard those stale database-only records while preserving failures.
+            await session.execute(
+                delete(BotContentPost).where(
+                    BotContentPost.bot_id == bot.id,
+                    BotContentPost.tg_message_id.is_(None),
+                )
+            )
+            await session.execute(
+                delete(ChannelLayout).where(
+                    ChannelLayout.channel_bot_id == bot.id,
+                    ChannelLayout.tg_message_id.is_(None),
+                )
+            )
+
+        if failed_ids:
+            raise RuntimeError(
+                f"Could not delete {len(failed_ids)} tracked recovery message(s)"
+            )
+        log.info("backup.dist.cleanup_done", anime=anime_doc_id,
+                 chat=chat_id, deleted=deleted)
+        return deleted
 
     async def record_index(self) -> ChannelContentBackup | None:
         """Snapshot the whole index channel (verbatim) for a fresh-channel rebuild.
@@ -580,7 +752,7 @@ class BackupService:
         return re.sub(r"\{BOT_QUAL(?:#(\d+))?:([^}]+)\}", _sub, caption)
 
     async def restore_distribution_channel(
-        self, anime_doc_id: str, new_chat_id: int,
+        self, anime_doc_id: str, new_chat_id: int, *, client=None,
     ) -> RestoreStats:
         """Re-post a backed-up distribution channel verbatim onto ``new_chat_id``.
 
@@ -591,7 +763,7 @@ class BackupService:
 
         Returns a :class:`RestoreStats`; a per-card failure is counted and skipped.
         """
-        client = getattr(self._c, "admin_client", None)
+        client = client or getattr(self._c, "admin_client", None)
         if client is None:
             return RestoreStats()
 
@@ -630,6 +802,40 @@ class BackupService:
         msg_by_id: dict[int, int] = {}
         restored_cards: list[tuple[dict, int]] = []
         restored_layout: list[tuple[str, int, dict | None]] = []
+
+        # Track each Telegram message as soon as it is posted. The final
+        # reconciliation below still replaces these rows with the complete
+        # snapshot, but this incremental journal means a worker crash between
+        # Telegram's successful send and the final DB write leaves cleanup IDs
+        # behind for the next retry.
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            restore_bot = (
+                await session.execute(
+                    select(DistributionBot).where(
+                        DistributionBot.anime_doc_id == anime_doc_id,
+                        DistributionBot.chat_id == new_chat_id,
+                        DistributionBot.is_channel.is_(True),
+                    ).order_by(DistributionBot.id.desc())
+                )
+            ).scalars().first()
+        restore_bot_id = restore_bot.id if restore_bot is not None else None
+        track_seq = 0
+
+        async def _track_message(kind: str, message_id: int) -> None:
+            nonlocal track_seq
+            if restore_bot_id is None:
+                return
+            async with session_scope(self._c.pg_sessionmaker) as session:
+                session.add(ChannelLayout(
+                    channel_bot_id=restore_bot_id,
+                    seq=track_seq,
+                    kind=kind,
+                    tg_message_id=message_id,
+                    anilist_id=None,
+                    is_pinned=False,
+                ))
+            track_seq += 1
+
         for card in cards:
             try:
                 if card.get("divider_before") and divider:
@@ -637,6 +843,7 @@ class BackupService:
                         divider_msg = await client.send_sticker(new_chat_id, divider)
                         if divider_msg is not None:
                             restored_layout.append(("divider", divider_msg.id, None))
+                            await _track_message("divider", divider_msg.id)
                     except Exception as exc:  # noqa: BLE001
                         log.debug("restore.dist.divider_failed", error=str(exc))
 
@@ -667,6 +874,7 @@ class BackupService:
                         log.debug("restore.dist.pin_failed", error=str(exc))
                 restored_cards.append((card, sent.id))
                 restored_layout.append((card.get("kind") or "season_card", sent.id, card))
+                await _track_message(card.get("kind") or "season_card", sent.id)
                 stats.restored += 1
             except Exception as exc:  # noqa: BLE001 — skip one bad card
                 stats.failed += 1
@@ -703,6 +911,8 @@ class BackupService:
                             session.add(BotContentPost(
                                 bot_id=bot.id,
                                 post_type=kind,
+                                season=card.get("season"),
+                                season_part=card.get("season_part"),
                                 order=content_order,
                                 caption=card.get("caption") or "",
                                 image_url=card.get("image_url"),

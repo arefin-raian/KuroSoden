@@ -208,3 +208,21 @@ class WorkService:
             if _session is None:
                 await session.commit()
             return True
+
+    async def cancel(self, code: str, *, _session=None) -> bool:
+        """Cancel an open work item (removes it from the manage queue).
+
+        The owner's Manage REQ/WRK console routes a WRK row's destructive
+        action here (REQ rows go to ``RequestService``). Only open/claimed
+        items can be cancelled; returns False for a done/absent one.
+        """
+        async with self._maybe_session(_session) as session:
+            w = (await session.execute(
+                select(WorkItem).where(WorkItem.code == code)
+            )).scalar_one_or_none()
+            if w is None or w.status not in (STATUS_OPEN, STATUS_CLAIMED):
+                return False
+            w.status = STATUS_CANCELLED
+            if _session is None:
+                await session.commit()
+            return True

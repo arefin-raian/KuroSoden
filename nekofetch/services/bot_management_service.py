@@ -132,6 +132,31 @@ class BotManagementService:
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                # A failed human recovery may have already restored media into this
+                # exact chat before a later surface failed. Reuse only that disabled
+                # recovery row for the same title; never steal an unrelated channel.
+                if (
+                    not existing.enabled
+                    and creation_scope == "human_recovery"
+                    and existing.anime_doc_id == anime_doc_id
+                ):
+                    existing.name = name
+                    existing.username = username
+                    # A failed attempt may have left a stale invite on this
+                    # disabled row. Clearing it forces the next successful
+                    # handback to mint a fresh controlled invite for the same
+                    # Telegram channel instead of silently reusing the old one.
+                    existing.invite_link = None
+                    existing.enabled = True
+                    existing.creation_scope = creation_scope
+                    existing.userbot_account = userbot_account
+                    await session.flush()
+                    info = BotInfo(
+                        existing.id, existing.name, existing.username,
+                        existing.enabled, is_channel=True, chat_id=chat_id,
+                    )
+                    log.info("channel.reused", id=info.id, name=name, chat_id=chat_id)
+                    return info
                 raise NekoFetchError("This channel is already registered.")
 
             record = DistributionBot(
@@ -184,7 +209,9 @@ class BotManagementService:
             except Exception:  # noqa: BLE001
                 log.warning("bot.set_enabled.sync_failed", id=bot_id, enabled=enabled)
 
-    async def bind_title(self, bot_id: int, anime_doc_id: str | None) -> None:
+    async def bind_title(
+        self, bot_id: int, anime_doc_id: str | None, *, client=None,
+    ) -> bool:
         """Bind a distribution bot to a single title (or clear with None).
 
         A bound bot opens directly on that title's page instead of the catalog. Binding also
@@ -197,17 +224,20 @@ class BotManagementService:
         log.info("bot.bound", id=bot_id, anime=anime_doc_id)
 
         if not anime_doc_id:
-            return
+            return True
         # Auto-brand the live bot (best-effort) and refresh the main-channel post.
         manager = getattr(self._c, "bot_manager", None)
-        client = manager.get_client(bot_id) if manager else None
+        client = client or (manager.get_client(bot_id) if manager else None)
         if client is not None:
             from nekofetch.services.bot_branding import apply_bot_branding
 
             await apply_bot_branding(self._c, client, anime_doc_id)
         from nekofetch.services.main_channel_service import MainChannelService
 
-        await MainChannelService(self._c).publish(anime_doc_id)
+        published = await MainChannelService(self._c).publish(
+            anime_doc_id, client=client,
+        )
+        return published is not None
 
     async def pending_bot_animes(self) -> list[tuple[str, str]]:
         """Titles that have stored content but no enabled bot bound yet."""

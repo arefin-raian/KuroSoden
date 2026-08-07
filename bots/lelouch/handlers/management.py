@@ -54,6 +54,34 @@ def _art():
     return pick_artwork("lelouch")
 
 
+async def req_wrk_rows(container: Container, limit: int = 20):
+    """Combined REQ + WRK rows for the owner's Manage REQ/WRK console.
+
+    Returns ``(rows, total)`` where each row is ``(label, callback_data)``
+    and the label's leading code makes REQ vs WRK visible (``REQ-1073 …`` /
+    ``WRK-42 …``). REQ rows come from ``RequestService.list_active``; WRK
+    rows from :meth:`WorkService.list_open`. Both detail cards are reached
+    through the same ``mg|reqdet|<code>`` callback — the handler branches on
+    the ``WRK-`` prefix and routes destructive actions to ``WorkService``
+    instead of ``RequestService``.
+    """
+    from kurosoden.shared.work_service import WorkService
+    from nekofetch.services.request_service import RequestService
+
+    reqs = await RequestService(container).list_active(limit=limit)
+    works = await WorkService(container.pg_sessionmaker).list_open(limit=limit)
+    rows: list[tuple[str, str]] = []
+    for r in reqs:
+        st = r.status.value if hasattr(r.status, "value") else str(r.status)
+        label = f"{V.esc(r.code)} · {V.esc((r.anime_title or '')[:22])} [{st}]"
+        rows.append((label, cb("mg", "reqdet", r.code)))
+    for w in works:
+        label = (f"{V.esc(w.code)} · {V.esc((w.anime_title or '')[:22])} "
+                 f"[{V.esc(w.status)}]")
+        rows.append((label, cb("mg", "reqdet", w.code)))
+    return rows, len(reqs) + len(works)
+
+
 def _staff(obj) -> bool:
     user = getattr(obj, "nf_user", None)
     if user is None:
@@ -473,21 +501,17 @@ def register(client: Client, container: Container) -> None:
 
     async def _render_requests(client: Client, chat_id: int,
                                old_msg: CallbackQuery | None) -> None:
-        reqs = await _req_service().list_active(limit=20)
-        rows = []
-        for r in reqs:
-            st = r.status.value if hasattr(r.status, "value") else str(r.status)
-            label = f"{V.esc(r.code)} · {V.esc((r.anime_title or '')[:22])} [{st}]"
-            rows.append([(label, cb("mg", "reqdet", r.code))])
-        rows.append([(V.BTN_BACK_ADMIN, cb(BOT, "admin"))])
+        rows, total = await req_wrk_rows(container, limit=20)
+        buttons = [[(label, cb_data)] for label, cb_data in rows]
+        buttons.append([(V.BTN_BACK_ADMIN, cb(BOT, "admin"))])
         caption = (
-            f"{V.ICON} <b>Manage Requests</b>\n\n"
-            f"<b>{len(reqs)}</b> in flight. Tap one to re-fetch it under a fresh "
-            f"ticket or delete it.\n\n"
+            f"{V.ICON} <b>Manage REQ/WRK</b>\n\n"
+            f"<b>{total}</b> in flight — <b>REQ</b> tickets and <b>WRK</b> work "
+            f"items. Tap one to re-fetch/delete it or cancel the work item.\n\n"
             "<i>A commander prunes the line so the charge stays clean.</i>"
         )
         await send_screen(client, chat_id,
-                          card(caption, image=_art(), bot_name=BOT, buttons=rows),
+                          card(caption, image=_art(), bot_name=BOT, buttons=buttons),
                           old_msg=old_msg)
 
     @client.on_callback_query(filters.regex(r"^mg\|reqs"))
@@ -502,6 +526,11 @@ def register(client: Client, container: Container) -> None:
         if not await _owner_guard(q):
             return
         code = _parts(q)[2]
+        # WRK rows route to the work-item console (cancel only); REQ rows keep
+        # the full re-fetch/delete lifecycle.
+        if code.startswith("WRK-"):
+            await _work_detail(client, q, code)
+            return
         try:
             req = await _req_service().get(code)
         except Exception:  # noqa: BLE001 — vanished mid-navigation
@@ -528,6 +557,46 @@ def register(client: Client, container: Container) -> None:
         await send_screen(client, q.message.chat.id,
                           card(caption, bot_name=BOT, buttons=rows),
                           old_msg=q.message)
+
+    async def _work_detail(client: Client, q: CallbackQuery, code: str) -> None:
+        """Detail card for a WRK row: status + a working cancel action."""
+        from kurosoden.shared.work_service import WorkService
+
+        svc = WorkService(container.pg_sessionmaker)
+        w = next((item for item in await svc.list_open(limit=200)
+                  if item.code == code), None)
+        if w is None:
+            await q.answer("That work item is gone.", show_alert=True)
+            await _render_requests(client, q.message.chat.id, q.message)
+            return
+        await q.answer()
+        caption = (
+            f"{V.ICON} <b>{V.esc(w.anime_title or code)}</b>\n\n"
+            f"<b>code:</b> <code>{V.esc(code)}</code>\n"
+            f"<b>stage:</b> {V.esc(w.stage)}\n"
+            f"<b>status:</b> {V.esc(w.status)}\n\n"
+            "<b>🗑 Cancel work item</b> — remove it from the queue; it stops "
+            "for every stage.\n\n"
+            "<i>This cannot be undone.</i>"
+        )
+        rows = [
+            [("🗑 Cancel work item", cb("mg", "wrkcancel", code))],
+            [("↩️ Back", cb("mg", "reqs", 0))],
+        ]
+        await send_screen(client, q.message.chat.id,
+                          card(caption, bot_name=BOT, buttons=rows),
+                          old_msg=q.message)
+
+    @client.on_callback_query(filters.regex(r"^mg\|wrkcancel\|"))
+    async def _work_cancel(_: Client, q: CallbackQuery) -> None:
+        if not await _owner_guard(q):
+            return
+        code = _parts(q)[2]
+        from kurosoden.shared.work_service import WorkService
+
+        ok = await WorkService(container.pg_sessionmaker).cancel(code)
+        await q.answer("Work item cancelled." if ok else "Nothing to cancel.")
+        await _render_requests(client, q.message.chat.id, q.message)
 
     @client.on_callback_query(filters.regex(r"^mg\|refresh\|"))
     async def _request_refresh_confirm(_: Client, q: CallbackQuery) -> None:

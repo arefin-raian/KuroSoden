@@ -219,8 +219,9 @@ class IndexChannelService:
     # the label-to-message mapping (two publishes racing on the same letter).
     _locks: dict[str, asyncio.Lock] = {}
 
-    def __init__(self, container: Container) -> None:
+    def __init__(self, container: Container, client=None) -> None:
         self._c = container
+        self._client_override = client
         self.cfg = container.config.index_channel
 
     # ── Client selection: Gojo (Publisher) is the PRIMARY actor for the index
@@ -241,7 +242,9 @@ class IndexChannelService:
     )
 
     def _primary_client(self):
-        """Gojo (Publisher) client if running, else the admin client as substitute."""
+        """Use an explicitly supplied actor, otherwise Gojo/admin fallback."""
+        if self._client_override is not None:
+            return self._client_override
         pm = getattr(self._c, "pipeline_manager", None)
         gojo = getattr(pm, "gojo", None) if pm else None
         return gojo or getattr(self._c, "admin_client", None)

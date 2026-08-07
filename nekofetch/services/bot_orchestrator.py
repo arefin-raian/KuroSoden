@@ -15,7 +15,9 @@ from sqlalchemy import delete, select
 
 from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
-from nekofetch.infrastructure.database.postgres.models import BotContentPost, DistributionBot
+from nekofetch.infrastructure.database.postgres.models import (
+    BotContentPost, DistributionBot, StoragePack,
+)
 from nekofetch.infrastructure.database.postgres.session import session_scope
 from nekofetch.services.bot_management_service import BotInfo
 
@@ -196,7 +198,239 @@ class BotOrchestratorService:
 
         return info
 
-    async def _refresh_index_for(self, anime_doc_id: str) -> None:
+    async def recover_human_channel(
+        self,
+        anime_doc_id: str,
+        new_chat_id: int,
+        *,
+        username: str | None = None,
+        name: str | None = None,
+        client=None,
+    ) -> BotInfo | None:
+        """Adopt a human-created replacement channel and restore it in place.
+
+        Unlike :meth:`recreate_bot`, this method never deletes the old row before
+        the replacement has been verified. That matters for the human wizard: a
+        mistyped channel id must not destroy the only live database reference.
+        Once the replacement is registered, the old entity is disabled, the
+        wipe-proof distribution backup is restored, and the existing relink/main
+        reply/index refresh path is applied.
+        """
+        if not self._c.config.features.distribution_bots:
+            return None
+
+        from nekofetch.services.backup_service import BackupService
+        from nekofetch.services.bot_management_service import BotManagementService
+
+        # Capture before changing either entity. This is idempotent and preserves
+        # the exact cards/buttons needed by the restore.
+        await BackupService(self._c).record_distribution_channel(anime_doc_id)
+
+        client = client or getattr(self._c, "admin_client", None)
+        chat = None
+        if client is not None:
+            try:
+                chat = await client.get_chat(new_chat_id)
+            except Exception as exc:  # noqa: BLE001 — verification belongs to caller
+                log.warning("bot.orchestrator.human_recovery_chat_lookup_failed",
+                            anime=anime_doc_id, chat=new_chat_id, error=str(exc))
+                return None
+        resolved_name = name or getattr(chat, "title", None) or anime_doc_id
+        resolved_username = username or getattr(chat, "username", None)
+        if resolved_username:
+            resolved_username = str(resolved_username).lstrip("@")
+
+        try:
+            info = await BotManagementService(self._c).register_channel(
+                new_chat_id,
+                name=resolved_name,
+                username=resolved_username,
+                anime_doc_id=anime_doc_id,
+                creation_scope="human_recovery",
+            )
+        except Exception as exc:  # noqa: BLE001 — duplicate/invalid channel
+            log.warning("bot.orchestrator.human_recovery_register_failed",
+                        anime=anime_doc_id, chat=new_chat_id, error=str(exc))
+            return None
+
+        # Keep the old entity active while the replacement is restored and its
+        # controlled invite is minted. Only switch the active row after every
+        # subscriber-facing prerequisite has succeeded.
+        old_ids: list[int] = []
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            old_rows = (await session.execute(
+                select(DistributionBot).where(
+                    DistributionBot.anime_doc_id == anime_doc_id,
+                    DistributionBot.id != info.id,
+                    DistributionBot.enabled.is_(True),
+                )
+            )).scalars().all()
+            old_ids = [int(old.id) for old in old_rows]
+
+        # A previous attempt may have restored some cards before a later invite,
+        # relink, or index step failed. Remove only messages tracked for this exact
+        # replacement before reposting; this makes retry idempotent without wiping
+        # unrelated human content in the channel.
+        try:
+            await BackupService(self._c).clear_distribution_channel(
+                anime_doc_id, new_chat_id, client=client,
+            )
+        except Exception as exc:  # noqa: BLE001 — restore still reports failure safely
+            log.warning("bot.orchestrator.recovery_cleanup_failed",
+                        anime=anime_doc_id, chat=new_chat_id, error=str(exc))
+            return await self._rollback_human_recovery(
+                info.id, old_ids, anime_doc_id, client=client,
+            )
+
+        restored = await self._restore_channel(
+            anime_doc_id, new_chat_id, client=client,
+        )
+        if not restored:
+            log.warning("bot.orchestrator.human_recovery_restore_empty",
+                        anime=anime_doc_id, chat=new_chat_id)
+            return await self._rollback_human_recovery(
+                info.id, old_ids, anime_doc_id, client=client,
+            )
+
+        # A human-created channel has no BotFactory setup step, so mint its fresh
+        # controlled invite explicitly before refreshing the public surfaces.
+        try:
+            from nekofetch.services.invite_link_service import InviteLinkService
+
+            invite = await InviteLinkService(self._c).ensure_for_bot(info.id)
+        except Exception as exc:  # noqa: BLE001 — a failed invite is unsafe
+            log.warning("bot.orchestrator.human_recovery_invite_failed",
+                        anime=anime_doc_id, error=str(exc))
+            invite = None
+        if not invite:
+            log.warning("bot.orchestrator.human_recovery_invite_empty",
+                        anime=anime_doc_id, chat=new_chat_id)
+            return await self._rollback_human_recovery(
+                info.id, old_ids, anime_doc_id, client=client,
+            )
+
+        # Reuse the same post-restore behavior as automated recovery. Keep the
+        # old row active until all subscriber-facing surfaces have refreshed.
+        # buttons, backups, the main-channel reply, and the index synchronized.
+        try:
+            from kurosoden.shared.senku_publisher import SenkuPublisher
+
+            await SenkuPublisher(self._c).relink_packs_in_place(
+                client, anime_doc_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bot.orchestrator.human_recovery_relink_failed",
+                        anime=anime_doc_id, error=str(exc))
+            return await self._rollback_human_recovery(
+                info.id, old_ids, anime_doc_id, client=client,
+            )
+        if not await self._bind_title(info.id, anime_doc_id, client=client):
+            return await self._rollback_human_recovery(
+                info.id, old_ids, anime_doc_id, client=client,
+            )
+
+        try:
+            from nekofetch.services.main_channel_service import MainChannelService
+
+            main = MainChannelService(self._c)
+            channel_link = await main.distribution_link(anime_doc_id)
+            if channel_link:
+                async with session_scope(self._c.pg_sessionmaker) as session:
+                    from nekofetch.infrastructure.database.postgres.models import StoragePack
+                    pack = (await session.execute(
+                        select(StoragePack).where(
+                            StoragePack.anime_doc_id == anime_doc_id
+                        ).limit(1)
+                    )).scalars().first()
+                replied = await main.reply_recovery(
+                    anime_doc_id,
+                    pack.anime_title if pack else resolved_name,
+                    channel_link,
+                    client=client,
+                )
+                if not replied:
+                    return await self._rollback_human_recovery(
+                        info.id, old_ids, anime_doc_id, client=client,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bot.orchestrator.human_recovery_reply_failed",
+                        anime=anime_doc_id, error=str(exc))
+            return await self._rollback_human_recovery(
+                info.id, old_ids, anime_doc_id, client=client,
+            )
+        if not await self._refresh_index_for(anime_doc_id, client=client):
+            return await self._rollback_human_recovery(
+                info.id, old_ids, anime_doc_id, client=client,
+            )
+
+        # Only now switch active lookups. The replacement is fully restored,
+        # linked, published, and has a controlled invite.
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            for old_id in old_ids:
+                old = await session.get(DistributionBot, old_id)
+                if old is not None:
+                    old.enabled = False
+        return info
+
+    async def _rollback_human_recovery(
+        self, replacement_id: int, old_ids: list[int], anime_doc_id: str,
+        *, client=None,
+    ) -> None:
+        """Disable an incomplete replacement and restore subscriber-facing links."""
+        invite_needs_revoke = False
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            replacement = await session.get(DistributionBot, replacement_id)
+            if replacement is not None:
+                invite_needs_revoke = bool(replacement.invite_link)
+                replacement.enabled = False
+            for old_id in old_ids:
+                old = await session.get(DistributionBot, old_id)
+                if old is not None:
+                    old.enabled = True
+
+        # The replacement may already have refreshed the main/index surfaces before
+        # a later step failed. Re-publish after the old row is enabled again so the
+        # Download button and index link point back to the known-good channel.
+        try:
+            from nekofetch.services.index_channel_service import IndexChannelService
+            from nekofetch.services.main_channel_service import MainChannelService
+
+            await MainChannelService(self._c).publish(anime_doc_id, client=client)
+            pack = (
+                await self._first_storage_pack(anime_doc_id)
+            )
+            if pack is not None:
+                index = IndexChannelService(self._c, client=client)
+                await index.refresh_letter(index.letter_of(pack.anime_title))
+        except Exception as exc:  # noqa: BLE001 — rollback remains DB-safe
+            log.warning("bot.orchestrator.rollback_surface_refresh_failed",
+                        anime=anime_doc_id, error=str(exc))
+
+        if invite_needs_revoke:
+            try:
+                from nekofetch.services.invite_link_service import InviteLinkService
+
+                await InviteLinkService(self._c).revoke_for_bot(
+                    replacement_id, client=client,
+                )
+            except Exception as exc:  # noqa: BLE001 — stale invite is logged for cleanup
+                log.warning("bot.orchestrator.rollback_invite_revoke_failed",
+                            anime=anime_doc_id, error=str(exc))
+        log.warning("bot.orchestrator.human_recovery_rolled_back",
+                    anime=anime_doc_id, replacement=replacement_id)
+        return None
+
+    async def _first_storage_pack(self, anime_doc_id: str):
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            return (
+                await session.execute(
+                    select(StoragePack)
+                    .where(StoragePack.anime_doc_id == anime_doc_id)
+                    .limit(1)
+                )
+            ).scalars().first()
+
+    async def _refresh_index_for(self, anime_doc_id: str, *, client=None) -> bool:
         """Rebuild the index letter section for this title (best-effort).
 
         The index caption hyperlinks each title to its channel's private invite
@@ -215,39 +449,49 @@ class BotOrchestratorService:
                     )
                 ).scalars().first()
             if pack is None:
-                return
-            svc = IndexChannelService(self._c)
-            await svc.refresh_letter(svc.letter_of(pack.anime_title))
+                return False
+            svc = IndexChannelService(self._c, client=client)
+            return await svc.refresh_letter(svc.letter_of(pack.anime_title)) is not None
         except Exception as exc:  # noqa: BLE001 — index refresh is best-effort
             log.warning("bot.orchestrator.index_refresh.failed",
                         anime=anime_doc_id, error=str(exc))
+            return False
 
-    async def _restore_channel(self, anime_doc_id: str, new_chat_id: int) -> bool:
+    async def _restore_channel(
+        self, anime_doc_id: str, new_chat_id: int, *, client=None,
+    ) -> bool:
         """Re-post a banned channel verbatim from backup. True if anything posted."""
         try:
             from nekofetch.services.backup_service import BackupService
 
             stats = await BackupService(self._c).restore_distribution_channel(
-                anime_doc_id, new_chat_id,
+                anime_doc_id, new_chat_id, client=client,
             )
         except Exception as exc:  # noqa: BLE001 — fall back to regeneration
             log.warning("bot.orchestrator.restore_failed",
                         anime=anime_doc_id, error=str(exc))
             return False
-        if stats.restored:
+        if stats.total > 0 and stats.restored == stats.total and stats.failed == 0:
             log.info("bot.orchestrator.channel_restored", anime=anime_doc_id,
                      restored=stats.restored, failed=stats.failed)
             return True
+        log.warning("bot.orchestrator.channel_restore_incomplete", anime=anime_doc_id,
+                    total=stats.total, restored=stats.restored, failed=stats.failed)
         return False
 
-    async def _bind_title(self, bot_id: int, anime_doc_id: str) -> None:
-        """Bind the entity to its title (also refreshes the main-channel post)."""
+    async def _bind_title(
+        self, bot_id: int, anime_doc_id: str, *, client=None,
+    ) -> bool:
+        """Bind the entity and report whether the main surface refreshed."""
         from nekofetch.services.bot_management_service import BotManagementService
 
         try:
-            await BotManagementService(self._c).bind_title(bot_id, anime_doc_id)
+            return await BotManagementService(self._c).bind_title(
+                bot_id, anime_doc_id, client=client,
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("bot.orchestrator.bind.failed", bot_id=bot_id, error=str(exc))
+            return False
 
     async def _find_existing_bot(self, anime_doc_id: str) -> BotInfo | None:
         """Find an existing enabled bot/channel bound to this anime."""

@@ -118,6 +118,50 @@ class InviteLinkService:
             await self.store(bot_id, link)
         return link
 
+    async def revoke_for_bot(self, bot_id: str, *, client=None) -> bool:
+        """Revoke and clear a private invite left by a failed recovery attempt.
+
+        ``client`` is the verified actor from a human recovery flow. It is tried
+        first; the normal Gojo/admin and userbot fallbacks remain for background
+        cleanup callers. If Telegram refuses every actor, the DB link is retained
+        so a later retry can revoke it rather than losing the only token.
+        """
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            row = (
+                await session.execute(
+                    select(DistributionBot).where(DistributionBot.id == bot_id)
+                )
+            ).scalar_one_or_none()
+            if row is None or not row.chat_id or not row.invite_link:
+                return True
+            chat_id, invite_link = row.chat_id, row.invite_link
+
+        clients = [client, self._bot_client()]
+        try:
+            clients.append(self._userbot())
+        except Exception:  # noqa: BLE001 — bot-only environments are valid
+            pass
+        revoked = False
+        for actor in clients:
+            if actor is None:
+                continue
+            try:
+                if hasattr(actor, "execute"):
+                    await actor.execute(
+                        lambda c: c.revoke_chat_invite_link(chat_id, invite_link)
+                    )
+                else:
+                    await actor.revoke_chat_invite_link(chat_id, invite_link)
+                revoked = True
+                break
+            except Exception as exc:  # noqa: BLE001 — try the next actor
+                log.warning("invitelink.revoke.failed",
+                            bot_id=bot_id, chat_id=chat_id, error=str(exc))
+
+        if revoked:
+            await self.store(bot_id, None)
+        return revoked
+
     async def store(self, bot_id: str, invite_link: str | None) -> None:
         """Persist ``invite_link`` on the ``bots`` row (durable across restarts)."""
         async with session_scope(self._c.pg_sessionmaker) as session:
