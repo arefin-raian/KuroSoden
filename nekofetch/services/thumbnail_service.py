@@ -297,6 +297,22 @@ async def gather_thumbnail_fields(container: Any, title: str,
     }
 
 
+def render_fields(fields: dict) -> dict:
+    """Keep a persisted metadata dict compatible with ``render_thumbnail``.
+
+    ``ThumbnailSource.fields`` also carries editor/identity keys (``entry_label``,
+    ``anilist_id``, ``thumbnail_chat_id`` …) that ``render_thumbnail`` doesn't
+    accept; the persisted dict must be filtered to the renderer's signature
+    before it can be splatted. Single source of truth for both the admin editor
+    and the redo metadata refresh so a re-render can never raise ``TypeError``.
+    """
+    import inspect
+
+    allowed = set(inspect.signature(ThumbnailRenderService.render_thumbnail).parameters)
+    allowed.discard("self")
+    return {key: value for key, value in fields.items() if key in allowed}
+
+
 async def persist_thumbnail_source(
     container: Any,
     anime_doc_id: str | None,

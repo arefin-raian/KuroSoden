@@ -32,6 +32,7 @@ import asyncio
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import select
 
 from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
@@ -242,6 +243,143 @@ class ThumbnailChannelService:
                               json.dumps(data),
                               label="thumbcc.workflow.set")
 
+    async def mark_entry_rendered(
+        self, anime_doc_id: str, anilist_id: int | None, image_path: str,
+    ) -> bool:
+        """Persist a rendered image in the Redis workflow through a public API.
+
+        Admin editors must not reach through this service's private Redis helpers.
+        The workflow is operator state, so a failed sync never invalidates the
+        durable ``ThumbnailSource`` edit.
+        """
+        workflow = await self._get_workflow(anime_doc_id)
+        if not workflow:
+            return False
+        target_id = None if anilist_id in (None, -1) else int(anilist_id)
+        entry = next((item for item in workflow if item.anilist_id == target_id), None)
+        if entry is None:
+            return False
+        entry.thumbnail_url = f"thumb://{image_path}"
+        entry.status = "done"
+        await self._save_workflow(anime_doc_id, workflow)
+        return True
+
+    async def refresh_published_thumbnail(
+        self, anime_doc_id: str, anilist_id: int, image_path: str,
+    ) -> bool:
+        """Replace one live distribution-card image and its restore snapshot."""
+        from pathlib import Path
+        from nekofetch.infrastructure.database.postgres.models import (
+            BotContentPost, ChannelContentBackup, ChannelLayout, DistributionBot,
+        )
+        from nekofetch.infrastructure.database.postgres.session import session_scope
+        from sqlalchemy.orm.attributes import flag_modified
+        from kurosoden.shared.image_backup import backup_bytes
+        from pyrogram.types import InputMediaPhoto
+
+        if not Path(image_path).exists():
+            return False
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            bot = (await session.execute(
+                select(DistributionBot).where(
+                    DistributionBot.anime_doc_id == anime_doc_id,
+                    DistributionBot.enabled.is_(True),
+                ).order_by(DistributionBot.id.desc())
+            )).scalars().first()
+            if bot is None or not bot.chat_id:
+                return False
+            layout = (await session.execute(
+                select(ChannelLayout).where(
+                    ChannelLayout.channel_bot_id == bot.id,
+                    ChannelLayout.anilist_id == anilist_id,
+                    ChannelLayout.kind.in_(("season_card", "movie_card")),
+                    ChannelLayout.tg_message_id.is_not(None),
+                ).order_by(ChannelLayout.seq)
+            )).scalars().first()
+            post = (await session.execute(
+                select(BotContentPost).where(
+                    BotContentPost.bot_id == bot.id,
+                    BotContentPost.anilist_id == anilist_id,
+                    BotContentPost.post_type.in_(("season_card", "movie_card")),
+                ).order_by(BotContentPost.order)
+            )).scalars().first()
+            if layout is None and (post is None or not post.tg_message_id):
+                return False
+            chat_id = int(bot.chat_id)
+            message_id = int(layout.tg_message_id if layout else post.tg_message_id)
+            fallback_caption = post.caption if post else ""
+
+        # Senku owns distribution-channel edits when its client is running;
+        # the admin client remains a safe fallback for single-client deployments.
+        client = getattr(getattr(self._c, "pipeline_manager", None), "senku", None)
+        client = client or self._client
+        if client is None:
+            return False
+        caption = fallback_caption
+        try:
+            if hasattr(client, "get_messages"):
+                live = await client.get_messages(chat_id, message_id)
+                caption = getattr(live, "caption", None) or getattr(live, "text", None) or caption
+            if not caption:
+                log.warning("thumbcc.published_refresh.no_caption",
+                            anime=anime_doc_id, anilist_id=anilist_id)
+                return False
+            await client.edit_message_media(
+                chat_id, message_id,
+                InputMediaPhoto(str(image_path), caption=caption,
+                                parse_mode=ParseMode.HTML),
+            )
+        except Exception as exc:  # noqa: BLE001 - one live surface must not abort the edit
+            log.warning("thumbcc.published_refresh.failed", anime=anime_doc_id,
+                        anilist_id=anilist_id, error=str(exc))
+            return False
+
+        path = Path(image_path)
+        mime = {
+            ".png": "image/png",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }.get(path.suffix.lower(), "image/jpeg")
+        mirrored = await backup_bytes(self._c, path.read_bytes(), mime=mime)
+        durable = mirrored.primary
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            bot = (await session.execute(
+                select(DistributionBot).where(
+                    DistributionBot.anime_doc_id == anime_doc_id,
+                    DistributionBot.enabled.is_(True),
+                ).order_by(DistributionBot.id.desc())
+            )).scalars().first()
+            if bot is not None:
+                post = (await session.execute(
+                    select(BotContentPost).where(
+                        BotContentPost.bot_id == bot.id,
+                        BotContentPost.anilist_id == anilist_id,
+                        BotContentPost.post_type.in_(("season_card", "movie_card")),
+                    ).order_by(BotContentPost.order)
+                )).scalars().first()
+                if post is not None:
+                    post.image_url = str(image_path)
+                    post.image_cached_url = durable
+                    post.tg_message_id = message_id
+                row = (await session.execute(
+                    select(ChannelContentBackup).where(
+                        ChannelContentBackup.scope == "distribution",
+                        ChannelContentBackup.channel_key == anime_doc_id,
+                    )
+                )).scalar_one_or_none()
+                if row is not None and row.cards:
+                    cards = list(row.cards)
+                    changed = False
+                    for card in cards:
+                        if (card.get("anilist_id") == anilist_id and
+                                card.get("kind") in ("season_card", "movie_card")):
+                            card["image_url"] = durable
+                            changed = True
+                    if changed:
+                        row.cards = cards
+                        flag_modified(row, "cards")
+        return True
+
     async def _get_selected(self, anime_doc_id: str, entry_index: int) -> dict | None:
         raw = await safe_redis_get(self._c.redis,
                                     _K_SELECTED.format(anime_doc_id=anime_doc_id,
@@ -305,6 +443,102 @@ class ThumbnailChannelService:
         ids = list(set(await self._tracked_ids() + list(mids)))
         await safe_redis_set(self._c.redis, _K_TRACKED, json.dumps(ids),
                               label="thumbcc.tracked.set")
+
+    async def refresh_published_caption(
+        self, anime_doc_id: str, anilist_id: int, caption: str,
+    ) -> bool:
+        """Edit one live distribution-card caption + its restore snapshot.
+
+        The redo metadata refresh (Task O) rebuilds an entry card's caption when
+        its language/episode-count line changed. This is the caption-only sibling
+        of :meth:`refresh_published_thumbnail`: media stays untouched, the live
+        message's caption is edited in place, and the matching ``BotContentPost``
+        + ``ChannelContentBackup`` card copy are updated so a restore ships the
+        corrected text.
+        """
+        from nekofetch.infrastructure.database.postgres.models import (
+            BotContentPost,
+            ChannelContentBackup,
+            ChannelLayout,
+            DistributionBot,
+        )
+        from nekofetch.infrastructure.database.postgres.session import session_scope
+        from sqlalchemy.orm.attributes import flag_modified
+
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            bot = (await session.execute(
+                select(DistributionBot).where(
+                    DistributionBot.anime_doc_id == anime_doc_id,
+                    DistributionBot.enabled.is_(True),
+                ).order_by(DistributionBot.id.desc())
+            )).scalars().first()
+            if bot is None or not bot.chat_id:
+                return False
+            layout = (await session.execute(
+                select(ChannelLayout).where(
+                    ChannelLayout.channel_bot_id == bot.id,
+                    ChannelLayout.anilist_id == anilist_id,
+                    ChannelLayout.kind.in_(("season_card", "movie_card")),
+                    ChannelLayout.tg_message_id.is_not(None),
+                ).order_by(ChannelLayout.seq)
+            )).scalars().first()
+            post = (await session.execute(
+                select(BotContentPost).where(
+                    BotContentPost.bot_id == bot.id,
+                    BotContentPost.anilist_id == anilist_id,
+                )
+            )).scalars().first()
+            if layout is None and post is None:
+                return False
+            chat_id = bot.chat_id
+            message_id = (
+                layout.tg_message_id if layout is not None else None
+            ) or (post.tg_message_id if post is not None else None)
+            if message_id is None:
+                return False
+            bot_id = bot.id
+
+        mgr = getattr(self._c, "pipeline_manager", None)
+        client = getattr(mgr, "senku", None) if mgr is not None else None
+        if client is None:
+            client = self._client
+        if client is None:
+            return False
+        try:
+            await client.edit_message_caption(
+                chat_id, message_id, caption=caption, parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:  # noqa: BLE001 - redo survives a failed caption edit
+            log.warning("thumbcc.caption_refresh.failed",
+                        anime=anime_doc_id, entry=anilist_id, error=str(exc))
+            return False
+
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            post = (await session.execute(
+                select(BotContentPost).where(
+                    BotContentPost.bot_id == bot_id,
+                    BotContentPost.anilist_id == anilist_id,
+                )
+            )).scalars().first()
+            if post is not None:
+                post.caption = caption
+            backup = (await session.execute(
+                select(ChannelContentBackup).where(
+                    ChannelContentBackup.scope == "distribution",
+                    ChannelContentBackup.channel_key == anime_doc_id,
+                )
+            )).scalars().first()
+            if backup is not None and backup.cards:
+                changed = False
+                for card in backup.cards:
+                    if (card.get("kind") in ("season_card", "movie_card")
+                            and card.get("anilist_id") == anilist_id):
+                        card["caption"] = caption
+                        changed = True
+                if changed:
+                    backup.cards = list(backup.cards)
+                    flag_modified(backup, "cards")
+        return True
 
     async def refresh_queue(self) -> None:
         """Rebuild the pinned queue message in the channel."""
@@ -1291,7 +1525,10 @@ class ThumbnailChannelService:
             await self._post_or_update_workflow(anime_doc_id, workflow)
             return
 
-        # Upload the thumbnail to the channel for reference
+        # Upload the thumbnail to the channel for reference. Keep the message
+        # coordinates in the durable source row so /edit_thumbnail can replace
+        # this exact Telegram message instead of creating an orphaned card.
+        source_fields["thumbnail_chat_id"] = self.cfg.channel_id
         try:
             photo_msg = await self._client.send_photo(
                 self.cfg.channel_id, str(thumbnail_path),
@@ -1302,9 +1539,22 @@ class ThumbnailChannelService:
                 parse_mode=ParseMode.HTML,
             )
             entry.thumbnail_url = f"thumb://{thumbnail_path}"
+            source_fields["thumbnail_message_id"] = photo_msg.id
         except Exception as exc:
             log.warning("thumbcc.upload.failed", error=str(exc))
             entry.thumbnail_url = f"file://{thumbnail_path}"
+
+        # The first persistence happens before upload so a render survives a
+        # Telegram hiccup. Persist once more with the message coordinates when
+        # the upload succeeds; retries converge on the same durable row.
+        try:
+            from nekofetch.services.thumbnail_service import persist_thumbnail_source
+            await persist_thumbnail_source(
+                self._c, anime_doc_id, entry.anilist_id, source_fields,
+                image_path=thumbnail_path,
+            )
+        except Exception as exc:  # noqa: BLE001 - DB is authoritative but best effort here
+            log.warning("thumbcc.source.message_ref_failed", error=str(exc))
 
         # Mark as done
         entry.status = "done"

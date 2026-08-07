@@ -151,13 +151,14 @@ class ThumbnailOrchestratorService:
 
     async def get_generated_thumbnails(
         self, anime_doc_id: str,
-    ) -> dict[int, str]:
+    ) -> dict[int | None, str]:
         """Return ``{anilist_id: thumbnail_url}`` for every entry that's done.
 
-        Used by :meth:`BotContentService.generate_posts` to swap AniList
-        posters for user-generated artwork in the bot/channel cards.
+        The database uses ``-1`` for a mapping-only/root entry, while workflow
+        entries use ``None``. Normalize that sentinel at the service boundary so
+        card builders can use the actual entry id consistently.
         """
-        out: dict[int, str] = {}
+        out: dict[int | None, str] = {}
         raw = await safe_redis_get(self._c.redis,
                                     _K_WORKFLOW.format(anime_doc_id=anime_doc_id),
                                     label="thumbnail.orchestrator.get_generated")
@@ -172,8 +173,15 @@ class ThumbnailOrchestratorService:
                 continue
             url = e.get("thumbnail_url")
             aid = e.get("anilist_id")
-            if url and aid is not None:
-                out[int(aid)] = url
+            if not url or aid is None:
+                continue
+            try:
+                normalized_aid = int(aid)
+            except (TypeError, ValueError):
+                # Ignore malformed legacy workflow entries rather than
+                # breaking the whole publish fallback path.
+                continue
+            out[None if normalized_aid == -1 else normalized_aid] = url
         return out
 
     async def get_first_season_thumbnail(
@@ -185,14 +193,36 @@ class ThumbnailOrchestratorService:
         spec: "the main channel thumbnail, which is essentially the first
         season thumbnail, just the info's changed a bit").
         """
-        thumbs = await self.get_generated_thumbnails(anime_doc_id)
-        if not thumbs:
+        raw = await safe_redis_get(
+            self._c.redis,
+            _K_WORKFLOW.format(anime_doc_id=anime_doc_id),
+            label="thumbnail.orchestrator.get_first_season",
+        )
+        if not raw:
             return None
-        # Workflow entries are 1-indexed; the first entry's anilist_id is the
-        # lowest in the returned map when sorted, but we trust admin ordering
-        # \u2014 a stable ``sort by index`` would be safer for adversarial ingest.
-        ordered = sorted(thumbs.items(), key=lambda kv: kv[0])
-        return ordered[0][1] if ordered else None
+        try:
+            workflow = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+
+        # ``index`` is the admin workflow order. The root/mapping-only entry
+        # uses the -1 sentinel and is useful for the info card, but it is not a
+        # season; never let it become the main channel's first-season image.
+        candidates = []
+        for entry in workflow:
+            if (
+                entry.get("status") != "done"
+                or not entry.get("thumbnail_url")
+                or entry.get("anilist_id") in (None, -1, "-1")
+            ):
+                continue
+            try:
+                index = int(entry.get("index"))
+            except (TypeError, ValueError):
+                continue
+            candidates.append((index, entry))
+        first = min(candidates, key=lambda item: item[0], default=None)
+        return first[1].get("thumbnail_url") if first else None
 
     # \u2500\u2500 helpers \u2500\u2500 used by :class:`ThumbnailChannelService.handle_callback` \u2500\u2500\u2500\u2500\u2500
 

@@ -26,6 +26,7 @@ def register_all(client: Client, container: Container) -> None:
         staff_admin,
         start,
         storage_admin,
+        thumbnail_edit,
         thumbnail_handler,
     )
     from nekofetch.bots.middleware import install_auth_middleware
@@ -45,4 +46,5 @@ def register_all(client: Client, container: Container) -> None:
     staff_admin.register(client, container)
     channel_guard.register(client, container)
     thumbnail_handler.register(client, container)
+    thumbnail_edit.register(client, container)
     shift_handlers.register(client, container)
