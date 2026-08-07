@@ -142,3 +142,27 @@ async def test_link_map_resolves_title_to_invite(sessionmaker, session):
     svc = IndexChannelService(_container(sessionmaker))
     links = await svc._links_for_titles(["Attack on Titan", "Unknown Show"])
     assert links == {"Attack on Titan": "https://t.me/+aot"}
+
+
+@pytest.mark.asyncio
+async def test_revoke_for_bot_revokes_and_clears_link(sessionmaker):
+    bot_id = await _make_channel(
+        sessionmaker, chat_id=-100111, anime_doc_id="a1",
+        invite_link="https://t.me/+stale",
+    )
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        async def revoke_chat_invite_link(self, chat_id, invite_link):
+            self.calls.append((chat_id, invite_link))
+
+    client = Client()
+    svc = InviteLinkService(_container(sessionmaker))
+    assert await svc.revoke_for_bot(bot_id, client=client) is True
+    assert client.calls == [(-100111, "https://t.me/+stale")]
+
+    async with sessionmaker() as s:
+        row = await s.get(DistributionBot, bot_id)
+        assert row.invite_link is None

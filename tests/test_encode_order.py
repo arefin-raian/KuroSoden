@@ -1,14 +1,16 @@
+"""Encode release order — drives the REAL sort contract.
+
+Previously this file re-implemented the sort key locally and asserted against
+its own copy, so it stayed green even if ``stages.py`` broke. The sort key is
+now a named function (:func:`nekofetch.services.processing.stages.release_key`)
+that :class:`EncodeStage` itself uses — this test sorts through it.
+"""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
 
-
-def _release_key(row):
-    return (
-        row.season if row.season is not None else 10_000,
-        row.season_part if row.season_part is not None else 0,
-        row.episode if row.episode is not None else 0,
-    )
+from nekofetch.services.processing.stages import release_key
 
 
 def test_release_order_sorts_part_then_episode():
@@ -20,7 +22,7 @@ def test_release_order_sorts_part_then_episode():
         SimpleNamespace(season=1, season_part=2, episode=1),
     ]
 
-    ordered = sorted(rows, key=_release_key)
+    ordered = sorted(rows, key=release_key)
 
     assert [
         (r.season, r.season_part, r.episode) for r in ordered
@@ -31,3 +33,13 @@ def test_release_order_sorts_part_then_episode():
         (1, 2, 1),
         (1, 2, 2),
     ]
+
+
+def test_release_order_matches_encodestage_usage():
+    """The stage sorts ``ctx.files`` through the same named key this test uses."""
+    import inspect
+
+    from nekofetch.services.processing import stages
+
+    source = inspect.getsource(stages.EncodeStage.process)
+    assert "ctx.files.sort(key=release_key)" in source

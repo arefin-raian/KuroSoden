@@ -70,8 +70,11 @@ class _FakeFSMRedis:
     def __init__(self):
         self.store: dict = {}
 
-    async def set(self, key, val, ex=None):
+    async def set(self, key, val, ex=None, nx=False):
+        if nx and key in self.store:
+            return False
         self.store[key] = val
+        return True
 
     async def get(self, key):
         return self.store.get(key)
@@ -108,7 +111,7 @@ def _container(monkeypatch, *, results, gojo, admin_ids=(555,)):
     import nekofetch.services.maintenance_service as ms
     monkeypatch.setattr(ms.MaintenanceService, "scan_updates", fake_scan)
 
-    # No admin pool → job falls back to env.admin_ids.
+    # No admin pool → the configured owner is the human recovery recipient.
     async def fake_list_admins(self, *, stage=None, _session=None):
         return []
 
@@ -183,11 +186,22 @@ async def test_bancheck_job_recovers_and_dms(monkeypatch):
     import kurosoden.shared.management_service as mgmt
     monkeypatch.setattr(mgmt.ManagementService, "list_admins", fake_list_admins)
 
+    # Capture the real recovery card without needing Telegram media methods.
+    import kurosoden.bots.gojo.handlers.tasks as tasks
+
+    async def capture_screen(client, chat_id, screen, **kwargs):
+        client.sent.append((chat_id, screen.caption))
+
+    monkeypatch.setattr(tasks, "send_screen", capture_screen)
     await make_monthly_bancheck_job(container)()
 
-    assert recovered == ["doc1"]          # down channel auto-recovered
-    assert len(gojo.sent) == 1            # admins DMed a summary
-    assert gojo.sent[0][0] == 555
+    assert recovered == []                 # human handoff takes priority
+    from nekofetch.bots.fsm import FSM
+    state, data = await FSM(container.redis, bot="gojo").get(555)
+    assert state == "gojo:await_recovery_channel"
+    assert data["anime_doc_id"] == "doc1"
+    assert len(gojo.sent) == 2              # recovery card + monthly summary
+    assert gojo.sent[-1][0] == 555
 
 
 async def test_bancheck_job_noop_when_clear(monkeypatch):

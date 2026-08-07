@@ -68,14 +68,14 @@ async def test_update_header_caption_persists_and_edits_live_header(sessionmaker
     )
 
     assert updated is not None
-    assert updated.header_caption == "<b>Edited header</b>"
+    assert updated.caption == "<b>Edited header</b>"
     assert client.edits == [
         ("text", -100123, 42, "<b>Edited header</b>", {"parse_mode": ParseMode.HTML}),
     ]
 
     async with sessionmaker() as session:
         row = await session.get(StoragePack, pack_id)
-        assert row.header_caption == "<b>Edited header</b>"
+        assert row.caption == "<b>Edited header</b>"
 
 
 @pytest.mark.asyncio
@@ -122,7 +122,7 @@ async def test_update_header_caption_syncs_enabled_sibling_packs(sessionmaker):
                 StoragePack.anime_doc_id == "anime-group",
             )
         )).scalars().all()
-        assert {row.header_caption for row in rows} == {"<b>Shared header</b>"}
+        assert {row.caption for row in rows} == {"<b>Shared header</b>"}
 
 
 @pytest.mark.asyncio
@@ -173,4 +173,5 @@ async def test_update_header_caption_rejects_disabled_pack(sessionmaker):
 
 
 def test_storage_pack_has_editable_caption_column():
-    assert "header_caption" in {column.name for column in StoragePack.__table__.columns}
+    assert "caption" in {column.name for column in StoragePack.__table__.columns}
+    assert "header_caption" not in {column.name for column in StoragePack.__table__.columns}

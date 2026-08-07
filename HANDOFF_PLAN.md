@@ -1,18 +1,31 @@
-# NekoFetch / KuroSoden — FINAL EXECUTION PLAN (v2, code-verified)
+# NekoFetch / KuroSoden — FINAL EXECUTION PLAN (v2, code-
+verified)
 
 > **You are the executor.** This plan was written by an AI that read the codebase and verified every
 > path/line/signature below. Follow it exactly. Where it says "already exists — just do X", do NOT
 > rebuild from scratch. Two different AIs following this file must produce functionally identical
-> results. All line numbers are from the state of the repo at handoff; re-`grep` to confirm before
+> results. All line numbers are from the state of the repo at handoff; re-
+`grep` to confirm before
 > editing (they may shift by a few lines).
 
----
+-
+-
+-
+
 
 ## 0. ENVIRONMENT (do not get this wrong)
-- **WSL/Linux, Bash only. No PowerShell.** Working dir: `/mnt/c/Users/Admin/Documents/NekoFetch/KuroSoden`.
-- Python: `./.venv/Scripts/python.exe` (Windows venv from WSL). Tests: `./.venv/Scripts/python.exe -m pytest <path> -q`. Compile: `./.venv/Scripts/python.exe -m py_compile <files>`.
-- **Remote DBs (Render PG / Mongo / Redis) are UNREACHABLE here.** Verify ONLY with in-memory SQLite unit tests + py_compile. Never write a script that connects to prod.
-- `kurosoden.*` is a synthetic namespace (conftest.py) mapping onto `shared/`, `bots/`, `nekofetch/`.
+-
+ **WSL/Linux, Bash only. No PowerShell.** Working dir: `/mnt/c/Users/Admin/Documents/NekoFetch/KuroSoden`.
+-
+ Python: `./.venv/Scripts/python.exe` (Windows venv from WSL). Tests: `./.venv/Scripts/python.exe -
+m pytest <path> -
+q`. Compile: `./.venv/Scripts/python.exe -
+m py_compile <files>`.
+-
+ **Remote DBs (Render PG / Mongo / Redis) are UNREACHABLE here.** Verify ONLY with in-
+memory SQLite unit tests + py_compile. Never write a script that connects to prod.
+-
+ `kurosoden.*` is a synthetic namespace (conftest.py) mapping onto `shared/`, `bots/`, `nekofetch/`.
 
 ### Mandatory test harness
 ```python
@@ -35,71 +48,125 @@ async def sessionmaker_():
 ```
 Container stub: `types.SimpleNamespace(pg_sessionmaker=sm, redis=None, config=..., env=...)`.
 
-### EXECUTION DISCIPLINE (non-negotiable)
+### EXECUTION DISCIPLINE (non-
+negotiable)
 1. **Read the cited file+lines before editing.** Never invent a symbol; confirm it exists.
-2. **Reuse existing code** the plan points to. No parallel re-implementations.
-3. Every task: add/adjust a unit test, `py_compile` clean, `pytest -q` (new test + full suite) green.
-4. **Run a code-review pass** (self-review the diff or `/code-review` skill) before "done"; fix findings.
+2. **Reuse existing code** the plan points to. No parallel re-
+implementations.
+3. Every task: add/adjust a unit test, `py_compile` clean, `pytest -
+q` (new test + full suite) green.
+4. **Run a code-
+review pass** (self-
+review the diff or `/code-
+review` skill) before "done"; fix findings.
 5. Don't regress §2 DONE items. Items marked **[CONFIRM WITH OWNER]** must be confirmed first.
 
----
+-
+-
+-
+
 
 ## 1. ARCHITECTURE MAP (verified)
 
 **Four Pyrogram bots**, wired by `shared/pipeline_manager.py` (owns all 4 clients: `lelouch`, `levi`, `senku`, `gojo`; `container.admin_client` = admin bot or gojo fallback). Stage handoffs in `shared/handoff.py`:
-- `handoff_download_to_distribution(container, code, title)` — Levi→Senku (`complete_task(code,"levi")` → `assign(code,"senku")`).
-- `handoff_distribution_to_publish(container, code, title)` — Senku→Gojo. Called from `bots/senku/handlers/wizard.py:~870` after `SenkuPublisher.publish`.
+-
+ `handoff_download_to_distribution(container, code, title)` — Levi→Senku (`complete_task(code,"levi")` → `assign(code,"senku")`).
+-
+ `handoff_distribution_to_publish(container, code, title)` — Senku→Gojo. Called from `bots/senku/handlers/wizard.py:~870` after `SenkuPublisher.publish`.
 
-**Pipeline:** Lelouch (request/batch) → Levi (download+encode) → storage packs → Senku (distribution channel + thumbnails) → Gojo (main-channel post + A-Z index).
+**Pipeline:** Lelouch (request/batch) → Levi (download+encode) → storage packs → Senku (distribution channel + thumbnails) → Gojo (main-
+channel post + A-
+Z index).
 
 ### Data models — `nekofetch/infrastructure/database/postgres/models.py`
-- `Request` (59) — `user_id` FKs `users.id` (NOT telegram_id; resolve via `UserRepository.get_or_create(tg).id`). Holds `franchise_data` JSON.
-- `DownloadJob` (94, table `download_queue`) — `priority`, `status`, `current_episode`. **No `processing_order` column.**
-- `MediaFile` (122, table `files`) — has `season`, **`season_part`**, `episode`, `resolution`, `audio`.
-- `StoragePack` (215) — unique `(anime_doc_id, season, season_part, resolution, audio, entry_id)`; `header_message_id`, `start_message_id`, `end_message_id`, `file_message_ids` JSON, `episode_from/to`, `entry_id`, `enabled`. **NO `caption` column.**
-- `ChannelPost` (262) — one per `anime_doc_id`; `main_message_id`, `index_letter`, `index_message_id`.
-- `ChannelLayout` (358) — per distribution bot, ordered `seq`; `kind` ∈ {info_card, season_card, movie_card, watch_guide, divider, footer}, `anilist_id`, `tg_message_id`, `is_pinned`.
-- `PublishedPostBackup` (277) / `ChannelContentBackup` (313) — recovery snapshots (caption HTML, mirrored image URLs, `button_data`, `cards` JSON). Editing a live post must also update its backup.
-- `IndexSection` (438) — A-Z slots; `base_letter`, `label`, `message_id` (posted iff non-null), `repurposed`.
+-
+ `Request` (59) — `user_id` FKs `users.id` (NOT telegram_id; resolve via `UserRepository.get_or_create(tg).id`). Holds `franchise_data` JSON.
+-
+ `DownloadJob` (94, table `download_queue`) — `priority`, `status`, `current_episode`. **No `processing_order` column.**
+-
+ `MediaFile` (122, table `files`) — has `season`, **`season_part`**, `episode`, `resolution`, `audio`.
+-
+ `StoragePack` (215) — unique `(anime_doc_id, season, season_part, resolution, audio, entry_id)`; `header_message_id`, `start_message_id`, `end_message_id`, `file_message_ids` JSON, `episode_from/to`, `entry_id`, `enabled`. **NO `caption` column.**
+-
+ `ChannelPost` (262) — one per `anime_doc_id`; `main_message_id`, `index_letter`, `index_message_id`.
+-
+ `ChannelLayout` (358) — per distribution bot, ordered `seq`; `kind` ∈ {info_card, season_card, movie_card, watch_guide, divider, footer}, `anilist_id`, `tg_message_id`, `is_pinned`.
+-
+ `PublishedPostBackup` (277) / `ChannelContentBackup` (313) — recovery snapshots (caption HTML, mirrored image URLs, `button_data`, `cards` JSON). Editing a live post must also update its backup.
+-
+ `IndexSection` (438) — A-
+Z slots; `base_letter`, `label`, `message_id` (posted iff non-
+null), `repurposed`.
 
 ### Franchise mapping — `nekofetch/services/franchise_flow.py`
-`FranchiseFlowService.build_mapping(franchise_data, anime_doc_id, franchise_entries=None) -> FranchiseMapping` (186). `MappingEntry` dataclass (74): `anilist_id, kind (ContentKind SEASON|MOVIE|SPECIAL), season_number, season_part, title, episodes, included, auto_detected_part`. `FranchiseMapping.included_entries` (96). **`dataclasses.asdict()` works** (no custom serializer). `dict_to_mapping(mapping_dict)` (505) already reads a dict of the same shape.
+`FranchiseFlowService.build_mapping(franchise_data, anime_doc_id, franchise_entries=None) -
+> FranchiseMapping` (186). `MappingEntry` dataclass (74): `anilist_id, kind (ContentKind SEASON|MOVIE|SPECIAL), season_number, season_part, title, episodes, included, auto_detected_part`. `FranchiseMapping.included_entries` (96). **`dataclasses.asdict()` works** (no custom serializer). `dict_to_mapping(mapping_dict)` (505) already reads a dict of the same shape.
 
 ### UI conventions (MANDATORY — match exactly)
-- `nekofetch/ui/screens.py::Screen(caption, image, keyboard)` + `send_screen(client, chat_id, screen, old_msg=...)`; `card(...)` builder.
-- `nekofetch/ui/components.py::keyboard(*rows)`; rows are `[(label, callback)]`; `cb("<bot>","<action>",*args)`.
-- `nekofetch/ui/artwork.py::pick_artwork("<bot>")`. Owner gate `shared/access_gate.py::is_owner(container,obj)`; staff `is_staff(obj)`.
-- Voice in `shared/<bot>_voice.py` as `V`. Localized strings via `nekofetch/localization/messages.py::t(M.KEY, **kw)` reading `resources/language/en.json` (`{placeholder}` syntax, Telegram HTML incl. `<a href>`; unknown placeholders render literally — safe).
-- **FSM text capture:** `nekofetch/bots/fsm.py::FSM(redis, bot=..., ttl=900)` with `.set/.get/.update/.clear`; register the text handler at a UNIQUE `group=` (e.g. Gojo schedule uses one, Levi naming uses group=13) so it doesn't fight other handlers. Model new caption-edit flows on `bots/levi/handlers/naming_confirm_handler.py`.
+-
+ `nekofetch/ui/screens.py::Screen(caption, image, keyboard)` + `send_screen(client, chat_id, screen, old_msg=...)`; `card(...)` builder.
+-
+ `nekofetch/ui/components.py::keyboard(*rows)`; rows are `[(label, callback)]`; `cb("<bot>","<action>",*args)`.
+-
+ `nekofetch/ui/artwork.py::pick_artwork("<bot>")`. Owner gate `shared/access_gate.py::is_owner(container,obj)`; staff `is_staff(obj)`.
+-
+ Voice in `shared/<bot>_voice.py` as `V`. Localized strings via `nekofetch/localization/messages.py::t(M.KEY, **kw)` reading `resources/language/en.json` (`{placeholder}` syntax, Telegram HTML incl. `<a href>`; unknown placeholders render literally — safe).
+-
+ **FSM text capture:** `nekofetch/bots/fsm.py::FSM(redis, bot=..., ttl=900)` with `.set/.get/.update/.clear`; register the text handler at a UNIQUE `group=` (e.g. Gojo schedule uses one, Levi naming uses group=13) so it doesn't fight other handlers. Model new caption-
+edit flows on `bots/levi/handlers/naming_confirm_handler.py`.
 
----
+-
+-
+-
+
 
 ## 2. STATUS
 ### ✅ DONE & TESTED (do not redo; don't regress)
-1. Gojo `/stats` — DB-driven `nekofetch/services/stats_service.py::compute()`. Tests `tests/test_stats_db_driven.py`.
+1. Gojo `/stats` — DB-
+driven `nekofetch/services/stats_service.py::compute()`. Tests `tests/test_stats_db_driven.py`.
 2. Gojo Schedule button → real list view + Back (`bots/gojo/handlers/schedule.py`).
 3. Gojo `/start` vs Settings menu drift → `bots/gojo/app.py::_home_rows`. Tests `tests/test_gojo_home_menu.py`.
 4. Gojo Settings trimmed (`bots/gojo/handlers/__init__.py`) — removed thumbnail_channel + timezone.
-5. **Lelouch `/redo` fixed.** Root cause: `bots/lelouch/handlers/requests.py:97` `LELOUCH_COMMANDS` (the free-text title handler's `~filters.command(...)` exclusion list) was missing `"redo"`. Because `register_requests` mounts that group-0 text handler BEFORE `register_redo`, typing `/redo` matched `_text`, was treated as an anime-title search, found nothing, and returned — so the real `/redo` handler in `redo.py` never fired and nothing was logged (`/settings` worked only because it WAS in the list). Fix: added `"redo"` to the list. Tests `tests/test_lelouch_redo_command.py` (2 pass) — one pins `redo`, one asserts EVERY registered Lelouch command is in the exclusion list so this can't regress.
+5. **Lelouch `/redo` fixed.** Root cause: `bots/lelouch/handlers/requests.py:97` `LELOUCH_COMMANDS` (the free-
+text title handler's `~filters.command(...)` exclusion list) was missing `"redo"`. Because `register_requests` mounts that group-
+0 text handler BEFORE `register_redo`, typing `/redo` matched `_text`, was treated as an anime-
+title search, found nothing, and returned — so the real `/redo` handler in `redo.py` never fired and nothing was logged (`/settings` worked only because it WAS in the list). Fix: added `"redo"` to the list. Tests `tests/test_lelouch_redo_command.py` (2 pass) — one pins `redo`, one asserts EVERY registered Lelouch command is in the exclusion list so this can't regress.
 
 ### 🟡 PARTIAL — `_map_episode_to_part` exists (`nekofetch/services/download_service.py:1942`) and `_record_file` (1561) already calls it + sets `MediaFile.season_part`, BUT it reads `franchise_data["entries"]` which is never written. **Task A is the linchpin.**
 
 ### Key discoveries that SHRINK the work
-- **Pack splitting per part is ALREADY implemented.** `publishing_service._upload_packs` groups by `(season, season_part, resolution, audio, entry_id)` (`publishing_service.py:560`) and orders by season→part→resolution (575). Once `season_part` is populated (Task A), Vanitas becomes 2 packs automatically. **Task B is mostly verification + Senku entry cards.**
-- **The update/append flow ALREADY exists.** `publishing_service.py:373` `is_update_entry` branch → `SenkuPublisher.update_distribution_channel(...)`; append logic `_append_and_refooter` deletes guide/dividers/footer, appends new card, re-posts guide+footer, rewrites `ChannelLayout`. Test `tests/test_senku_channel_update.py`. **Task K reuses this**, adding: torrent partial-download + Gojo reply-to-main + thumbnail-as-step-1.
-- **Per-entry thumbnail infra ALREADY exists.** `SenkuThumbnailAdapter.next_pending(code)` / `is_complete(code)`; selections are per `(code,index)` in `shared/distribution_cache.py`. The wizard just hardcodes `index=0` (`bots/senku/handlers/wizard.py:~700`). **Task D = loop + approve/reject buttons.**
+-
+ **Pack splitting per part is ALREADY implemented.** `publishing_service._upload_packs` groups by `(season, season_part, resolution, audio, entry_id)` (`publishing_service.py:560`) and orders by season→part→resolution (575). Once `season_part` is populated (Task A), Vanitas becomes 2 packs automatically. **Task B is mostly verification + Senku entry cards.**
+-
+ **The update/append flow ALREADY exists.** `publishing_service.py:373` `is_update_entry` branch → `SenkuPublisher.update_distribution_channel(...)`; append logic `_append_and_refooter` deletes guide/dividers/footer, appends new card, re-
+posts guide+footer, rewrites `ChannelLayout`. Test `tests/test_senku_channel_update.py`. **Task K reuses this**, adding: torrent partial-
+download + Gojo reply-
+to-
+main + thumbnail-
+as-
+step-
+1.
+-
+ **Per-
+entry thumbnail infra ALREADY exists.** `SenkuThumbnailAdapter.next_pending(code)` / `is_complete(code)`; selections are per `(code,index)` in `shared/distribution_cache.py`. The wizard just hardcodes `index=0` (`bots/senku/handlers/wizard.py:~700`). **Task D = loop + approve/reject buttons.**
 
 
----
+-
+-
+-
+
 
 ## 3. TASKS
 
 ### TASK A — Persist franchise entries → finish S01P02E01 + episode renumbering (THE LINCHPIN; do first)
 **Why:** Vanitas S1(12)+S1P2(12)=24 showed `S01E13`. `_map_episode_to_part` (`download_service.py:1942`) reads `franchise_data["entries"]`, which is never written, so it returns `None` and packs/naming/progress all lose the part. **Plus:** episodes must restart at 1 per part — S01P02 files are `E01–E12`, not `E13–E24`.
 
-**A1. Persist the mapping at request-commit.**
-- File `bots/lelouch/handlers/requests.py`, function `_finalize` (~423–484) builds `franchise_json` and calls `RequestService(container).submit(..., franchise_data=franchise_json)`. Batch equivalent: `bots/lelouch/handlers/batch.py` commit (`keep`/`franchise_data`).
-- Before submit, build the mapping and attach entries. Use the SAME resolution path the pipeline uses:
+**A1. Persist the mapping at request-
+commit.**
+-
+ File `bots/lelouch/handlers/requests.py`, function `_finalize` (~423–484) builds `franchise_json` and calls `RequestService(container).submit(..., franchise_data=franchise_json)`. Batch equivalent: `bots/lelouch/handlers/batch.py` commit (`keep`/`franchise_data`).
+-
+ Before submit, build the mapping and attach entries. Use the SAME resolution path the pipeline uses:
 ```python
 from nekofetch.services.franchise_flow import FranchiseFlowService
 import dataclasses
@@ -112,9 +179,14 @@ franchise_json["entries"] = [
     for e in mapping.included_entries
 ]
 ```
-  (`kind.value` is lowercase `"season"|"movie"|"special"` — matches what `_map_episode_to_part` checks: `e.get("kind")=="season"`.) Do this in BOTH the single-request `_finalize` and the batch commit so every Request carries `entries`.
+  (`kind.value` is lowercase `"season"|"movie"|"special"` — matches what `_map_episode_to_part` checks: `e.get("kind")=="season"`.) Do this in BOTH the single-
+request `_finalize` and the batch commit so every Request carries `entries`.
 
-**A2. Rewrite `_map_episode_to_part` to return `(part, renumbered_episode)`.** Currently it returns `part | None`. Change to return `tuple[int|None, int]` — part number AND the episode-within-part. For S01P02 ep 13 from the torrent → `(2, 1)`. Logic: find the part via cumulative boundaries (current logic), then `renumbered = episode_num - sum(eps for prior parts in same season)`. Single-part seasons still return `(None, episode_num)` — no renumber.
+**A2. Rewrite `_map_episode_to_part` to return `(part, renumbered_episode)`.** Currently it returns `part | None`. Change to return `tuple[int|None, int]` — part number AND the episode-
+within-
+part. For S01P02 ep 13 from the torrent → `(2, 1)`. Logic: find the part via cumulative boundaries (current logic), then `renumbered = episode_num -
+ sum(eps for prior parts in same season)`. Single-
+part seasons still return `(None, episode_num)` — no renumber.
 
 **A3. Thread the renumbered episode through `_record_file`.** Currently `MediaFile.episode = ep.number` (the torrent's raw number). Change to:
 ```python
@@ -125,14 +197,17 @@ So `MediaFile.episode` stores the **renumbered** value (1–12 for part 2), not 
 
 **A4. Filename + progress use renumbered episode.** `nekofetch/services/processing/stages.py:604–642` renders filename; it reads `MediaFile.episode`, which is now renumbered (A3) — **verify no second adjustment needed**. Progress card (`nekofetch/ui/progress.py:209`) currently shows `E{int(current_episode):02d}` — pass the renumbered value from the mapping. Template default still changes to `{title} S{season}{season_part}E{episode} ...` (add `{season_part}`).
 
-**A5. Re-ask filename template when a part is present.** (unchanged from prior)
+**A5. Re-
+ask filename template when a part is present.** (unchanged from prior)
 
-**A6. TEST** `tests/test_episode_part_mapping.py`: `franchise_data={"entries":[{"kind":"season","season_number":1,"season_part":1,"episodes":12},{"kind":"season","season_number":1,"season_part":2,"episodes":12}]}`. Assert `_map_episode_to_part(13,1,fd) == (2, 1)`, `(24,1,fd) == (2, 12)`, `(12,1,fd) == (1, 12)`, `(1,1,fd) == (1, 1)`; single-entry season → `(None, <unchanged>)`. Also assert a `MediaFile` created with raw ep=13 stores `episode=1, season_part=2`.
+**A6. TEST** `tests/test_episode_part_mapping.py`: `franchise_data={"entries":[{"kind":"season","season_number":1,"season_part":1,"episodes":12},{"kind":"season","season_number":1,"season_part":2,"episodes":12}]}`. Assert `_map_episode_to_part(13,1,fd) == (2, 1)`, `(24,1,fd) == (2, 12)`, `(12,1,fd) == (1, 12)`, `(1,1,fd) == (1, 1)`; single-
+entry season → `(None, <unchanged>)`. Also assert a `MediaFile` created with raw ep=13 stores `episode=1, season_part=2`.
 
 ### TASK B — Two entry cards for a split season (packs already split)
 **Already done:** pack grouping/order in `publishing_service._upload_packs` (560/575) yields one `StoragePack` per `(season, season_part, resolution, audio, entry_id)` once Task A populates `season_part`. **Verify** the end sticker is per pack (`storage_channel_service.py:231`, inside `upload_pack`) — it is.
 
-**What to add:** ensure Senku posts **one `season_card` per `(season, season_part)`**, not per season. In `shared/senku_publisher.py` (`_build_posts` ~447, `_send_posts` ~856) and `nekofetch/services/bot_content.py` (`_build_franchise_watch_guide` ~960, season lines), entries are keyed by `anilist_id`. Vanitas S1 and S1P2 are **separate AniList entries** with distinct `anilist_id`, so they should already produce two cards **if** both appear in the franchise walk. **Confirm** by reading `_build_update_cards`/card build: does it iterate franchise entries (per `anilist_id`) or collapse by `season_number`? If it collapses by season_number, change it to iterate per entry (`anilist_id`, carrying `season_part`) so both parts get a card + a watch-guide line. Card `kind` stays `season_card`; label uses `season_part` (e.g. "Season 1 Part 2").
+**What to add:** ensure Senku posts **one `season_card` per `(season, season_part)`**, not per season. In `shared/senku_publisher.py` (`_build_posts` ~447, `_send_posts` ~856) and `nekofetch/services/bot_content.py` (`_build_franchise_watch_guide` ~960, season lines), entries are keyed by `anilist_id`. Vanitas S1 and S1P2 are **separate AniList entries** with distinct `anilist_id`, so they should already produce two cards **if** both appear in the franchise walk. **Confirm** by reading `_build_update_cards`/card build: does it iterate franchise entries (per `anilist_id`) or collapse by `season_number`? If it collapses by season_number, change it to iterate per entry (`anilist_id`, carrying `season_part`) so both parts get a card + a watch-
+guide line. Card `kind` stays `season_card`; label uses `season_part` (e.g. "Season 1 Part 2").
 
 **TEST** `tests/test_two_part_cards.py`: with a franchise of two TV entries sharing season_number=1 (parts 1,2), assert the post/layout builder emits two `season_card` entries with distinct `anilist_id` and correct labels.
 
@@ -140,64 +215,116 @@ So `MediaFile.episode` stores the **renumbered** value (1–12 for part 2), not 
 **Facts:** caption is generated on the fly by `nekofetch/services/bot_naming.py::build_pack_caption(...)` (427) via `storage_channel_service.header_text()` (80→110); **not stored.** `StoragePack.header_message_id` (models.py:236) is the message to edit; edit API `edit_message_caption` (used in `main_channel_service.py:456`, `index_channel_service.py:558`).
 
 **Owner's mental model (two distinct things — don't conflate):**
-- **Filename title** (used in `S01E01`-style filenames): short, filesystem-safe (e.g. "Vanitas no Carte"). When the owner changes the filename title on ONE entry during naming, it propagates the **title portion** to ALL entries of that show — but each entry keeps its own `S1`/`S1P2` label. See A7 below.
-- **Pack caption** (the header text on the storage pack, can be longer): editable separately in Levi. The owner may set filename="Vanitas no Carte" but caption="The Case Study of Vanitas". THIS task is the caption editor.
+-
+ **Filename title** (used in `S01E01`-
+style filenames): short, filesystem-
+safe (e.g. "Vanitas no Carte"). When the owner changes the filename title on ONE entry during naming, it propagates the **title portion** to ALL entries of that show — but each entry keeps its own `S1`/`S1P2` label. See A7 below.
+-
+ **Pack caption** (the header text on the storage pack, can be longer): editable separately in Levi. The owner may set filename="Vanitas no Carte" but caption="The Case Study of Vanitas". THIS task is the caption editor.
 
 **Do:**
 1. **Add a nullable `caption` column** to `StoragePack` (models.py ~215–260): `caption: Mapped[str | None] = mapped_column(Text)`. Add an Alembic migration if the repo uses Alembic (grep `alembic/versions`); else it's created by `Base.metadata.create_all` on dev. Persist the generated caption in `storage_channel_service._persist` (~245–274) so existing packs backfill on next upload; when `caption` is set, `header_text()` should prefer the stored value.
-2. **Levi menu:** add `("✏️ Edit Captions", cb("levi","captions"))` to BOTH `/start` (`bots/levi/app.py:~193`) and the `levi|home` callback (`~101`). **Refactor Levi's menu to a single `_home_rows`-style builder** (mirror the Gojo precedent) so the two never drift — this also satisfies the cross-bot menu-consistency rule.
+2. **Levi menu:** add `("✏️ Edit Captions", cb("levi","captions"))` to BOTH `/start` (`bots/levi/app.py:~193`) and the `levi|home` callback (`~101`). **Refactor Levi's menu to a single `_home_rows`-
+style builder** (mirror the Gojo precedent) so the two never drift — this also satisfies the cross-
+bot menu-
+consistency rule.
 3. **Flow:** `levi|captions` → list **one row per entry** = distinct `(anime_doc_id, season, season_part)` across `StoragePack` (dedupe resolutions/audio). Label via `build_pack_caption`'s entry label (e.g. "Vanitas — Season 1 Part 2"). Tap entry → `FSM(container.redis, bot="levi_caption").set(user_id,"edit_caption", anime_doc_id=..., season=..., season_part=...)`; prompt "send the new caption". Register a text handler at a UNIQUE group (e.g. `group=14`) modeled on `naming_confirm_handler.py`.
 4. **Save:** update `StoragePack.caption` for all rows of that `(anime_doc_id, season, season_part)`; then `for pack: await levi.edit_message_caption(pack.channel_id, pack.header_message_id, new_caption)`. Filename NEVER changes. If a `ChannelContentBackup` card exists for this entry, update its stored caption too (so a restore uses the corrected text). Persist to whichever store holds it (Postgres primary; mirror to Redis/Mongo if the caption is cached there).
-5. **Owner/staff gate** with `is_owner`/`is_staff` consistent with other Levi owner-only tools.
+5. **Owner/staff gate** with `is_owner`/`is_staff` consistent with other Levi owner-
+only tools.
 6. **TEST** `tests/test_levi_caption_edit.py`: seed 2 entries × 3 resolutions, run the save path with a stub client recording `edit_message_caption` calls; assert only the targeted entry's rows got the new `caption` and one edit per stored `header_message_id`.
 
-**A7 — Filename-title propagation (belongs to the naming flow, Task A).** When the owner edits the filename title for one entry in the naming confirm, apply that title to ALL entries of the same `anime_doc_id` (the name portion only). Each entry's `S{season}{season_part}` stays as-is — S1 stays S1, S1P2 stays S1P2; only `{title}`/`{short_title}` changes across entries. Store the chosen title on the request (e.g. `franchise_data["_display_title"]`) so every entry's rename uses it. **TEST:** editing the title for the S1P2 entry updates the S1 entry's rendered filename title too, while S1 keeps `S01...` and S1P2 keeps `S01P02...`.
+**A7 — Filename-
+title propagation (belongs to the naming flow, Task A).** When the owner edits the filename title for one entry in the naming confirm, apply that title to ALL entries of the same `anime_doc_id` (the name portion only). Each entry's `S{season}{season_part}` stays as-
+is — S1 stays S1, S1P2 stays S1P2; only `{title}`/`{short_title}` changes across entries. Store the chosen title on the request (e.g. `franchise_data["_display_title"]`) so every entry's rename uses it. **TEST:** editing the title for the S1P2 entry updates the S1 entry's rendered filename title too, while S1 keeps `S01...` and S1P2 keeps `S01P02...`.
 
 
-### TASK D — Per-entry thumbnail approve/reject in Senku
-**Facts:** `bots/senku/handlers/wizard.py` thumbnail loop (~698–863) fetches `cache.get_entry(code, 0)` — hardcoded index 0. Per-entry selection storage already exists: `shared/distribution_cache.py::Selection` keyed `(code,index)` (`get_selection`/`set_selection` ~317–369, `all_done` ~386). Adapter `SenkuThumbnailAdapter.next_pending(code)`/`is_complete(code)` already exist. Render: `nekofetch/services/thumbnail_service.py::render_thumbnail(...)` (336) → WebP under `data/thumbnails/`.
+### TASK D — Per-
+entry thumbnail approve/reject in Senku
+**Facts:** `bots/senku/handlers/wizard.py` thumbnail loop (~698–863) fetches `cache.get_entry(code, 0)` — hardcoded index 0. Per-
+entry selection storage already exists: `shared/distribution_cache.py::Selection` keyed `(code,index)` (`get_selection`/`set_selection` ~317–369, `all_done` ~386). Adapter `SenkuThumbnailAdapter.next_pending(code)`/`is_complete(code)` already exist. Render: `nekofetch/services/thumbnail_service.py::render_thumbnail(...)` (336) → WebP under `data/thumbnails/`.
 
 **Do:**
-1. In `_enter_thumbnails` (~698) replace `get_entry(code,0)` with `entry = await thumbs.next_pending(code)`; if `None`, go to watch-order/publish. Track the current index in FSM data so pick callbacks (`senku|wiz|pick|<code>|<index>|<asset>|<n>`, already carry `index`) target the right entry.
+1. In `_enter_thumbnails` (~698) replace `get_entry(code,0)` with `entry = await thumbs.next_pending(code)`; if `None`, go to watch-
+order/publish. Track the current index in FSM data so pick callbacks (`senku|wiz|pick|<code>|<index>|<asset>|<n>`, already carry `index`) target the right entry.
 2. After `_thumb_generate` renders the preview, show **Approve / Redo** buttons (new callbacks `senku|wiz|thumbok|<code>|<index>` and `senku|wiz|thumbredo|<code>|<index>`):
-   - **Approve** → `cache.set_selection(code, index, done=True)` then `_enter_thumbnails` again (advances to `next_pending`, or finishes).
-   - **Redo** → clear THIS entry's selection only (`set_selection(code,index, asset="logo"/"poster"/"backdrop"=None, done=False)` or add a `clear_selection(code,index)` to distribution_cache) and re-enter the logo step **for this same index**. Do NOT touch other entries (they stay `done`).
+   -
+ **Approve** → `cache.set_selection(code, index, done=True)` then `_enter_thumbnails` again (advances to `next_pending`, or finishes).
+   -
+ **Redo** → clear THIS entry's selection only (`set_selection(code,index, asset="logo"/"poster"/"backdrop"=None, done=False)` or add a `clear_selection(code,index)` to distribution_cache) and re-
+enter the logo step **for this same index**. Do NOT touch other entries (they stay `done`).
 3. Because approve/reject advance via `next_pending`, a reject on entry 2 restarts entry 2 only — entry 1 remains confirmed. This satisfies the exact requirement.
-4. **TEST** `tests/test_thumb_per_entry_fsm.py`: a pure state-machine helper `advance(entries, index, action)` → `(next_index, substate)`; assert approve advances 0→1, reject at 1 stays at 1 with substate "select_logo", 0 stays done; `all_done` gates completion.
+4. **TEST** `tests/test_thumb_per_entry_fsm.py`: a pure state-
+machine helper `advance(entries, index, action)` → `(next_index, substate)`; assert approve advances 0→1, reject at 1 stays at 1 with substate "select_logo", 0 stays done; `all_done` gates completion.
 
 ### TASK E — Thumbnail editing (Senku for distribution, Gojo for main) — [CONFIRM WITH OWNER: HTML host]
-**Facts:** `render_thumbnail` writes the HTML to `data/thumbnails/assets_{title}/thumbnail.html` then the WebP (thumbnail_service.py ~441–459). Template `thumbnail/index.html` tokens: `{{TITLE}} {{NATIVE_TITLE}} {{ROMAJI_TITLE}} {{SYNOPSIS}} {{GENRE_PILLS}} {{STUDIO}} {{TMDB_RATING}} {{ANILIST_SCORE}} {{LOGO_IMAGE}} {{POSTER_IMAGE}} {{BG_IMAGE}} {{FLAG_IMAGE}}` (substitution ~419–439). Field gathering: `gather_thumbnail_fields(container,title,anime_doc_id)` (131). Main-post record: `MainChannelService` (`_record` 481, `publish` 423); reply/edit via `client.edit_message_media` / `edit_message_caption`.
+**Facts:** `render_thumbnail` writes the HTML to `data/thumbnails/assets_{title}/thumbnail.html` then the WebP (thumbnail_service.py ~441–459). Template `thumbnail/index.html` tokens: `{{TITLE}} {{NATIVE_TITLE}} {{ROMAJI_TITLE}} {{SYNOPSIS}} {{GENRE_PILLS}} {{STUDIO}} {{TMDB_RATING}} {{ANILIST_SCORE}} {{LOGO_IMAGE}} {{POSTER_IMAGE}} {{BG_IMAGE}} {{FLAG_IMAGE}}` (substitution ~419–439). Field gathering: `gather_thumbnail_fields(container,title,anime_doc_id)` (131). Main-
+post record: `MainChannelService` (`_record` 481, `publish` 423); reply/edit via `client.edit_message_media` / `edit_message_caption`.
 
-**Storage decision — RECOMMENDATION (confirm before coding):** persist the thumbnail's **input fields** (the dict that produced it: logo_url, poster_url, bg_url, synopsis, rating, genres, studio, titles) in the DB, not just the WebP. Add a small table `thumbnail_source(anime_doc_id, anilist_id, fields JSONB, html TEXT NULL, updated_at)` (or a JSONB column on `StoragePack`/`ChannelPost`). This is durable + transactional + needs no external host. The owner floated Catbox/GitHub — do **NOT** hardcode an external host without sign-off. Fallback chain when editing: stored fields → re-gather via `gather_thumbnail_fields` → prompt user to regenerate.
+**Storage decision — RECOMMENDATION (confirm before coding):** persist the thumbnail's **input fields** (the dict that produced it: logo_url, poster_url, bg_url, synopsis, rating, genres, studio, titles) in the DB, not just the WebP. Add a small table `thumbnail_source(anime_doc_id, anilist_id, fields JSONB, html TEXT NULL, updated_at)` (or a JSONB column on `StoragePack`/`ChannelPost`). This is durable + transactional + needs no external host. The owner floated Catbox/GitHub — do **NOT** hardcode an external host without sign-
+off. Fallback chain when editing: stored fields → re-
+gather via `gather_thumbnail_fields` → prompt user to regenerate.
 
 **Do:**
 1. Persist fields on every render (hook `render_thumbnail` callers in the wizard + publishing to write the `thumbnail_source` row).
-2. **Senku `/edit_thumbnail`** (owner/staff): pick anime → pick entry → menu (Edit Logo / Poster / Backdrop / Synopsis / Rating / Genres). Asset edits reuse the wizard's existing gallery pickers; text edits use the FSM text-capture pattern. Re-render via `render_thumbnail`, update the `thumbnail_source` row, re-post/edit the distribution card (Senku owns that channel), and update the `ChannelContentBackup` card.
-3. **Main-channel edits go through Gojo** (Senku has no main access). Route via `pipeline_manager`/`container.admin_client`: Senku signals Gojo (or the owner runs the same edit in Gojo). Gojo re-renders, `edit_message_media` on `ChannelPost.main_message_id`, and updates `PublishedPostBackup`. Provide the SAME edit UI in Gojo for main posts.
+2. **Senku `/edit_thumbnail`** (owner/staff): pick anime → pick entry → menu (Edit Logo / Poster / Backdrop / Synopsis / Rating / Genres). Asset edits reuse the wizard's existing gallery pickers; text edits use the FSM text-
+capture pattern. Re-
+render via `render_thumbnail`, update the `thumbnail_source` row, re-
+post/edit the distribution card (Senku owns that channel), and update the `ChannelContentBackup` card.
+3. **Main-
+channel edits go through Gojo** (Senku has no main access). Route via `pipeline_manager`/`container.admin_client`: Senku signals Gojo (or the owner runs the same edit in Gojo). Gojo re-
+renders, `edit_message_media` on `ChannelPost.main_message_id`, and updates `PublishedPostBackup`. Provide the SAME edit UI in Gojo for main posts.
 4. All edits update the DB (source row + relevant backup) so a later restore uses corrected values.
-5. **TEST** `tests/test_thumbnail_edit.py`: seed a `thumbnail_source` row, apply a synopsis edit through the service function, assert the row's `fields["synopsis"]` changed and a re-render was requested (stub the renderer). Assert main-channel path updates `PublishedPostBackup`.
+5. **TEST** `tests/test_thumbnail_edit.py`: seed a `thumbnail_source` row, apply a synopsis edit through the service function, assert the row's `fields["synopsis"]` changed and a re-
+render was requested (stub the renderer). Assert main-
+channel path updates `PublishedPostBackup`.
 
-### TASK E2 — Main-channel thumbnail/caption metadata rules (mostly VERIFY, some fix)
-The main-channel post's **generated thumbnail** differs from a distribution entry card. Confirm each rule holds; fix if not.
-1. **Synopsis = TMDB franchise overview, NOT AniList per-entry.** ALREADY IMPLEMENTED — `main_channel_service.py:164–165, 250–277` ("TMDB's franchise-level synopsis is preferred for the main post per spec"); the entry-card thumbnail keeps AniList's per-season synopsis. Just verify the main-post thumbnail render is fed `facts.overview` (TMDB), not the AniList synopsis.
+### TASK E2 — Main-
+channel thumbnail/caption metadata rules (mostly VERIFY, some fix)
+The main-
+channel post's **generated thumbnail** differs from a distribution entry card. Confirm each rule holds; fix if not.
+1. **Synopsis = TMDB franchise overview, NOT AniList per-
+entry.** ALREADY IMPLEMENTED — `main_channel_service.py:164–165, 250–277` ("TMDB's franchise-
+level synopsis is preferred for the main post per spec"); the entry-
+card thumbnail keeps AniList's per-
+season synopsis. Just verify the main-
+post thumbnail render is fed `facts.overview` (TMDB), not the AniList synopsis.
 2. **AniList rating = average of ALL franchise entries.** ALREADY IMPLEMENTED — `main_channel_service.py::_avg_score_pct` (38–49), used at 352/380. Verify the thumbnail's `anilist_score` uses this franchise average on the main post.
-3. **Language label rule (main-channel thumbnail AND main-channel caption if audio shown there).** The label is franchise-level: **if we provide English (dub/dual) for even ONE entry, the whole show reads "English & Japanese"** — a season that's sub-only, or extras that are sub-only, do NOT downgrade it. Find where the `languages` set feeding `language_label`/the thumbnail is built for the main post (grep `languages=` in `main_channel_service.py:391`, `gather_facts`, and `bot_content.py::_gather_metadata` ~509). Ensure it UNIONs languages across all included entries (so one English entry ⇒ English present) rather than reading a single entry. `language_label` (`bot_naming.py:143`) already renders "English & Japanese" from the set; the fix (if any) is upstream set-construction. Apply the same to the main-channel caption's audio/language line if it shows one.
-4. **TEST** `tests/test_main_channel_meta.py`: build facts from entries where only ONE entry has English audio and the rest are sub-only → assert language label == "English & Japanese"; assert rating == average of all entry scores; assert synopsis source is the TMDB overview field.
+3. **Language label rule (main-
+channel thumbnail AND main-
+channel caption if audio shown there).** The label is franchise-
+level: **if we provide English (dub/dual) for even ONE entry, the whole show reads "English & Japanese"** — a season that's sub-
+only, or extras that are sub-
+only, do NOT downgrade it. Find where the `languages` set feeding `language_label`/the thumbnail is built for the main post (grep `languages=` in `main_channel_service.py:391`, `gather_facts`, and `bot_content.py::_gather_metadata` ~509). Ensure it UNIONs languages across all included entries (so one English entry ⇒ English present) rather than reading a single entry. `language_label` (`bot_naming.py:143`) already renders "English & Japanese" from the set; the fix (if any) is upstream set-
+construction. Apply the same to the main-
+channel caption's audio/language line if it shows one.
+4. **TEST** `tests/test_main_channel_meta.py`: build facts from entries where only ONE entry has English audio and the rest are sub-
+only → assert language label == "English & Japanese"; assert rating == average of all entry scores; assert synopsis source is the TMDB overview field.
 
-### TASK E3 — Episode-count line format ("25 + 3 extras", "+ 2 movies")
-The main-channel post (and/or info card) has an **episodes** section. Format it as:
-- Total **main seasonal** episodes as the base number (e.g. `25`).
-- If there are extras (OVA/ONA/Special), append ` + N extras` where N = total extra EPISODES across all extra entries (e.g. two OVAs of 2 eps + 1 ep = `+ 3 extras`). If exactly one extra episode → ` + 1 extra` (singular).
-- If there are movies, append ` + N movie(s)` (e.g. `+ 1 movie`, `+ 2 movies`, `+ 3 movies`).
-- Example composite: `25 + 3 extras + 2 movies`.
+### TASK E3 — Episode-
+count line format ("25 + 3 extras", "+ 2 movies")
+The main-
+channel post (and/or info card) has an **episodes** section. Format it as:
+-
+ Total **main seasonal** episodes as the base number (e.g. `25`).
+-
+ If there are extras (OVA/ONA/Special), append ` + N extras` where N = total extra EPISODES across all extra entries (e.g. two OVAs of 2 eps + 1 ep = `+ 3 extras`). If exactly one extra episode → ` + 1 extra` (singular).
+-
+ If there are movies, append ` + N movie(s)` (e.g. `+ 1 movie`, `+ 2 movies`, `+ 3 movies`).
+-
+ Example composite: `25 + 3 extras + 2 movies`.
 **Do:** find where the episode count is rendered (grep `episodes`, `{episodes}`, `ep count`, `franchise_episodes` in `main_channel_service.py` caption build + `bot_content.py` info card). Build the string from `franchise_data["entries"]`: sum `episodes` for `kind=="season"` entries → base; sum `episodes` for `kind=="special"` → extras; count `kind=="movie"` → movies. Handle singular/plural. **TEST** `tests/test_episode_count_label.py`: assert `25`, `25 + 1 extra`, `25 + 3 extras`, `25 + 2 movies`, `25 + 3 extras + 2 movies` for the matching entry sets.
 
 ### TASK F — Encode in RELEASE order AND episode order
 **Requirement (clarified):** BOTH levels — entries in release order (S1 → S1P2 → S2 → S2P2 → …) **and** episodes ascending within each (E1 → E2 → E3, never E1 → E4).
 **Facts:** queue claims **jobs** not episodes (`queue_repo.py::next_queued` (15) = `ORDER BY priority ASC, created_at ASC`). Within a job, the encode stage iterates `ctx.files` (`stages.py:~604`).
 **Do:**
-1. Sort the encode iteration list by the full key `(season, season_part or 0, episode)` ascending right before the encode/processing loop (`ctx.files` in `stages.py`). This handles episode-order within a request AND part-order within a season.
-2. For cross-request order (S2 request vs S1 request), keep `priority, created_at` (S1 created first → release-ordered). Add `processing_order` only if reading proves neither sort suffices.
+1. Sort the encode iteration list by the full key `(season, season_part or 0, episode)` ascending right before the encode/processing loop (`ctx.files` in `stages.py`). This handles episode-
+order within a request AND part-
+order within a season.
+2. For cross-
+request order (S2 request vs S1 request), keep `priority, created_at` (S1 created first → release-
+ordered). Add `processing_order` only if reading proves neither sort suffices.
 3. **TEST** `tests/test_encode_order.py`: feed files as `[S1E3, S1E1, S1P2E2, S1E2, S1P2E1]` → assert iteration yields `S1E1, S1E2, S1E3, S1P2E1, S1P2E2`.
 
 ### TASK G — DDL option missing in "Begin Now"
@@ -206,147 +333,951 @@ The main-channel post (and/or info card) has an **episodes** section. Format it 
 
 ### TASK H — Levi/Lelouch batch "board" button → "Open Tasks"
 **Facts:** batch commit screen `bots/lelouch/handlers/batch.py:547–554` shows buttons `[[V.BTN_QUEUE→lelouch|queue|0, V.BTN_HOME→lelouch|home]]`. `lelouch|queue` shows request stats ("The Board"), NOT Levi tasks. **Lelouch and Levi are separate bot clients — a callback can't cross bots.** Precedent: `shared/access_gate.py::lelouch_link` (66) resolves a bot's `https://t.me/<username>` via `pipeline_manager`.
-**Do:** add a `levi_link(container)` helper (mirror `lelouch_link`, using `mgr.levi`). On the batch-done screen add a **URL button** "📋 Open Tasks" → `levi_link(container)` (a deep link into Levi where the admin runs `/tasks`). Omit the button if the link can't resolve (never show a dead button). Keep Home. **TEST** `tests/test_batch_done_button.py`: with a stub pipeline_manager exposing a Levi username, assert the batch-done keyboard contains a URL button to `t.me/<levi>`.
+**Do:** add a `levi_link(container)` helper (mirror `lelouch_link`, using `mgr.levi`). On the batch-
+done screen add a **URL button** "📋 Open Tasks" → `levi_link(container)` (a deep link into Levi where the admin runs `/tasks`). Omit the button if the link can't resolve (never show a dead button). Keep Home. **TEST** `tests/test_batch_done_button.py`: with a stub pipeline_manager exposing a Levi username, assert the batch-
+done keyboard contains a URL button to `t.me/<levi>`.
 
 
 ### TASK J — Monthly ban recovery + full channel rebuild
-**Facts (already substantial):** monthly sweep registered in `nekofetch/bots/manager.py:703` (`entity_full_check_days`, default 30) → `_monthly_full_check` (385) → `check_all_entities` (136) → `_probe_entity` → ban markers (`maintenance_service.py:34`). On ban: disable + `BotOrchestratorService.recreate_bot(anime_doc_id)` (`bot_orchestrator.py:77`) which pre-backs-up (`BackupService.record_distribution_channel`), deletes old, creates fresh, `_restore_channel` → `BackupService.restore_distribution_channel` (`backup_service.py:425`), regenerates content, refreshes index. Warm-up exists: `SenkuPublisher._warm_global_search` (~1487). Main/index manual recovery: `/recovermain`, `/recoverindex` (`nekofetch/bots/admin/handlers/commands.py:184/228`).
+**Facts (already substantial):** monthly sweep registered in `nekofetch/bots/manager.py:703` (`entity_full_check_days`, default 30) → `_monthly_full_check` (385) → `check_all_entities` (136) → `_probe_entity` → ban markers (`maintenance_service.py:34`). On ban: disable + `BotOrchestratorService.recreate_bot(anime_doc_id)` (`bot_orchestrator.py:77`) which pre-
+backs-
+up (`BackupService.record_distribution_channel`), deletes old, creates fresh, `_restore_channel` → `BackupService.restore_distribution_channel` (`backup_service.py:425`), regenerates content, refreshes index. Warm-
+up exists: `SenkuPublisher._warm_global_search` (~1487). Main/index manual recovery: `/recovermain`, `/recoverindex` (`nekofetch/bots/admin/handlers/commands.py:184/228`).
 
 **What needs fixing/adding:**
-1. **Admin assignment messages.** Gojo DMs a free admin via the existing channel-creation message flow (reuse the SAME recurring artwork, UI layout, character voice from the normal Senku channel-creation wizard — find those in `bots/senku/handlers/wizard.py::_ask_channel` and related). Light modifications for ban-recovery context: "Restoring a banned channel — create a replacement or use the userbot." Admin creates the channel, gives it a username, **adds the PFP (profile picture)**, removes the "changed photo" service messages, adds Senku + Gojo as admins. That's all the human does.
-2. **Button-link bug.** `restore_distribution_channel` re-posts entry cards with verbatim `button_data` → Download buttons keep the OLD invite link. Fix: after restore, call `BotManagementService.bind_title` (or the `BotContentService.generate_posts` path) to rebuild buttons with the new `invite_link`. Invoke inside `recreate_bot` after `_restore_channel`.
-3. **Main-channel Download button + reply.** After the restore, go to the main-channel post (`ChannelPost.main_message_id` for `anime_doc_id`), **edit the Download button's invite link** to the new channel's (real button, not text), **then reply** to that post with a block-quoted, bulleted, en.json-editable message announcing the restore — including a **"click here" hyperlink** to the new channel. Add `"ban_recovery_reply": "<blockquote><b>{title}</b>\n• The channel was banned and has been restored\n• <a href=\"{channel_link}\">Click here</a> to access the new channel</blockquote>"` to `resources/language/en.json` + constant `BAN_RECOVERY_REPLY` to `messages.py::M`. Send via `MainChannelService`: `await admin_client.send_message(main_channel_id, t(M.BAN_RECOVERY_REPLY, ...), reply_to_message_id=main_msg_id, parse_mode=ParseMode.HTML)` — **no `reply_markup`**.
-4. Confirm warm-up runs before re-posting, and watch-guide deep links are remapped (the restore already remaps `{BOT_QUAL#...}` — verify).
-5. **TEST** `tests/test_ban_recovery_full.py`: seed `ChannelContentBackup` with stale button links, run restore+rebind+main-edit+reply path with stub client, assert (a) re-posted cards have NEW invite link, (b) guide references new message IDs, (c) main-post Download button updated, (d) reply posted with text hyperlink + no buttons.
+1. **Admin assignment messages.** Gojo DMs a free admin via the existing channel-
+creation message flow (reuse the SAME recurring artwork, UI layout, character voice from the normal Senku channel-
+creation wizard — find those in `bots/senku/handlers/wizard.py::_ask_channel` and related). Light modifications for ban-
+recovery context: "Restoring a banned channel — create a replacement or use the userbot." Admin creates the channel, gives it a username, **adds the PFP (profile picture)**, removes the "changed photo" service messages, adds Senku + Gojo as admins. That's all the human does.
+2. **Button-
+link bug.** `restore_distribution_channel` re-
+posts entry cards with verbatim `button_data` → Download buttons keep the OLD invite link. Fix: after restore, call `BotManagementService.bind_title` (or the `BotContentService.generate_posts` path) to rebuild buttons with the new `invite_link`. Invoke inside `recreate_bot` after `_restore_channel`.
+3. **Main-
+channel Download button + reply.** After the restore, go to the main-
+channel post (`ChannelPost.main_message_id` for `anime_doc_id`), **edit the Download button's invite link** to the new channel's (real button, not text), **then reply** to that post with a block-
+quoted, bulleted, en.json-
+editable message announcing the restore — including a **"click here" hyperlink** to the new channel. Add `"ban_recovery_reply": "<blockquote><b>{title}</b>\n• The channel was banned and has been restored\n• <a href=\"{channel_link}\">Click here</a> to access the new channel</blockquote>"` to `resources/language/en.json` + constant `BAN_RECOVERY_REPLY` to `messages.py::M`. Send via `MainChannelService`: `await admin_client.send_message(main_channel_id, t(M.BAN_RECOVERY_REPLY, ...), reply_to_message_id=main_msg_id, parse_mode=ParseMode.HTML)` — **no `reply_markup`**.
+4. Confirm warm-
+up runs before re-
+posting, and watch-
+guide deep links are remapped (the restore already remaps `{BOT_QUAL#...}` — verify).
+5. **TEST** `tests/test_ban_recovery_full.py`: seed `ChannelContentBackup` with stale button links, run restore+rebind+main-
+edit+reply path with stub client, assert (a) re-
+posted cards have NEW invite link, (b) guide references new message IDs, (c) main-
+post Download button updated, (d) reply posted with text hyperlink + no buttons.
 
 ### TASK K — Update flow (new season/part appended) — reuses existing append
-**Facts:** append already implemented — `publishing_service.py:373` `is_update_entry` → `SenkuPublisher.update_distribution_channel` → `_append_and_refooter` (deletes guide/dividers/footer, appends new `season_card`, re-posts guide+footer, rewrites `ChannelLayout`); test `tests/test_senku_channel_update.py`. Handoff/assignment via `shared/handoff.py` + `AdminAssignmentEngine.assign`.
+**Facts:** append already implemented — `publishing_service.py:373` `is_update_entry` → `SenkuPublisher.update_distribution_channel` → `_append_and_refooter` (deletes guide/dividers/footer, appends new `season_card`, re-
+posts guide+footer, rewrites `ChannelLayout`); test `tests/test_senku_channel_update.py`. Handoff/assignment via `shared/handoff.py` + `AdminAssignmentEngine.assign`.
 
 **What's missing (add these):**
-1. **Torrent partial download.** When admins supply a torrent that contains S1+S2 (or S1+S1P2) but the request is only the new entry, download ONLY the new entry's episode range. Find file selection in the download path (grep `torrent`, file-index selection, `select_files`, `qbittorrent` in `nekofetch/sources/`). Use the new entry's `(episodes, season_part)` from `franchise_data["entries"]` (Task A) to compute the wanted episode window (e.g. S1P2 = eps 13–24, S2 = its own 1–N) and select only those files. Handle: 13 separate torrents (one per ep), one combined torrent (subset), and a season-pack torrent.
-2. **Thumbnail becomes step 1 on updates.** On the update branch, Senku must NOT create a channel; it starts at thumbnail generation for the new entry only. Gate the wizard: if `is_update_entry` (channel already exists for `anime_doc_id`), skip channel-create states and enter `_enter_thumbnails` for the new entry index. (Task D's per-entry loop makes this natural.)
-3. **Gojo replies to the main post.** After the append completes, Gojo replies to `ChannelPost.main_message_id` (look it up by `anime_doc_id`) with an **en.json-driven, block-quoted, bulleted** message containing a **channel hyperlink** and **NO buttons**:
-   - Add to `resources/language/en.json` a key e.g. `"season_update_reply": "<blockquote><b>{title} — {entry_label}</b>\n• {episodes} episodes • {quality}\n• <a href=\"{channel_link}\">click here</a> to watch</blockquote>"` (use the `•` bullet; owner may reword — that's the point of en.json).
-   - Add `SEASON_UPDATE_REPLY = "season_update_reply"` to `nekofetch/localization/messages.py::M`.
-   - Send: `await container.admin_client.send_message(main_channel_id, t(M.SEASON_UPDATE_REPLY, ...), reply_to_message_id=main_msg_id, parse_mode=ParseMode.HTML)` — **no `reply_markup`**. Put this in `MainChannelService` as a new method `reply_update(anime_doc_id, entry_label, episodes, quality, channel_link)` and call it from the update branch after Senku finishes.
-4. **TEST** `tests/test_update_flow.py`: (a) file-selection picks only the new entry's episodes from a combined torrent listing; (b) update branch skips channel creation; (c) `reply_update` posts a reply to the recorded `main_message_id` using the en.json template with a hyperlink and no buttons (assert `reply_markup is None`).
+1. **Torrent partial download.** When admins supply a torrent that contains S1+S2 (or S1+S1P2) but the request is only the new entry, download ONLY the new entry's episode range. Find file selection in the download path (grep `torrent`, file-
+index selection, `select_files`, `qbittorrent` in `nekofetch/sources/`). Use the new entry's `(episodes, season_part)` from `franchise_data["entries"]` (Task A) to compute the wanted episode window (e.g. S1P2 = eps 13–24, S2 = its own 1–N) and select only those files. Handle: 13 separate torrents (one per ep), one combined torrent (subset), and a season-
+pack torrent.
+2. **Thumbnail becomes step 1 on updates.** On the update branch, Senku must NOT create a channel; it starts at thumbnail generation for the new entry only. Gate the wizard: if `is_update_entry` (channel already exists for `anime_doc_id`), skip channel-
+create states and enter `_enter_thumbnails` for the new entry index. (Task D's per-
+entry loop makes this natural.)
+3. **Gojo replies to the main post.** After the append completes, Gojo replies to `ChannelPost.main_message_id` (look it up by `anime_doc_id`) with an **en.json-
+driven, block-
+quoted, bulleted** message containing a **channel hyperlink** and **NO buttons**:
+   -
+ Add to `resources/language/en.json` a key e.g. `"season_update_reply": "<blockquote><b>{title} — {entry_label}</b>\n• {episodes} episodes • {quality}\n• <a href=\"{channel_link}\">click here</a> to watch</blockquote>"` (use the `•` bullet; owner may reword — that's the point of en.json).
+   -
+ Add `SEASON_UPDATE_REPLY = "season_update_reply"` to `nekofetch/localization/messages.py::M`.
+   -
+ Send: `await container.admin_client.send_message(main_channel_id, t(M.SEASON_UPDATE_REPLY, ...), reply_to_message_id=main_msg_id, parse_mode=ParseMode.HTML)` — **no `reply_markup`**. Put this in `MainChannelService` as a new method `reply_update(anime_doc_id, entry_label, episodes, quality, channel_link)` and call it from the update branch after Senku finishes.
+4. **TEST** `tests/test_update_flow.py`: (a) file-
+selection picks only the new entry's episodes from a combined torrent listing; (b) update branch skips channel creation; (c) `reply_update` posts a reply to the recorded `main_message_id` using the en.json template with a hyperlink and no buttons (assert `reply_markup is None`).
 
-**K5. Update-DURING-redo (owner now wants this — NOT deferred).** Scenario: owner redoes a series early in the month; a new season aired yesterday but the monthly check hasn't run. So the redo flow must OFFER the update inline and let the owner choose.
-- In the `/redo` flow (`RedoService` / `bots/lelouch/handlers/redo.py`), after resolving the franchise, detect entries present in `franchise_data` but NOT yet in the channel (compare to existing `ChannelLayout`/`StoragePack` entries for `anime_doc_id`). If new entries exist, show a prompt: "Season N is available — include it in this redo? [Yes] [No]".
-- **If Yes:** run the normal update flow (K1–K3) for the NEW entry: download its episodes, generate ONLY the new entry's thumbnail, append its `season_card` (remove guide+divider+footer → add new card → re-post updated guide+divider+footer), then Gojo replies to the main post (K3).
-- **For the entry being redone (e.g. S1):** its thumbnail already exists — do NOT regenerate for the user; just replace its Download/quality buttons with the fresh packs' links (the redo-relink path). See Task O for metadata refresh that DOES force regeneration (rating/episode-count/language changes).
-- **If No:** redo only the selected entry; skip the update.
-- **TEST** extend `tests/test_update_flow.py`: redo with a detectable new season → prompt path invoked; Yes → append+reply for new entry only; No → no append.
+**K5. Update-
+DURING-
+redo (owner now wants this — NOT deferred).** Scenario: owner redoes a series early in the month; a new season aired yesterday but the monthly check hasn't run. So the redo flow must OFFER the update inline and let the owner choose.
+-
+ In the `/redo` flow (`RedoService` / `bots/lelouch/handlers/redo.py`), after resolving the franchise, detect entries present in `franchise_data` but NOT yet in the channel (compare to existing `ChannelLayout`/`StoragePack` entries for `anime_doc_id`). If new entries exist, show a prompt: "Season N is available — include it in this redo? [Yes] [No]".
+-
+ **If Yes:** run the normal update flow (K1–K3) for the NEW entry: download its episodes, generate ONLY the new entry's thumbnail, append its `season_card` (remove guide+divider+footer → add new card → re-
+post updated guide+divider+footer), then Gojo replies to the main post (K3).
+-
+ **For the entry being redone (e.g. S1):** its thumbnail already exists — do NOT regenerate for the user; just replace its Download/quality buttons with the fresh packs' links (the redo-
+relink path). See Task O for metadata refresh that DOES force regeneration (rating/episode-
+count/language changes).
+-
+ **If No:** redo only the selected entry; skip the update.
+-
+ **TEST** extend `tests/test_update_flow.py`: redo with a detectable new season → prompt path invoked; Yes → append+reply for new entry only; No → no append.
 
 ### TASK L — Special/OVA handling + naming preview
-**Facts:** classifier `nekofetch/services/processing/stages.py::classify_kind` (172) + `_content_type_label` (187); extras filtered in `download_service.py:213–229` (keeps `kind=="episode"` when an explicit list isn't given). MAL client with episode names EXISTS: `nekofetch/sources/telegram/myanimelist.py::MyAnimeListClient.episode_titles(mal_id, max_pages=5) -> [{number,title}]` (663).
+**Facts:** classifier `nekofetch/services/processing/stages.py::classify_kind` (172) + `_content_type_label` (187); extras filtered in `download_service.py:213–229` (keeps `kind=="episode"` when an explicit list isn't given). MAL client with episode names EXISTS: `nekofetch/sources/telegram/myanimelist.py::MyAnimeListClient.episode_titles(mal_id, max_pages=5) -
+> [{number,title}]` (663).
 
 **Do:**
 1. **Skip unselected specials.** If `franchise_data["entries"]` has no SPECIAL/OVA entry, exclude extra files (13.5 etc.) — extend the existing filter (213) to also drop `kind in {"special","ova","ona","extra"}` unless a matching mapping entry is `included`.
-2. **Single OVA → auto-map** to that entry.
-3. **Multiple OVAs → name-match.** Fetch `episode_titles` from MAL (resolve MAL id from the mapping/AniList→MAL); fuzzy-match torrent filenames to episode titles (use `difflib.SequenceMatcher` ratio > 0.8; no new dep). Auto-map on confident match.
-4. **Fallback → ask the user.** FSM flow listing unmatched OVA files vs OVA entries; user pairs them (buttons or "file → entry"). Persist the mapping so re-download reuses it.
+2. **Single OVA → auto-
+map** to that entry.
+3. **Multiple OVAs → name-
+match.** Fetch `episode_titles` from MAL (resolve MAL id from the mapping/AniList→MAL); fuzzy-
+match torrent filenames to episode titles (use `difflib.SequenceMatcher` ratio > 0.8; no new dep). Auto-
+map on confident match.
+4. **Fallback → ask the user.** FSM flow listing unmatched OVA files vs OVA entries; user pairs them (buttons or "file → entry"). Persist the mapping so re-
+download reuses it.
 5. **Naming/caption preview for OVAs/movies** (not just seasons): `NamingConfirm.confirm` must run for extra entries too, showing the proposed filename + caption preview. For seasons the template just swaps `{season}`; for OVAs/movies use `special_template`/`movie_template` (`config.py:258–265`).
-6. **TEST** `tests/test_special_mapping.py`: (a) no OVA entry → 13.5 excluded; (b) one OVA → auto-mapped; (c) two OVAs with MAL titles matching filenames → auto-mapped; (d) no match → mapping prompt path invoked.
+6. **TEST** `tests/test_special_mapping.py`: (a) no OVA entry → 13.5 excluded; (b) one OVA → auto-
+mapped; (c) two OVAs with MAL titles matching filenames → auto-
+mapped; (d) no match → mapping prompt path invoked.
 
-### TASK M — Movie >2000 MB: 2-pass compress to ≤2000 MB @1080p, else split
-**Facts:** encoder `nekofetch/sources/_transcode.py::_encode` (445) builds the ffmpeg cmd (libx264, `-crf` from `_CRF={1080:21,...}` line 22, `-preset fast -tune animation`); oversize heuristic `is_oversized_1080` (348) exists but **there is NO 2000 MB cap and NO splitting anywhere.** Movies classified via `classify_kind` (KIND_MOVIE). Encode stage `stages.py::EncodeStage` (1350), upload in `publishing_service._upload_packs` (~654 `storage.upload_pack`).
+### TASK M — Movie >2000 MB: 2-
+pass compress to ≤2000 MB @1080p, else split
+**Facts:** encoder `nekofetch/sources/_transcode.py::_encode` (445) builds the ffmpeg cmd (libx264, `-
+crf` from `_CRF={1080:21,...}` line 22, `-
+preset fast -
+tune animation`); oversize heuristic `is_oversized_1080` (348) exists but **there is NO 2000 MB cap and NO splitting anywhere.** Movies classified via `classify_kind` (KIND_MOVIE). Encode stage `stages.py::EncodeStage` (1350), upload in `publishing_service._upload_packs` (~654 `storage.upload_pack`).
 
 **Do:**
-1. Add `_encode_to_target_size(src, out, target_mb=1990, height=1080)` in `_transcode.py`: probe duration (there's already an ffprobe helper — grep `ffprobe`/`_duration`), compute video bitrate `= (target_mb*8*1024)/duration_s - audio_kbps`, run **2-pass** libx264 (`-pass 1`/`-pass 2 -b:v <calc>k`), keep `-vf scale=-2:1080`, audio AAC 128k. Verify output ≤ 2000 MB (hard: not one MB over — target 1990 for safety).
-2. Hook it for MOVIE packs before upload in `_upload_packs` (~650): if `content_type==Movie` and file > 2000 MB → compress; re-check.
-3. **If still >2000 MB → split.** Add `split_movie(src, target_mb=1990) -> [part1, part2, ...]` using ffmpeg segment by computed time (or `-fs`), name `"{title} Part 1"`, `"{title} Part 2"`; upload as separate files within the same pack (or sub-packs with `entry_id` suffix `_p1/_p2`) so the pack reads "Movie (2 parts)". Ensure `MediaFile`/pack metadata distinguishes the parts.
+1. Add `_encode_to_target_size(src, out, target_mb=1990, height=1080)` in `_transcode.py`: probe duration (there's already an ffprobe helper — grep `ffprobe`/`_duration`), compute video bitrate `= (target_mb*8*1024)/duration_s -
+ audio_kbps`, run **2-
+pass** libx264 (`-
+pass 1`/`-
+pass 2 -
+b:v <calc>k`), keep `-
+vf scale=-
+2:1080`, audio AAC 128k. Verify output ≤ 2000 MB (hard: not one MB over — target 1990 for safety).
+2. Hook it for MOVIE packs before upload in `_upload_packs` (~650): if `content_type==Movie` and file > 2000 MB → compress; re-
+check.
+3. **If still >2000 MB → split.** Add `split_movie(src, target_mb=1990) -
+> [part1, part2, ...]` using ffmpeg segment by computed time (or `-
+fs`), name `"{title} Part 1"`, `"{title} Part 2"`; upload as separate files within the same pack (or sub-
+packs with `entry_id` suffix `_p1/_p2`) so the pack reads "Movie (2 parts)". Ensure `MediaFile`/pack metadata distinguishes the parts.
 4. **TEST** `tests/test_movie_size.py` (mock ffmpeg/ffprobe + `os.stat`): (a) 1.8 GB → no action; (b) 2.5 GB compressible → single compressed file ≤2000 MB (assert bitrate math); (c) 4 GB not compressible → split into 2 parts. Assert exact 2000 MB boundary handling (2001 MB triggers, 2000 does not).
 
-### TASK N — RESEARCH ONLY: userbot+bot-token to add buttons to a user's message [CONFIRM WITH OWNER]
-Research whether a userbot (user session) can attach an inline keyboard to a message the USER posted (bots can't edit messages they didn't send). In Pyrogram/Telegram: a bot can only add `reply_markup` to its own messages; a user account cannot attach inline keyboards at all (only bots can). Investigate the real options: (a) the bot reposts the content with buttons and the user deletes theirs; (b) `via_bot`/inline-mode; (c) business-connection APIs. **Deliverable:** write findings to `docs/userbot_edit_research.md` — is it possible, what setup/permissions, recommended approach or the concrete alternative. **Do not implement** anything in production until the owner decides.
+### TASK N — RESEARCH ONLY: userbot+bot-
+token to add buttons to a user's message [CONFIRM WITH OWNER]
+Research whether a userbot (user session) can attach an inline keyboard to a message the USER posted (bots can't edit messages they didn't send). In Pyrogram/Telegram: a bot can only add `reply_markup` to its own messages; a user account cannot attach inline keyboards at all (only bots can). Investigate the real options: (a) the bot reposts the content with buttons and the user deletes theirs; (b) `via_bot`/inline-
+mode; (c) business-
+connection APIs. **Deliverable:** write findings to `docs/userbot_edit_research.md` — is it possible, what setup/permissions, recommended approach or the concrete alternative. **Do not implement** anything in production until the owner decides.
 
-### TASK O — Redo metadata refresh (rating/episode-count/language/channel-title)
-When `/redo` is run on a title, and metadata has changed since the original publish (a new season was added → episode count increased; dual-audio arrived → language changed; rating shifted), the main-channel thumbnail AND entry-card thumbnails must regenerate, captions update, and channel metadata (title, PFP, service messages) refresh.
+### TASK O — Redo metadata refresh (rating/episode-
+count/language/channel-
+title)
+When `/redo` is run on a title, and metadata has changed since the original publish (a new season was added → episode count increased; dual-
+audio arrived → language changed; rating shifted), the main-
+channel thumbnail AND entry-
+card thumbnails must regenerate, captions update, and channel metadata (title, PFP, service messages) refresh.
 
-**Facts:** `/redo` is `shared/redo_service.py` + `bots/lelouch/handlers/redo.py`. Main-post publish: `MainChannelService.publish`. Distribution: `SenkuPublisher`. Thumbnail render: `thumbnail_service.py::render_thumbnail` + stored source in `thumbnail_source` (Task E1). Channel title edit: Pyrogram `edit_chat_title`, followed by deleting the "channel name changed" service message.
+**Facts:** `/redo` is `shared/redo_service.py` + `bots/lelouch/handlers/redo.py`. Main-
+post publish: `MainChannelService.publish`. Distribution: `SenkuPublisher`. Thumbnail render: `thumbnail_service.py::render_thumbnail` + stored source in `thumbnail_source` (Task E1). Channel title edit: Pyrogram `edit_chat_title`, followed by deleting the "channel name changed" service message.
 
 **O1. Detect metadata changes.** After the redo downloads/encodes fresh files, compare the NEW `franchise_data["entries"]` to the stored `thumbnail_source` fields for each entry + the main post:
-- **Episode count** — sum `episodes` for `kind=="season"` entries + extras/movies (Task E3 format). Compare to stored.
-- **Language** — union languages across all entries; apply "one English entry ⇒ English & Japanese" rule (Task E2). Compare to stored main-post language.
-- **Rating** — franchise-average AniList score (Task E2, already implemented). Compare to stored.
-- If ANY differ, regenerate thumbnails for affected entries + main post.
+-
+ **Episode count** — sum `episodes` for `kind=="season"` entries + extras/movies (Task E3 format). Compare to stored.
+-
+ **Language** — union languages across all entries; apply "one English entry ⇒ English & Japanese" rule (Task E2). Compare to stored main-
+post language.
+-
+ **Rating** — franchise-
+average AniList score (Task E2, already implemented). Compare to stored.
+-
+ If ANY differ, regenerate thumbnails for affected entries + main post.
 
-**O2. Regenerate thumbnails ONLY for changed metadata.** For entries being redone that have NO metadata change (e.g. redo for quality upgrade only), do NOT regenerate the thumbnail — just replace Download/quality buttons (the redo-relink path). For entries with changed language/episode-count/rating, call `render_thumbnail` with updated fields, save to `thumbnail_source`, and `edit_message_media` on the entry card (distribution) or main post (Gojo). Update `ChannelContentBackup` + `PublishedPostBackup`.
+**O2. Regenerate thumbnails ONLY for changed metadata.** For entries being redone that have NO metadata change (e.g. redo for quality upgrade only), do NOT regenerate the thumbnail — just replace Download/quality buttons (the redo-
+relink path). For entries with changed language/episode-
+count/rating, call `render_thumbnail` with updated fields, save to `thumbnail_source`, and `edit_message_media` on the entry card (distribution) or main post (Gojo). Update `ChannelContentBackup` + `PublishedPostBackup`.
 
-**O3. Update captions.** Main-channel caption (`MainChannelService._caption`) and distribution entry-card captions use the episode-count line + language label. Re-render and `edit_message_caption` where needed. Also update the stored backups.
+**O3. Update captions.** Main-
+channel caption (`MainChannelService._caption`) and distribution entry-
+card captions use the episode-
+count line + language label. Re-
+render and `edit_message_caption` where needed. Also update the stored backups.
 
-**O4. Channel title refresh.** If the franchise title changed in `franchise_data` (e.g. user switched from "Case Study of Vanitas" to "Vanitas no Carte" — Task A clarification), update the distribution channel's title via `edit_chat_title(new_title)`, then delete the "channel name changed to…" service message (grep service-message deletion in `senku_publisher.py::_warm_global_search` line ~1512 for the pattern).
+**O4. Channel title refresh.** If the franchise title changed in `franchise_data` (e.g. user switched from "Case Study of Vanitas" to "Vanitas no Carte" — Task A clarification), update the distribution channel's title via `edit_chat_title(new_title)`, then delete the "channel name changed to…" service message (grep service-
+message deletion in `senku_publisher.py::_warm_global_search` line ~1512 for the pattern).
 
-**O5. TEST** `tests/test_redo_metadata_refresh.py`: seed old `thumbnail_source` with rating=75, language="Japanese"; redo with new entries giving rating=82, one English entry → assert thumbnails regenerated for main+affected entries, captions updated with new episode count + "English & Japanese", channel title edited + service message deleted. Assert NO regeneration when only quality changed (redo-relink only).
+**O5. TEST** `tests/test_redo_metadata_refresh.py`: seed old `thumbnail_source` with rating=75, language="Japanese"; redo with new entries giving rating=82, one English entry → assert thumbnails regenerated for main+affected entries, captions updated with new episode count + "English & Japanese", channel title edited + service message deleted. Assert NO regeneration when only quality changed (redo-
+relink only).
 
-### TASK P — Lelouch admin panel: "Manage REQ/WRK" + Redo/Clear-DB row (owner-only)
+### TASK P — Lelouch admin panel: "Manage REQ/WRK" + Redo/Clear-
+DB row (owner-
+only)
 **Facts:** admin panel keyboard is `bots/lelouch/screens.py::admin_panel` (49–66). Current rows include `[("🗂 Manage Requests", cb("mg","reqs",0))]` (62) and `[(V.BTN_CLEAR_DATABASE, cb(BOT,"dbclear"))]` (63). The manage plane is `bots/lelouch/handlers/management.py` (namespace `mg|…`); it currently lists/cancels/reassigns **requests** (REQ). Work items are WRK codes (`kurosoden.shared.work_service`). Redo command handler is `bots/lelouch/handlers/redo.py`; the redo entry callback is `redo|new` (redo.py:104).
 
 **Do:**
 1. **Rename + merge to "Manage REQ/WRK".** Change the button label to "🗂 Manage REQ/WRK". In `management.py`'s `mg|reqs` list, include BOTH REQ (Request rows) and WRK (WorkItem rows), each with the same actions the request list already offers (cancel, reassign). Read `management.py` to see how REQ rows are listed/actioned and extend the query + action handlers to cover WRK codes. Label each row with its code prefix so REQ vs WRK is visible.
-2. **Redo + Clear-DB row (owner-only).** Replace the standalone Clear-DB row (63) with a single two-button row: `[("🔁 Redo", cb("redo","new")), (V.BTN_CLEAR_DATABASE, cb(BOT,"dbclear"))]`. The `redo|new` callback already exists (redo.py:104) and starts the redo flow. **Gate the whole row to owner only** — `admin_panel` is already admin-scoped, so wrap this row in `if is_owner(...)`. Since `admin_panel` is a pure screen builder, thread an `is_owner: bool` param into it (the caller in `app.py`/handlers has the update object) and only append the Redo/Clear row when true.
-3. **TEST** `tests/test_lelouch_admin_panel.py`: `admin_panel(..., is_owner=True)` → keyboard contains a row with BOTH a `redo|new` button and a `dbclear` button, and a "Manage REQ/WRK" button; `is_owner=False` → no Redo/Clear-DB row. Plus a management test: the REQ/WRK list includes a seeded WorkItem with a cancel action.
+2. **Redo + Clear-
+DB row (owner-
+only).** Replace the standalone Clear-
+DB row (63) with a single two-
+button row: `[("🔁 Redo", cb("redo","new")), (V.BTN_CLEAR_DATABASE, cb(BOT,"dbclear"))]`. The `redo|new` callback already exists (redo.py:104) and starts the redo flow. **Gate the whole row to owner only** — `admin_panel` is already admin-
+scoped, so wrap this row in `if is_owner(...)`. Since `admin_panel` is a pure screen builder, thread an `is_owner: bool` param into it (the caller in `app.py`/handlers has the update object) and only append the Redo/Clear row when true.
+3. **TEST** `tests/test_lelouch_admin_panel.py`: `admin_panel(..., is_owner=True)` → keyboard contains a row with BOTH a `redo|new` button and a `dbclear` button, and a "Manage REQ/WRK" button; `is_owner=False` → no Redo/Clear-
+DB row. Plus a management test: the REQ/WRK list includes a seeded WorkItem with a cancel action.
 
----
+-
+-
+-
+
 
 ## 4. ORDER & DEPENDENCIES
 1. **A first** (episode renumber + persist entries — unblocks B, E2, E3, F, K, L, O).
 2. **B, C** (packs/captions).
-3. **E2, E3** (main-post metadata rules + episode-count format — mostly verify; feed O).
-4. **D → E → E1** (per-entry thumbnails → edit → source storage).
+3. **E2, E3** (main-
+post metadata rules + episode-
+count format — mostly verify; feed O).
+4. **D → E → E1** (per-
+entry thumbnails → edit → source storage).
 5. **G, H** (small UI fixes, independent).
 6. **J, N** (ban recovery; research — independent).
-7. **K** (update flow, incl. K5 update-during-redo; needs A, D, E).
+7. **K** (update flow, incl. K5 update-
+during-
+redo; needs A, D, E).
 8. **L, M** (specials/movies; need A).
 9. **O** (redo metadata refresh; needs A, E1, E2, E3).
-10. **I = redo Sabikui Bisco, ORB, Vanitas LAST**, via `/redo` (`shared/redo_service.py`), verifying Vanitas → 2 packs, 2 cards, `S01P02E01`–`E12` (renumbered), release+episode-order encode, and any metadata refresh (O).
+10. **I = redo Sabikui Bisco, ORB, Vanitas LAST**, via `/redo` (`shared/redo_service.py`), verifying Vanitas → 2 packs, 2 cards, `S01P02E01`–`E12` (renumbered), release+episode-
+order encode, and any metadata refresh (O).
 
 ## 5. DEFINITION OF DONE (every task)
-- Matches UI/voice/menu conventions; single-source-of-truth menus (no `/start` vs callback drift).
-- en.json-driven copy where specified; DB writes update the matching backup snapshot.
-- New unit test green **and** full suite green: `./.venv/Scripts/python.exe -m pytest -q`.
-- `py_compile` clean; no remote-DB dependency for verification.
-- Code-review pass done; findings fixed. §2 DONE items not regressed.
+-
+ Matches UI/voice/menu conventions; single-
+source-
+of-
+truth menus (no `/start` vs callback drift).
+-
+ en.json-
+driven copy where specified; DB writes update the matching backup snapshot.
+-
+ New unit test green **and** full suite green: `./.venv/Scripts/python.exe -
+m pytest -
+q`.
+-
+ `py_compile` clean; no remote-
+DB dependency for verification.
+-
+ Code-
+review pass done; findings fixed. §2 DONE items not regressed.
 
 ## 6. FILES CHANGED THIS SESSION (context; do not undo)
 `nekofetch/services/stats_service.py`, `bots/gojo/app.py`, `bots/gojo/handlers/schedule.py`, `bots/gojo/handlers/__init__.py`, `nekofetch/services/download_service.py` (`_map_episode_to_part` + `_record_file` wiring, INCOMPLETE per Task A), tests `tests/test_gojo_home_menu.py`, `tests/test_stats_db_driven.py`.
 
 
-
-
-## 7. IMPLEMENTATION RECORD — 2026-08-07
+## 7. IMPLEMENTATION RECORD — 2026-
+08-
+07
 
 > This section records what was actually completed in this session. The original plan above is preserved unchanged.
 
 ### What users will see
 
-- New anime downloads still follow the same flow: files are downloaded, checked, processed, and placed into the storage channel. The public main-channel post is then created with artwork, episode/quality/language information, Index, and Download buttons.
-- A new season or extra episode set is added to the existing distribution channel instead of creating a duplicate title. The main-channel post receives a short reply saying the new entry is available and linking to the current distribution channel.
-- If a distribution channel is recreated after a ban, saved cards are reposted from backup. Captions, artwork, buttons, dividers, and pinned cards come back without depending on fresh TMDB/AniList results. Once the replacement channel is live, download buttons are relinked to fresh storage packs, and the main post receives a recovery reply with the new link.
-- Selected thumbnail artwork and the gathered display information are saved durably, so the thumbnail workflow is not dependent only on temporary wizard state after a restart.
-- Movies larger than Telegram's ordinary upload limit are compressed first, then split if needed, and every resulting part is checked. Unsafe conversion failures leave the original available for retry instead of silently deleting it.
-- Successful uploads clean the original movie, compressed copies, split parts, and other generated temporary artifacts from disk.
-- Main-channel episode summaries distinguish TV episodes, extras, and movies, for example `25 + 3 extras + 2 movies`.
+-
+ New anime downloads still follow the same flow: files are downloaded, checked, processed, and placed into the storage channel. The public main-
+channel post is then created with artwork, episode/quality/language information, Index, and Download buttons.
+-
+ A new season or extra episode set is added to the existing distribution channel instead of creating a duplicate title. The main-
+channel post receives a short reply saying the new entry is available and linking to the current distribution channel.
+-
+ If a distribution channel is recreated after a ban, saved cards are reposted from backup. Captions, artwork, buttons, dividers, and pinned cards come back without depending on fresh TMDB/AniList results. Once the replacement channel is live, download buttons are relinked to fresh storage packs, and the main post receives a recovery reply with the new link.
+-
+ Selected thumbnail artwork and the gathered display information are saved durably, so the thumbnail workflow is not dependent only on temporary wizard state after a restart.
+-
+ Movies larger than Telegram's ordinary upload limit are compressed first, then split if needed, and every resulting part is checked. Unsafe conversion failures leave the original available for retry instead of silently deleting it.
+-
+ Successful uploads clean the original movie, compressed copies, split parts, and other generated temporary artifacts from disk.
+-
+ Main-
+channel episode summaries distinguish TV episodes, extras, and movies, for example `25 + 3 extras + 2 movies`.
 
 ### What was changed
 
-- Added localized main-channel update and recovery replies and wired them into update and channel-recreation paths.
-- Removed duplicate `PublicationFacts` fields found during review.
-- Added the `ThumbnailSource` table and migration for selected artwork, gathered fields, entry identity, and rendered image path.
-- Made thumbnail persistence use a non-null root sentinel and atomic upsert, avoiding duplicate root rows and retry races on PostgreSQL.
-- Added movie size-control helpers, two-pass target encoding, verified splitting, safe failure handling, and cleanup tracking for generated artifacts.
-- Rebound restored distribution content/layout rows to fresh Telegram message IDs, then relinked fresh storage buttons where live pack information is available.
-- Added focused regression tests for movie limits, thumbnail persistence, main-channel replies, and distribution backup/restore.
-- Updated the schema-count test from 22 to 23 tables to include `thumbnail_sources`.
+-
+ Added localized main-
+channel update and recovery replies and wired them into update and channel-
+recreation paths.
+-
+ Removed duplicate `PublicationFacts` fields found during review.
+-
+ Added the `ThumbnailSource` table and migration for selected artwork, gathered fields, entry identity, and rendered image path.
+-
+ Made thumbnail persistence use a non-
+null root sentinel and atomic upsert, avoiding duplicate root rows and retry races on PostgreSQL.
+-
+ Added movie size-
+control helpers, two-
+pass target encoding, verified splitting, safe failure handling, and cleanup tracking for generated artifacts.
+-
+ Rebound restored distribution content/layout rows to fresh Telegram message IDs, then relinked fresh storage buttons where live pack information is available.
+-
+ Added focused regression tests for movie limits, thumbnail persistence, main-
+channel replies, and distribution backup/restore.
+-
+ Updated the schema-
+count test from 22 to 23 tables to include `thumbnail_sources`.
 
 ### Verification
 
-- Focused regression tests: 11 passed.
-- Python compilation across `nekofetch`, `shared`, `bots`, `tests`, and `migrations`: clean.
-- The full suite's previous run was 794 passed, 5 skipped, and 1 stale table-count expectation; that expectation was updated for the intentional new table. The full suite is being rerun after this update.
-- Live Telegram ban/recovery and a real 2GB+ movie upload still require configured production Telegram accounts, channels, storage, and FFmpeg. They were not falsely claimed as live-tested here.
+-
+ Focused regression tests: 11 passed.
+-
+ Python compilation across `nekofetch`, `shared`, `bots`, `tests`, and `migrations`: clean.
+-
+ The full suite's previous run was 794 passed, 5 skipped, and 1 stale table-
+count expectation; that expectation was updated for the intentional new table. The full suite is being rerun after this update.
+-
+ Live Telegram ban/recovery and a real 2GB+ movie upload still require configured production Telegram accounts, channels, storage, and FFmpeg. They were not falsely claimed as live-
+tested here.
 
 ### Intentionally not implemented
 
-- The plan's userbot-plus-bot-token research item for editing buttons into arbitrary user messages remains research-only. It needs owner confirmation and a live Telegram permission/security decision.
+-
+ The plan's userbot-
+plus-
+bot-
+token research item for editing buttons into arbitrary user messages remains research-
+only. It needs owner confirmation and a live Telegram permission/security decision.
+
+-
+-
+-
+
+
+## 8. REVIEWER COMMENTS — per task (broader context)
+
+> **Who wrote this and why.** These comments were added by the AI that ran the ORIGINAL planning session with the owner — it heard the owner's spoken clarifications (voice notes) that never made it verbatim into §3. The executor AI that did the §7 work only had the written plan, so where it "misunderstood" or "stopped short," that's usually because the nuance lived in those clarifications, not in the task text. Each comment gives: a plain status, what the owner ACTUALLY meant, and the concrete gap to close. Verified against the working tree on 2026-
+08-
+07 (uncommitted changes present; full suite 795 passed / 5 skipped). Status legend: ✅ done · 🟡 partial · ❌ not done.
+
+## 8A. EXECUTOR RESPONSES TO REVIEWER COMMENTS — 2026-
+08-
+07
+
+> Read this section first. Each response says what was changed, where it lives, how it was checked, and what still needs confirmation or more work. The detailed reviewer notes below are preserved as historical context; this section is the current answer to them.
+
+### A — episode/part identity
+-
+ **Reviewer concern:** persist franchise entries, restart episode numbering for split seasons, and keep the filename title consistent.
+-
+ **Response:** entries are persisted for both single requests and batches; `_map_episode_locator` carries `(season_part, renumbered_episode)` into `MediaFile`, while the confirmed filename title is stored at job level so S01 and S01P02 keep their own labels.
+-
+ **Evidence:** `tests/test_episode_part_mapping.py`, `tests/test_encode_order.py`, and the existing download/stage code paths.
+-
+ **Still open:** the plan's requested function name/return shape differs from the compatibility wrapper; separate per-
+entry display titles within one job are not supported.
+
+### B — two cards for a split season
+-
+ **Reviewer concern:** S01 and S01P02 must not collapse into one card containing all episodes.
+-
+ **Response:** card generation now iterates franchise entries by AniList ID, computes `(season, season_part)`, filters packs by both values, and labels the second entry as `Season 01 Part 2`. Senku update cards, watch-
+guide lines, layouts, content rows, and restore backups carry the same part identity.
+-
+ **Evidence:** `nekofetch/services/bot_content.py::_packs_for_tv_entry`, `shared/senku_publisher.py` card/update builders, `nekofetch/services/backup_service.py`, and the 41-
+test focused run.
+-
+ **Still open:** add the plan's dedicated `tests/test_two_part_cards.py` for a direct two-
+card assertion; the implementation is present but that exact regression test is not.
+
+### C — Levi pack-
+caption editing
+-
+ **Reviewer concern:** edit one logical entry across all resolution/audio packs, edit live headers, preserve filenames, and make restore backups use the new caption.
+-
+ **Response:** `StorageChannelService.update_header_caption` updates sibling packs for the same `(anime_doc_id, season, season_part, entry_id)`, edits each live header with text-
+to-
+media-
+caption fallback, and synchronizes matching `ChannelContentBackup` cards. `caption` is canonical; `header_caption` remains a compatibility mirror.
+-
+ **Evidence:** `tests/test_storage_pack_caption.py`; migrations `0025_add_storage_pack_header_caption.py` and `0028_add_storage_pack_caption.py`.
+-
+ **Still open:** Levi `/start` and callback-
+home menus still duplicate row construction instead of sharing one `_home_rows` builder.
+
+### D — per-
+entry thumbnail approve/redo
+-
+ **Reviewer concern:** approving entry 1 must advance to entry 2, while redoing entry 2 must not reset entry 1.
+-
+ **Response:** the thumbnail workflow uses `next_pending` and per-
+entry selection state; Approve marks only that entry done, and Redo clears/restarts only that entry.
+-
+ **Evidence:** `tests/test_thumb_per_entry_fsm.py`.
+-
+ **Still open:** none identified by the reviewer for this task.
+
+### E — thumbnail editing and durable source data
+-
+ **Reviewer concern:** save the inputs behind a thumbnail and provide an owner editor instead of forcing a full redo.
+-
+ **Response:** added `ThumbnailSource` plus atomic persistence/upsert, and added the owner-
+gated `/edit_thumbnail` handler. It lets the owner choose a saved source, edit stored fields, re-
+render, sync Redis workflow state, and edit/repost the thumbnail-
+channel image where message data exists.
+-
+ **Evidence:** `nekofetch/bots/admin/handlers/thumbnail_edit.py`, `nekofetch/services/thumbnail_service.py`, `tests/test_thumbnail_source_persistence.py`.
+-
+ **Still open:** a separately verified Gojo/main-
+channel editing surface and the plan's dedicated `tests/test_thumbnail_edit.py` are still needed. Do not call the entire Senku-
+plus-
+Gojo editing experience fully complete yet.
+
+### E2 — main-
+channel metadata and language union
+-
+ **Reviewer concern:** one English/dub/dual entry must make the whole show read `English & Japanese`, even when other entries are sub-
+only.
+-
+ **Response:** main-
+channel language construction now unions audio languages across all packs instead of using only one season. The focused test covers both the mixed case and the sub-
+only case.
+-
+ **Evidence:** `nekofetch/services/main_channel_service.py::_language_summary`, `tests/test_main_channel_meta.py`.
+-
+ **Still open:** the dedicated end-
+to-
+end test for the rendered main caption/thumbnail, franchise-
+average rating, and TMDB synopsis source is still recommended.
+
+### E3 — episode-
+count wording
+-
+ **Reviewer concern:** show totals as `25 + 3 extras + 2 movies`, with correct singular/plural forms.
+-
+ **Response:** the formatter and tests cover the requested base/extras/movies combinations, including singular forms.
+-
+ **Evidence:** `tests/test_episode_count_label.py`.
+-
+ **Still open:** none identified by the reviewer for this task.
+
+### F — encode order
+-
+ **Reviewer concern:** order entries by release order and episodes ascending within each entry.
+-
+ **Response:** processing sorts by season, season part, and episode before encoding.
+-
+ **Evidence:** `tests/test_encode_order.py`.
+-
+ **Still open:** none identified by the reviewer for this task.
+
+### G — DDL in “Begin Now”
+-
+ **Reviewer concern:** the DDL source option might be missing from a particular admin screen.
+-
+ **Response:** the source picker already contains DDL (`review.py`), but that change predates this session and no current-
+session code change proves it is the exact “Begin Now” surface the owner meant.
+-
+ **Evidence:** source-
+picker implementation and existing DDL flow.
+-
+ **Still open / owner question:** confirm whether the missing button was in the review source picker or in a different Levi task-
+card screen before changing it.
+
+### H — batch “Open Tasks” link
+-
+ **Reviewer concern:** Lelouch cannot send a callback directly into Levi, so the batch completion screen needs a real Levi URL button.
+-
+ **Response:** added the `levi_link` URL helper and conditionally shows `📋 Open Tasks` while keeping Home; it is omitted when no valid Levi username exists.
+-
+ **Evidence:** batch screen/link implementation and the full-
+suite regression coverage currently exercising the batch paths.
+-
+ **Still open:** add the exact dedicated `tests/test_batch_done_button.py` requested by the plan.
+
+### J — ban recovery
+-
+ **Reviewer concern:** recovery must restore content and links, update the main post, and also guide a human admin through replacement-
+channel setup.
+-
+ **Response:** automated recovery now restores saved cards/layout, carries season identity, relinks fresh download buttons, updates the main post, and sends the localized block-
+quoted recovery reply without buttons.
+-
+ **Evidence:** backup/restore services, `ban_recovery_reply` localization, and existing distribution backup/recovery tests.
+-
+ **Still open:** the human-
+in-
+the-
+loop Gojo DM using the normal Senku artwork/voice, PFP setup, service-
+message cleanup, and admin promotion flow is not implemented; the dedicated full recovery test is also still missing.
+
+### K — update flow and update-
+during-
+redo
+-
+ **Reviewer concern:** update only the new entry, start with its thumbnail, limit combined torrents, and offer the new season during redo.
+-
+ **Response:** the existing append/re-
+footer flow and localized main-
+post update reply are retained and season/part identity now travels through that flow.
+-
+ **Evidence:** `shared/senku_publisher.py`, `MainChannelService.reply_update`, `tests/test_senku_channel_update.py`, and `tests/test_main_channel_replies.py`.
+-
+ **Still open:** combined-
+torrent episode-
+window selection, update wizard gating, and the interactive Yes/No redo prompt are not implemented; no claim is made that K1/K2/K5 are complete.
+
+### L — specials/OVAs
+-
+ **Reviewer concern:** exclude unselected specials, auto-
+map one OVA, fuzzy-
+match multiple OVAs, and provide a manual fallback/preview.
+-
+ **Response:** no new implementation was made for the mapping and manual-
+pairing requirements in this session.
+-
+ **Evidence:** existing special-
+episode parsing tests cover only the earlier parser behavior.
+-
+ **Still open:** the complete task remains open, including its dedicated tests.
+
+### M — oversized movies
+-
+ **Reviewer concern:** compress movies over 2000 MB, split if still too large, verify sizes, preserve originals on failure, and clean temporary files after success.
+-
+ **Response:** two-
+pass target encoding, verified splitting, failure-
+safe cleanup tracking, and upload integration are present.
+-
+ **Evidence:** `_encode_to_target_size`, `split_movie`, publishing integration, and `tests/test_movie_size.py`.
+-
+ **Still open:** add the exact boundary assertion that 2000 MB does not trigger while 2001 MB does.
+
+### N — userbot plus bot-
+token button research
+-
+ **Reviewer concern:** determine whether a userbot can add an inline keyboard to a user's existing message before implementing anything.
+-
+ **Response:** production behavior was not changed. This remains intentionally deferred pending owner confirmation and a documented research deliverable.
+-
+ **Evidence:** the plan's intentional-
+defer note.
+-
+ **Still open:** write `docs/userbot_edit_research.md` and get the owner's decision.
+
+### O — redo metadata refresh
+-
+ **Reviewer concern:** redo should regenerate only when rating/language/episode metadata changed, and otherwise only relink buttons.
+-
+ **Response:** no differential metadata-
+driven regeneration was added in this session. The durable thumbnail source table now provides the storage foundation for it.
+-
+ **Evidence:** `ThumbnailSource` persistence exists; no `redo_service.py` metadata-
+diff implementation is claimed.
+-
+ **Still open:** the complete comparison, selective regeneration, caption/channel-
+title refresh, and dedicated tests.
+
+### P — Manage REQ/WRK
+-
+ **Reviewer concern:** the menu label must represent a real combined REQ and WRK management view, not just a rename.
+-
+ **Response:** the owner-
+only Redo/Clear-
+DB row and `Manage REQ/WRK` label are present, but the management list still needs the actual WorkItem query/actions.
+-
+ **Evidence:** `bots/lelouch/screens.py`, `tests/test_lelouch_admin_panel.py`.
+-
+ **Still open:** merge WorkItem listing/cancel/reassign behavior into `management.py`; this task is partial, not complete.
+
+### Follow-
+up review findings after the first response
+-
+ **Root thumbnail sentinel:** fixed by normalizing Redis `anilist_id=-
+1` to the `None` card key, excluding root-
+only entries from first-
+season selection, and selecting the first real season by workflow `index`; malformed IDs and indexes are skipped safely. Evidence: `nekofetch/services/thumbnail_orchestrator_service.py` and `tests/test_thumbnail_orchestrator.py`.
+-
+ **Legacy relink compatibility:** `_tv_entry_identities` now falls back safely for minimal legacy objects that have only an AniList ID/format, while preserving an explicit `season_number` when present. This fixed the full-
+suite relink regression.
+-
+ **Schema consistency:** `StoragePack.caption` is present in the model and migration `0028`; `header_caption` remains mirrored for compatibility. The migration chain is linear: `0024 → 0025 → 0026 → 0027 → 0028`.
+-
+ **Validation:** the final full suite reaches 816 passed / 5 skipped / 0 failed; the focused human-
+recovery and maintenance suite reaches 11 passed.
+
+### What the next reviewer should verify
+1. Is the split-
+season card behavior acceptable without the dedicated two-
+part-
+card test, or should that test be added before production use?
+2. Should Levi's duplicated menus be consolidated now, or is the caption feature acceptable as-
+is?
+3. Does `/edit_thumbnail` need a separate Gojo/main-
+channel surface before the thumbnail task can be marked complete?
+4. Was “Begin Now” referring to the existing DDL source picker or another screen?
+5. Should the human ban-
+recovery wizard, K1/K2/K5 update flow, OVA mapping, redo metadata refresh, and REQ/WRK management be implemented next?
+
+-
+-
+-
+
+### A — episode renumbering + persist entries — ✅ done (works), 2 naming deviations
+
+> **Historical reviewer note.** The comments in §8 were written against an earlier
+> working-
+tree snapshot. The current source/tests below the note are authoritative;
+> statuses that changed after review are recorded in the current-
+session addendum.
+The linchpin landed correctly: entries ARE persisted at commit in both `_finalize` (`bots/lelouch/handlers/requests.py:448`) and batch (`batch.py:443`) via `FranchiseFlowService.persisted_entries`, and Vanitas S1P2 renumbers to E01–E12 (`tests/test_episode_part_mapping.py` asserts `(13,1)→(2,1)`). Two things to know so nobody "fixes" a non-
+bug:
+-
+ The tuple `(part, renumbered_episode)` lives in a NEW function **`_map_episode_locator`** (`download_service.py:2073`). The old `_map_episode_to_part` is now a thin legacy wrapper returning part-
+only. The plan told you to change `_map_episode_to_part`'s return type; the executor added a sibling instead. Functionally identical — just grep for `_map_episode_locator`, not the old name.
+-
+ **A7 (title propagation) was solved differently than the plan wrote.** There is no `franchise_data["_display_title"]`. Instead one confirmed title is stored job-
+wide in `DownloadJob.resume_state["name_title"]` (`download_service.py:991`) and applied to every file while each keeps its own `S01`/`S01P02` label (`stages.py:590`). **This matches what the owner wanted** ("edit the title once, it applies to the whole show, but S1 stays S1 and S1P2 stays S1P2") — for an ENTIRE_SERIES request that's one job, so it's correct. The only real limitation: there's ONE job-
+level title edit, not a per-
+entry title surface. If the owner ever wants to give S1 and a spin-
+off different display titles in the SAME request, this design can't do it. Flag for owner; not urgent.
+
+### B — two entry cards for a split season — ✅ implemented in current tree; focused test still recommended
+The current tree now carries `season_part` through the normal cards, update cards, saved layouts, content rows, and distribution backups. Pack matching uses `(season, season_part)` and labels split entries as `Part N`, so a split season can render as separate cards. A dedicated `test_two_part_cards.py` is still recommended for explicit UI-
+level regression coverage.
+
+### C — edit pack captions in Levi — 🟡 partial
+The editor works: `bots/levi/handlers/pack_caption_handler.py` + the `StoragePack` caption fields (migrations 0025/0028) + service fan-
+out that live-
+edits every sibling message with a media-
+caption fallback, owner-
+gated, and syncs distribution backup cards. Filenames are correctly left untouched — the owner's "Vanitas no Carte (filename) vs The Case Study of Vanitas (caption)" distinction is honored. Gaps ranked by importance:
+1. **Menu single-
+source-
+of-
+truth was NOT done — and the owner called this out as a general rule for all bots.** The "Pack Captions" button is added in TWO places in `bots/levi/app.py` (callback-
+home line 103, `/start` line 201) with duplicated owner-
+gates. Gojo has the shared `_home_rows` builder; Levi still doesn't. This is the exact `/start`-
+vs-
+Settings drift the owner told us to kill everywhere. Please refactor Levi to a shared row builder.
+2. The Levi menu still has duplicated `/start` and callback-
+home row construction, so the standing single-
+source-
+of-
+truth menu rule remains open.
+3. The canonical stored field is now `caption`, with `header_caption` retained as a compatibility mirror; a dedicated migration and focused tests cover both edit paths.
+### D — per-
+entry thumbnail approve/reject — ✅ done
+`_enter_thumbnails` now loops via `next_pending(code)` (no more hardcoded index 0), Approve advances / Redo restarts only that entry, others stay confirmed. `tests/test_thumb_per_entry_fsm.py` proves the state machine. This matches the owner's "reject entry 2 → redo entry 2 only, entry 1 stays approved." No notes.
+
+### E — thumbnail EDITING command — 🟡 partial; current tree has the core owner editor
+The current tree has the core owner `/edit_thumbnail` editor in `nekofetch/bots/admin/handlers/thumbnail_edit.py`, durable source persistence, field capture, re-
+rendering, workflow synchronization, and best-
+effort live-
+message edit/repost behavior. The main-
+channel-
+specific Gojo editing surface and dedicated `test_thumbnail_edit.py` remain recommended follow-
+up coverage; do not describe the entire cross-
+bot edit experience as fully verified.
+
+### E2 — main-
+channel metadata rules — 🟡 partial; language union now has focused coverage
+Synopsis (TMDB) and rating (franchise average) remain in place. The language-
+label rule now has focused coverage in `tests/test_main_channel_meta.py`: one English-
+audio entry among sub-
+only entries yields `English & Japanese`, while a sub-
+only franchise remains Japanese. Full end-
+to-
+end caption rendering is still worth a dedicated test.
+
+### E3 — episode-
+count line ("25 + 3 extras + 2 movies") — ✅ done, matches the spec verbatim
+`tests/test_episode_count_label.py` asserts the exact strings including singular "1 extra" / "1 movie". This is exactly the format the owner dictated. No notes.
+
+### F — encode in release + episode order — ✅ done
+Sort by `(season, season_part or 0, episode)` before the encode loop; `tests/test_encode_order.py` proves `[S1E3,S1E1,S1P2E2,S1E2,S1P2E1] → S1E1,S1E2,S1E3,S1P2E1,S1P2E2`. Exactly the two-
+level ordering the owner asked for. No notes.
+
+### G — DDL in "Begin Now" — ⚠️ already existed; not this session's work (verify it's the same gap the owner hit)
+The DDL button IS present in the source picker (`review.py:585`), but it was added by an EARLIER commit (`cbc93aa`, "DDL provide-
+link flow"), and `review.py` has no changes in this session's working tree. So either the owner's "DDL missing in Begin Now" was already fixed before this batch, OR the owner meant a DIFFERENT surface than the admin review picker (e.g. a Levi task-
+card "Begin Now" button, or DDL missing under a specific condition). **Worth a direct question to the owner:** "when you said DDL was missing from Begin Now, was it the admin review source picker, or somewhere else?" Don't mark G done until that's confirmed — the plan may have pointed at the wrong screen.
+
+### H — batch "board" button → "Open Tasks" — ✅ done
+`levi_link()` helper added, batch-
+done screen shows a URL button "📋 Open Tasks" deep-
+linking into Levi, omitted when the link can't resolve. This is exactly the cross-
+bot workaround the owner needed (Lelouch can't callback into Levi). No `test_batch_done_button.py`, but the code is correct — add the test for regression safety.
+
+### J — ban recovery — ✅ machine recovery + HUMAN replacement wizard implemented and hardened
+Parts 2 and 3 remain in place: restored cards relink to the new invite link (`relink_packs_in_place`), the main-
+post Download button refreshes (`_bind_title`), and Gojo posts the block-
+quoted recovery reply with a click-
+through link. Part 1 is implemented: Gojo sends a private card using Senku's existing artwork/layout/voice, the admin creates the replacement or chooses automatic recovery, the submitted handle/ID is checked against the old chat, Gojo attempts to add/promote Senku and verifies operational privileges, existing Senku service-
+message cleanup runs, and the handback enters `recover_human_channel`. Scheduled monthly ban checks use the same handoff before automatic fallback.Recovery now prefers an enabled non-recovery channel over a partial replacement when refreshing the durable snapshot, tracks failed Telegram deletions for retry, attempts to restore the old public links if a late step fails, and attempts to revoke a replacement invite using the verified recovery client. If Telegram refuses a surface refresh or invite revoke, the old row/link state is retained for a later retry rather than silently discarded. `tests/test_ban_recovery_full.py`, distribution backup/restore tests, invite-link tests, and scheduled-maintenance coverage prove the real helper and callback paths.
+
+
+### K — update flow (new season appended) — 🟡 K3 done; K1, K2, K5 missing (and K5 is the one the owner un-
+deferred)
+K3 is done: `reply_update` posts the en.json `season_update_reply` (block-
+quote, hyperlink, no buttons) after an append. The existing `_append_and_refooter` append machinery is reused correctly. But three parts the owner asked for are absent:
+-
+ **K1 (torrent partial download) — ❌.** No file-
+window selection: when a torrent carries S1+S2 but the request is only the new entry, nothing restricts the download to the new entry's episode range. Grep for `select_files`/episode-
+windowing turns up nothing new. The owner explicitly described this (13 separate torrents / one combined torrent / a season pack).
+-
+ **K2 (update skips channel creation, starts at thumbnail) — ❌ not gated.** The wizard has no `is_update_entry` branch that skips channel-
+create states and jumps straight into `_enter_thumbnails` for the new entry. On an update the owner does NOT want a new channel — they want to go straight to thumbnailing the new season.
+-
+ **K5 (update-
+DURING-
+redo) — 🟡 detect-
+only.** `redo_service.py:321 _detect_and_notify_new_seasons` DETECTS a new season and sends an informational DM, but `new_season_ids` is then never consumed (set at line 222, read nowhere). The owner un-
+deferred this and wanted an interactive **"Season N is available — include it? [Yes] [No]"** that, on Yes, actually runs the append for the new entry. Right now it just notifies. The docstring even admits "the caller MAY use the returned ids" — nobody does.
+No `test_update_flow.py`. K is the most under-
+built cluster relative to what the owner asked for; §7 doesn't flag any of this.
+
+### L — special/OVA handling — ❌ essentially not done this session
+The plan's L work (skip unselected specials; single-
+OVA auto-
+map; multi-
+OVA MAL-
+title fuzzy-
+match; user-
+pairing fallback; naming/caption preview for OVAs & movies) does not appear in the working tree, and there's no `test_special_mapping.py`. Some special-
+episode PARSING exists from an earlier commit (`20b5644`, `tests/test_torrent_special_episodes.py`), but the MAPPING/auto-
+match/preview flow the owner described is absent. If the owner's near-
+term redos (Sabikui, ORB, Vanitas) have no OVAs, this can wait — but it should be labeled ❌, not silently omitted.
+
+### M — movie >2000 MB compress-
+then-
+split — ✅ done, one thing to double-
+check
+`_encode_to_target_size` (2-
+pass, bitrate math), `split_movie` (verified-
+size splitting), and the `_upload_packs` hook all exist; `tests/test_movie_size.py` covers the bitrate math and the no-
+op/compress/split branches with mocked ffmpeg. The owner's "keep the original on failure, don't silently delete" and "clean temp artifacts on success" are honored per the §7 record. **One thing the test does NOT pin:** the exact 2000-
+vs-
+2001 MB boundary the plan called for (the tests assert bitrate math and duration-
+guard, not "2001 triggers, 2000 does not"). Add that boundary assertion so a future refactor can't drift the cap over Telegram's hard limit. Otherwise solid.
+
+### N — userbot+buttons research — ❌ deliverable missing
+`docs/userbot_edit_research.md` was not written; §7 honestly lists this as intentionally-
+not-
+done. Note for context: the answer is already known from the planning session (a user account can't attach inline keyboards; only a bot can, and only to its own messages — so the workable path is bot-
+reposts-
+with-
+buttons or leave-
+old-
+post-
+and-
+reply-
+below to preserve views). Someone just needs to write those findings into the doc. Low effort, low priority.
+
+### O — redo metadata refresh — ❌ not done
+The plan's O work (on redo, detect changed episode-
+count/language/rating vs the stored `thumbnail_source`, regenerate ONLY affected thumbnails, refresh captions + channel title + delete the "name changed" service message, but skip regeneration when only quality changed) is not in `redo_service.py`, and there's no `test_redo_metadata_refresh.py`. The redo path does relink packs and detect new seasons, but the metadata-
+diff-
+driven regeneration the owner detailed (using ORB as the example: English available but dual-
+audio comes out → language section updates, poster stays) is absent. This depends on E's `thumbnail_sources` row (which now exists) and on E2's language union — so it's unblocked, just not built. Mark ❌.
+
+### P — Lelouch "Manage REQ/WRK" + Redo/Clear-
+DB row — 🟡 the row is done; the REQ/WRK merge is cosmetic-
+only
+The Redo + Clear-
+DB row is correct: `admin_panel(is_owner=...)` gates a single row with both `redo|new` and `dbclear`, owner-
+only, with a passing `test_lelouch_admin_panel.py`. **But the button was only RENAMED, not rewired.** `bots/lelouch/handlers/management.py` is untouched: `_render_requests` still calls `list_active()` (Requests/REQ only) and the header still literally says "Manage Requests" (line 484). So tapping "🗂 Manage REQ/WRK" shows REQ items only — WorkItems (WRK) never appear, and they have no cancel/reassign here. The owner explicitly asked to show **BOTH** REQ and WRK with the same actions. **Fix:** extend `_render_requests` to also query WorkItems and label each row by its code prefix (REQ-
+/WRK-
+), and wire the cancel/reassign handlers to accept WRK codes. Until then, P is a label change, not the feature.
+
+-
+-
+-
+
+
+### Cross-
+cutting notes for whoever picks this up
+1. **This execution record is still uncommitted.** The current working tree contains the implementation and focused regression changes; commit it in reviewable chunks before building on it. The last verified focused run passed 41 tests; do not treat the historical `795/5 skipped` claim as a post-
+patch full-
+suite result.
+2. **The "single-
+source-
+of-
+truth menu" rule is a standing owner requirement, not a per-
+task detail.** Gojo got it (`_home_rows`); Levi did NOT (Task C). Apply it to every bot with a `/start`-
+vs-
+callback menu.
+3. **Test coverage is honest but partial.** The 9 test files that DO exist all pass; the 9 the plan asked for that DON'T exist map almost exactly onto the ❌/🟡 tasks (B, C-
+menu, E-
+UI, E2, H, J, K, L, O). Missing test ≈ missing/partial feature — a useful shortcut when triaging.
+4. **Priority order for the owner's imminent Vanitas/ORB/Sabikui redos:** Task **B** (two cards — most visible), then **O** + **E2** (redo metadata/language refresh — ORB is dual-
+audio), then **E**-
+UI (so mistakes are fixable without a full redo). K1/K2/K5, J-
+Part-
+1, and L are important but not blockers for those three specific redos.
+
+-
+-
+-
+
+
+## 9. CORRECTIVE DIRECTIVES — build these THIS way (supersedes the "still open" notes above)
+
+### 9.11 — Reviewer response: J / §9.5 human recovery
+
+-
+ **“Human promotion is not implemented.”** Fixed: after the operator adds Gojo, the recovery verifier uses the available admin-
+capable client to add/promote Senku and re-
+promote either bot when required; both bots must have the operational rights needed for posting, editing, deleting, inviting, pinning, and channel-
+info changes.
+-
+ **“Scheduled recovery bypasses the wizard.”** Fixed: manual `/recover`, manual `/bancheck`, and `make_monthly_bancheck_job` all call `offer_human_recovery` first; `recreate_bot` is only the no-
+claim fallback.
+-
+ **“Same-
+title replacements were rejected.”** Fixed: same-
+channel protection compares the submitted chat id with the stored old chat id, not channel title.
+-
+ **“A failed/partial restore could strand an empty channel.”** Fixed: the old row remains enabled while the replacement is restored; only a complete `total == restored` / `failed == 0` restore is accepted. Empty or partial restore disables the replacement and leaves the old row active.- **“Late rollback could leave public links pointing at the failed channel.”** Hardened: rollback re-enables the known-good row, attempts to republish the main-channel button, and attempts to refresh the title's index letter through the supplied recovery client before returning failure. If Telegram rejects either corrective edit, the failure is logged and the old row remains available for retry.
+
+-
+ **“Retry cleanup could lose IDs when Telegram deletion failed.”** Fixed: successful deletions remove their tracking rows, but failed message IDs remain durable and cause the recovery attempt to stop before reposting; a later retry can try them again.- **“Fresh invite links were not guaranteed.”** Fixed: human recovery requires `InviteLinkService.ensure_for_bot` to return a link before switching active rows; invite failure disables the replacement and stops the handback. If a later step fails, rollback attempts to revoke that replacement invite through the verified recovery client; when revocation fails, the stored link remains so a later retry can revoke it.
+- **“A partial replacement could overwrite the durable backup.”** Fixed: distribution capture prefers enabled non-`human_recovery` channels, falling back to a recovery row only when no non-recovery channel is enabled.
+
+-
+ **“Admin reservations could collide or release another workflow.”** Fixed: Redis `SET NX` stores a unique claim token, and release uses an atomic compare-
+and-
+delete so an expired workflow cannot delete a newer claim.
+-
+ **“Tests were helper-
+only.”** Fixed: recovery tests now cover Senku card/artwork, handback, claim ownership, required privileges, scheduled FSM state, real Gojo callback registration, tracked-
+message cleanup retry, stale-
+invite reset/revocation, and the distribution restore path. Final validation is recorded below after the last patch.
+
+
+> **Read this before touching anything.** The reviewer (the planning-
+session AI, broader owner context) went back through the actual working tree on 2026-
+08-
+07 and verified each item at code level. These directives are prescriptive: where a task was left partial or built differently than the owner intended, the exact shape to produce is spelled out with `file:line` anchors. **Reuse the cited symbols — do not re-
+implement in parallel.** Every fix must be proven by a test that drives the REAL code path (no shadow tests — see §9.7). `py_compile` clean + full suite green (currently 799 passed / 5 skipped — do not regress) before marking any item done.
+>
+> **Two corrections to §8A first (don't waste effort):**
+> -
+ **Levi menu is ALREADY unified.** `bots/levi/app.py:34 _home_rows` is the single source of truth, called by both `/start` (:209) and callback-
+home (:127). §8A/§C's "still duplicated" note is STALE. Do NOT redo it. Mark Task C's menu sub-
+item ✅.
+> -
+ **The double caption column is safe to collapse** — see §9.8. Both are always written to the same value and read as `caption or header_caption`.
+
+### 9.1 — E: thumbnail edit MUST propagate to the LIVE published surfaces (highest priority)
+**Why this is the headline fix:** the current `/edit_thumbnail` (`nekofetch/bots/admin/handlers/thumbnail_edit.py`) only edits the admin **staging/thumbnail channel** (`fields["thumbnail_chat_id"]` / `thumbnail_message_id`, :198–245). The owner's actual use case is "I already PUBLISHED, a field is wrong, fix what SUBSCRIBERS see." Re-
+staging does not fix the published post. As built, the editor is a regeneration tool, not an edit tool — do not describe it as done.
+
+**Build it this way. Two live surfaces carry a thumbnail image; the edit must reach whichever exists:**
+1. **Main-
+channel post (via Gojo).** The post is tracked as `ChannelPost.main_message_id` for the `anime_doc_id` (`main_channel_service.py:489`, edited in place in `publish()`). Add a method on `MainChannelService` — `async def refresh_thumbnail(self, anime_doc_id, image_path) -
+> bool` — that loads the `ChannelPost`, and if `main_message_id` is set, calls `self._c.admin_client.edit_message_media(main_channel_id, main_message_id, InputMediaPhoto(image_path, caption=<existing caption>, parse_mode=HTML))`. Preserve the existing caption (re-
+read it or pass it through) — do NOT blank it. Update `PublishedPostBackup` for that post so a later restore uses the corrected image. Because the admin bot IS Gojo (`container.admin_client`), Senku triggering this routes through Gojo correctly — that satisfies the owner's "main-
+channel edits go through Gojo" rule without a cross-
+bot hop.
+2. **Distribution entry card (via Senku).** The card is a `BotContentPost`/`ChannelLayout` row with `tg_message_id` (`models.py:548`, layout `cards` JSON at :376 holds `{"kind","caption","image_url",...}`). Add the parallel edit on the Senku side (or reuse `SenkuPublisher`) to `edit_message_media` that card and rewrite the stored `cards` JSON + `ChannelContentBackup` so restore stays correct.
+3. **Wire the command to call the right one.** In `thumbnail_edit.py` after the re-
+render + `persist_thumbnail_source` (:202), branch on entry identity: root/`anilist_id == -
+1` → main post (surface 1); a specific season/part entry → its distribution card (surface 2). Keep the existing staging-
+channel edit as a THIRD, best-
+effort update (staging is the operator's preview, not the deliverable). Report back to the operator WHICH live surface was updated ("✅ Updated the main-
+channel post" / "✅ Updated the Season 1 Part 2 card"), not the current generic "saved."
+4. **Add `tests/test_thumbnail_edit.py`** (the plan's originally-
+requested test, still missing): seed a `ThumbnailSource` + a `ChannelPost` with a `main_message_id`; run the edit service with a stub `admin_client` recording calls; assert `edit_message_media` fired against `main_message_id` with the NEW image and the OLD caption preserved, and that `PublishedPostBackup` was updated. Same for a distribution-
+card entry against its `tg_message_id`.
+
+**Until 9.1 is done, Task E stays 🟡 and the operator must be told the editor only re-
+stages.** This is the one gap that changes day-
+to-
+day usability.
+
+### 9.2 — E code-
+quality fixes (do alongside 9.1)
+1. **Stop reaching into another service's privates.** `thumbnail_edit.py:210–222` calls `ThumbnailChannelService._get_workflow` / `_save_workflow` (underscore = private). Add a PUBLIC method on `ThumbnailChannelService` — e.g. `async def mark_entry_rendered(self, anime_doc_id, anilist_id, image_path)` — that does the workflow lookup + status="done" + save internally, and call THAT. Keeps the encapsulation the rest of the codebase respects.
+2. **Escape caption interpolation.** `:233` and `:241` build `caption=f"<b>{fields.get('title')}</b> — <i>{fields.get('entry_label')}</i>"` with raw f-
+strings. A title containing `&`, `<`, or `>` (common in anime titles) produces broken/injected HTML. Use the project's existing escape helper (`V.esc(...)` per the voice modules, or `html.escape`) on both interpolated values — match whatever `main_channel_service` / `bot_naming` already use for caption building.
+
+### 9.3 — O: redo metadata refresh (now UNBLOCKED — the storage it needed exists)
+Task O was blocked on "no durable thumbnail source." That's gone — `ThumbnailSource` (migration 0026) + `persist_thumbnail_source` now store every entry's rendered fields. Build O on top of it. **The owner's ORB example is the acceptance case:** English was available but a dual-
+audio version comes out → on redo, old files deleted, dual-
+audio uploaded, links relinked, the entry-
+card caption's language line updates, the main-
+post thumbnail regenerates BECAUSE language/rating changed — but the poster/logo do NOT change and users are NOT re-
+notified.
+
+**Build it this way, in `shared/redo_service.py`:**
+1. **Compute the new franchise facts** after the redo's fresh files exist: episode-
+count line (Task E3 formatter — reuse it, don't rewrite), franchise-
+average rating (`main_channel_service._avg_score_pct`), and the language union (Task E2 `_language_summary` — reuse it).
+2. **Diff against stored.** Load each entry's `ThumbnailSource.fields`. Compare episode-
+count / rating / language. Build a `changed: set[str]` per entry and for the main post.
+3. **Regenerate ONLY on change.** If `changed` is empty for an entry (e.g. quality-
+only redo) → do NOT re-
+render; just relink download/quality buttons via the EXISTING redo-
+relink path (`SenkuPublisher.relink_packs_in_place`). If `changed` is non-
+empty → re-
+render that thumbnail with the new fields, `persist_thumbnail_source`, and push it to the live surface via the 9.1 `refresh_thumbnail` method (main) / distribution-
+card edit. This is exactly why 9.1 must land first — O depends on it.
+4. **Update captions** (main + entry cards) via `edit_message_caption` where the episode-
+count/language line changed; update the matching backups.
+5. **Channel title refresh** (owner's "Case Study of Vanitas" → "Vanitas no Carte" case): if the franchise display title changed, `edit_chat_title(new_title)` on the distribution channel, then delete the "channel name changed" service message (the pattern already exists near `senku_publisher.py` warm-
+search cleanup — reuse it).
+6. **Add `tests/test_redo_metadata_refresh.py`** driving the REAL `redo_service` diff: seed old `ThumbnailSource` (rating=75, language="Japanese"); redo with entries yielding rating=82 + one English pack → assert the affected thumbnails re-
+render AND 9.1's propagation fired; assert a quality-
+only redo (identical metadata) does NOT re-
+render and only relinks.
+
+### 9.4 — K5: make update-
+during-
+redo INTERACTIVE (it currently only notifies)
+`redo_service.py:321 _detect_and_notify_new_seasons` detects a new season and DMs a notice, but `new_season_ids` (set :222) is read nowhere. The owner un-
+deferred this and wants a CHOICE, not a notice.
+**Build it this way:** when `new_season_ids` is non-
+empty, before finalizing the redo, send the owner an inline prompt **"Season N is available — include it in this redo? [Yes] [No]"** (use the existing Lelouch screen/keyboard conventions + a `redo|update|yes|<doc>` / `redo|update|no|<doc>` callback). On **Yes** → run the normal append/update flow (the existing `_append_and_refooter` + K3 `reply_update`) for the NEW entry only: download its episodes, generate ONLY the new entry's thumbnail (Task D per-
+entry loop), append its `season_card`, Gojo replies to the main post. On **No** → redo only the originally-
+selected entries. Add the Yes/No branch to `tests/test_update_flow.py` (create it — still missing) driving the real handler. **Note the dependency:** a clean Yes-
+path also wants K1 (download only the new entry's episode window) and K2 (update skips channel creation) — if those aren't built yet, gate the Yes path to "new entry download + append" and flag K1/K2 as the remaining edge (combined-
+torrent windowing).
+
+### 9.5 — J Part 1: the human recovery wizard (the part the owner detailed most)
+Machine recovery (relink, main-
+post button refresh, recovery reply) is done and good. What's missing is the HUMAN handoff. `bot_orchestrator.recreate_bot` currently calls `factory.create_for_anime_channel()` (fully automated) — the owner's design puts an admin in the loop with a FAMILIAR UI.
+**Build it this way:** when a ban is detected and a replacement channel is needed, Gojo DMs a free admin **reusing the Senku channel-
+creation wizard's artwork + layout + character voice** (`bots/senku/handlers/wizard.py:349 _ask_channel` and siblings — reuse those builders, do not invent a new look), reworded for recovery: "Restoring a banned channel — create a replacement or use the userbot." The admin creates the channel, gives it a username, sets the PFP, and the flow then: removes the "photo changed" / "channel created" service messages, adds Senku + Gojo as admins, and hands the new `chat_id` back into the existing restore path (`_restore_channel` → relink → main-
+post refresh → recovery reply, all already built). Only the human-
+facing assignment + service-
+message cleanup + admin-
+promotion is new; everything after the handback already works. Add `tests/test_ban_recovery_full.py` covering: assignment DM uses the wizard builders (assert the shared artwork/voice symbols are invoked), and post-
+handback the restore relinks + refreshes as already tested.
+
+### 9.6 — P: actually merge WRK into "Manage REQ/WRK" (currently a rename only)
+`bots/lelouch/handlers/management.py:474 _render_requests` still calls `list_active()` (Requests only) and the header literally reads "Manage Requests" (:484). The button was relabeled but the list wasn't rewired.
+**Build it this way:** in `_render_requests`, also query WorkItems (`kurosoden.shared.work_service`) and render BOTH REQ and WRK rows in one list, each row prefixed by its code so REQ vs WRK is visible (e.g. "REQ-
+1073 · …", "WRK-
+42 · …"). Change the header to "Manage REQ/WRK". Extend the existing cancel/reassign callback handlers to accept WRK codes (route to `work_service` for WRK, `request_service` for REQ — branch on the code prefix). Add to `tests/test_lelouch_admin_panel.py` (exists): seed one Request + one WorkItem, assert the rendered list contains both and that a WRK row exposes a working cancel action.
+
+### 9.7 — Replace the two SHADOW tests with real-
+path tests
+`tests/test_encode_order.py` and `tests/test_thumb_per_entry_fsm.py` currently RE-
+IMPLEMENT the logic inside the test and assert against their own copy — they never import the real code, so they'd stay green if `stages.py` / the wizard broke. That's a false safety net.
+-
+ **F:** `test_encode_order.py:6–11` defines a local `_release_key` + `sorted()`. Delete it. Instead build real `MediaFile` rows (unordered), run them through the ACTUAL sort in `EncodeStage` (`nekofetch/services/processing/stages.py` — the `ctx.files.sort(...)` right before the encode loop; call that stage/helper directly or factor the sort into a named function the test imports), and assert the real output order.
+-
+ **D:** `test_thumb_per_entry_fsm.py:12` defines a local `advance()`. Delete it. Instead drive the real per-
+entry transition — `SenkuThumbnailAdapter.next_pending` + the Approve/Redo handlers in `bots/senku/handlers/wizard.py` (or the `distribution_cache` selection functions they call) — and assert approve advances / redo restarts-
+this-
+entry-
+only against the REAL state store.
+Keep the assertions identical; only change WHAT they exercise. If factoring a helper out of `stages.py`/`wizard.py` is needed to make the real path callable, do that refactor (it also improves the code).
+
+### 9.8 — Collapse the duplicate caption column (schema hygiene)
+`storage_packs` now has BOTH `header_caption` (migration 0025) and `caption` (0028). Verified they're always written together and read as `caption or header_caption` (`storage_channel_service.py:278,320,361,391`). Pick `caption` as canonical (it's the newer, cleaner name), and in a NEW migration `0029`: backfill `caption` from `header_caption` where null, then drop `header_caption`. Update the model + the ~4 write sites to stop mirroring. Keep `ChannelContentBackup.caption` (unrelated — that's the backup snapshot). This is low-
+risk cleanup; do it after the functional items above, and only if the full suite stays green. If a downstream reader outside `storage_channel_service` still references `header_caption`, update it in the same pass (grep first).
+
+### 9.9 — Priority order for these directives
+Do them in this order — earlier ones unblock later ones and cover the owner's imminent Vanitas/ORB/Sabikui redos:
+1. **9.1 (E propagation)** — unblocks 9.3; also the biggest usability win on its own.
+2. **9.3 (O redo refresh)** — the ORB dual-
+audio case; needs 9.1.
+3. **9.7 (real tests for D/F)** — cheap, removes a false safety net before more is built on it.
+4. **9.2 (E code quality)** — fold into 9.1's PR.
+5. **9.6 (P WRK merge)** and **9.4 (K5 interactive)** — self-
+contained feature completions.
+6. **9.5 (J human wizard)** — larger, no imminent-
+redo dependency.
+7. **9.8 (caption column)** — hygiene, last, only if suite stays green.
+**Not in scope here (still ❌ from §8, unchanged):** K1/K2 combined-
+torrent windowing, L (OVA mapping), N (research doc) — leave labeled, tackle after the above.
+
+### 9.10 — Definition of done for §9
+Every directive: reuse the cited symbol (no parallel re-
+impl); test drives the REAL code path (§9.7 rule applies to ALL new tests); `py_compile` clean; full suite green and NOT below 799 passed / 5 skipped; DB writes update the matching backup snapshot; operator-
+facing copy stays en.json-
+driven where the surrounding code already is. Update §8A's status line for each item you complete (🟡/❌ → ✅) so the record stays honest.

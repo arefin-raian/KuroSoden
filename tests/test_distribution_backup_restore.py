@@ -24,6 +24,7 @@ from nekofetch.core.config import PostFormatConfig
 from nekofetch.infrastructure.database.postgres.models import (
     BotContentPost,
     ChannelContentBackup,
+    ChannelLayout,
     DistributionBot,
 )
 from nekofetch.services.backup_service import BackupService
@@ -43,6 +44,7 @@ class _FakeClient:
     def __init__(self, *, username: str | None = "fresh_channel"):
         self.username = username
         self.events: list[tuple[str, object]] = []
+        self.deleted: list[tuple[int, int]] = []
         self.pins: list[int] = []
         self._next_id = 5000
 
@@ -67,6 +69,9 @@ class _FakeClient:
 
     async def pin_chat_message(self, chat_id, mid, disable_notification=False):
         self.pins.append(mid)
+
+    async def delete_messages(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
 
 
 def _container(sessionmaker, client=None):
@@ -214,3 +219,65 @@ async def test_restore_no_backup_is_noop(sessionmaker):
     stats = await svc.restore_distribution_channel("missing", -100999)
     assert stats.total == 0 and stats.restored == 0
     assert client.events == []
+
+
+async def test_failed_recovery_cleanup_deletes_only_tracked_messages(
+    sessionmaker,
+):
+    bot_id = await _seed_channel(sessionmaker)
+    async with sessionmaker() as s:
+        bot = await s.get(DistributionBot, bot_id)
+        s.add(ChannelLayout(
+            channel_bot_id=bot_id, seq=10, kind="divider", tg_message_id=1001,
+        ))
+        await s.commit()
+
+    client = _FakeClient()
+    svc = BackupService(_container(sessionmaker, client))
+    deleted = await svc.clear_distribution_channel(
+        "anime1", -100111, client=client,
+    )
+
+    assert deleted == 2
+    assert {mid for _chat, mid in client.deleted} == {1001, 999}
+    async with sessionmaker() as s:
+        from sqlalchemy import select
+        assert (await s.execute(
+            select(BotContentPost).where(BotContentPost.bot_id == bot_id)
+        )).scalars().all() == []
+        assert (await s.execute(
+            select(ChannelLayout).where(ChannelLayout.channel_bot_id == bot_id)
+        )).scalars().all() == []
+
+
+async def test_cleanup_keeps_failed_message_ids_for_retry(sessionmaker):
+    bot_id = await _seed_channel(sessionmaker)
+
+    async with sessionmaker() as s:
+        s.add(ChannelLayout(
+            channel_bot_id=bot_id, seq=10, kind="divider", tg_message_id=1001,
+        ))
+        await s.commit()
+
+    class FailingDeleteClient(_FakeClient):
+        async def delete_messages(self, chat_id, message_id):
+            if message_id == 1001:
+                raise RuntimeError("temporary Telegram failure")
+            await super().delete_messages(chat_id, message_id)
+
+    client = FailingDeleteClient()
+    svc = BackupService(_container(sessionmaker, client))
+    with pytest.raises(RuntimeError, match="tracked recovery message"):
+        await svc.clear_distribution_channel(
+            "anime1", -100111, client=client,
+        )
+
+    from sqlalchemy import select
+
+    async with sessionmaker() as s:
+        assert (await s.execute(
+            select(ChannelLayout).where(
+                ChannelLayout.channel_bot_id == bot_id,
+                ChannelLayout.tg_message_id == 1001,
+            )
+        )).scalars().all()
