@@ -100,6 +100,21 @@ async def test_backdrop_alias_maps_to_same_field(cache):
 
 
 @pytest.mark.asyncio
+async def test_clear_selection_only_resets_target_entry(cache):
+    await cache.set_entries("REQ-1", _entries())
+    await cache.set_selection("REQ-1", 1, asset="logo", value="one")
+    await cache.set_selection("REQ-1", 1, done=True)
+    await cache.set_selection("REQ-1", 2, asset="logo", value="other")
+
+    await cache.clear_selection("REQ-1", 1)
+
+    cleared = await cache.get_selection("REQ-1", 1)
+    assert cleared == Selection()
+    # A different entry in the same request is untouched by the redo reset.
+    assert (await cache.get_selection("REQ-1", 2)).logo_url == "other"
+
+
+@pytest.mark.asyncio
 async def test_done_flag_and_all_done(cache):
     await cache.set_entries("REQ-1", _entries())
     assert await cache.all_done("REQ-1") is False

@@ -297,6 +297,9 @@ def register(client: Client, container: Container) -> None:
 
     # ── Finalize redo ──────────────────────────────────────────────────────
     async def _finalize_redo(q: CallbackQuery) -> None:
+        if not _is_owner(q, container):
+            await q.answer(V.OWNER_ONLY, show_alert=True)
+            return
         # By confirm time the franchise dict is already fully resolved (single
         # match, version pick, or "both"), so just read it — mirror requests.py.
         _, data = await fsm.get(q.from_user.id)

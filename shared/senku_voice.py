@@ -523,6 +523,8 @@ BTN_SHOW_POSTERS = "🖼 Show Posters"
 BTN_SHOW_BACKDROPS = "🌄 Show Backdrops"
 BTN_UPLOAD_OWN = "⬆️ Upload my own"
 BTN_GENERATE = "⚗️ Generate Thumbnail"
+BTN_THUMB_APPROVE = "✅ Approve"
+BTN_THUMB_REDO = "↻ Redo"
 
 BTN_ORDER_CORRECT = "✅ Order is correct"
 BTN_ORDER_EDIT = "✏️ Edit order"

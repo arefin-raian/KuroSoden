@@ -100,13 +100,18 @@ def build_levi(container: Container, token: str) -> Client:
 
             rows = [
                 [InlineKeyboardButton("📋 Tasks", callback_data=cb(bot, "tasks"))],
+                [InlineKeyboardButton("🛠 Pack Captions", callback_data=cb(bot, "packcaptions"))],
                 [InlineKeyboardButton("⚙️ Settings", callback_data=cb(bot, "set", "home")),
                  InlineKeyboardButton("❓ Help", callback_data=cb(bot, "help"))],
             ]
             if not is_owner(container, q):
                 rows = [
                     row for row in rows
-                    if all("set|home" not in (btn.callback_data or "") for btn in row)
+                    if all(
+                        "set|home" not in (btn.callback_data or "")
+                        and "packcaptions" not in (btn.callback_data or "")
+                        for btn in row
+                    )
                 ]
             keyboard = InlineKeyboardMarkup(rows)
             await send_screen(client, q.message.chat.id,
@@ -193,6 +198,7 @@ def build_levi(container: Container, token: str) -> Client:
         rows = [
             [("📋 Tasks", cb("levi", "tasks"))],
             [("🌐 How Sourcing Works", cb("levi", "sources"))],
+            [("🛠 Pack Captions", cb("levi", "packcaptions"))],
             [("⚙️ Settings", cb("levi", "settings")),
              ("❓ Help", cb("levi", "help"))],
         ]
@@ -200,7 +206,10 @@ def build_levi(container: Container, token: str) -> Client:
         if not is_owner(container, message):
             rows = [
                 row for row in rows
-                if all("settings" not in data for _label, data in row)
+                if all(
+                    "settings" not in data and "packcaptions" not in data
+                    for _label, data in row
+                )
             ]
         screen = Screen(
             caption=(

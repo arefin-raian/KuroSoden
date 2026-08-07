@@ -93,6 +93,8 @@
   "error_not_found": "🔎 <b>Couldn't find that.</b> Try a different spelling or the original title.",
   "notif_ready_title": "✅ <b>{title} is ready!</b>",
   "notif_ready_body": "Your requested anime has been published.",
+  "season_update_reply": "<blockquote><b>{title} — {entry_label}</b>\n• {episodes} episodes • {quality}\n• <a href=\"{channel_link}\">click here</a> to watch</blockquote>",
+  "ban_recovery_reply": "<blockquote><b>{title}</b>\n• The channel was banned and has been restored\n• <a href=\"{channel_link}\">Click here</a> to access the new channel</blockquote>",
   "confirm_adaptation_choose": "<b>This title has multiple adaptations.</b> Which one do you want?",
   "btn_choose": "Choose",
   "btn_read_more": "📖 Read full synopsis",

@@ -29,6 +29,7 @@ class ProgressSnapshot:
     resolution: str | None = None  # e.g. "1080p" — the variant currently in flight
     audio: str | None = None       # "Sub" / "Dub" / "Dual"
     season: int | None = None
+    season_part: int | None = None     # split-season part (P1/P2), if any
     episode_index: int | None = None   # n-th of total_episodes
     total_episodes: int | None = None
     retry_attempt: int = 0             # 0 = first try; >0 = which retry is in flight

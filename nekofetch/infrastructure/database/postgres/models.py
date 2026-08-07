@@ -238,6 +238,9 @@ class StoragePack(Base, PKMixin, TimestampMixin):
     end_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)     # end sticker / last
     file_message_ids: Mapped[list | None] = mapped_column(JSONB)                # ordered, explicit
     file_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Exact HTML caption used for the header message. Persisted so an operator can
+    # edit a pack later without reconstructing the generated title/formatting.
+    header_caption: Mapped[str | None] = mapped_column(Text)
 
     episode_from: Mapped[int | None] = mapped_column(Integer)
     episode_to: Mapped[int | None] = mapped_column(Integer)
@@ -256,6 +259,30 @@ class StoragePack(Base, PKMixin, TimestampMixin):
             "entry_id", name="uq_storage_pack"
         ),
         Index("ix_storage_pack_lookup", "anime_doc_id", "season", "season_part", "resolution", "audio", "entry_id"),
+    )
+
+
+class ThumbnailSource(Base, PKMixin, TimestampMixin):
+    """Durable inputs used to render one entry thumbnail.
+
+    Keeping the selected artwork and gathered metadata means an owner can edit or
+    regenerate a card after a restart without depending on the temporary Redis
+    workflow or a provider returning the same result.
+    """
+
+    __tablename__ = "thumbnail_sources"
+
+    anime_doc_id: Mapped[str] = mapped_column(String(48), index=True, nullable=False)
+    # ``-1`` represents a mapping-only/root thumbnail with no AniList id. A
+    # non-null key is intentional: PostgreSQL treats NULLs as distinct in a
+    # UNIQUE constraint, which would allow duplicate root rows during retries.
+    anilist_id: Mapped[int] = mapped_column(BigInteger, index=True, default=-1, nullable=False)
+    fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    html: Mapped[str | None] = mapped_column(Text)
+    image_path: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        UniqueConstraint("anime_doc_id", "anilist_id", name="uq_thumbnail_source_entry"),
     )
 
 

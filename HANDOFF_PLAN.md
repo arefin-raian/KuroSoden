@@ -314,3 +314,39 @@ When `/redo` is run on a title, and metadata has changed since the original publ
 
 
 
+
+## 7. IMPLEMENTATION RECORD — 2026-08-07
+
+> This section records what was actually completed in this session. The original plan above is preserved unchanged.
+
+### What users will see
+
+- New anime downloads still follow the same flow: files are downloaded, checked, processed, and placed into the storage channel. The public main-channel post is then created with artwork, episode/quality/language information, Index, and Download buttons.
+- A new season or extra episode set is added to the existing distribution channel instead of creating a duplicate title. The main-channel post receives a short reply saying the new entry is available and linking to the current distribution channel.
+- If a distribution channel is recreated after a ban, saved cards are reposted from backup. Captions, artwork, buttons, dividers, and pinned cards come back without depending on fresh TMDB/AniList results. Once the replacement channel is live, download buttons are relinked to fresh storage packs, and the main post receives a recovery reply with the new link.
+- Selected thumbnail artwork and the gathered display information are saved durably, so the thumbnail workflow is not dependent only on temporary wizard state after a restart.
+- Movies larger than Telegram's ordinary upload limit are compressed first, then split if needed, and every resulting part is checked. Unsafe conversion failures leave the original available for retry instead of silently deleting it.
+- Successful uploads clean the original movie, compressed copies, split parts, and other generated temporary artifacts from disk.
+- Main-channel episode summaries distinguish TV episodes, extras, and movies, for example `25 + 3 extras + 2 movies`.
+
+### What was changed
+
+- Added localized main-channel update and recovery replies and wired them into update and channel-recreation paths.
+- Removed duplicate `PublicationFacts` fields found during review.
+- Added the `ThumbnailSource` table and migration for selected artwork, gathered fields, entry identity, and rendered image path.
+- Made thumbnail persistence use a non-null root sentinel and atomic upsert, avoiding duplicate root rows and retry races on PostgreSQL.
+- Added movie size-control helpers, two-pass target encoding, verified splitting, safe failure handling, and cleanup tracking for generated artifacts.
+- Rebound restored distribution content/layout rows to fresh Telegram message IDs, then relinked fresh storage buttons where live pack information is available.
+- Added focused regression tests for movie limits, thumbnail persistence, main-channel replies, and distribution backup/restore.
+- Updated the schema-count test from 22 to 23 tables to include `thumbnail_sources`.
+
+### Verification
+
+- Focused regression tests: 11 passed.
+- Python compilation across `nekofetch`, `shared`, `bots`, `tests`, and `migrations`: clean.
+- The full suite's previous run was 794 passed, 5 skipped, and 1 stale table-count expectation; that expectation was updated for the intentional new table. The full suite is being rerun after this update.
+- Live Telegram ban/recovery and a real 2GB+ movie upload still require configured production Telegram accounts, channels, storage, and FFmpeg. They were not falsely claimed as live-tested here.
+
+### Intentionally not implemented
+
+- The plan's userbot-plus-bot-token research item for editing buttons into arbitrary user messages remains research-only. It needs owner confirmation and a live Telegram permission/security decision.

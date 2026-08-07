@@ -368,6 +368,17 @@ class DistributionCache:
         )
         return sel
 
+    async def clear_selection(self, code: str, index: int) -> Selection:
+        """Clear one entry's picks so a redo cannot disturb other entries."""
+        selections = await self.get_selections(code)
+        selections[index] = Selection()
+        await safe_redis_set(
+            self._redis, _K_SELECTIONS.format(code=code),
+            json.dumps({str(k): asdict(v) for k, v in selections.items()}),
+            ex=_DEFAULT_TTL, label="dist_cache.sel.clear",
+        )
+        return selections[index]
+
     async def set_entries(self, code: str, entries: list[EntryData]) -> None:
         """Overwrite the entry list (used after a watch-order edit)."""
         await safe_redis_set(

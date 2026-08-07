@@ -72,7 +72,7 @@ processing:
 #            {source} {group} {content_type}
 rename:
   enabled: true
-  template: "{title} S{season}E{episode} [{resolution}] [{audio}] @AniXWeebs"
+  template: "{title} S{season}{season_part}E{episode} [{resolution}] [{audio}] @AniXWeebs"
   movie_template: "{short_title} - Movie [{resolution}] [{audio}] @AniXWeebs"
   special_template: "{short_title} - {content_type} E{episode} [{resolution}] [{audio}] @AniXWeebs"
 

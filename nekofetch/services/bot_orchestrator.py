@@ -151,6 +151,44 @@ class BotOrchestratorService:
                 # title (which also refreshes the main-channel post) instead of
                 # re-publishing the channel from scratch.
                 await self._bind_title(info.id, anime_doc_id)
+                # The backup preserves the old buttons so the restore can happen
+                # without metadata calls. Once fresh pack rows/content exist,
+                # re-point each restored card at the new storage messages and
+                # persist those links for the next backup.
+                try:
+                    from kurosoden.shared.senku_publisher import SenkuPublisher
+
+                    await SenkuPublisher(self._c).relink_packs_in_place(
+                        self._c.admin_client, anime_doc_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 — cosmetic relink is best-effort
+                    log.warning("bot.orchestrator.restore_relink_failed",
+                                anime=anime_doc_id, error=str(exc))
+            # Rebinding refreshes the main post's Download button. Follow it with
+            # a reply so subscribers can find the replacement channel immediately.
+            if was_channel and info is not None:
+                try:
+                    from nekofetch.services.main_channel_service import MainChannelService
+                    main = MainChannelService(self._c)
+                    channel_link = await main.distribution_link(anime_doc_id)
+                    if channel_link:
+                        async with session_scope(self._c.pg_sessionmaker) as session:
+                            from nekofetch.infrastructure.database.postgres.models import StoragePack
+                            pack = (
+                                await session.execute(
+                                    select(StoragePack)
+                                    .where(StoragePack.anime_doc_id == anime_doc_id)
+                                    .limit(1)
+                                )
+                            ).scalars().first()
+                        await main.reply_recovery(
+                            anime_doc_id,
+                            pack.anime_title if pack else anime_doc_id,
+                            channel_link,
+                        )
+                except Exception as exc:  # noqa: BLE001 — recovery reply is best-effort
+                    log.warning("bot.orchestrator.recovery_reply_failed",
+                                anime=anime_doc_id, error=str(exc))
             # A recreated channel gets a fresh private invite link (the row is new,
             # so gather_facts mints one on the main-channel refresh above). Refresh
             # this title's index letter too so its hyperlink points at the new link.

@@ -51,6 +51,7 @@ class RedoPlan:
     owner_admin_id: int | None = None                   # admin currently on the task (notify)
     current_stage: str | None = None                    # levi / senku / gojo
     published_season_ids: list[int] = field(default_factory=list)  # anilist ids already in a channel
+    new_season_ids: list[int] = field(default_factory=list)
 
     @property
     def keep_channel(self) -> bool:
@@ -215,8 +216,12 @@ class RedoService:
             fr["redo_anime_doc_id"] = anime_doc_id
         await self._requeue_as_work(owner_id, title, anime_doc_id, fr)
 
-        # 5. New-season detection (v1: notify only). Full append is a v2 follow-up.
-        await self._detect_and_notify_new_seasons(plan, franchise_data, owner_id)
+        # 5. Detect entries discovered during redo that are not already on the
+        # channel. The handler can present the owner with a Yes/No choice; the
+        # normal update request remains separate so choosing No is safe.
+        plan.new_season_ids = await self._detect_and_notify_new_seasons(
+            plan, franchise_data, owner_id,
+        )
 
         return plan
 
@@ -316,9 +321,11 @@ class RedoService:
     async def _detect_and_notify_new_seasons(
         self, plan: RedoPlan, franchise_data: dict, owner_id: int,
     ) -> list[int]:
-        """Compare the franchise's TV seasons to those already in the channel; if
-        the redo surfaces season(s) not yet published, DM the owner. v1 only NOTIFIES
-        — the append+thumbnail flow is a v2 follow-up. Returns the new anilist ids."""
+        """Compare the franchise's TV seasons to those already in the channel.
+
+        Returns new AniList ids and sends the existing informational notice. The
+        caller may use the returned ids to offer an explicit update choice.
+        """
         if plan.state is not RedoState.PUBLISHED or not plan.published_season_ids:
             return []
         try:

@@ -234,12 +234,14 @@ class DownloadWorker:
             from nekofetch.services.torrent_mapping import TorrentMapping
             from nekofetch.sources.base import Episode
             tm = TorrentMapping.from_dict(torrent_mapping_dict)
-            ep_override: dict[int, tuple[int, int]] = {}
+            ep_override: dict[int, tuple[int, int, int | None]] = {}
             for tme in tm.included_entries:
                 fe = tme.franchise_entry
                 for fa in tme.files:
                     if fa.episode_number is not None:
-                        ep_override[fa.file_index] = (fe.season_number, fa.episode_number)
+                        ep_override[fa.file_index] = (
+                            fe.season_number, fa.episode_number, fe.season_part,
+                        )
             if ep_override:
                 remapped = []
                 for ep in episodes:
@@ -248,9 +250,14 @@ class DownloadWorker:
                     except Exception:
                         fidx = None
                     if fidx is not None and fidx in ep_override:
-                        s, n = ep_override[fidx]
+                        s, n, part = ep_override[fidx]
+                        # The mapping has already normalized this torrent file to
+                        # its franchise entry. Preserve the part explicitly so the
+                        # locator and every later progress/pack key do not apply the
+                        # cumulative split-season offset a second time.
                         remapped.append(Episode(
-                            source_ref=ep.source_ref, season=s, number=n, title=ep.title,
+                            source_ref=ep.source_ref, season=s, number=n,
+                            title=ep.title, season_part=part,
                         ))
                 if remapped:
                     episodes = remapped
@@ -284,9 +291,18 @@ class DownloadWorker:
         # real tag (e.g. "Dual" on a native dual-audio source) instead of the
         # first *configured* language ("Dub").
         try:
+            preview_ep = episodes[0] if episodes else None
+            preview_part = None
+            if preview_ep is not None:
+                preview_part, _ = _map_episode_locator(
+                    preview_ep.number, preview_ep.season,
+                    getattr(req, "franchise_data", None) or {},
+                    season_part=getattr(preview_ep, "season_part", None),
+                )
             await self._run_naming_confirms(
                 job_id, req, resolutions, audios, variants,
-                season=episodes[0].season if episodes else None,
+                season=preview_ep.season if preview_ep else None,
+                season_part=preview_part,
             )
         except Exception as exc:  # noqa: BLE001 — confirm is a nicety, never fatal
             log.debug("download.naming_confirm.skipped", job_id=job_id, error=str(exc))
@@ -415,7 +431,7 @@ class DownloadWorker:
                     continue
                 spec = self._spec(ep, variant.resolution, variant.audio, dual=False)
                 try:
-                    if await self._already_have(job_id, ep, variant.resolution, variant.audio):
+                    if await self._already_have(job_id, req, ep, variant.resolution, variant.audio):
                         continue
                     if not await self._run_unit(job_id, req, source, ep, variant, folder, cfg):
                         failed.append(spec)
@@ -459,7 +475,7 @@ class DownloadWorker:
                         continue
                     # Resume: if a prior run already downloaded this exact unit and
                     # the file is still on disk, skip it (e.g. eps 1-9 done → ep 10).
-                    if await self._already_have(job_id, ep, resolution, audio):
+                    if await self._already_have(job_id, req, ep, resolution, audio):
                         continue
                     if not await self._run_unit(job_id, req, source, ep, variant, folder, cfg):
                         failed.append(spec)
@@ -475,6 +491,7 @@ class DownloadWorker:
     @staticmethod
     def _spec(ep, resolution, audio, *, dual: bool) -> dict:
         return {"ep_ref": ep.source_ref, "season": ep.season, "number": ep.number,
+                "season_part": getattr(ep, "season_part", None),
                 "title": ep.title, "resolution": resolution,
                 "audio": audio.value if audio is not None else None, "dual": dual}
 
@@ -533,8 +550,8 @@ class DownloadWorker:
             / f"S{ep.season:02d}E{ep.number:03d}_{variant.resolution}_{variant.audio.value}"
               f".{variant.container or 'mkv'}"
         )
-        on_progress = self._make_progress(job_id, ep, variant, cfg)
-        on_retry = self._make_retry(job_id, ep, variant, cfg)
+        on_progress = self._make_progress(job_id, req, ep, variant, cfg)
+        on_retry = self._make_retry(job_id, req, ep, variant, cfg)
         try:
             result = await self._download_watched(job_id, source, variant, dest,
                                                   on_progress, cfg, on_retry)
@@ -581,7 +598,7 @@ class DownloadWorker:
             except TimeoutError:
                 continue
 
-    def _make_progress(self, job_id, ep, variant, cfg):
+    def _make_progress(self, job_id, req, ep, variant, cfg):
         """Build the rolling-window progress callback for one unit."""
         st = {"last": 0.0, "win_t": time.monotonic(), "win_done": 0}
 
@@ -594,15 +611,20 @@ class DownloadWorker:
             st["win_t"], st["win_done"], st["last"] = now, done, now
             pct = (done / total * 100) if total else 0.0
             eta = int((total - done) / speed) if speed > 0 else None
+            display_part, display_episode = _map_episode_locator(
+                ep.number, ep.season, getattr(req, "franchise_data", None) or {},
+                season_part=getattr(ep, "season_part", None),
+            )
             if self._c.progress:
                 try:
                     await self._c.progress.set(ProgressSnapshot(
                         job_id=job_id, status=JobStatus.RUNNING.value, progress=pct,
                         speed_bps=speed, downloaded_bytes=done, total_bytes=total,
-                        current_episode=ep.number, eta_seconds=eta,
+                        current_episode=display_episode, eta_seconds=eta,
+                        season=ep.season, season_part=display_part,
                         resolution=variant.resolution, audio=variant.audio.value,
                         label=(
-                            f"S{ep.season:02d}E{ep.number:03d} "
+                            f"S{ep.season:02d}E{display_episode:03d} "
                             f"{variant.resolution} {variant.audio.value}"
                         ),
                     ))
@@ -613,7 +635,7 @@ class DownloadWorker:
                     log.debug("download.progress_redis_blip", job_id=job_id)
         return on_progress
 
-    def _make_retry(self, job_id, ep, variant, cfg):
+    def _make_retry(self, job_id, req, ep, variant, cfg):
         """Build the on-retry callback fired between auto-retry attempts for one unit.
 
         Publishes a snapshot marking WHICH attempt is now in flight and a human
@@ -622,16 +644,21 @@ class DownloadWorker:
         async def on_retry(attempt: int, reason: str | None) -> None:
             if not self._c.progress:
                 return
+            display_part, display_episode = _map_episode_locator(
+                ep.number, ep.season, getattr(req, "franchise_data", None) or {},
+                season_part=getattr(ep, "season_part", None),
+            )
             try:
                 await self._c.progress.set(ProgressSnapshot(
                     job_id=job_id, status=JobStatus.RUNNING.value,
-                    current_episode=ep.number, season=ep.season,
+                    current_episode=display_episode, season=ep.season,
+                    season_part=display_part,
                     resolution=variant.resolution, audio=variant.audio.value,
                     stage="Retrying",
                     retry_attempt=attempt, retry_max=cfg.retry_attempts,
                     retry_reason=reason,
                     label=(
-                        f"S{ep.season:02d}E{ep.number:03d} "
+                        f"S{ep.season:02d}E{display_episode:03d} "
                         f"{variant.resolution} {variant.audio.value}"
                     ),
                 ))
@@ -644,7 +671,8 @@ class DownloadWorker:
         from nekofetch.sources.base import Episode
 
         ep = Episode(source_ref=spec["ep_ref"], season=spec["season"],
-                     number=spec["number"], title=spec.get("title"))
+                     number=spec["number"], title=spec.get("title"),
+                     season_part=spec.get("season_part"))
         try:
             if spec.get("dual"):
                 await self._acquire_dual(chain, req, ep, spec["resolution"], folder, job_id, cfg)
@@ -870,7 +898,8 @@ class DownloadWorker:
 
     async def _run_naming_confirms(self, job_id: int, req, resolutions: list[str],
                                    audios, variants=None, *,
-                                   season: int | None) -> None:
+                                   season: int | None,
+                                   season_part: int | None = None) -> None:
         """Show the filename + caption confirm cards and persist the admin's
         choices onto the job's ``resume_state`` for RenameStage / the upload path.
 
@@ -912,13 +941,14 @@ class DownloadWorker:
         try:
             await self._run_naming_confirms_inner(
                 job_id, req, confirm, nc, chat_id, msg_id,
-                smallest=smallest, audio=audio, season=season)
+                smallest=smallest, audio=audio, season=season,
+                season_part=season_part)
         finally:
             await self._set_confirm_hold(job_id, False)
 
     async def _run_naming_confirms_inner(self, job_id, req, confirm, nc,
                                          chat_id, msg_id, *, smallest, audio,
-                                         season) -> None:
+                                         season, season_part=None) -> None:
         # Pull the cached anilist blob once for the "usable names" block.
         blob = None
         try:
@@ -940,7 +970,8 @@ class DownloadWorker:
 
         # ── filename gate ──
         example_name = nc.build_example_filename(
-            self._c, req, resolution=smallest, audio=audio, season=season, episode=1)
+            self._c, req, resolution=smallest, audio=audio, season=season,
+            season_part=season_part, episode=1)
         name_card = (
             "🎬 <b>File name preview</b>\n\n"
             f"<code>{example_name}</code>\n"
@@ -1259,7 +1290,7 @@ class DownloadWorker:
             log.warning("download.has_recorded_files.check_failed", error=str(exc))
             return None
 
-    async def _already_have(self, job_id, ep, resolution, audio) -> bool:
+    async def _already_have(self, job_id, req, ep, resolution, audio) -> bool:
         """True if this exact unit is safely accounted for and needn't re-download.
 
         "Accounted for" means one of:
@@ -1273,11 +1304,16 @@ class DownloadWorker:
         In that case we return False so the unit is fetched again.
         """
         try:
+            season_part, episode = _map_episode_locator(
+                ep.number, ep.season, getattr(req, "franchise_data", None) or {},
+                season_part=getattr(ep, "season_part", None),
+            )
             async with session_scope(self._c.pg_sessionmaker) as session:
                 row = (await session.execute(
                     select(MediaFile).where(
                         MediaFile.job_id == job_id, MediaFile.season == ep.season,
-                        MediaFile.episode == ep.number, MediaFile.resolution == resolution,
+                        MediaFile.season_part == season_part,
+                        MediaFile.episode == episode, MediaFile.resolution == resolution,
                         MediaFile.audio == audio,
                     )
                 )).scalars().first()
@@ -1560,10 +1596,12 @@ class DownloadWorker:
 
     async def _record_file(self, job_id, req, ep, variant, dest, result) -> None:
         actual_path = result.get("path") or str(dest)
-        # Determine season_part from franchise structure so split seasons
-        # (e.g. Vanitas S1 eps 1-12 + S1P2 eps 13-24) name/pack correctly.
-        season_part = _map_episode_to_part(
-            ep.number, ep.season, req.franchise_data or {}
+        # Determine both the part and the episode number within that part. A
+        # torrent may expose S1P2 as raw episodes 13..24, but every downstream
+        # MediaFile/pack/name must carry S1P2 E01..E12.
+        season_part, episode = _map_episode_locator(
+            ep.number, ep.season, req.franchise_data or {},
+            season_part=getattr(ep, "season_part", None),
         )
         async with session_scope(self._c.pg_sessionmaker) as session:
             # Drop any stale orphan row for this exact unit before inserting — a
@@ -1574,7 +1612,8 @@ class DownloadWorker:
             stale = (await session.execute(
                 select(MediaFile).where(
                     MediaFile.job_id == job_id, MediaFile.season == ep.season,
-                    MediaFile.episode == ep.number,
+                    MediaFile.season_part == season_part,
+                    MediaFile.episode == episode,
                     MediaFile.resolution == variant.resolution,
                     MediaFile.audio == variant.audio,
                     MediaFile.published.is_(False),
@@ -1588,7 +1627,7 @@ class DownloadWorker:
                     anime_doc_id=_safe_anime_doc_id(req),
                     season=ep.season,
                     season_part=season_part,
-                    episode=ep.number,
+                    episode=episode,
                     resolution=variant.resolution,
                     audio=variant.audio,
                     original_name=ep.title,
@@ -1818,6 +1857,7 @@ class DownloadWorker:
                         eta_seconds=eta, stage="Uploading", label=title,
                         current_episode=int(ep) if ep is not None else None,
                         season=meta.get("season"),
+                        season_part=meta.get("season_part"),
                         resolution=meta.get("resolution"),
                         audio=meta.get("audio"),
                         episode_index=meta.get("file_index"),
@@ -1939,47 +1979,107 @@ def _safe_folder(req) -> str:
     return re.sub(r"[^\w.\-]+", "_", str(base)).strip("_") or "work"
 
 
-def _map_episode_to_part(episode_num: int, season_num: int, franchise_data: dict) -> int | None:
-    """Map an episode number to its season_part based on franchise structure.
+def _map_episode_locator(
+    episode_num: int, season_num: int | None, franchise_data: dict,
+    *, season_part: int | None = None,
+) -> tuple[int | None, int]:
+    """Return ``(season_part, episode_within_part)`` for a source episode.
 
-    Returns the part number (1, 2, 3...) if the episode belongs to a multi-part season,
-    or None if the season has no parts.
-
-    Example: Vanitas Season 1 has 24 episodes split into Season 1 (eps 1-12) and
-    Season 1 Part 2 (eps 13-24). Episode 15 → part 2.
+    Sources such as torrent packs commonly number a split season continuously
+    (S1E13..S1E24), while the franchise contract treats the second entry as
+    S1P2E01..S1P2E12. A single-entry season remains un-parted and unchanged.
     """
-    if not franchise_data:
-        return None
+    if season_part is not None:
+        # Torrent mappings preserve the source's absolute episode token while
+        # carrying the destination part explicitly (e.g. S1E13 -> part 2).
+        # Normalize it here, but leave already per-part numbering untouched.
+        entries = franchise_data.get("entries", []) if franchise_data else []
+        matching = [
+            e for e in entries
+            if isinstance(e, dict)
+            and e.get("kind") == "season"
+            and e.get("season_number") == season_num
+            and e.get("season_part") == season_part
+        ]
+        if matching:
+            current = matching[0]
+            try:
+                current_count = int(current.get("episodes") or 12)
+            except (TypeError, ValueError):
+                current_count = 12
+            prior = 0
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if (entry.get("kind") == "season"
+                        and entry.get("season_number") == season_num
+                        and (entry.get("season_part") or 0) < season_part):
+                    try:
+                        prior += int(entry.get("episodes") or 12)
+                    except (TypeError, ValueError):
+                        prior += 12
+            if episode_num > current_count and prior:
+                return season_part, max(1, episode_num - prior)
+        return season_part, episode_num
+    if not franchise_data or season_num is None:
+        return None, episode_num
 
-    # Check if franchise has entries with part info
     entries = franchise_data.get("entries", [])
-    if not entries:
-        return None
-
-    # Find all entries matching this season number
     season_entries = [
         e for e in entries
-        if e.get("kind") == "season" and e.get("season_number") == season_num
+        if isinstance(e, dict)
+        and e.get("kind") == "season"
+        and e.get("season_number") == season_num
     ]
-
     if len(season_entries) <= 1:
-        # Single entry for this season, no parts
-        return None
+        return None, episode_num
+    # Multiple unlabelled entries are not enough evidence of a split season;
+    # keep the source locator unchanged until the franchise supplies explicit
+    # part numbers.
+    if not any(e.get("season_part") is not None for e in season_entries):
+        return None, episode_num
 
-    # Multiple entries for same season — they have parts.
-    # Sort by part number and calculate episode boundaries.
     season_entries.sort(key=lambda e: e.get("season_part") or 1)
+    cumulative = 0
+    for index, entry in enumerate(season_entries):
+        try:
+            count = int(entry.get("episodes") or 12)
+        except (TypeError, ValueError):
+            count = 12
+        count = max(count, 1)
+        start = cumulative + 1
+        end = cumulative + count
+        if episode_num <= end:
+            part = entry.get("season_part") or (index + 1)
+            return int(part), max(1, episode_num - cumulative)
+        cumulative = end
 
-    episode_count = 0
-    for entry in season_entries:
-        part_episodes = entry.get("episodes") or 12  # fallback to 12 if not specified
-        episode_count += part_episodes
+    # Keep an out-of-range source episode attached to the final part, while
+    # preserving a useful within-part number instead of returning an invalid
+    # ``None`` locator.
+    last = season_entries[-1]
+    part = last.get("season_part")
+    if part is None:
+        # Multiple entries without explicit part labels are not a split-season
+        # contract; preserve the source locator rather than inventing P01/P02.
+        return None, episode_num
+    try:
+        last_count = int(last.get("episodes") or 12)
+    except (TypeError, ValueError):
+        last_count = 12
+    return int(part), max(1, last_count + episode_num - cumulative)
 
-        if episode_num <= episode_count:
-            return entry.get("season_part")
 
-    # Episode beyond known boundaries — assign to last part
-    return season_entries[-1].get("season_part")
+def _map_episode_to_part(
+    episode_num: int, season_num: int, franchise_data: dict,
+) -> int | None:
+    """Legacy helper returning only the part number.
+
+    New code should use ``_map_episode_locator`` when it also needs the
+    episode-within-part. Keeping this wrapper preserves callers that only used
+    the original part-only contract.
+    """
+    return _map_episode_locator(episode_num, season_num, franchise_data)[0]
 
 
 def _audio_for_language(language: str) -> AudioType | None:

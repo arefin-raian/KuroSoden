@@ -92,6 +92,13 @@ def register_all(client: Client, container: Container) -> None:
 
     register_naming_confirm(client, container)
 
+    # ── Owner pack-caption editor ──────────────────────────────────────────
+    from kurosoden.bots.levi.handlers.pack_caption_handler import (
+        register as register_pack_caption,
+    )
+
+    register_pack_caption(client, container)
+
     # Expose the spawn hook on the container so the shared review enqueue path
     # can raise a live card without importing a Levi module directly.
     async def _spawn_card(job_id: int, chat_id: int) -> None:

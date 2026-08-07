@@ -50,6 +50,40 @@ def _avg_score_pct(scores: list[float]) -> str:
     return f"{int(round(pct))}%"
 
 
+def format_episode_summary(entries) -> str:
+    """Format franchise episode content for the main-channel caption.
+
+    Seasonal episodes are the base number. OVA/ONA/special entries contribute
+    their episode totals as ``extras``; movies are counted as movie entries,
+    because a movie is one title rather than an episode count.
+    """
+    seasonal = extras = movies = 0
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind") or entry.get("format") or "").lower()
+        episodes = int(entry.get("episodes") or entry.get("episode_count") or 0)
+        if kind in {"season", "tv", "tv_short"}:
+            seasonal += episodes
+        elif kind in {"movie", "movies"} or kind == "movie".lower():
+            movies += 1
+        elif kind in {"special", "tv_special", "ova", "ona", "extra"}:
+            extras += episodes
+
+    parts: list[str] = []
+    if seasonal:
+        parts.append(str(seasonal))
+    elif extras:
+        parts.append("0")
+    elif not movies:
+        return "—"
+    if extras:
+        parts.append(f"+ {extras} {'extra' if extras == 1 else 'extras'}")
+    if movies:
+        parts.append(f"+ {movies} {'movie' if movies == 1 else 'movies'}")
+    return " ".join(parts)
+
+
 def _collapse(text: str | None) -> str:
     """Flatten a synopsis to one clean paragraph.
 
@@ -87,8 +121,6 @@ class PublicationFacts:
     backdrop_url: str | None = None   # TMDB English 16:9 backdrop for the post photo
     bot_username: str | None = None
     is_channel: bool = False            # True when distribution target is a channel, not a bot
-    invite_link: str | None = None      # private invite link we minted for the channel
-    anime_doc_id_bot: int | None = None  # DistributionBot.id backing this title, if any
     # Private, bot-minted invite link to the distribution channel. Preferred over
     # the public t.me/<username> link for the Download button so traffic flows
     # through a link we control (and can revoke/replace on a recreate).
@@ -333,24 +365,19 @@ class MainChannelService:
             walk = (blob or {}).get("franchise")
             if walk:
                 vals = list(walk.values()) if isinstance(walk, dict) else list(walk)
-                # Episodes = Σ episodes of EVERY entry (seasons + movies + OVAs +
-                # ONAs + specials) — the franchise TOTAL, per spec. A single-ONA
-                # franchise (Takopi) has 0 TV episodes, so a TV-only sum wrongly
-                # fell back to the pack count.
-                total_eps = sum(
-                    (e.get("episodes") or 0)
-                    for e in vals
-                    if isinstance(e, dict)
-                )
-                if total_eps:
-                    facts.episodes = str(total_eps)
+                # Keep the main seasonal count distinct from extras/movies so a
+                # franchise reads "25 + 3 extras + 2 movies" instead of one opaque
+                # total that makes movies look like episodes.
+                summary = format_episode_summary(vals)
+                if summary != "—":
+                    facts.episodes = summary
                 # Rating = average of every entry's AniList score, as a plain
                 # 2-digit percent (scores are 0-10 here → ×10, rounded to int).
                 scores = [e.get("score") for e in vals
                           if isinstance(e, dict) and e.get("score") is not None]
                 if scores:
                     facts.rating = _avg_score_pct(scores)
-                if total_eps or scores:
+                if any(isinstance(e, dict) and (e.get("episodes") or e.get("episode_count")) for e in vals) or scores:
                     return
         except Exception as exc:  # noqa: BLE001 — cache miss → live below
             log.debug("mainchannel.franchise_cache.failed",
@@ -367,14 +394,19 @@ class MainChannelService:
             return
         root_id = int(raw_id)
 
-        # Episodes = Σ episodes of EVERY entry, and Rating = average of every
-        # entry's AniList score (plain 2-digit percent). One walk supplies both.
+        # Episodes and rating come from the same franchise walk.
         try:
             entries = await anilist.walk_franchise_full(root_id)
             vals = list(entries.values())
-            total_eps = sum((getattr(e, "episodes", 0) or 0) for e in vals)
-            if total_eps:
-                facts.episodes = str(total_eps)
+            summary = format_episode_summary([
+                {
+                    "format": getattr(e, "format", ""),
+                    "episodes": getattr(e, "episodes", 0),
+                }
+                for e in vals
+            ])
+            if summary != "—":
+                facts.episodes = summary
             scores = [e.score for e in vals if e.score is not None]
             if scores:
                 facts.rating = _avg_score_pct(scores)
@@ -477,6 +509,107 @@ class MainChannelService:
         await self._record(anime_doc_id, message_id, facts.title)
         log.info("mainchannel.published", anime=anime_doc_id, message_id=message_id)
         return message_id
+
+    async def distribution_link(self, anime_doc_id: str) -> str | None:
+        """Return the current user-facing link for a title's distribution target."""
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            bot = (
+                await session.execute(
+                    select(DistributionBot).where(
+                        DistributionBot.anime_doc_id == anime_doc_id,
+                        DistributionBot.enabled.is_(True),
+                    )
+                )
+            ).scalars().first()
+        if bot is None or not bot.username and not bot.invite_link:
+            return None
+        if bot.is_channel:
+            return bot.invite_link or f"https://t.me/{bot.username}"
+        return f"https://t.me/{bot.username}?start=anime_{anime_doc_id}" if bot.username else None
+
+    async def reply_update(
+        self,
+        anime_doc_id: str,
+        entry_label: str,
+        episodes: int | str,
+        quality: str,
+        channel_link: str,
+    ) -> bool:
+        """Reply to the existing main-channel post after a new entry is published.
+
+        The reply deliberately has no keyboard: the only action is the localized
+        hyperlink in the catalog template. This keeps update announcements readable
+        and lets the owner reword them without a code change.
+        """
+        client = getattr(self._c, "admin_client", None)
+        if not self._active() or client is None:
+            return False
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            post = (
+                await session.execute(
+                    select(ChannelPost).where(ChannelPost.anime_doc_id == anime_doc_id)
+                )
+            ).scalar_one_or_none()
+        if post is None or not post.main_message_id:
+            return False
+        from nekofetch.localization.messages import M, t
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            pack = (
+                await session.execute(
+                    select(StoragePack)
+                    .where(StoragePack.anime_doc_id == anime_doc_id)
+                    .limit(1)
+                )
+            ).scalars().first()
+        title = pack.anime_title if pack else anime_doc_id
+        try:
+            await client.send_message(
+                self.cfg.channel_id,
+                t(
+                    M.SEASON_UPDATE_REPLY,
+                    title=title,
+                    entry_label=entry_label,
+                    episodes=episodes,
+                    quality=quality,
+                    channel_link=channel_link,
+                ),
+                reply_to_message_id=post.main_message_id,
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — announcement must not fail publish
+            log.warning("mainchannel.update_reply.failed",
+                        anime=anime_doc_id, error=str(exc))
+            return False
+
+    async def reply_recovery(
+        self, anime_doc_id: str, title: str, channel_link: str,
+    ) -> bool:
+        """Reply to a main post after its distribution channel is restored."""
+        client = getattr(self._c, "admin_client", None)
+        if not self._active() or client is None:
+            return False
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            post = (
+                await session.execute(
+                    select(ChannelPost).where(ChannelPost.anime_doc_id == anime_doc_id)
+                )
+            ).scalar_one_or_none()
+        if post is None or not post.main_message_id:
+            return False
+        from nekofetch.localization.messages import M, t
+        try:
+            await client.send_message(
+                self.cfg.channel_id,
+                t(M.BAN_RECOVERY_REPLY, title=title, channel_link=channel_link),
+                reply_to_message_id=post.main_message_id,
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("mainchannel.recovery_reply.failed",
+                        anime=anime_doc_id, error=str(exc))
+            return False
 
     async def _record(self, anime_doc_id: str, message_id: int, title: str) -> None:
         from nekofetch.services.index_channel_service import IndexChannelService

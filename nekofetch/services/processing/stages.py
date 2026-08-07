@@ -1384,13 +1384,22 @@ class EncodeStage(Stage):
         if not heights:
             return
 
+        # Release order is part of the encode contract. Normalize before
+        # selecting source files so combined torrents cannot make processing run
+        # S1E03 → S1E01 or S1P2 before S1P1.
+        ctx.files.sort(key=lambda f: (
+            f.season if f.season is not None else 10_000,
+            f.season_part if f.season_part is not None else 0,
+            f.episode if f.episode is not None else 0,
+        ))
+
         # Only encode files that are actually present on disk this pass. To stay
         # safe across reprocess passes (where rows are reloaded from the DB and
         # the in-memory ``_is_rendition`` marker is gone), encode ONLY the
         # highest-resolution files on disk — derived lower tiers are never a
         # source, so we can't re-encode our own outputs.
         on_disk = [
-            f for f in list(ctx.files)
+            f for f in ctx.files
             if f.local_path and Path(f.local_path).exists()
         ]
         if not on_disk:
@@ -1411,7 +1420,10 @@ class EncodeStage(Stage):
         for f in on_disk:
             h = _res_h(f)
             if h > 0:
-                present.setdefault((f.season, f.episode, f.audio), set()).add(h)
+                present.setdefault(
+                    (f.season, f.season_part, f.episode, f.audio),
+                    set(),
+                ).add(h)
 
         max_h = max((_res_h(f) for f in on_disk), default=0)
         sources = [f for f in on_disk if _res_h(f) == max_h and max_h > 0]
@@ -1447,7 +1459,9 @@ class EncodeStage(Stage):
         total_units = sum(
             1 for f in sources for h in heights
             if f"{h}p" != (f.resolution or "1080p")
-            and h not in present.get((f.season, f.episode, f.audio), set())
+            and h not in present.get(
+                (f.season, f.season_part, f.episode, f.audio), set()
+            )
         ) or 1
         done_units = 0
         await _push_stage_progress(self.c, ctx, "Encoding", 0.0, file_index=0, file_total=n)
@@ -1474,7 +1488,9 @@ class EncodeStage(Stage):
                 # Reversal: this tier was already downloaded for this unit —
                 # skip encoding it (that's the whole point of downloading every
                 # provided quality instead of transcoding down from 1080p).
-                if height in present.get((f.season, f.episode, f.audio), set()):
+                if height in present.get(
+                    (f.season, f.season_part, f.episode, f.audio), set()
+                ):
                     ctx.notes.append(f"encode {label}: already downloaded — skipped")
                     continue
                 await _push_stage_progress(
@@ -1500,10 +1516,11 @@ class EncodeStage(Stage):
                         # Is this rendition already known (loaded from DB into
                         # ctx.files, or added earlier this pass)? Match on the
                         # natural key so we don't insert a duplicate row.
-                        existing = next(
-                            (r for r in list(ctx.files) + new_rows
-                             if r.season == f.season and r.episode == f.episode
-                             and r.resolution == label and r.audio == f.audio),
+                        existing = next(                             (r for r in list(ctx.files) + new_rows
+                              if r.season == f.season
+                              and r.season_part == f.season_part
+                              and r.episode == f.episode
+                              and r.resolution == label and r.audio == f.audio),
                             None,
                         )
                         if existing is None:

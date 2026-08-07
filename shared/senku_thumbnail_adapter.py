@@ -324,14 +324,31 @@ class SenkuThumbnailAdapter:
         anime_doc_id = franchise.get("anime_doc_id")
         title = entry.title or entry.label
         try:
-            from nekofetch.services.thumbnail_service import gather_thumbnail_fields
+            from nekofetch.services.thumbnail_service import (
+                gather_thumbnail_fields,
+                persist_thumbnail_source,
+            )
             fields = await gather_thumbnail_fields(self._c, title, anime_doc_id)
+            source_fields = {
+                **fields,
+                "title": title,
+                "logo_url": sel.logo_url,
+                "poster_url": sel.poster_url,
+                "bg_url": sel.backdrop_url,
+                "entry_label": entry.label,
+                "entry_index": entry.index,
+                "anilist_id": entry.anilist_id,
+            }
             path = await renderer.render_thumbnail(
                 title=title,
                 logo_url=sel.logo_url,
                 poster_url=sel.poster_url,
                 bg_url=sel.backdrop_url,
                 **fields,
+            )
+            await persist_thumbnail_source(
+                self._c, anime_doc_id, entry.anilist_id, source_fields,
+                image_path=path,
             )
         except Exception as exc:  # noqa: BLE001
             # Flag a missing/broken headless browser distinctly so the wizard can
@@ -350,8 +367,10 @@ class SenkuThumbnailAdapter:
             return None
         if not path:
             return None
+        # Rendering produces a preview only. The wizard's explicit Approve action
+        # is the sole transition that marks an entry done.
         await self.cache.set_selection(code, entry.index, asset="thumbnail",
-                                       value=f"file://{path}", done=True)
+                                       value=f"file://{path}")
         log.info("senku.thumb.rendered", code=code, entry=entry.index, path=str(path))
         return path
 

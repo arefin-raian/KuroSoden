@@ -241,6 +241,32 @@ class FranchiseFlowService:
                 log.debug("franchise.entries.walk_failed", error=str(exc))
         return entries or None
 
+    async def persisted_entries(self, franchise_data: dict, anime_doc_id: str) -> list[dict]:
+        """Return the canonical, JSON-safe entries to persist on a Request.
+
+        Request rows are the durable handoff contract between Lelouch and every
+        later stage. Resolve the same cache-first/live franchise walk used by the
+        download and distribution paths, then serialize only included entries in
+        the shape consumed by ``_map_episode_to_part`` and ``dict_to_mapping``.
+        """
+        walked = await self.resolve_franchise_entries(franchise_data, anime_doc_id)
+        mapping = self.build_mapping(
+            franchise_data, anime_doc_id, franchise_entries=walked,
+        )
+        return [
+            {
+                "anilist_id": entry.anilist_id,
+                "kind": entry.kind.value,
+                "season_number": entry.season_number,
+                "season_part": entry.season_part,
+                "episodes": entry.episodes,
+                "title": entry.title,
+                "included": entry.included,
+                "auto_detected_part": entry.auto_detected_part,
+            }
+            for entry in mapping.included_entries
+        ]
+
     def _build_from_franchise_entries(
         self,
         franchise_entries: dict[int, any],

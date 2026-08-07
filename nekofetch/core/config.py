@@ -253,7 +253,7 @@ class ProcessingConfig(BaseModel):
 class RenameConfig(BaseModel):
     enabled: bool = True
     # Default (TV season) filename pattern.
-    template: str = "{title} S{season}E{episode} [{resolution}] [{audio}] - {group}"
+    template: str = "{title} S{season}{season_part}E{episode} [{resolution}] [{audio}] - {group}"
     # Per-type overrides. Movies and OVAs/specials have no meaningful S/E pair, so
     # forcing them into the season template ("S90E01") reads terribly. When a
     # per-type template is empty, that type falls back to ``template``.

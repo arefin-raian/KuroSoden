@@ -1251,6 +1251,15 @@ class ThumbnailChannelService:
         # Shared with Senku's distribution wizard via ``gather_thumbnail_fields``. ──
         from nekofetch.services.thumbnail_service import gather_thumbnail_fields
         fields = await gather_thumbnail_fields(self._c, title, anime_doc_id)
+        source_fields = {
+            **fields,
+            "title": title,
+            "logo_url": entry.logo_url,
+            "poster_url": entry.poster_url,
+            "bg_url": entry.bg_url,
+            "entry_label": entry.label,
+            "anilist_id": entry.anilist_id,
+        }
 
         # Build the thumbnail
         thumbnail_path = None
@@ -1261,6 +1270,11 @@ class ThumbnailChannelService:
                 poster_url=entry.poster_url,
                 bg_url=entry.bg_url,
                 **fields,
+            )
+            from nekofetch.services.thumbnail_service import persist_thumbnail_source
+            await persist_thumbnail_source(
+                self._c, anime_doc_id, entry.anilist_id, source_fields,
+                image_path=thumbnail_path,
             )
         except Exception as exc:
             log.warning("thumbcc.render.failed", anime=anime_doc_id, error=str(exc))

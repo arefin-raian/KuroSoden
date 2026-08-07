@@ -1,8 +1,7 @@
 """Phase 2 coverage — main-channel post content corrections (Gojo spec).
 
 The main-channel post must show franchise-level truth, not season-1 leftovers:
-  • EPISODES = Σ episodes of the TV-season continuity chain ONLY
-    (movies / OVAs / specials / spin-offs excluded).
+  • EPISODES = seasonal episodes plus explicitly labelled extras and movies.
   • RATING   = AVERAGE of every franchise entry's AniList score.
   • OVERVIEW = one clean paragraph (ragged newlines / <br> collapsed).
 
@@ -85,9 +84,8 @@ def _entry_eps(aid: int, score: float | None, episodes: int | None,
 
 
 @pytest.mark.asyncio
-async def test_episodes_are_total_of_all_entries():
-    """EPISODES = Σ episodes of EVERY entry (seasons + movies + OVAs), per spec —
-    NOT a TV-only sum and NOT the pack-derived max."""
+async def test_episodes_are_formatted_by_entry_kind():
+    """Seasonal episodes remain the base; extras and movies are labelled."""
     anilist = _FakeAnilist(
         totals=FranchiseTotals(seasons=3, movies=2, episodes=64),
         entries={
@@ -103,7 +101,7 @@ async def test_episodes_are_total_of_all_entries():
 
     await svc._apply_franchise_facts("anilist:100", facts)
 
-    assert facts.episodes == "27"          # 12+12+1+2, NOT the "12" pack max
+    assert facts.episodes == "24 + 2 extras + 1 movie"
     assert anilist.walk_calls == [100]
 
 

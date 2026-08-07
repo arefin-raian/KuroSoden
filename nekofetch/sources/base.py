@@ -47,6 +47,9 @@ class Episode:
     number: int
     title: str | None = None
     kind: ContentKind = ContentKind.SEASON
+    # Normalized franchise part for split seasons (e.g. S1P2). None means the
+    # source locator is still using the season's native numbering.
+    season_part: int | None = None
 
 
 @dataclass(slots=True)

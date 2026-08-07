@@ -23,6 +23,7 @@ to the Phase 3 handler once it lands.
 from __future__ import annotations
 
 import asyncio
+import secrets
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
@@ -706,7 +707,7 @@ def register(client: Client, container: Container) -> None:
         await _thumb_next(q.message.chat.id, code, old_msg=q.message)
 
     async def _thumb_generate(q: CallbackQuery, code: str, index: int) -> None:
-        """Render one entry's thumbnail, upload it for reference, then advance."""
+        """Render one entry's thumbnail, then wait for explicit approval."""
         entry = await cache.get_entry(code, index)
         if entry is None:
             await q.answer("Entry not found.", show_alert=True)
@@ -728,12 +729,108 @@ def register(client: Client, container: Container) -> None:
                 old_msg=q.message,
             )
             return
-        # Upload the rendered card so the admin sees the result inline.
+        # Upload the rendered card so the admin sees the result inline, but do not
+        # advance until the operator explicitly approves this entry.
         try:
-            await client.send_photo(q.message.chat.id, str(path))
-        except Exception as exc:  # noqa: BLE001 — preview is best-effort
+            await client.send_photo(
+                q.message.chat.id, str(path),
+                reply_markup=keyboard([
+                    [(V.BTN_THUMB_APPROVE,
+                      cb(BOT, "wiz", "thumbok", code, str(index))),
+                     (V.BTN_THUMB_REDO,
+                      cb(BOT, "wiz", "thumbredo", code, str(index)))],
+                ]),
+            )
+        except Exception as exc:  # noqa: BLE001 — keep the Generate card usable
             log.debug("senku.wiz.thumb_preview_failed", code=code, error=str(exc))
-        await _thumb_next(q.message.chat.id, code, old_msg=None)
+            await send_screen(
+                client, q.message.chat.id,
+                card(V.THUMB_GALLERY_FAIL, image=pick_artwork(BOT), bot_name=BOT,
+                     buttons=[[(V.BTN_GENERATE,
+                                cb(BOT, "wiz", "gen", code, str(index)))],
+                              [(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))]]),
+                old_msg=q.message,
+            )
+            return
+        await q.message.delete()
+
+    async def _thumb_callback_lock(code: str, index: int) -> tuple[str, str] | None:
+        """Atomically claim one thumbnail callback until its state transition ends."""
+        redis = container.redis
+        if redis is None:
+            return None
+        key = f"nf:senku:thumb_callback:{code}:{index}"
+        token = secrets.token_urlsafe(18)
+        try:
+            acquired = await redis.set(key, token, nx=True, ex=180)
+        except Exception as exc:  # noqa: BLE001 — fail closed on Redis blips
+            log.warning("senku.wiz.thumb_lock_failed", code=code, error=str(exc))
+            return None
+        return (key, token) if acquired else ("", "")
+
+    async def _release_thumb_callback_lock(lock: tuple[str, str]) -> None:
+        """Release only our lock; never delete a later owner's lock."""
+        key, token = lock
+        redis = container.redis
+        if redis is None:
+            return
+        # Redis deployments in this project expose eval; use a compare/delete
+        # script so an expired-and-reacquired lock cannot be removed by us.
+        try:
+            await redis.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                "return redis.call('del', KEYS[1]) else return 0 end",
+                1, key, token,
+            )
+        except Exception as exc:  # noqa: BLE001 — TTL still bounds the lock
+            log.debug("senku.wiz.thumb_unlock_failed", key=key, error=str(exc))
+
+    async def _thumb_approve(q: CallbackQuery, code: str, index: int) -> None:
+        """Approve exactly one rendered entry and advance to the next pending one."""
+        lock = await _thumb_callback_lock(code, index)
+        if lock is None:
+            await q.answer("Thumbnail actions are temporarily unavailable.", show_alert=True)
+            return
+        if lock == ("", ""):
+            await q.answer("This thumbnail action is already processing.", show_alert=True)
+            return
+        try:
+            await q.answer("Checking…")
+            try:
+                await q.message.edit_reply_markup(None)
+            except Exception:  # noqa: BLE001 — callback locking is cosmetic
+                pass
+            sel = await cache.get_selection(code, index)
+            if sel.done or not sel.thumbnail_url:
+                return
+            await cache.set_selection(code, index, done=True)
+            await _thumb_next(q.message.chat.id, code, old_msg=q.message)
+        finally:
+            await _release_thumb_callback_lock(lock)
+
+    async def _thumb_redo(q: CallbackQuery, code: str, index: int) -> None:
+        """Reset only this entry's picks and reopen its logo step."""
+        lock = await _thumb_callback_lock(code, index)
+        if lock is None:
+            await q.answer("Thumbnail actions are temporarily unavailable.", show_alert=True)
+            return
+        if lock == ("", ""):
+            await q.answer("This thumbnail action is already processing.", show_alert=True)
+            return
+        try:
+            await q.answer("Redoing this entry.")
+            try:
+                await q.message.edit_reply_markup(None)
+            except Exception:  # noqa: BLE001
+                pass
+            await cache.clear_selection(code, index)
+            entry = await cache.get_entry(code, index)
+            if entry is None:
+                await q.answer("Entry not found.", show_alert=True)
+                return
+            await _thumb_asset_card(q.message.chat.id, code, entry, "logo", old_msg=q.message)
+        finally:
+            await _release_thumb_callback_lock(lock)
 
     async def _enter_watch_order(chat_id: int, code: str, *, old_msg: Message | None,
                                  rendered: bool = False) -> None:
@@ -942,6 +1039,16 @@ def register(client: Client, container: Container) -> None:
                 await q.answer("Bad entry.", show_alert=True)
                 return
             await _thumb_generate(q, code, index)
+        elif action in ("thumbok", "thumbredo"):
+            try:
+                index = int(parts[4])
+            except (IndexError, ValueError):
+                await q.answer("Bad entry.", show_alert=True)
+                return
+            if action == "thumbok":
+                await _thumb_approve(q, code, index)
+            else:
+                await _thumb_redo(q, code, index)
         elif action == "order":
             # Watch-order confirm card (Phase 4).
             await q.answer()

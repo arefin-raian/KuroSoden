@@ -35,13 +35,14 @@ from dataclasses import dataclass
 
 from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
 from nekofetch.infrastructure.database.postgres.models import (
     BotContentPost,
     ChannelContentBackup,
+    ChannelLayout,
     ChannelPost,
     DistributionBot,
     PublishedPostBackup,
@@ -627,11 +628,15 @@ class BackupService:
         # references already has a new id → its {BOT_QUAL#id:…} quality links jump
         # to the restored season card, not the channel root.
         msg_by_id: dict[int, int] = {}
+        restored_cards: list[tuple[dict, int]] = []
+        restored_layout: list[tuple[str, int, dict | None]] = []
         for card in cards:
             try:
                 if card.get("divider_before") and divider:
                     try:
-                        await client.send_sticker(new_chat_id, divider)
+                        divider_msg = await client.send_sticker(new_chat_id, divider)
+                        if divider_msg is not None:
+                            restored_layout.append(("divider", divider_msg.id, None))
                     except Exception as exc:  # noqa: BLE001
                         log.debug("restore.dist.divider_failed", error=str(exc))
 
@@ -660,11 +665,62 @@ class BackupService:
                         )
                     except Exception as exc:  # noqa: BLE001
                         log.debug("restore.dist.pin_failed", error=str(exc))
+                restored_cards.append((card, sent.id))
+                restored_layout.append((card.get("kind") or "season_card", sent.id, card))
                 stats.restored += 1
             except Exception as exc:  # noqa: BLE001 — skip one bad card
                 stats.failed += 1
                 log.warning("restore.dist.card_failed",
                             anime=anime_doc_id, error=str(exc))
+
+        # Keep the database's content/layout snapshot aligned with the messages
+        # just restored. This matters because recreate_bot otherwise has no live
+        # BotContentPost rows left after its pre-restore wipe, and a later backup
+        # or update would silently lose the restored cards/buttons.
+        if restored_cards:
+            async with session_scope(self._c.pg_sessionmaker) as session:
+                bot = (
+                    await session.execute(
+                        select(DistributionBot).where(
+                            DistributionBot.anime_doc_id == anime_doc_id,
+                            DistributionBot.chat_id == new_chat_id,
+                            DistributionBot.is_channel.is_(True),
+                        )
+                    )
+                ).scalars().first()
+                if bot is not None:
+                    await session.execute(
+                        # The recreate path deleted these already; deleting here
+                        # also makes a direct/manual restore idempotent.
+                        delete(BotContentPost).where(BotContentPost.bot_id == bot.id)
+                    )
+                    await session.execute(
+                        delete(ChannelLayout).where(ChannelLayout.channel_bot_id == bot.id)
+                    )
+                    content_order = 0
+                    for seq, (kind, message_id, card) in enumerate(restored_layout):
+                        if card is not None:
+                            session.add(BotContentPost(
+                                bot_id=bot.id,
+                                post_type=kind,
+                                order=content_order,
+                                caption=card.get("caption") or "",
+                                image_url=card.get("image_url"),
+                                image_cached_url=card.get("image_url"),
+                                button_data=card.get("button_data"),
+                                is_pinned=bool(card.get("is_pinned")),
+                                tg_message_id=message_id,
+                                anilist_id=card.get("anilist_id"),
+                            ))
+                            content_order += 1
+                        session.add(ChannelLayout(
+                            channel_bot_id=bot.id,
+                            seq=seq,
+                            kind=kind,
+                            tg_message_id=message_id,
+                            anilist_id=(card.get("anilist_id") if card else None),
+                            is_pinned=bool(card and card.get("is_pinned")),
+                        ))
 
         log.info("restore.dist.done", anime=anime_doc_id, total=stats.total,
                  restored=stats.restored, failed=stats.failed, chat=new_chat_id)

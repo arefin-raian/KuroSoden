@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from pyrogram.enums import ParseMode
 from sqlalchemy import select
 
 from nekofetch.core.container import Container
@@ -146,6 +147,7 @@ class StorageChannelService:
 
         file_ids: list[int] = []
         header_id: int | None = None
+        header_caption: str | None = None
         for mid in range(start_message_id, end_message_id + 1):
             try:
                 msg = await client.get_messages(channel_id, mid)
@@ -155,8 +157,9 @@ class StorageChannelService:
                 continue
             if msg.document or msg.video or msg.audio:
                 file_ids.append(mid)
-            elif msg.text and header_id is None and not file_ids:
+            elif (getattr(msg, "text", None) or getattr(msg, "caption", None)) and header_id is None and not file_ids:
                 header_id = mid
+                header_caption = getattr(msg, "text", None) or getattr(msg, "caption", None)
             # stickers/other are treated as markers and skipped
 
         return await self._persist(
@@ -165,6 +168,7 @@ class StorageChannelService:
             start_message_id=file_ids[0] if file_ids else start_message_id,
             end_message_id=end_message_id,
             file_message_ids=file_ids,
+            header_caption=header_caption,
             ingest_method="indexed",
         )
 
@@ -200,13 +204,13 @@ class StorageChannelService:
         channel_id = self.cfg.channel_id
         thumb_arg = str(thumb) if thumb and thumb.exists() else None
 
-        header = await client.send_message(
-            channel_id,
-            self.header_text(title=title, season=key.season, resolution=key.resolution,
-                             audio=key.audio, episode_from=episode_from, episode_to=episode_to,
-                             content_type=content_type, season_part=key.season_part,
-                             alt_titles=alt_titles),
+        header_caption = self.header_text(
+            title=title, season=key.season, resolution=key.resolution,
+            audio=key.audio, episode_from=episode_from, episode_to=episode_to,
+            content_type=content_type, season_part=key.season_part,
+            alt_titles=alt_titles,
         )
+        header = await client.send_message(channel_id, header_caption)
         n_files = len(file_paths)
         file_ids: list[int] = []
         for idx, path in enumerate(file_paths):
@@ -215,6 +219,8 @@ class StorageChannelService:
             meta = dict((file_meta or [{}] * n_files)[idx] or {})
             meta.setdefault("file_index", idx + 1)
             meta.setdefault("file_total", n_files)
+            meta.setdefault("season", key.season)
+            meta.setdefault("season_part", key.season_part)
             prog_cb = None
             if on_progress is not None:
                 async def prog_cb(current, total, _meta=meta):  # noqa: ANN001
@@ -240,6 +246,7 @@ class StorageChannelService:
             file_message_ids=file_ids,
             ingest_method="uploaded",
             episode_from=episode_from, episode_to=episode_to,
+            header_caption=header_caption,
         )
 
     async def _persist(self, key: PackKey, **fields) -> StoragePack:
@@ -266,6 +273,7 @@ class StorageChannelService:
                 start_message_id=fields["start_message_id"],
                 end_message_id=fields["end_message_id"],
                 file_message_ids=file_ids, file_count=len(file_ids),
+                header_caption=fields.get("header_caption"),
                 episode_from=fields.get("episode_from"), episode_to=fields.get("episode_to"),
                 entry_id=key.entry_id,
                 ingest_method=fields.get("ingest_method"),
@@ -304,6 +312,8 @@ class StorageChannelService:
                 existing.file_message_ids = merged
                 existing.file_count = len(merged)
                 existing.end_message_id = fields["end_message_id"]
+                if fields.get("header_caption") is not None:
+                    existing.header_caption = fields["header_caption"]
                 # Keep the original header/start from the first upload.
                 existing.ingest_method = fields.get("ingest_method")
                 pack = existing
@@ -315,6 +325,80 @@ class StorageChannelService:
             return pack
 
     # ── lookup & delivery ──
+    async def update_header_caption(self, pack_id: int, caption: str) -> StoragePack | None:
+        """Persist an entry caption across sibling packs and edit live headers.
+
+        A storage entry can have several resolution/audio packs, but the operator
+        edits one logical header. Keep those sibling rows synchronized and update
+        every live header. Indexed headers may be media messages (caption rather
+        than text), so fall back to ``edit_message_caption`` when Telegram rejects
+        the text edit.
+        """
+        clean = (caption or "").strip()
+        if not clean:
+            raise ValueError("caption must not be empty")
+
+        headers: list[tuple[int, int, int]] = []
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            selected = await session.get(StoragePack, pack_id)
+            if selected is None or not selected.enabled:
+                return None
+            siblings = list((await session.execute(
+                select(StoragePack).where(
+                    StoragePack.anime_doc_id == selected.anime_doc_id,
+                    StoragePack.season == selected.season,
+                    StoragePack.season_part == selected.season_part,
+                    StoragePack.entry_id == selected.entry_id,
+                    StoragePack.enabled.is_(True),
+                )
+            )).scalars().all())
+            for pack in siblings:
+                pack.header_caption = clean
+                if pack.header_message_id:
+                    headers.append((pack.channel_id, pack.header_message_id, pack.id))
+            await session.flush()
+            session.expunge_all()
+
+        if headers:
+            client = self._client
+            for channel_id, message_id, sibling_id in headers:
+                try:
+                    await client.edit_message_text(
+                        channel_id, message_id, clean,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as text_exc:  # noqa: BLE001 - media headers use captions
+                    try:
+                        await client.edit_message_caption(
+                            channel_id, message_id, clean,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception as caption_exc:  # noqa: BLE001 - DB remains authoritative
+                        log.warning(
+                            "storage.header_caption.telegram_edit_failed",
+                            pack=sibling_id, text_error=str(text_exc),
+                            caption_error=str(caption_exc),
+                        )
+        # Return the selected row's detached, updated representation. It is
+        # deliberately reconstructed from the persisted values rather than
+        # relying on a session-expunged ORM instance after sibling updates.
+        selected.header_caption = clean
+        return selected
+
+    async def list_packs(self, *, limit: int = 30) -> list[StoragePack]:
+        """Return enabled packs for the Levi caption editor."""
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            packs = list((await session.execute(
+                select(StoragePack)
+                .where(StoragePack.enabled.is_(True))
+                .order_by(StoragePack.anime_title, StoragePack.season,
+                         StoragePack.season_part, StoragePack.resolution)
+                .limit(limit)
+            )).scalars().all())
+            for pack in packs:
+                session.expunge(pack)
+            return packs
+
     async def find_pack(self, key: PackKey) -> StoragePack | None:
         async with session_scope(self._c.pg_sessionmaker) as session:
             pack = (

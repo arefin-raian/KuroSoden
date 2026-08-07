@@ -152,7 +152,9 @@ def parse_filename_edit(text: str) -> dict:
 # ── preview builders (shared by the worker's confirm cards) ───────────────────
 
 def build_example_filename(container, request, *, resolution: str,
-                           audio, season: int | None, episode: int = 1) -> str:
+                           audio, season: int | None,
+                           season_part: int | None = None,
+                           episode: int = 1) -> str:
     """Render the episode-1 example filename exactly as RenameStage would.
 
     Mirrors the RenameStage token assembly (same ``_short_title`` + template +
@@ -172,7 +174,8 @@ def build_example_filename(container, request, *, resolution: str,
     return templates.render_filename(
         cfg.template,
         title=anime_title, short_title=short,
-        season=f"{season or 1:02d}", season_part="",
+        season=f"{season or 1:02d}",
+        season_part=f"P{season_part:02d}" if season_part else "",
         episode=f"{episode:02d}", content_type="Season",
         resolution=resolution or "1080p", audio=audio_short,
         source=request.source, group=group,

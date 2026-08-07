@@ -182,6 +182,7 @@ def download_card_html(
     progress: float = 0.0,
     stage: str | None = None,
     season: int | None = None,
+    season_part: int | None = None,
     current_episode: int | None = None,
     episode_index: int | None = None,
     total_episodes: int | None = None,
@@ -206,7 +207,10 @@ def download_card_html(
     """
     title_bits = [_esc(title)]
     if current_episode is not None:
-        title_bits.append(f"[S{(season or 1):02d}E{int(current_episode):02d}]")
+        part = f"P{int(season_part):02d}" if season_part is not None else ""
+        title_bits.append(
+            f"[S{(season or 1):02d}{part}E{int(current_episode):02d}]"
+        )
     if resolution:
         title_bits.append(f"[{_esc(resolution)}]")
     if audio:

@@ -63,6 +63,26 @@ def is_owner(container: Container, obj: Any) -> bool:
         return False
 
 
+async def levi_link(container: Container) -> str | None:
+    """Deep link to the Levi task bot, or ``None`` when it is unavailable."""
+    cached = getattr(container, "_levi_username", None)
+    if cached:
+        return f"https://t.me/{cached}"
+    mgr = getattr(container, "pipeline_manager", None)
+    client = getattr(mgr, "levi", None) if mgr else None
+    if client is None:
+        return None
+    try:
+        me = await client.get_me()
+        username = getattr(me, "username", None)
+        if username:
+            container._levi_username = username  # type: ignore[attr-defined]
+            return f"https://t.me/{username}"
+    except Exception as exc:  # noqa: BLE001 — best-effort; button just omitted
+        log.warning("access_gate.levi_link_failed", error=str(exc))
+    return None
+
+
 async def lelouch_link(container: Container) -> str | None:
     """Deep link to the Lelouch request bot (``https://t.me/<username>``).
 

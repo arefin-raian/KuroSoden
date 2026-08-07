@@ -437,6 +437,20 @@ def register(client: Client, container: Container) -> None:
         anilist_id = franchise_data.get("anilist_id")
         source = franchise_data.get("_source", "anilist")
 
+        # Persist the canonical franchise walk on the request. Later stages use
+        # this JSON after the Telegram/UI context is gone, especially to split a
+        # season into independently numbered parts (S1P2 E01..E12).
+        franchise_json_entries: list[dict] = []
+        try:
+            from nekofetch.services.franchise_flow import FranchiseFlowService
+
+            doc_id = f"{anilist_id}" if anilist_id is not None else query
+            franchise_json_entries = await FranchiseFlowService(container).persisted_entries(
+                franchise_data, doc_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — aggregated fallback remains valid
+            log.warning("lelouch.franchise_entries.persist_failed", error=str(exc))
+
         franchise_json = {
             "anilist_id": anilist_id,
             "source": source,
@@ -452,6 +466,7 @@ def register(client: Client, container: Container) -> None:
             "franchise_ovas": franchise_data.get("franchise_ovas"),
             "franchise_onas": franchise_data.get("franchise_onas"),
             "franchise_specials": franchise_data.get("franchise_specials"),
+            "entries": franchise_json_entries,
             "relations": franchise_data.get("relations", []),
             "genres": franchise_data.get("genres", []),
             "synonyms": franchise_data.get("synonyms", []),

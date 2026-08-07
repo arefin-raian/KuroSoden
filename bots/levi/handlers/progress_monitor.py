@@ -110,6 +110,7 @@ async def _job_view(container: Container, job_id: int) -> dict | None:
             "progress": snap.progress,
             "stage": snap.stage,
             "season": snap.season,
+            "season_part": snap.season_part,
             "current_episode": snap.current_episode,
             "episode_index": snap.episode_index,
             "total_episodes": snap.total_episodes,
@@ -170,7 +171,8 @@ def _render_live(job_id: int, view: dict) -> str:
     return download_card_html(
         title=view["title"], job_id=job_id, status=view["status"],
         progress=view.get("progress", 0.0), stage=view.get("stage"),
-        season=view.get("season"), current_episode=view.get("current_episode"),
+        season=view.get("season"), season_part=view.get("season_part"),
+        current_episode=view.get("current_episode"),
         episode_index=view.get("episode_index"), total_episodes=view.get("total_episodes"),
         resolution=view.get("resolution"), audio=view.get("audio"),
         speed_bps=view.get("speed_bps", 0.0),

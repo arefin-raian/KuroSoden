@@ -23,8 +23,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from sqlalchemy import select
 
 from nekofetch.core.logging import get_logger
+from nekofetch.infrastructure.database.postgres.models import ThumbnailSource
+from nekofetch.infrastructure.database.postgres.session import session_scope
 
 log = get_logger(__name__)
 
@@ -292,6 +295,81 @@ async def gather_thumbnail_fields(container: Any, title: str,
         "anilist_score": anilist_score,
         "country": country,
     }
+
+
+async def persist_thumbnail_source(
+    container: Any,
+    anime_doc_id: str | None,
+    anilist_id: int | None,
+    fields: dict,
+    *,
+    image_path: str | Path | None = None,
+) -> None:
+    """Save the inputs behind a rendered thumbnail for later edits/recovery."""
+    if not anime_doc_id or getattr(container, "pg_sessionmaker", None) is None:
+        return
+    source_fields = dict(fields)
+    for key in ("genres",):
+        if isinstance(source_fields.get(key), tuple):
+            source_fields[key] = list(source_fields[key])
+    # Use a non-null sentinel for mapping-only/root thumbnails. This makes the
+    # database key truly unique on PostgreSQL and lets retries safely converge.
+    entry_id = int(anilist_id) if anilist_id is not None else -1
+    values = {
+        "anime_doc_id": anime_doc_id,
+        "anilist_id": entry_id,
+        "fields": source_fields,
+    }
+    if image_path:
+        values["image_path"] = str(image_path)
+    async with session_scope(container.pg_sessionmaker) as session:
+        dialect = session.bind.dialect.name if session.bind is not None else ""
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert
+        else:
+            insert = None
+
+        if insert is not None:
+            stmt = insert(ThumbnailSource).values(**values)
+            update_values = {
+                "fields": stmt.excluded.fields,
+                "image_path": (
+                    stmt.excluded.image_path
+                    if image_path else ThumbnailSource.image_path
+                ),
+            }
+            if dialect == "postgresql":
+                stmt = stmt.on_conflict_do_update(
+                    constraint="uq_thumbnail_source_entry",
+                    set_=update_values,
+                )
+            else:
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[
+                        ThumbnailSource.anime_doc_id,
+                        ThumbnailSource.anilist_id,
+                    ],
+                    set_=update_values,
+                )
+            await session.execute(stmt)
+        else:
+            # Keep non-Postgres/non-SQLite development backends usable. The
+            # production paths above are atomic; this fallback is only for a
+            # backend without an ON CONFLICT dialect extension.
+            row = (await session.execute(
+                select(ThumbnailSource).where(
+                    ThumbnailSource.anime_doc_id == anime_doc_id,
+                    ThumbnailSource.anilist_id == entry_id,
+                )
+            )).scalars().first()
+            if row is None:
+                session.add(ThumbnailSource(**values))
+            else:
+                row.fields = source_fields
+                if image_path:
+                    row.image_path = str(image_path)
 
 
 class ThumbnailRenderService:

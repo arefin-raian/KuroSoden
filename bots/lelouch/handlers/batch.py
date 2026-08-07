@@ -429,11 +429,28 @@ def register(client: Client, container: Container) -> None:
         resolved = data.get("resolved", [])
         skipped = list(data.get("skipped", []))
 
-        keep: list[dict] = [
-            {"anime_title": fr.get("title") or fr.get("_query"),
-             "franchise_data": fr}
-            for fr in resolved
-        ]
+        # Persist the same canonical entry mapping as single requests. WorkItems
+        # carry this franchise JSON into the Request bridge below, so split-season
+        # episode boundaries survive the batch handoff too.
+        keep: list[dict] = []
+        from nekofetch.services.franchise_flow import FranchiseFlowService
+        mapping_service = FranchiseFlowService(container)
+        for fr in resolved:
+            franchise = dict(fr)
+            try:
+                aid = franchise.get("anilist_id")
+                doc_id = f"{aid}" if aid is not None else franchise.get("title") or "batch"
+                franchise["entries"] = await mapping_service.persisted_entries(
+                    franchise, doc_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — keep batch acceptance resilient
+                log.warning("lelouch.batch.franchise_entries.persist_failed",
+                            title=franchise.get("title"), error=str(exc)[:200])
+                franchise.setdefault("entries", [])
+            keep.append({
+                "anime_title": franchise.get("title") or franchise.get("_query"),
+                "franchise_data": franchise,
+            })
 
         await fsm.clear(user_id)
 
@@ -544,9 +561,12 @@ def register(client: Client, container: Container) -> None:
         except Exception as exc:  # noqa: BLE001 — batch still shows success; the recovery sweep picks up unassigned items
             log.error("lelouch.batch.bridge_failed", error=str(exc)[:300])
 
+        from kurosoden.shared.access_gate import levi_link
+        open_tasks = await levi_link(container)
         await send_screen(
             client, q.message.chat.id,
             card(V.batch_done(len(created), skipped), image=_art(), bot_name=BOT,
+                 url_buttons=[[(V.BTN_OPEN_TASKS, open_tasks)]] if open_tasks else None,
                  buttons=[[(V.BTN_QUEUE, cb(BOT, "queue", 0)),
                            (V.BTN_HOME, cb(BOT, "home"))]]),
             old_msg=q.message,

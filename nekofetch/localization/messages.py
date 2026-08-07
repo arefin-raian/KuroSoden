@@ -686,6 +686,8 @@ class M:
     # ── notifications ──
     NOTIF_READY_TITLE = "notif_ready_title"
     NOTIF_READY_BODY = "notif_ready_body"
+    SEASON_UPDATE_REPLY = "season_update_reply"
+    BAN_RECOVERY_REPLY = "ban_recovery_reply"
 
     # ── batch request ──
     BATCH_TITLE = "batch_title"

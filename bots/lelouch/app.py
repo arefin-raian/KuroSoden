@@ -140,12 +140,14 @@ def build_lelouch(container: Container, token: str) -> Client:
         )
         await send_screen(client, chat_id, screen, old_msg=old_msg)
 
-    async def _render_admin(chat_id: int, old_msg: Message | None = None) -> None:
+    async def _render_admin(chat_id: int, obj=None,
+                            old_msg: Message | None = None) -> None:
         is_open = await requests_open(container)
         mode = await get_mode(container)
         stats = await _request_stats()
         screen = S.admin_panel(mode=mode, requests_open=is_open,
-                               total=stats.total, working=stats.working)
+                               total=stats.total, working=stats.working,
+                               is_owner=_is_owner(obj))
         await send_screen(client, chat_id, screen, old_msg=old_msg)
 
     # ── Main menu dispatcher — every lelouch|<action> resolves here ───────────
@@ -183,13 +185,13 @@ def build_lelouch(container: Container, token: str) -> Client:
 
         # ── Admin management is OWNER-ONLY (pause requests, ranks, hours) ──
         owner = _is_owner(q)
-        _owner_only = {"admin", "reqtoggle", "manage", "avail", "hours", "dbclear"}
+        _owner_only = {"admin", "reqtoggle", "manage", "avail", "hours", "dbclear", "redo"}
         if action in _owner_only and not owner:
             await q.answer("🔒 That's the owner's console.", show_alert=True)
             return
 
         if action == "admin":
-            await _render_admin(chat_id, old_msg=q.message)
+            await _render_admin(chat_id, obj=q, old_msg=q.message)
             await q.answer()
             return
 
@@ -198,7 +200,7 @@ def build_lelouch(container: Container, token: str) -> Client:
             await set_requests_open(container, new_state)
             await q.answer("🟢 Requests resumed." if new_state
                            else "🔴 Requests paused.")
-            await _render_admin(chat_id, old_msg=q.message)
+            await _render_admin(chat_id, obj=q, old_msg=q.message)
             return
 
         if action == "queue":
@@ -235,7 +237,7 @@ def build_lelouch(container: Container, token: str) -> Client:
                 await q.answer("Database cleared.", show_alert=True)
                 return
             if arg == "cancel":
-                await _render_admin(chat_id, old_msg=q.message)
+                await _render_admin(chat_id, obj=q, old_msg=q.message)
                 await q.answer("Kept intact.")
                 return
             await _render_clear_database_confirm(chat_id, q.message)
@@ -284,7 +286,7 @@ def build_lelouch(container: Container, token: str) -> Client:
         if _role(q) not in (Role.STAFF, Role.ADMIN):
             await q.answer("🔒 Command is staff only.", show_alert=True)
             return
-        await _render_admin(q.message.chat.id, old_msg=q.message)
+        await _render_admin(q.message.chat.id, obj=q, old_msg=q.message)
         await q.answer()
 
     @client.on_callback_query(filters.regex(r"^queue\|view"))
@@ -396,7 +398,7 @@ def build_lelouch(container: Container, token: str) -> Client:
             await message.reply("🔒 <b>Command is staff only.</b>",
                                 parse_mode=ParseMode.HTML)
             return
-        await _render_admin(message.chat.id)
+        await _render_admin(message.chat.id, obj=message)
 
     async def _render_clear_database_confirm(
         chat_id: int,

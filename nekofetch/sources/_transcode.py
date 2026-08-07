@@ -25,6 +25,9 @@ _CRF = {1080: 21, 720: 21, 480: 22}
 # anything above this per-minute rate as oversized and recompress.
 MB_PER_MIN_1080 = 16.0
 OVERSIZE_FACTOR = 1.0  # recompress when size > budget (budget = rate * minutes)
+MOVIE_MAX_BYTES = 2000 * 1024 * 1024
+MOVIE_TARGET_BYTES = 1990 * 1024 * 1024
+MOVIE_AUDIO_KBPS = 128
 
 
 def probe_duration_s(path: Path) -> float:
@@ -343,6 +346,89 @@ async def run_watermark(
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("no watermark encoder candidates available")
+
+
+def movie_needs_size_control(size_bytes: int) -> bool:
+    """Return True only when a movie is strictly larger than Telegram's cap."""
+    return int(size_bytes) > MOVIE_MAX_BYTES
+
+
+def target_video_bitrate_kbps(
+    target_bytes: int, duration_s: float, audio_kbps: int = MOVIE_AUDIO_KBPS,
+) -> int:
+    """Calculate a safe video bitrate for a target total file size."""
+    if duration_s <= 0:
+        raise ValueError("movie duration must be positive")
+    total_kbps = (target_bytes * 8) / duration_s / 1000
+    return max(64, int(total_kbps - audio_kbps))
+
+
+async def _encode_to_target_size(
+    src: Path, out: Path, *, target_mb: int = 1990, height: int = 1080,
+    audio_kbps: int = MOVIE_AUDIO_KBPS,
+) -> Path:
+    """Two-pass H.264 encode aimed below Telegram's 2000 MiB upload limit."""
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found")
+    duration = await probe_duration_s_async(src)
+    bitrate = target_video_bitrate_kbps(target_mb * 1024 * 1024, duration, audio_kbps)
+    passlog = out.with_suffix(".pass")
+    common = [
+        ffmpeg, "-y", "-loglevel", "error", "-i", str(src),
+        "-map", "0:v:0", "-vf", f"scale=-2:{height}",
+        "-c:v", "libx264", "-preset", "fast", "-b:v", f"{bitrate}k",
+        "-passlogfile", str(passlog),
+    ]
+    await _run_ffmpeg(common + ["-an", "-pass", "1", "-f", "null", "/dev/null"])
+    await _run_ffmpeg(common + [
+        "-map", "0:a?", "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+        "-map", "0:s?", "-c:s", "copy", "-pass", "2", str(out),
+    ])
+    for suffix in (".log", ".log.mbtree"):
+        pass_file = Path(f"{passlog}{suffix}")
+        pass_file.unlink(missing_ok=True)
+    return out
+
+
+async def split_movie(
+    src: Path, *, target_mb: int = 1990, output_dir: Path | None = None,
+) -> list[Path]:
+    """Split a movie into parts and verify every part is below the target.
+
+    Stream-copy segmentation is fast but keyframes can make a part larger than
+    the requested duration budget. If that happens, split again with more parts;
+    bounded retries keep the upload path safe without silently sending an
+    oversized Telegram file.
+    """
+    target_bytes = target_mb * 1024 * 1024
+    if src.stat().st_size <= target_bytes:
+        return [src]
+    duration = await probe_duration_s_async(src)
+    out_dir = output_dir or src.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found")
+
+    parts = max(2, (src.stat().st_size + target_bytes - 1) // target_bytes)
+    for attempt in range(4):
+        pattern = out_dir / f"{src.stem}.part%02d{src.suffix}"
+        for old in out_dir.glob(f"{src.stem}.part*{src.suffix}"):
+            old.unlink(missing_ok=True)
+        segment_seconds = max(1, duration / parts) if duration > 0 else 1
+        await _run_ffmpeg([
+            ffmpeg, "-y", "-loglevel", "error", "-i", str(src),
+            "-map", "0", "-c", "copy", "-f", "segment",
+            "-segment_time", str(segment_seconds), "-reset_timestamps", "1",
+            str(pattern),
+        ])
+        result = sorted(out_dir.glob(f"{src.stem}.part*{src.suffix}"))
+        if result and all(p.stat().st_size <= target_bytes for p in result):
+            return result
+        parts *= 2
+
+    raise RuntimeError(f"could not split movie below {target_mb} MiB: {src}")
 
 
 def is_oversized_1080(size_bytes: int, duration_s: float) -> bool:

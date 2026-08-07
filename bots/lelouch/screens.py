@@ -47,7 +47,7 @@ def home(name: str, *, is_staff: bool = False, is_admin: bool = False,
 
 
 def admin_panel(*, mode: str, requests_open: bool, total: int,
-                working: int) -> Screen:
+                working: int, is_owner: bool = False) -> Screen:
     caption = V.admin_panel(mode, requests_open, total, working)
     toggle = (V.BTN_PAUSE, cb(BOT, "reqtoggle")) if requests_open \
         else (V.BTN_RESUME, cb(BOT, "reqtoggle"))
@@ -59,10 +59,12 @@ def admin_panel(*, mode: str, requests_open: bool, total: int,
          (V.BTN_AVAIL, cb(BOT, "avail"))],
         [(V.BTN_HOURS, cb(BOT, "hours")),
          (V.BTN_SETTINGS, cb(BOT, "settings"))],
-        [("🗂 Manage Requests", cb("mg", "reqs", 0))],
-        [(V.BTN_CLEAR_DATABASE, cb(BOT, "dbclear"))],
-        [(V.BTN_HOME, cb(BOT, "home"))],
+        [("🗂 Manage REQ/WRK", cb("mg", "reqs", 0))],
     ]
+    if is_owner:
+        rows.append([("🔁 Redo", cb("redo", "new")),
+                     (V.BTN_CLEAR_DATABASE, cb(BOT, "dbclear"))])
+    rows.append([(V.BTN_HOME, cb(BOT, "home"))])
     return card(caption, bot_name=BOT, buttons=rows)
 
 

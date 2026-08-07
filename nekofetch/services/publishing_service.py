@@ -183,7 +183,7 @@ class PublishingService:
                 for f in files
             ]
 
-        uploaded_paths = await self._upload_packs(
+        uploaded_paths, cleanup_paths = await self._upload_packs(
             anime_doc_id, title, snapshot, on_progress=on_progress,
         )
 
@@ -193,11 +193,21 @@ class PublishingService:
         # files uploaded we additionally sweep the now-empty work/manual/library
         # dirs so nothing (stray temp files, empty trees) is left behind.
         all_paths = {s["path"] for s in snapshot if s.get("path")}
-        confirmed = [s for s in snapshot if s.get("path") in uploaded_paths]
+        # Movie compression/splitting creates temporary derivatives that are not
+        # part of the DB snapshot. Include every successful derivative in the same
+        # cleanup pass, otherwise a good upload can leave multi-gigabyte artifacts.
+        # Every path Telegram received is also safe to delete; movie-specific
+        # cleanup paths add the original/compressed/part artifacts around them.
+        cleanup_paths |= uploaded_paths
+        cleanup_snapshot = list(snapshot)
+        cleanup_snapshot.extend(
+            {"path": path} for path in cleanup_paths if path not in all_paths
+        )
+        confirmed = [s for s in cleanup_snapshot if s.get("path") in cleanup_paths]
         if confirmed:
             self._delete_uploaded_files(confirmed)
         if all_paths and uploaded_paths >= all_paths:
-            self._cleanup_local_files(snapshot, code=code, title=title)
+            self._cleanup_local_files(cleanup_snapshot, code=code, title=title)
         else:
             from nekofetch.core.logging import get_logger
             get_logger(__name__).warning(
@@ -371,11 +381,12 @@ class PublishingService:
         # notify) still runs so the update is observable.
         is_redo_relink = bool(fd.get("redo_relink"))
         if is_update_entry:
+            update_result = {"appended": 0}
             try:
                 from kurosoden.shared.senku_publisher import SenkuPublisher
 
                 ids = [int(update_anilist_id)] if update_anilist_id is not None else None
-                await SenkuPublisher(self._c).update_distribution_channel(
+                update_result = await SenkuPublisher(self._c).update_distribution_channel(
                     self._c.admin_client, anime_doc_id, ids,
                 )
             except Exception as exc:  # noqa: BLE001 — never fail an update publish
@@ -384,6 +395,23 @@ class PublishingService:
                     "publish.channel_update.failed",
                     anime=anime_doc_id, error=str(exc),
                 )
+            if update_result.get("appended"):
+                try:
+                    from nekofetch.services.main_channel_service import MainChannelService
+
+                    fd_entry = fd.get("entry_label") or fd.get("english") or title
+                    entry_eps = fd.get("episodes") or count
+                    quality = ", ".join(sorted({str(f.resolution) for f in files if f.resolution})) or (res or "—")
+                    channel_link = await MainChannelService(self._c).distribution_link(anime_doc_id)
+                    if channel_link:
+                        await MainChannelService(self._c).reply_update(
+                            anime_doc_id, str(fd_entry), entry_eps, quality, channel_link,
+                        )
+                except Exception as exc:  # noqa: BLE001 — reply is best-effort
+                    from nekofetch.core.logging import get_logger
+                    get_logger(__name__).warning(
+                        "publish.update_reply.failed", anime=anime_doc_id, error=str(exc),
+                    )
         elif is_redo_relink:
             # Redo-relink branch: the owner triggered a redo of an already-
             # published title, so the channel/posts are kept but the storage
@@ -533,8 +561,9 @@ class PublishingService:
                             *, on_progress=None) -> set[str]:
         """Group published files by (season, resolution, audio, entry_id) and upload each as a pack.
 
-        Returns the set of local file paths that were CONFIRMED uploaded to the
-        storage channel, so the caller only cleans up what actually shipped.
+        Returns ``(uploaded_paths, cleanup_paths)``: the first set contains only
+        paths Telegram actually received; the second also contains safe-to-delete
+        source/temporary movie artifacts.
         """
         from nekofetch.core.logging import get_logger
         _log = get_logger(__name__)
@@ -546,9 +575,9 @@ class PublishingService:
             _log.warning("publish.storage_channel_disabled",
                          anime=anime_doc_id, title=title, files=len(files),
                          hint="set storage_channel.enabled + channel_id to upload packs")
-            return set()
+            return set(), set()
         if not files:
-            return set()
+            return set(), set()
         from pathlib import Path
 
         from nekofetch.core.exceptions import FeatureDisabled
@@ -592,6 +621,7 @@ class PublishingService:
         alt_titles = await self._anilist_alt_titles(anime_doc_id)
 
         uploaded_paths: set[str] = set()
+        cleanup_paths: set[str] = set()
         for (season, season_part, resolution, audio, entry_id), items in ordered_groups:
             if not resolution or audio is None:
                 continue
@@ -603,6 +633,53 @@ class PublishingService:
             # lock-step (both go through processing.stages).
             name_hint = items[0].get("original_name") or items[0].get("path") or ""
             ct = _content_type_label(season, len(items), name_hint)
+            # Telegram's ordinary upload path must never receive an oversized
+            # movie. Aim below the hard 2000 MiB limit first; if the result still
+            # cannot fit, split it into duration-based parts and upload those as
+            # one movie pack. Episodes are unaffected by this rule.
+            if str(ct).lower() == "movie":
+                from nekofetch.sources._transcode import (
+                    MOVIE_MAX_BYTES,
+                    _encode_to_target_size,
+                    movie_needs_size_control,
+                    split_movie,
+                )
+                controlled: list[dict] = []
+                for item in items:
+                    original = Path(item["path"])
+                    if not movie_needs_size_control(original.stat().st_size):
+                        copy = dict(item)
+                        copy["_cleanup_paths"] = [str(original)]
+                        controlled.append(copy)
+                        continue
+                    compressed = original.with_name(f"{original.stem}.telegram.mkv")
+                    movie_cleanup_paths = [str(original), str(compressed)]
+                    try:
+                        await _encode_to_target_size(original, compressed)
+                        if compressed.exists() and compressed.stat().st_size <= MOVIE_MAX_BYTES:
+                            copy = dict(item)
+                            copy["path"] = str(compressed)
+                            copy["_cleanup_paths"] = movie_cleanup_paths
+                            controlled.append(copy)
+                            continue
+                        source = compressed if compressed.exists() else original
+                    except Exception as exc:  # noqa: BLE001 — splitting is the safe fallback
+                        _log.warning("publish.movie.compress_failed", path=str(original), error=str(exc))
+                        source = original
+                    try:
+                        parts = await split_movie(source)
+                    except Exception as exc:  # noqa: BLE001 — keep the original for retry
+                        _log.warning("publish.movie.split_failed", path=str(original), error=str(exc))
+                        continue
+                    for part in parts:
+                        copy = dict(item)
+                        copy["path"] = str(part)
+                        copy["_cleanup_paths"] = movie_cleanup_paths + [str(part)]
+                        controlled.append(copy)
+                items = controlled
+                if not items:
+                    _log.warning("publish.movie.no_safe_parts", title=title)
+                    continue
             # This pack's OWN AniList poster (keyed by entry_id, else season), fit
             # to a Telegram thumbnail beside the media files. Falls back to the
             # shared TMDB poster.jpg the thumbnail stage wrote when AniList had
@@ -649,6 +726,8 @@ class PublishingService:
                               anime=anime_doc_id, season=season,
                               resolution=resolution, files=len(items))
                     uploaded_paths.update(i["path"] for i in items if i.get("path"))
+                    for item in items:
+                        cleanup_paths.update(item.get("_cleanup_paths", []))
                     continue
 
             try:
@@ -676,16 +755,20 @@ class PublishingService:
                     on_progress=on_progress,
                     file_meta=file_meta,
                 )
-                # Pack persisted → these files are safely in the channel.
+                # Pack persisted → these files are safely in the channel. Include
+                # source and generated movie paths so the caller can remove every
+                # artifact, not only the path Telegram received.
                 uploaded_paths.update(i["path"] for i in items if i.get("path"))
+                for item in items:
+                    cleanup_paths.update(item.get("_cleanup_paths", []))
             except FeatureDisabled:
                 _log.warning("publish.storage_channel_disabled_midway",
                              anime=anime_doc_id, season=season, resolution=resolution)
-                return uploaded_paths
+                return uploaded_paths, cleanup_paths
             except Exception as exc:  # noqa: BLE001 - one pack failing shouldn't abort publish
                 _log.warning("publish.upload_pack.failed",
                              season=season, resolution=resolution, error=str(exc))
-        return uploaded_paths
+        return uploaded_paths, cleanup_paths
 
     async def _anilist_alt_titles(self, anime_doc_id: str) -> list[str]:
         """Shorter title candidates for the pack caption's fit-to-38 shortener.

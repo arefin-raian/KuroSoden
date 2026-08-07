@@ -81,7 +81,7 @@ class TestSchemaTables:
         assert "admin_availability" in table_names
 
     def test_total_table_count(self):
-        """Sanity check: should have 22 tables (19 NekoFetch + 3 Kage:
+        """Sanity check: should have 23 tables (20 NekoFetch + 3 Kage:
         admin_assignments, admin_availability, work_items).
 
         NekoFetch side includes ``channel_layout`` — the per-channel message
@@ -98,7 +98,7 @@ class TestSchemaTables:
         from nekofetch.infrastructure.database.postgres.base import Base
 
         table_names = list(Base.metadata.tables.keys())
-        assert len(table_names) == 22
+        assert len(table_names) == 23
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
