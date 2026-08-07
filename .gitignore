@@ -56,5 +56,11 @@ PLAN_SENKU.md
 PLAN_DOWNLOAD_UX.md
 LEVI_PLAN.md
 
-# Local debug/verification media (never commit large mkvs)
-#issue/
+# Local debug/verification media (never commit large mkvs).
+# NOTE: the leading '#' is a literal directory name, so it MUST be escaped —
+# an unescaped '#issue/' is read as a comment and ignores nothing.
+\#issue/
+_subs_probe/
+
+# Session continuation logs dumped into the repo root (local scratch).
+*this-session-is-being-continued*.txt
