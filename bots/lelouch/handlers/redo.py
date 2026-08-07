@@ -34,7 +34,7 @@ from nekofetch.ui.artwork import (
     pick_artwork,
     seed_anime_art,
 )
-from nekofetch.ui.components import lock_buttons
+from nekofetch.ui.components import cb, keyboard, lock_buttons
 from nekofetch.ui.progress import SPINNER, animate_until
 from nekofetch.ui.screens import (
     Screen,
@@ -325,7 +325,28 @@ def register(client: Client, container: Container) -> None:
             q.from_user.id, title, anime_doc_id, franchise,
         )
 
-        # Receipt card summarizing detected stage + action taken.
+        # K5: the redo surfaced season(s) the channel doesn't have yet — the
+        # owner gets an explicit CHOICE, not a notice. The receipt (and FSM
+        # clear) is deferred to the redo|update|yes/no branch.
+        if plan.new_season_ids:
+            season_labels = await _season_labels(container, franchise, plan.new_season_ids)
+            rows = [
+                [("✅ Yes — include it", cb("redo", "update", "yes", anime_doc_id))],
+                [("✖️ No — redo only this", cb("redo", "update", "no", anime_doc_id))],
+            ]
+            await send_screen(
+                client, q.message.chat.id,
+                Screen(caption=V.redo_update_prompt(title, season_labels),
+                       image=pick_artwork("lelouch"), keyboard=keyboard(*rows)),
+                old_msg=q.message,
+            )
+            return
+
+        await _redo_receipt(client, q, plan, title)
+        await fsm.clear(q.from_user.id)
+
+    async def _redo_receipt(client: Client, q: CallbackQuery, plan, title: str) -> None:
+        """Receipt card summarizing the detected stage + action taken."""
         state_label = {
             "published": "Published",
             "in_progress": "In Progress",
@@ -338,4 +359,65 @@ def register(client: Client, container: Container) -> None:
             Screen(caption=caption, image=pick_artwork("lelouch")),
             old_msg=q.message,
         )
+
+    async def _season_labels(container: Container, franchise: dict,
+                             new_season_ids: list[int]) -> list[str]:
+        """Human labels ("Season 2") for the newly-discovered ids."""
+        from kurosoden.shared.redo_service import RedoService
+
+        by_id = {e["anilist_id"]: e for e in RedoService._franchise_entries(franchise)}
+        labels: list[str] = []
+        for aid in new_season_ids:
+            e = by_id.get(int(aid))
+            if e and e.get("season") is not None:
+                labels.append(f"Season {int(e['season'])}")
+            else:
+                labels.append(f"entry {aid}")
+        return labels or ["a new season"]
+
+    # ── K5: update-during-redo Yes/No ───────────────────────────────────────
+    @client.on_callback_query(filters.regex(r"^redo\|update\|yes\|"))
+    async def _update_yes(_: Client, q: CallbackQuery) -> None:
+        if not _is_owner(q, container):
+            await q.answer(V.OWNER_ONLY, show_alert=True)
+            return
+        await lock_buttons(q)
+        anime_doc_id = q.data.split("|", 3)[3]
+        _, data = await fsm.get(q.from_user.id)
+        franchise = data.get("franchise", {})
+        title = franchise.get("title") or "Anime"
+        await q.answer()
+        from kurosoden.shared.redo_service import RedoService
+
+        svc = RedoService(container)
+        plan = await svc.detect_state(anime_doc_id)
+        queued = await svc.queue_update_for_new_seasons(
+            q.from_user.id, anime_doc_id, franchise, plan.new_season_ids or [],
+        )
+        caption = V.redo_update_queued(title, queued) if queued else (
+            "❌ No new season could be queued — check the logs."
+        )
+        await send_screen(
+            client, q.message.chat.id,
+            Screen(caption=caption, image=pick_artwork("lelouch")),
+            old_msg=q.message,
+        )
+        await fsm.clear(q.from_user.id)
+
+    @client.on_callback_query(filters.regex(r"^redo\|update\|no\|"))
+    async def _update_no(_: Client, q: CallbackQuery) -> None:
+        if not _is_owner(q, container):
+            await q.answer(V.OWNER_ONLY, show_alert=True)
+            return
+        await lock_buttons(q)
+        anime_doc_id = q.data.split("|", 3)[3]
+        _, data = await fsm.get(q.from_user.id)
+        title = data.get("franchise", {}).get("title") or "Anime"
+        # Re-detect to rebuild the plan for a faithful receipt (the redo itself
+        # already ran in submit()).
+        from kurosoden.shared.redo_service import RedoService
+
+        plan = await RedoService(container).detect_state(anime_doc_id)
+        await _redo_receipt(client, q, plan, title)
+        await q.answer()
         await fsm.clear(q.from_user.id)

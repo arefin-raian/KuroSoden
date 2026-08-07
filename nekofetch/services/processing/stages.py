@@ -21,6 +21,21 @@ from nekofetch.ui import templates
 log = get_logger(__name__)
 
 
+def release_key(f):
+    """The encode release-order contract: season → season_part → episode.
+
+    Combined torrents can otherwise run out of order (S1E03 before S1E01, or
+    S1P2 before S1P1). Every encode pass sorts its files by this key first;
+    named here so the contract is importable and unit-testable against the
+    real sort instead of a shadow copy.
+    """
+    return (
+        f.season if f.season is not None else 10_000,
+        f.season_part if f.season_part is not None else 0,
+        f.episode if f.episode is not None else 0,
+    )
+
+
 # ── Title shortening ───────────────────────────────────────────────────────────
 #
 # For filenames, long titles are shortened to an acronym. First we check the
@@ -1387,11 +1402,7 @@ class EncodeStage(Stage):
         # Release order is part of the encode contract. Normalize before
         # selecting source files so combined torrents cannot make processing run
         # S1E03 → S1E01 or S1P2 before S1P1.
-        ctx.files.sort(key=lambda f: (
-            f.season if f.season is not None else 10_000,
-            f.season_part if f.season_part is not None else 0,
-            f.episode if f.episode is not None else 0,
-        ))
+        ctx.files.sort(key=release_key)
 
         # Only encode files that are actually present on disk this pass. To stay
         # safe across reprocess passes (where rows are reloaded from the DB and

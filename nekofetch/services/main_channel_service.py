@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from pyrogram.enums import ParseMode
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 
 from nekofetch.core.container import Container
@@ -106,6 +106,19 @@ _AUDIO_LANG = {
 }
 
 
+def _language_summary(packs) -> str:
+    """Union audio languages across every stored entry/pack."""
+    found: set[str] = set()
+    for pack in packs or []:
+        found.update(_AUDIO_LANG.get(pack.audio, []))
+    if not found:
+        return "—"
+    preferred = ["English", "Japanese", "Hindi"]
+    ordered = [name for name in preferred if name in found]
+    ordered.extend(sorted(found.difference(preferred)))
+    return " & ".join(ordered)
+
+
 @dataclass(slots=True)
 class PublicationFacts:
     anime_doc_id: str
@@ -140,8 +153,8 @@ class MainChannelService:
         self._c = container
         self.cfg = container.config.main_channel
 
-    def _active(self) -> bool:
-        client = getattr(self._c, "admin_client", None)
+    def _active(self, client=None) -> bool:
+        client = client or getattr(self._c, "admin_client", None)
         return bool(self.cfg.enabled and self.cfg.channel_id != 0 and client is not None)
 
     async def gather_facts(self, anime_doc_id: str) -> PublicationFacts:
@@ -156,7 +169,7 @@ class MainChannelService:
                     select(DistributionBot).where(
                         DistributionBot.anime_doc_id == anime_doc_id,
                         DistributionBot.enabled.is_(True),
-                    )
+                    ).order_by(DistributionBot.id.desc())
                 )
             ).scalars().first()
 
@@ -166,12 +179,10 @@ class MainChannelService:
             resolutions = sorted({p.resolution for p in packs},
                                   key=lambda r: _RES_ORDER.get(r, 9999))
             facts.qualities = ", ".join(resolutions) or "—"
-            langs: list[str] = []
-            for p in packs:
-                for lang in _AUDIO_LANG.get(p.audio, []):
-                    if lang not in langs:
-                        langs.append(lang)
-            facts.languages = " & ".join(langs) or "—"
+            # This is deliberately a union over all packs, not the first
+            # season: one dubbed/dual-audio entry makes the franchise label
+            # English & Japanese even when other entries are sub-only.
+            facts.languages = _language_summary(packs)
             ep_max = max((p.episode_to or p.file_count or 0) for p in packs)
             facts.episodes = str(ep_max) if ep_max else "—"
         if bot and bot.username:
@@ -458,6 +469,7 @@ class MainChannelService:
         *,
         caption_override: str | None = None,
         silent: bool = False,
+        client=None,
     ) -> int | None:
         """Post (or edit) the main-channel entry for a title. Returns the message id.
 
@@ -465,12 +477,12 @@ class MainChannelService:
         finished HTML, e.g. an admin's hand-edited version). ``silent`` posts with
         notifications disabled — the "silent publish" option from Gojo's review card.
         """
-        if not self._active():
+        client = client or self._c.admin_client
+        if not self._active(client):
             return None
         facts = await self.gather_facts(anime_doc_id)
         caption = caption_override if caption_override is not None else self._caption(facts)
         markup = await self._buttons(facts)
-        client = self._c.admin_client
 
         async with session_scope(self._c.pg_sessionmaker) as session:
             post = (
@@ -510,6 +522,103 @@ class MainChannelService:
         log.info("mainchannel.published", anime=anime_doc_id, message_id=message_id)
         return message_id
 
+    async def refresh_thumbnail(self, anime_doc_id: str, image_path: str) -> bool:
+        """Replace the live main-channel image without changing its caption.
+
+        Thumbnail editing is deliberately media-only: the main post's caption and
+        buttons are already the reviewed/published copy subscribers know. The
+        durable backup is refreshed after Telegram accepts the new image so a later
+        channel restore uses the corrected artwork too.
+        """
+        client = getattr(self._c, "admin_client", None)
+        if client is None:
+            return False
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            post = (await session.execute(
+                select(ChannelPost).where(ChannelPost.anime_doc_id == anime_doc_id)
+            )).scalar_one_or_none()
+            if post is None or not post.main_message_id:
+                return False
+            chat_id = post.main_channel_id or self.cfg.channel_id
+            backup_caption = None
+            from nekofetch.infrastructure.database.postgres.models import PublishedPostBackup
+            backup = (await session.execute(
+                select(PublishedPostBackup).where(
+                    PublishedPostBackup.anime_doc_id == anime_doc_id
+                )
+            )).scalar_one_or_none()
+            if backup is not None:
+                backup_caption = backup.caption
+            message_id = post.main_message_id
+
+        caption = backup_caption
+        try:
+            if hasattr(client, "get_messages"):
+                live = await client.get_messages(chat_id, message_id)
+                caption = getattr(live, "caption", None) or getattr(live, "text", None) or caption
+            if not caption:
+                log.warning("mainchannel.thumbnail_refresh.no_caption",
+                            anime=anime_doc_id)
+                return False
+            await client.edit_message_media(
+                chat_id,
+                message_id,
+                InputMediaPhoto(str(image_path), caption=caption,
+                                parse_mode=ParseMode.HTML),
+            )
+        except Exception as exc:  # noqa: BLE001 - editor reports a safe failure
+            log.warning("mainchannel.thumbnail_refresh.failed",
+                        anime=anime_doc_id, error=str(exc))
+            return False
+
+        try:
+            from nekofetch.services.backup_service import BackupService
+            await BackupService(self._c).update_main_thumbnail(
+                anime_doc_id, image_path,
+            )
+        except Exception as exc:  # noqa: BLE001 - live edit already succeeded
+            log.warning("mainchannel.thumbnail_backup.failed",
+                        anime=anime_doc_id, error=str(exc))
+        return True
+
+    async def refresh_caption(self, anime_doc_id: str) -> bool:
+        """Regenerate + edit the live main-post caption from the current facts.
+
+        Used by the redo metadata refresh (Task O): after fresh packs land with
+        a changed episode-count/language line, the caption must reflect it. The
+        media (poster/thumbnail) and buttons are deliberately untouched — only
+        the caption text is re-rendered and edited in place, and the durable
+        backup caption is refreshed so a later restore uses the corrected copy.
+        """
+        client = getattr(self._c, "admin_client", None)
+        if client is None:
+            return False
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            post = (await session.execute(
+                select(ChannelPost).where(ChannelPost.anime_doc_id == anime_doc_id)
+            )).scalar_one_or_none()
+            if post is None or not post.main_message_id:
+                return False
+            chat_id = post.main_channel_id or self.cfg.channel_id
+            message_id = post.main_message_id
+        try:
+            facts = await self.gather_facts(anime_doc_id)
+            caption = self._caption(facts)
+            await client.edit_message_caption(
+                chat_id, message_id, caption=caption, parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:  # noqa: BLE001 - redo must survive a caption hiccup
+            log.warning("mainchannel.caption_refresh.failed",
+                        anime=anime_doc_id, error=str(exc))
+            return False
+        try:
+            from nekofetch.services.backup_service import BackupService
+            await BackupService(self._c).update_main_caption(anime_doc_id, caption)
+        except Exception as exc:  # noqa: BLE001 - live edit already succeeded
+            log.warning("mainchannel.caption_backup.failed",
+                        anime=anime_doc_id, error=str(exc))
+        return True
+
     async def distribution_link(self, anime_doc_id: str) -> str | None:
         """Return the current user-facing link for a title's distribution target."""
         async with session_scope(self._c.pg_sessionmaker) as session:
@@ -518,7 +627,7 @@ class MainChannelService:
                     select(DistributionBot).where(
                         DistributionBot.anime_doc_id == anime_doc_id,
                         DistributionBot.enabled.is_(True),
-                    )
+                    ).order_by(DistributionBot.id.desc())
                 )
             ).scalars().first()
         if bot is None or not bot.username and not bot.invite_link:
@@ -542,7 +651,7 @@ class MainChannelService:
         and lets the owner reword them without a code change.
         """
         client = getattr(self._c, "admin_client", None)
-        if not self._active() or client is None:
+        if not self._active(client) or client is None:
             return False
         async with session_scope(self._c.pg_sessionmaker) as session:
             post = (
@@ -583,11 +692,11 @@ class MainChannelService:
             return False
 
     async def reply_recovery(
-        self, anime_doc_id: str, title: str, channel_link: str,
+        self, anime_doc_id: str, title: str, channel_link: str, *, client=None,
     ) -> bool:
         """Reply to a main post after its distribution channel is restored."""
-        client = getattr(self._c, "admin_client", None)
-        if not self._active() or client is None:
+        client = client or getattr(self._c, "admin_client", None)
+        if not self._active(client) or client is None:
             return False
         async with session_scope(self._c.pg_sessionmaker) as session:
             post = (
