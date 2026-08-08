@@ -757,12 +757,16 @@ def register(client: Client, container: Container) -> None:
         local_preview = None if has_public_preview else (webp_to_jpeg(path) or path)
         preview = (rendered_selection.thumbnail_url
                    if has_public_preview else local_preview)
-        markup = keyboard([
+        # ``keyboard`` accepts each row as one positional argument. Passing an
+        # extra list layer makes each (label, callback) pair become the button's
+        # label/data tuple; Pyrogram then fails while serializing the markup with
+        # ``can't concat tuple to bytes`` before it can send the photo.
+        markup = keyboard(
             [(V.BTN_THUMB_APPROVE,
               cb(BOT, "wiz", "thumbok", code, str(index))),
              (V.BTN_THUMB_REDO,
               cb(BOT, "wiz", "thumbredo", code, str(index)))],
-        ])
+        )
         try:
             await client.send_photo(
                 q.message.chat.id, str(preview), reply_markup=markup,

@@ -9,7 +9,31 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from bots.senku.handlers.wizard import _thumbnail_preview_source
+from nekofetch.ui.components import cb, keyboard
+from kurosoden.shared import senku_voice as V
+
+
+async def _serialize_markup(markup):
+    """Exercise the same Pyrogram serialization used by send_photo."""
+    raw_markup = await markup.write(None)
+    return raw_markup.write()
+
+
+class TestSenkuThumbnailApprovalMarkup:
+    @pytest.mark.asyncio
+    async def test_approval_markup_serializes_as_bytes(self):
+        markup = keyboard(
+            [(V.BTN_THUMB_APPROVE, cb("senku", "wiz", "thumbok", "REQ-1078", "1")),
+             (V.BTN_THUMB_REDO, cb("senku", "wiz", "thumbredo", "REQ-1078", "1"))],
+        )
+
+        encoded = await _serialize_markup(markup)
+
+        assert isinstance(encoded, bytes)
+        assert encoded
 
 
 class TestThumbnailPreviewSource:
