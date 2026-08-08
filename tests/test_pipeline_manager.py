@@ -199,6 +199,7 @@ class TestBotBuilderImports:
         cmds = {c.command for c in LEVI_COMMANDS}
         assert "start" in cmds
         assert "tasks" in cmds
+        assert "packcaptions" in cmds
         assert "settings" in cmds
         assert "help" in cmds
         assert "assign" not in cmds
@@ -210,6 +211,7 @@ class TestBotBuilderImports:
         assert "tasks" in cmds
         assert "create" in cmds
         assert "generate" in cmds
+        assert "edit_thumbnail" in cmds
 
     def test_gojo_commands_have_expected(self):
         from kurosoden.bots.gojo.app import GOJO_COMMANDS

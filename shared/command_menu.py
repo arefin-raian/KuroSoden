@@ -52,7 +52,10 @@ _LEVI_STAFF = [
     _c("tasks", "Open your download tasks"),
     _c("help", "How the downloader works"),
 ]
-_LEVI_OWNER = _LEVI_STAFF + [_c("settings", "Configure the downloader (owner)")]
+_LEVI_OWNER = _LEVI_STAFF + [
+    _c("packcaptions", "Edit storage pack captions (owner)"),
+    _c("settings", "Configure the downloader (owner)"),
+]
 
 _SENKU_STAFF = [
     _c("start", "Your distribution tasks"),
@@ -61,7 +64,10 @@ _SENKU_STAFF = [
     _c("generate", "Generate content: /generate REQ-XXXX"),
     _c("help", "How distribution works"),
 ]
-_SENKU_OWNER = _SENKU_STAFF + [_c("settings", "Configure distribution (owner)")]
+_SENKU_OWNER = _SENKU_STAFF + [
+    _c("edit_thumbnail", "Edit saved thumbnails (owner)"),
+    _c("settings", "Configure distribution (owner)"),
+]
 
 _GOJO_STAFF = [
     _c("start", "Your publishing tasks"),

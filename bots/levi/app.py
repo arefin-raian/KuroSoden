@@ -24,6 +24,7 @@ from nekofetch.ui.artwork import pick_artwork
 LEVI_COMMANDS = [
     BotCommand("start", "View your assigned download tasks"),
     BotCommand("tasks", "Open your download tasks and pick a source"),
+    BotCommand("packcaptions", "Edit storage pack captions (owner)"),
     BotCommand("settings", "Configure the downloader bot"),
     BotCommand("help", "How the downloader works"),
 ]

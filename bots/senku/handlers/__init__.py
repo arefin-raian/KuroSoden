@@ -14,11 +14,16 @@ from nekofetch.core.container import Container
 
 def register_all(client: Client, container: Container) -> None:
     from nekofetch.bots.middleware import install_auth_middleware
+    from nekofetch.bots.admin.handlers import thumbnail_edit
     from kurosoden.bots.senku.handlers.tasks import register as register_tasks
     from kurosoden.bots.senku.handlers.wizard import register as register_wizard
     from kurosoden.shared.settings_ui import register_settings
 
     install_auth_middleware(client, container, staff_only_bot="senku")
+    # Reuse the durable editor on Senku as the owner-facing /edit_thumbnail
+    # command. Its callbacks/state are namespace-isolated from the wizard and its
+    # existing owner gate remains in force.
+    thumbnail_edit.register(client, container)
     register_wizard(client, container)
     register_tasks(client, container)
 

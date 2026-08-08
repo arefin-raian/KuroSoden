@@ -40,7 +40,7 @@ from nekofetch.ui.components import cb, keyboard
 from nekofetch.ui.screens import Screen, send_screen
 
 log = get_logger(__name__)
-LEVI_COMMANDS = ["start", "help", "tasks", "settings"]
+LEVI_COMMANDS = ["start", "help", "tasks", "packcaptions", "settings"]
 
 
 def _esc(value: object) -> str:

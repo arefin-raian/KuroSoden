@@ -64,20 +64,29 @@ def _pack_card(packs) -> tuple[str, list[list[tuple[str, str]]]]:
 def register(client: Client, container: Container) -> None:
     """Register owner-only pack caption list, selection, and text consumer."""
 
+    async def _show_pack_list(message: Message) -> None:
+        packs = await StorageChannelService(container).list_packs()
+        caption, rows = _pack_card(packs)
+        await send_screen(
+            client, message.chat.id,
+            Screen(caption=caption, keyboard=keyboard(*rows)),
+            old_msg=message,
+        )
+
+    @client.on_message(filters.command("packcaptions"), group=4)
+    async def _command(_: Client, message: Message) -> None:
+        if not is_owner(container, message):
+            return
+        await _show_pack_list(message)
+
     @client.on_callback_query(filters.regex(r"^levi\|packcaptions$"))
     async def _list(_: Client, q: CallbackQuery) -> None:
         if q.message is None or not is_owner(container, q):
             await q.answer("Owner access required.", show_alert=True)
             return
         await lock_buttons(q)
-        packs = await StorageChannelService(container).list_packs()
-        caption, rows = _pack_card(packs)
         await q.answer()
-        await send_screen(
-            client, q.message.chat.id,
-            Screen(caption=caption, keyboard=keyboard(*rows)),
-            old_msg=q.message,
-        )
+        await _show_pack_list(q.message)
 
     @client.on_callback_query(filters.regex(r"^levi\|packedit\|"))
     async def _select(_: Client, q: CallbackQuery) -> None:

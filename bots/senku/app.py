@@ -27,6 +27,7 @@ SENKU_COMMANDS = [
     BotCommand("tasks", "List active distribution tasks"),
     BotCommand("create", "Create a new distribution channel"),
     BotCommand("generate", "Generate content: /generate REQ-XXXX"),
+    BotCommand("edit_thumbnail", "Edit saved thumbnails (owner)"),
     BotCommand("settings", "Configure the distribution bot"),
     BotCommand("help", "How distribution works"),
 ]

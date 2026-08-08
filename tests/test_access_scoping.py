@@ -46,6 +46,7 @@ def test_staff_only_bots_publish_staff_global_menu():
     # Senku's staff tier specifically includes its operational commands.
     senku = _command_names(default_commands("senku"))
     assert {"create", "generate"}.issubset(senku)
+    assert "edit_thumbnail" not in senku
 
 
 def test_lelouch_global_menu_is_plain_user_only():
@@ -76,6 +77,26 @@ async def test_owner_gets_owner_only_commands():
     commands, scope = client.calls[-1]
     assert scope.chat_id == 100
     assert "settings" in _command_names(commands)
+
+
+@pytest.mark.asyncio
+async def test_owner_gets_levi_caption_editor_command():
+    client = _Client()
+    await apply_for_user(client, _container(owner_id=100), "levi", 100, _user("admin", 100))
+
+    commands, scope = client.calls[-1]
+    assert scope.chat_id == 100
+    assert {"settings", "packcaptions"}.issubset(_command_names(commands))
+
+
+@pytest.mark.asyncio
+async def test_owner_gets_senku_thumbnail_editor_command():
+    client = _Client()
+    await apply_for_user(client, _container(owner_id=100), "senku", 100, _user("admin", 100))
+
+    commands, scope = client.calls[-1]
+    assert scope.chat_id == 100
+    assert {"settings", "edit_thumbnail"}.issubset(_command_names(commands))
 
 
 @pytest.mark.asyncio
