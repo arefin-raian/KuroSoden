@@ -30,6 +30,8 @@ reports done and the wizard advances to Phase 4.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
 from nekofetch.providers.metadata.telegraph_client import ImageEntry, TelegraphClient
@@ -281,6 +283,24 @@ class SenkuThumbnailAdapter:
             return sel, self.next_asset(sel)
         url = assets[number - 1]["url"]
         sel = await self.cache.set_selection(code, index, asset=asset_type, value=url)
+        return sel, self.next_asset(sel)
+
+    async def store_text_logo(self, code: str, index: int, path) -> tuple[Selection, str | None]:
+        """Mirror a generated transparent text logo and save it as ``logo_url``.
+
+        This deliberately uses the same ``logo_url`` selection field as TMDB picks
+        and manual uploads. No new Redis field or database table is introduced.
+        """
+        from kurosoden.shared.image_backup import backup_bytes
+
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"text-logo preview no longer exists: {path}")
+        backup = await backup_bytes(
+            self._c, path.read_bytes(), mime="image/png", source_url=f"file://{path}",
+        )
+        url = backup.primary or f"file://{path}"
+        sel = await self.cache.set_selection(code, index, asset="logo", value=url)
         return sel, self.next_asset(sel)
 
     async def store_upload(self, code: str, index: int, asset_type: str,

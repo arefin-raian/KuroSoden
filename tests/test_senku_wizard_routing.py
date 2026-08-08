@@ -102,6 +102,13 @@ WIZARD_CALLBACKS = [
     f"senku|wiz|thumbs|{CODE}",     # verified → thumbnail loop
     f"senku|wiz|tnext|{CODE}",      # advance the thumbnail loop
     f"senku|wiz|pick|{CODE}|1|logo|2",   # numbered asset pick
+    f"senku|wiz|text|{CODE}|1",       # logo → text input
+    f"senku|wiz|textcat|{CODE}|1|elegant",  # category picker
+    f"senku|wiz|textfont|{CODE}|1|elegant|playfair",  # font picker
+    f"senku|wiz|textbackcat|{CODE}|1",  # back to categories
+    f"senku|wiz|textbackfont|{CODE}|1|elegant",  # back to fonts
+    f"senku|wiz|textcancel|{CODE}|1",  # cancel to logo picker
+    f"senku|wiz|textuse|{CODE}|1",  # approve preview
     f"senku|wiz|gen|{CODE}|1",      # generate one entry's thumbnail
     f"senku|wiz|order|{CODE}",      # all rendered → watch-order confirm
     f"senku|wiz|oedit|{CODE}",      # "Edit order" → free-text re-map step

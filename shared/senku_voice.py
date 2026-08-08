@@ -375,6 +375,48 @@ def thumb_selected(asset: str, number: int) -> str:
     return f"✅ {words.get(asset, asset.title())} #{number} locked in."
 
 
+def thumb_text_prompt() -> str:
+    return (
+        f"{ICON} <b>Type your logo text</b>\n"
+        "Send the words exactly as you want them to appear. You can use up to three "
+        "short lines. Tap <b>Cancel</b> to return to the asset choices."
+    )
+
+
+def thumb_text_categories() -> str:
+    return (
+        f"{ICON} <b>Choose a lettering style</b>\n\n"
+        "Pick a font family category. I'll show the best bundled free fonts in that "
+        "style next."
+    )
+
+
+def thumb_text_fonts(category: str, fonts: list[str]) -> str:
+    return (
+        f"{ICON} <b>{esc(category)}</b>\n\n"
+        "Choose a font to preview your logo. Every option here is bundled under the "
+        "SIL Open Font License.\n\n"
+        + "\n".join(f"• {esc(name)}" for name in fonts)
+    )
+
+
+def thumb_text_preview(font_name: str, text: str) -> str:
+    return (
+        f"{ICON} <b>Text logo preview</b>\n\n"
+        f"Font: <b>{esc(font_name)}</b>\n"
+        f"Text: <code>{esc(text)}</code>\n\n"
+        "If it looks right, use it. Otherwise go back and choose another font."
+    )
+
+
+def thumb_text_error() -> str:
+    return (
+        f"{ICON} <b>I couldn't make that logo.</b>\n\n"
+        "Use a short title with normal letters and try again. Your current asset "
+        "choices are still safe."
+    )
+
+
 def thumb_upload_prompt(asset: str) -> str:
     words = {"logo": "logo", "poster": "poster", "bg": "backdrop"}
     a = words.get(asset, asset)
@@ -572,7 +614,11 @@ BTN_RECOVERY_CANCEL = "✗ Cancel recovery"
 BTN_SHOW_LOGOS = "🔬 Show Logos"
 BTN_SHOW_POSTERS = "🖼 Show Posters"
 BTN_SHOW_BACKDROPS = "🌄 Show Backdrops"
-BTN_UPLOAD_OWN = "⬆️ Upload my own"
+BTN_UPLOAD_OWN = "⬆️ Upload"
+BTN_TEXT_LOGO = "✍️ Text"
+BTN_TEXT_CANCEL = "✗ Cancel"
+BTN_TEXT_USE = "✅ Use this"
+BTN_TEXT_BACK = "⇐ Back"
 BTN_GENERATE = "⚗️ Generate Thumbnail"
 BTN_THUMB_APPROVE = "✅ Approve"
 BTN_THUMB_REDO = "↻ Redo"

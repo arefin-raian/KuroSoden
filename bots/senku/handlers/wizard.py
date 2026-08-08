@@ -45,6 +45,13 @@ from kurosoden.shared.channel_essentials import build_channel_essentials
 from kurosoden.shared.distribution_cache import DistributionCache
 from kurosoden.shared import franchise_map
 from kurosoden.shared.senku_thumbnail_adapter import SenkuThumbnailAdapter
+from kurosoden.shared.text_logo import (
+    categories as text_logo_categories,
+    fonts_for_category,
+    get_category as get_text_logo_category,
+    get_font as get_text_logo_font,
+    render_text_logo,
+)
 
 log = get_logger(__name__)
 
@@ -72,6 +79,16 @@ STATE_AWAIT_ORDER = "senku:wiz:await_order"
 
 # FSM state: waiting for the admin to send their own asset image (logo/poster/bg).
 STATE_AWAIT_UPLOAD = "senku:wiz:await_upload"
+# State carried by the current logo picker so a stale Text button cannot start a
+# text-logo flow for a different request or entry.
+STATE_ASSET_PICKER = "senku:wiz:asset_picker"
+
+# FSM states for the text-logo flow. Data carries only the request/index/text;
+# generated files are deterministic local previews and are mirrored only on Use.
+STATE_AWAIT_TEXT = "senku:wiz:await_text"
+STATE_TEXT_CATEGORIES = "senku:wiz:text_categories"
+STATE_TEXT_FONTS = "senku:wiz:text_fonts"
+STATE_TEXT_PREVIEW = "senku:wiz:text_preview"
 
 # FSM state: after a userbot created the channel, waiting for the operator to JOIN
 # it via the invite link — you can only promote an existing member, so they must
@@ -101,6 +118,23 @@ def register(client: Client, container: Container) -> None:
             return Role(user.role) in (Role.STAFF, Role.ADMIN)
         except Exception:  # noqa: BLE001 — unknown role string ⇒ not staff
             return False
+
+    async def _text_state_matches(user_id: int, state: str, code: str,
+                                  index: int, **expected) -> tuple[bool, dict]:
+        current, data = await fsm.get(user_id)
+        if current != state:
+            return False, data
+        if str(data.get("code", "")) != str(code):
+            return False, data
+        try:
+            if int(data.get("index", -1)) != int(index):
+                return False, data
+        except (TypeError, ValueError):
+            return False, data
+        for key, value in expected.items():
+            if str(data.get(key, "")) != str(value):
+                return False, data
+        return True, data
 
     async def _art(franchise: dict | None, title: str):
         """This franchise's rotating backdrop, or Senku's character art.
@@ -651,9 +685,98 @@ def register(client: Client, container: Container) -> None:
             return
         await _thumb_asset_card(chat_id, code, entry, asset, old_msg=old_msg)
 
+    async def _thumb_text_categories(chat_id: int, user_id: int, code: str,
+                                     index: int, *, old_msg: Message | None,
+                                     text: str | None = None) -> None:
+        _state, existing = await fsm.get(user_id)
+        if text is None:
+            text = existing.get("text", "")
+        await fsm.set(user_id, STATE_TEXT_CATEGORIES, code=code, index=index,
+                      text=text)
+        rows = []
+        for category in text_logo_categories():
+            rows.append([(category.name, cb(BOT, "wiz", "textcat", code,
+                                            str(index), category.key))])
+        rows.append([(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code,
+                                            str(index)))])
+        await send_screen(
+            client, chat_id,
+            card(V.thumb_text_categories(), image=pick_artwork(BOT), bot_name=BOT,
+                 buttons=rows),
+            old_msg=old_msg,
+        )
+
+    async def _thumb_text_fonts(chat_id: int, user_id: int, code: str,
+                                index: int, category: str,
+                                *, old_msg: Message | None) -> None:
+        _state, existing = await fsm.get(user_id)
+        text = existing.get("text", "")
+        fonts = fonts_for_category(category)
+        if not fonts:
+            await _thumb_text_categories(chat_id, user_id, code, index,
+                                         old_msg=old_msg, text=text)
+            return
+        await fsm.set(user_id, STATE_TEXT_FONTS, code=code, index=index,
+                      category=category, text=text)
+        rows = [[(font.name, cb(BOT, "wiz", "textfont", code, str(index),
+                                  category, font.key))] for font in fonts]
+        rows.append([(V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackcat", code,
+                                          str(index)))])
+        rows.append([(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code,
+                                            str(index)))])
+        category_obj = get_text_logo_category(category)
+        await send_screen(
+            client, chat_id,
+            card(V.thumb_text_fonts(
+                category_obj.name if category_obj else category,
+                [font.name for font in fonts],
+            ), image=pick_artwork(BOT), bot_name=BOT, buttons=rows),
+            old_msg=old_msg,
+        )
+
+    async def _thumb_text_preview(chat_id: int, user_id: int, code: str,
+                                  index: int, text: str, font_key: str,
+                                  *, old_msg: Message | None) -> None:
+        font = get_text_logo_font(font_key)
+        if font is None:
+            await _thumb_text_categories(chat_id, user_id, code, index,
+                                         old_msg=old_msg, text=text)
+            return
+        try:
+            path = render_text_logo(text, font_key)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            log.warning("senku.wiz.text_logo_failed", code=code, entry=index,
+                        error=str(exc))
+            await send_screen(
+                client, chat_id,
+                card(V.thumb_text_error(), image=pick_artwork(BOT), bot_name=BOT,
+                     buttons=[[(V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackfont",
+                                                     code, str(index), font.category))],
+                              [(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
+                                                      code, str(index)))]]),
+                old_msg=old_msg,
+            )
+            return
+        await fsm.set(user_id, STATE_TEXT_PREVIEW, code=code, index=index,
+                      text=text, font=font_key, path=str(path))
+        await send_screen(
+            client, chat_id,
+            card(V.thumb_text_preview(font.name, text), image=path, bot_name=BOT,
+                 buttons=[[(V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackfont", code,
+                                                 str(index), font.category)),
+                            (V.BTN_TEXT_USE, cb(BOT, "wiz", "textuse", code,
+                                                str(index)))],
+                          [(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code,
+                                                  str(index)))]]),
+            old_msg=old_msg,
+        )
+
     async def _thumb_asset_card(chat_id: int, code: str, entry, asset: str,
                                 *, old_msg: Message | None) -> None:
         """One asset-pick card: header + gallery link + numbered buttons."""
+        if asset == "logo":
+            await fsm.set(chat_id, STATE_ASSET_PICKER, code=code,
+                          index=entry.index, asset=asset)
         entries = await cache.get_entries(code)
         franchise = await cache.get_franchise(code)
         title = await _title_of(code, franchise)
@@ -662,12 +785,30 @@ def register(client: Client, container: Container) -> None:
         # a numbered TMDB asset (senku|wiz|upl|<code>|<index>|<asset>).
         upload_row = [(V.BTN_UPLOAD_OWN,
                        cb(BOT, "wiz", "upl", code, str(entry.index), asset))]
+        if asset == "logo":
+            upload_row.append((V.BTN_TEXT_LOGO,
+                               cb(BOT, "wiz", "text", code, str(entry.index))))
         if not assets:
-            # TMDB had nothing for this type — still let the admin upload their own
-            # rather than dead-ending. The loop runs in the admin's private DM, so
-            # chat_id IS their telegram user id (what the FSM keys on).
-            await _ask_upload(chat_id, chat_id, code, entry.index, asset,
-                              old_msg=old_msg)
+            # TMDB had nothing for this type. Logos get the same two manual choices
+            # as a populated gallery; posters/backdrops retain the existing direct
+            # upload prompt because text is meaningful only for logos.
+            if asset == "logo":
+                await send_screen(
+                    client, chat_id,
+                    card("\n\n".join([
+                        V.thumb_entry_header(entry.label, entry.index, len(entries)),
+                        V.thumb_pick_prompt(asset),
+                        "<i>No matching logos were found. Upload one or create a text logo.</i>",
+                    ]), image=await _art(franchise, title), bot_name=BOT,
+                         buttons=[upload_row,
+                                  [(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))]]),
+                    old_msg=old_msg,
+                )
+            else:
+                # The loop runs in the admin's private DM, so chat_id IS their
+                # telegram user id (what the FSM keys on).
+                await _ask_upload(chat_id, chat_id, code, entry.index, asset,
+                                  old_msg=old_msg)
             return
         body = "\n\n".join([
             V.thumb_entry_header(entry.label, entry.index, len(entries)),
@@ -1080,6 +1221,121 @@ def register(client: Client, container: Container) -> None:
                 await q.answer("Bad selection.", show_alert=True)
                 return
             await _thumb_pick(q, code, index, asset, number)
+        elif action == "text":
+            try:
+                index = int(parts[4])
+            except (IndexError, ValueError):
+                await q.answer("Bad entry.", show_alert=True)
+                return
+            valid, _data = await _text_state_matches(
+                q.from_user.id, STATE_ASSET_PICKER, code, index, asset="logo",
+            )
+            if not valid:
+                await q.answer("That logo picker has expired.", show_alert=True)
+                return
+            await fsm.set(q.from_user.id, STATE_AWAIT_TEXT, code=code, index=index,
+                          prompt_msg_id=q.message.id, prompt_chat_id=chat_id)
+            await q.answer()
+            await send_screen(
+                client, chat_id,
+                card(V.thumb_text_prompt(), image=pick_artwork(BOT), bot_name=BOT,
+                     buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
+                                                         code, str(index)))]]),
+                old_msg=q.message,
+            )
+        elif action == "textcat":
+            try:
+                index, category = int(parts[4]), parts[5]
+            except (IndexError, ValueError):
+                await q.answer("Bad font category.", show_alert=True)
+                return
+            valid, _data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_CATEGORIES, code, index,
+            )
+            if not valid:
+                await q.answer("That font menu has expired.", show_alert=True)
+                return
+            await q.answer()
+            await _thumb_text_fonts(chat_id, q.from_user.id, code, index, category,
+                                    old_msg=q.message)
+        elif action == "textfont":
+            try:
+                index, category, font_key = int(parts[4]), parts[5], parts[6]
+            except (IndexError, ValueError):
+                await q.answer("Bad font.", show_alert=True)
+                return
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_FONTS, code, index, category=category,
+            )
+            if not valid:
+                await q.answer("That font menu has expired.", show_alert=True)
+                return
+            font = get_text_logo_font(font_key)
+            if font is None or font.category != category:
+                await q.answer("That font choice is invalid.", show_alert=True)
+                return
+            await q.answer()
+            await _thumb_text_preview(chat_id, q.from_user.id, code, index,
+                                      data.get("text", ""), font_key,
+                                      old_msg=q.message)
+        elif action == "textbackcat":
+            index = int(parts[4])
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_FONTS, code, index,
+            )
+            if not valid:
+                await q.answer("That font menu has expired.", show_alert=True)
+                return
+            await q.answer()
+            await _thumb_text_categories(chat_id, q.from_user.id, code, index,
+                                         old_msg=q.message, text=data.get("text", ""))
+        elif action == "textbackfont":
+            index, category = int(parts[4]), parts[5]
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_PREVIEW, code, index,
+            )
+            if not valid:
+                await q.answer("That preview has expired.", show_alert=True)
+                return
+            await q.answer()
+            await _thumb_text_fonts(chat_id, q.from_user.id, code, index, category,
+                                    old_msg=q.message)
+        elif action == "textcancel":
+            index = int(parts[4])
+            current_state, _data = await fsm.get(q.from_user.id)
+            valid, _data = await _text_state_matches(
+                q.from_user.id, current_state or "", code, index,
+            )
+            if not valid or current_state not in {
+                STATE_AWAIT_TEXT, STATE_TEXT_CATEGORIES, STATE_TEXT_FONTS,
+                STATE_TEXT_PREVIEW,
+            }:
+                await q.answer("That text-logo flow has expired.", show_alert=True)
+                return
+            await q.answer("Cancelled.")
+            entry = await cache.get_entry(code, index)
+            if entry is not None:
+                await fsm.clear(q.from_user.id)
+                await _thumb_asset_card(chat_id, code, entry, "logo", old_msg=q.message)
+        elif action == "textuse":
+            index = int(parts[4])
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_PREVIEW, code, index,
+            )
+            if not valid:
+                await q.answer("That preview has expired.", show_alert=True)
+                return
+            path = data.get("path")
+            try:
+                await thumbs.store_text_logo(code, index, path)
+            except Exception as exc:  # noqa: BLE001 — keep the picker recoverable
+                log.warning("senku.wiz.text_logo_store_failed", code=code,
+                            entry=index, error=str(exc))
+                await q.answer("Couldn't save that logo. Try again.", show_alert=True)
+                return
+            await fsm.clear(q.from_user.id)
+            await q.answer("Text logo locked in.")
+            await _thumb_next(chat_id, code, old_msg=q.message)
         elif action == "upl":
             # senku|wiz|upl|<code>|<index>|<asset> — arm the manual-upload step.
             try:
@@ -1150,7 +1406,7 @@ def register(client: Client, container: Container) -> None:
         if not message.from_user:
             return
         state, data = await fsm.get(message.from_user.id)
-        if state not in (STATE_AWAIT_CHANNEL, STATE_AWAIT_ORDER):
+        if state not in (STATE_AWAIT_CHANNEL, STATE_AWAIT_ORDER, STATE_AWAIT_TEXT):
             return  # not our turn
         if not _staff(message):
             return
@@ -1162,6 +1418,30 @@ def register(client: Client, container: Container) -> None:
             await message.delete()
         except Exception:  # noqa: BLE001 — best-effort (needs delete rights)
             pass
+
+        if state == STATE_AWAIT_TEXT:
+            if not raw:
+                await send_screen(
+                    client, message.chat.id,
+                    card(V.thumb_text_error(), image=pick_artwork(BOT), bot_name=BOT,
+                         buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
+                                                             code, str(data.get("index", 0))))]]),
+                )
+                return
+            prompt_msg_id = data.get("prompt_msg_id")
+            prompt_chat_id = data.get("prompt_chat_id") or message.chat.id
+            if prompt_msg_id:
+                try:
+                    await client.delete_messages(prompt_chat_id, int(prompt_msg_id))
+                except Exception:  # noqa: BLE001 — best-effort replacement
+                    pass
+            await fsm.set(message.from_user.id, STATE_TEXT_FONTS,
+                          code=code, index=int(data.get("index", 0)), text=raw)
+            await _thumb_text_categories(
+                message.chat.id, message.from_user.id, code,
+                int(data.get("index", 0)), old_msg=None, text=raw,
+            )
+            return
 
         if state == STATE_AWAIT_ORDER:
             if not raw:

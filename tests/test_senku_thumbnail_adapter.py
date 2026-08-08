@@ -150,6 +150,27 @@ async def test_store_pick_out_of_range_is_noop(adapter):
 # numbered pick; these tests mock that shared pipeline, not the raw host.
 
 @pytest.mark.asyncio
+async def test_store_text_logo_uses_existing_logo_field(adapter, monkeypatch, tmp_path):
+    await adapter.cache.set_entries("REQ-1", _entries())
+    logo = tmp_path / "logo.png"
+    logo.write_bytes(b"PNGDATA")
+
+    async def fake_backup_bytes(container, blob, *, mime="image/jpeg", source_url=""):
+        from kurosoden.shared.image_backup import BackupImage
+        assert mime == "image/png"
+        assert source_url.startswith("file://")
+        return BackupImage(source_url=source_url,
+                           catbox_url="https://files.catbox.moe/textlogo.png")
+
+    import kurosoden.shared.image_backup as image_backup
+    monkeypatch.setattr(image_backup, "backup_bytes", fake_backup_bytes)
+
+    sel, nxt = await adapter.store_text_logo("REQ-1", 1, logo)
+    assert sel.logo_url == "https://files.catbox.moe/textlogo.png"
+    assert nxt == "poster"
+
+
+@pytest.mark.asyncio
 async def test_store_upload_persists_mirror_url_and_advances(adapter, monkeypatch):
     await adapter.cache.set_entries("REQ-1", _entries())
 
