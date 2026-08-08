@@ -383,12 +383,14 @@ def register(client: Client, container: Container) -> None:
             f"{V.ICON} <b>Pick the route.</b>\n\n"
             f"<blockquote><b>{_esc(title)}</b>\n<code>{_esc(code)}</code></blockquote>\n\n"
             "Telegram is manual intake. Website lets you pick KickAss, AniKoto, Miruro, "
-            "or AniZone. Torrent opens the Nyaa release board."
+            "or AniZone. Torrent opens the Nyaa release board. Direct Link takes an "
+            "archive link (zip/rar/7z) instead."
         )
         kb = keyboard(
             [(V.BTN_SRC_TELEGRAM, cb("levi", "telegram", code)),
              ("🌐 Website", cb("levi", "website", code))],
-            [(V.BTN_SRC_TORRENT, cb("staff", "rsource", code, "torrent"))],
+            [(V.BTN_SRC_TORRENT, cb("staff", "rsource", code, "torrent")),
+             (V.BTN_SRC_DDL, cb("staff", "rsource", code, "ddl"))],
         )
         await send_screen(
             client,

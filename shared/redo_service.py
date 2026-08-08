@@ -261,6 +261,7 @@ class RedoService:
             from kurosoden.shared.management_service import ManagementService
             from kurosoden.shared.owner_seed import _owner_id
             from kurosoden.shared.work_service import WorkService
+            from types import SimpleNamespace
 
             await WorkService(self._c.pg_sessionmaker).add_batch(
                 owner_id,
@@ -303,6 +304,25 @@ class RedoService:
                     if owner is not None:
                         await ManagementService(self._c.pg_sessionmaker).reassign(
                             code, "levi", owner)
+                        # ``reassign`` writes the row but returns nothing; synthesize
+                        # the same shape ``assign`` would so the DM below still fires.
+                        result = SimpleNamespace(
+                            admin_telegram_id=owner, status="assigned",
+                            assignment_mode="fallback")
+                # The redo lands on Levi's board, but assign()/reassign() only write
+                # the DB row — without this the assigned admin never gets told their
+                # task was reopened (the exact "no assignment message" redo bug). Reuse
+                # the same DM primitive the normal + batch intake use.
+                if result is not None:
+                    try:
+                        from kurosoden.shared.handoff import notify_stage_assignment
+                        await notify_stage_assignment(
+                            self._c, "levi", result, code, title,
+                            franchise_json=franchise_data,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — DM best-effort
+                        log.warning("redo.notify_failed", code=code,
+                                    error=str(exc)[:200])
             except Exception as exc:  # noqa: BLE001 — recovery sweep still catches it
                 log.warning("redo.assign_failed", code=code, error=str(exc)[:200])
             return code

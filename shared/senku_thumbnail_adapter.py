@@ -367,10 +367,34 @@ class SenkuThumbnailAdapter:
             return None
         if not path:
             return None
-        # Rendering produces a preview only. The wizard's explicit Approve action
-        # is the sole transition that marks an entry done.
+        # Mirror the render across the image hosts RIGHT NOW. The render is only
+        # preview material until the operator approves, but if the session dies
+        # (or the DM preview can't be sent) the card must already live somewhere
+        # public — today the ONLY uploader was the publish-time bridge, so a
+        # render that never reached publish was lost entirely (the "rendered but
+        # never uploaded" bug). The DM preview still uses the local ``path``;
+        # the STORED url is the primary mirror, falling back to ``file://`` when
+        # every host rejects the upload (the publisher bridge still understands
+        # that). The wizard's explicit Approve action remains the sole transition
+        # that marks an entry done.
+        stored: str = f"file://{path}"
+        try:
+            from kurosoden.shared.image_backup import backup_bytes
+
+            suffix = str(path).lower()
+            mime = ("image/webp" if suffix.endswith(".webp")
+                    else "image/png" if suffix.endswith(".png")
+                    else "image/jpeg")
+            backup = await backup_bytes(self._c, path.read_bytes(), mime=mime)
+            if backup.primary:
+                stored = backup.primary
+                log.info("senku.thumb.hosted", code=code, entry=entry.index,
+                         url=backup.primary)
+        except Exception as exc:  # noqa: BLE001 — file:// fallback still works
+            log.warning("senku.thumb.host_failed", code=code, entry=entry.index,
+                        error=str(exc))
         await self.cache.set_selection(code, entry.index, asset="thumbnail",
-                                       value=f"file://{path}")
+                                       value=stored)
         log.info("senku.thumb.rendered", code=code, entry=entry.index, path=str(path))
         return path
 

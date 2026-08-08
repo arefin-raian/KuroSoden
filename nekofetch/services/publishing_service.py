@@ -711,6 +711,7 @@ class PublishingService:
             dest_dir = Path(items[0]["path"]).parent
             poster = await self._pack_poster(
                 entry_posters, entry_id, season, dest_dir,
+                season_part=season_part,
                 anime_doc_id=anime_doc_id,
             )
             if poster is None:
@@ -728,6 +729,12 @@ class PublishingService:
             # files) and just mark these paths clean so they get tidied up. A
             # pack that crashed mid-upload has NO row (or a partial range) → it
             # falls through and re-uploads from the beginning, as intended.
+            # NOTE: the pack ROW keeps the snapshot's ``entry_id`` (the request
+            # root) on purpose — the poster above resolves the per-part AniList
+            # id, but changing this key would break the resume guard below
+            # (``find_pack`` would miss already-uploaded packs and re-post them
+            # as duplicates on a reprocess). Packs are matched downstream by
+            # (season, season_part) anyway.
             pack_key = storage.key_from(
                 anime_doc_id, season, resolution, audio,
                 season_part=season_part, entry_id=entry_id,
@@ -882,6 +889,35 @@ class PublishingService:
                 cov = (e or {}).get("cover_url")
                 if cov:
                     out[("season", idx)] = cov
+            # Split seasons (Vanitas S1 vs S1 Part 2) are SEPARATE AniList
+            # entries that share one season number, so a (season, part) slot
+            # must resolve to ITS OWN anilist_id — not the request root's. Re-run
+            # the walk through the canonical mapping (same logic as
+            # ``_tv_entry_identities``) so the poster resolver can pick the right
+            # installment's cover. ``None``-part slots (the first half when it has
+            # no explicit part marker) are kept so a plain S1 pack still matches.
+            part_ids: dict[tuple[int | None, int | None], int] = {}
+            try:
+                from nekofetch.services.franchise_flow import (
+                    _franchise_entries_from_cache,
+                    FranchiseFlowService,
+                )
+
+                objects = _franchise_entries_from_cache(walk) or {}
+                if objects:
+                    mapping = FranchiseFlowService(None).build_mapping(
+                        {}, "", objects,
+                    )
+                    part_ids = {
+                        (e.season_number, e.season_part): int(e.anilist_id)
+                        for e in mapping.entries
+                        if getattr(e.kind, "value", None) == "season"
+                        and e.anilist_id is not None
+                    }
+            except Exception as exc:  # noqa: BLE001 — poster falls back gracefully
+                _log.debug("publish.anilist_part_ids.failed",
+                           anime=anime_doc_id, error=str(exc))
+            out["part_ids"] = part_ids
         except Exception as exc:  # noqa: BLE001 — cache/parse issue → TMDB fallback
             _log.debug("publish.anilist_posters.failed",
                        anime=anime_doc_id, error=str(exc))
@@ -889,24 +925,36 @@ class PublishingService:
 
     async def _pack_poster(
         self, entry_posters: dict, entry_id, season, dest_dir,
-        *, anime_doc_id: str | None = None,
+        *, season_part: int | None = None,
+        anime_doc_id: str | None = None,
     ):
         """Resolve + fit this pack's AniList poster; return a Path or ``None``.
 
         Offline-first: prefers the cover already downloaded + mirrored at
         prefetch time (``anilist_images.json`` local file, else a hosted
-        backup) for this pack's ``entry_id`` — no live AniList fetch. Falls back
-        to the franchise-walk cover URL only on a cache miss. Matches by
-        ``entry_id`` (AniList id) first, then season index, and fits the result
-        to Telegram's 320×320 thumbnail box under a per-entry filename so
-        S1/S2/OVA posters never clobber each other. ``None`` when there's no
-        AniList cover for this pack — the caller then uses the shared poster."""
+        backup) for this pack's entry — no live AniList fetch. Falls back to the
+        franchise-walk cover URL only on a cache miss. Matches by the pack's own
+        AniList id, which for a split season (Vanitas S1 vs S1 Part 2) is
+        resolved from the canonical ``(season, season_part)`` map first — the
+        snapshot's ``entry_id`` is the request ROOT, which would give BOTH
+        halves the first half's cover. Falls back to season index, then the root
+        cover, and fits the result to Telegram's 320×320 thumbnail box under a
+        per-entry filename so S1/S1P2/S2/OVA posters never clobber each other.
+        ``None`` when there's no AniList cover for this pack — the caller then
+        uses the shared poster."""
         from pathlib import Path
 
         from nekofetch.core.logging import get_logger
         _log = get_logger(__name__)
 
         eid = _as_int(entry_id)
+        part_ids = (entry_posters or {}).get("part_ids") or {}
+        part_eid = part_ids.get((season, season_part))
+        if part_eid is None and season_part is not None:
+            # The walk may leave the first half without an explicit part number.
+            part_eid = part_ids.get((season, None))
+        if part_eid is not None:
+            eid = int(part_eid)
         tag = eid if eid is not None else (f"s{season}" if season is not None else "x")
         dest = Path(dest_dir) / f"poster_anilist_{tag}.jpg"
         if dest.exists() and dest.stat().st_size > 0:

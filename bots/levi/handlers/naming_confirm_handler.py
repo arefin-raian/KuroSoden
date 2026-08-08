@@ -7,23 +7,30 @@ releases the worker:
 
 * **✅ Use it**  (``levi|nmuse|{job}|{kind}``) — accept the computed default:
   write the ``__use__`` sentinel, clear the awaiting flag, disarm, tidy the card.
-* **✏️ Edit**   (``levi|nmedit|{job}|{kind}``) — the marker is already armed, so we
-  just nudge the admin to send their corrected text back.
-* **text reply** (group=13) — when a marker with state ``levi_confirm_{kind}`` is
+* **✏️ Edit**   (``levi|nmedit|{job}|{kind}``) — swap the buttons to Cancel and
+  nudge the admin to send their corrected text back. The marker stays armed.
+* **❌ Cancel** (``levi|nmcancel|{job}|{kind}``) — restore the Use it / Edit row
+  without releasing the worker (nothing changes).
+* **text reply** (group=16) — when a marker with state ``levi_confirm_{kind}`` is
   live in this chat, the next text message IS the edit: write it to the value key,
   clear the awaiting flag, disarm, edit the card.
 
 Everything is chat-scoped (via ``channel_reply``), so it works both in a DM with
 Levi and from the anonymous Control Center channel. The text consumer sits in its
-own handler group (13) so it never collides with the review flow's group=12
-magnet/document consumers.
+own handler group (16) so it never collides with the review flow's group=4/5/6/7/
+10/12/13/14 handlers or pack-caption's group=15.
 """
 
 from __future__ import annotations
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.types import CallbackQuery, Message
+from pyrogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from nekofetch.bots.channel_reply import disarm as _disarm_reply
 from nekofetch.bots.channel_reply import peek as _peek_reply
@@ -39,10 +46,30 @@ from nekofetch.services.naming_confirm import (
     await_key,
     value_key,
 )
+from nekofetch.ui.components import cb
 
 log = get_logger(__name__)
 
 _KINDS = {"name", "caption"}
+
+
+def _choice_kb(job_id: int, kind: str) -> InlineKeyboardMarkup:
+    """The resting keyboard: accept the default, or start an edit.
+
+    Rebuilt (not stored) so it matches the worker's original card exactly — same
+    callbacks the confirm gate posts in ``naming_confirm.confirm``."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Use it", callback_data=cb("levi", "nmuse", job_id, kind)),
+        InlineKeyboardButton("✏️ Edit", callback_data=cb("levi", "nmedit", job_id, kind)),
+    ]])
+
+
+def _cancel_kb(job_id: int, kind: str) -> InlineKeyboardMarkup:
+    """The editing keyboard: while we await the typed value, the only action is to
+    back out. Tapping it restores :func:`_choice_kb`."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel", callback_data=cb("levi", "nmcancel", job_id, kind)),
+    ]])
 
 
 def _card_key(job_id: int, kind: str) -> str:
@@ -91,8 +118,14 @@ def register(client: Client, container: Container) -> None:
         parts = q.data.split("|")
         if len(parts) < 4:
             return
-        kind = parts[3]
+        job_id, kind = int(parts[2]), parts[3]
         what = "file name" if kind == "name" else "caption"
+        # We're now awaiting a typed value, so the only meaningful action left is
+        # to back out — swap the [Use it | Edit] row for a single Cancel button.
+        try:
+            await q.edit_message_reply_markup(reply_markup=_cancel_kb(job_id, kind))
+        except Exception:  # noqa: BLE001 — button swap is cosmetic
+            pass
         try:
             await q.answer(
                 f"Copy the {what} above, edit it, and send it back to me.",
@@ -100,7 +133,26 @@ def register(client: Client, container: Container) -> None:
         except Exception:  # noqa: BLE001
             pass
 
-    @client.on_message(filters.text & ~filters.command(["start"]), group=13)
+    @client.on_callback_query(filters.regex(r"^levi\|nmcancel\|"))
+    async def _cancel_edit(client: Client, q: CallbackQuery) -> None:
+        """Back out of an edit without changing anything — restore the choice row.
+
+        The worker stays blocked on the awaiting flag (we do NOT release it), so
+        the admin can still tap Use it or Edit again; nothing is lost."""
+        parts = q.data.split("|")
+        if len(parts) < 4:
+            return
+        job_id, kind = int(parts[2]), parts[3]
+        try:
+            await q.edit_message_reply_markup(reply_markup=_choice_kb(job_id, kind))
+        except Exception:  # noqa: BLE001 — button swap is cosmetic
+            pass
+        try:
+            await q.answer("Edit cancelled — the shown value stands.")
+        except Exception:  # noqa: BLE001
+            pass
+
+    @client.on_message(filters.text & ~filters.command(["start"]), group=16)
     async def _consume_edit(client: Client, message: Message) -> None:
         """Capture a text reply while a naming/caption marker is armed here."""
         redis = container.redis

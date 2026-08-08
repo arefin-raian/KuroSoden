@@ -1136,9 +1136,12 @@ class SenkuPublisher:
     ) -> tuple[dict[int, str], dict[int, str]]:
         """Mirror each rendered entry thumbnail to a public URL.
 
-        Phase 3 stores each rendered card as ``file://<path>`` in the entry's
-        selection. Telegram can't serve a local path, so we mirror each render
-        across the configured hosts (ImgBB first) here.
+        Phase 3 stores each rendered card in the entry's selection. Modern
+        renders are mirrored across the image hosts AT RENDER TIME and carry a
+        public ``http(s)`` URL, which passes straight through here; legacy
+        ``file://<path>`` renders (from before that change, or a render whose
+        host upload failed) are mirrored across the configured hosts (ImgBB
+        first) on the spot.
 
         Returns ``(by_index, by_anilist_id)``:
           * ``by_index``  — ``entry.index → url`` for EVERY rendered entry. Index
@@ -1166,7 +1169,15 @@ class SenkuPublisher:
         for entry in entries:
             sel = await self.cache.get_selection(code, entry.index)
             url = sel.thumbnail_url if sel else None
-            if not url or not url.startswith("file://"):
+            if not url:
+                continue
+            # Already public — uploaded when the entry rendered. No re-upload.
+            if url.startswith(("http://", "https://")):
+                by_index[entry.index] = url
+                if entry.anilist_id is not None:
+                    by_anilist[entry.anilist_id] = url
+                continue
+            if not url.startswith("file://"):
                 continue
             path = Path(url[len("file://"):])
             try:

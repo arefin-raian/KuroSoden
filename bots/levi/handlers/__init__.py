@@ -84,8 +84,10 @@ def register_all(client: Client, container: Container) -> None:
 
     # ── Interactive filename / caption confirm gate (worker ↔ bot) ─────────
     # The headless download worker posts a confirm card and blocks; this handler
-    # consumes the admin's Use-it / Edit answer and releases the worker. Its
-    # text consumer sits in group=13 so it never collides with review's group=12.
+    # consumes the admin's Use-it / Edit / Cancel answer and releases the worker.
+    # Its text consumer sits in group=16 — review already occupies group=13, so
+    # the earlier group=13 slot silently lost every edit to review's DDL-link
+    # handler (which matches any text and returns early). group=16 is unshared.
     from kurosoden.bots.levi.handlers.naming_confirm_handler import (
         register as register_naming_confirm,
     )

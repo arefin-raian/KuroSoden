@@ -23,7 +23,7 @@ from nekofetch.services.bot_render import (
     resolution_label,
     resolve_premium_emoji,
 )
-from kurosoden.shared.distribution_cache import EntryData
+from kurosoden.shared.distribution_cache import EntryData, Selection
 from kurosoden.shared.senku_publisher import SenkuPublisher
 
 FMT = PostFormatConfig()
@@ -223,6 +223,87 @@ def test_premium_emoji_maps_raw_glyph():
     fmt = PostFormatConfig(premium_emoji={"🎬": "999"})
     out = resolve_premium_emoji("🎬 tonight", fmt)
     assert out == '<tg-emoji emoji-id="999">🎬</tg-emoji> tonight'
+
+
+# ── _bridge_thumbnails ───────────────────────────────────────────────────────────
+
+class _FakeCache:
+    """Selections preloaded per entry index — no Redis needed."""
+
+    def __init__(self, selections):
+        self._selections = selections
+
+    async def get_selection(self, code, index):
+        return self._selections.get(index, Selection())
+
+
+@pytest.mark.asyncio
+async def test_bridge_passes_through_public_urls(pub, monkeypatch):
+    """Renders mirrored at render time already carry a public URL — the bridge
+    must NOT re-upload them, just index them by entry and anilist id."""
+    entries = [
+        EntryData(index=1, label="Season 1", anilist_id=101),
+        EntryData(index=2, label="Season 1 Part 2", anilist_id=102),
+    ]
+    pub.cache = _FakeCache({
+        1: Selection(thumbnail_url="https://files.catbox.moe/a.webp"),
+        2: Selection(thumbnail_url="https://imgbb.com/b.webp"),
+    })
+
+    async def must_not_upload(*a, **k):
+        raise AssertionError("public URLs must pass through, not re-upload")
+
+    import kurosoden.shared.image_backup as image_backup
+    monkeypatch.setattr(image_backup, "backup_bytes", must_not_upload)
+
+    by_index, by_id = await pub._bridge_thumbnails("REQ-1", entries)
+    assert by_index == {1: "https://files.catbox.moe/a.webp",
+                        2: "https://imgbb.com/b.webp"}
+    assert by_id == {101: "https://files.catbox.moe/a.webp",
+                     102: "https://imgbb.com/b.webp"}
+
+
+@pytest.mark.asyncio
+async def test_bridge_still_uploads_legacy_file_renders(pub, monkeypatch, tmp_path):
+    """Legacy ``file://`` selections (pre-render-time-hosting, or a render whose
+    host upload failed) are still mirrored here — the old path is preserved."""
+    webp = tmp_path / "thumb.webp"
+    webp.write_bytes(b"WEBPRENDER")
+    entries = [EntryData(index=1, label="Season 1", anilist_id=101)]
+    pub.cache = _FakeCache({1: Selection(thumbnail_url=f"file://{webp}")})
+
+    uploaded: dict = {}
+
+    async def fake_backup(container, blob, *, mime="image/jpeg", source_url=""):
+        from kurosoden.shared.image_backup import BackupImage
+        uploaded["bytes"] = blob
+        uploaded["mime"] = mime
+        return BackupImage(source_url=source_url,
+                           imgbb_url="https://imgbb.com/x.webp")
+
+    import kurosoden.shared.image_backup as image_backup
+    monkeypatch.setattr(image_backup, "backup_bytes", fake_backup)
+
+    by_index, by_id = await pub._bridge_thumbnails("REQ-1", entries)
+    assert by_index == {1: "https://imgbb.com/x.webp"}
+    assert by_id == {101: "https://imgbb.com/x.webp"}
+    assert uploaded["bytes"] == b"WEBPRENDER"
+    assert uploaded["mime"] == "image/webp"
+
+
+@pytest.mark.asyncio
+async def test_bridge_skips_entries_without_thumbnail(pub, monkeypatch):
+    entries = [EntryData(index=1, label="Season 1", anilist_id=101)]
+    pub.cache = _FakeCache({1: Selection()})  # no thumbnail yet
+
+    async def must_not_upload(*a, **k):
+        raise AssertionError("no thumbnail → nothing to upload")
+
+    import kurosoden.shared.image_backup as image_backup
+    monkeypatch.setattr(image_backup, "backup_bytes", must_not_upload)
+    by_index, by_id = await pub._bridge_thumbnails("REQ-1", entries)
+    assert by_index == {}
+    assert by_id == {}
 
 
 # ── _send_posts (fake client) ────────────────────────────────────────────────────

@@ -387,14 +387,18 @@ def register(client: Client, container: Container) -> None:
                 [InlineKeyboardButton(
                     "🌐 Website sources",
                     callback_data=cb("levi", "website", code),
-                )],
-                [InlineKeyboardButton(
+                ),
+                 InlineKeyboardButton(
                     "✈️ Telegram manual",
                     callback_data=cb("levi", "telegram", code),
                 )],
                 [InlineKeyboardButton(
                     "🧲 Torrent",
                     callback_data=cb("staff", "rsource", code, "torrent"),
+                ),
+                 InlineKeyboardButton(
+                    "🔗 Direct Link (DDL)",
+                    callback_data=cb("staff", "rsource", code, "ddl"),
                 )],
             ])
             try:

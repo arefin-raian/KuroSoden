@@ -376,3 +376,52 @@ async def test_relink_no_channel_is_noop(session, sessionmaker):
         client, "anilist:404")
     assert result == {"relinked": 0, "chat_id": None}
     assert client.edits == []
+
+
+async def test_submit_dms_assigned_admin(session, sessionmaker, tmp_path,
+                                         monkeypatch):
+    """Regression: a redo must DM the admin it assigns the reopened task to.
+
+    The bug: submit() re-queued + assigned to Levi but never sent the
+    assignment card, so the admin saw the task on the board with no
+    notification. This pins that notify_stage_assignment fires for the
+    assigned admin via the pipeline_manager's Levi client.
+    """
+    from nekofetch.infrastructure.repositories import request_repo
+    from kurosoden.shared import admin_assignment as aa
+    from kurosoden.shared import handoff
+    from kurosoden.shared.redo_service import RedoService
+
+    _seq = [3000]
+
+    async def _fake_next_seq(self):
+        _seq[0] += 1
+        return _seq[0]
+
+    async def _fake_assign(self, code, stage):
+        return SimpleNamespace(admin_telegram_id=7, status="assigned")
+
+    # Keep the DM hermetic: no backdrop fetch, text-only send path.
+    async def _no_art(container, stage, code, title, franchise_json):
+        return None
+
+    monkeypatch.setattr(request_repo.RequestRepository, "next_sequence",
+                        _fake_next_seq)
+    monkeypatch.setattr(aa.AdminAssignmentEngine, "assign", _fake_assign)
+    monkeypatch.setattr(handoff, "_stage_art", _no_art)
+
+    sent: list[tuple[int, str]] = []
+
+    class _FakeLevi:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append((chat_id, text))
+
+        async def send_photo(self, chat_id, photo, **kw):  # pragma: no cover
+            sent.append((chat_id, kw.get("caption", "")))
+
+    mgr = SimpleNamespace(levi=_FakeLevi(), lelouch=None)
+    svc = RedoService(_container(sessionmaker, tmp_path, pipeline_manager=mgr))
+    await svc.submit(42, "Notify Me", "anilist:930", {"anilist_id": 930})
+
+    assert sent, "no assignment DM was sent on redo"
+    assert sent[0][0] == 7, "DM did not go to the assigned admin (telegram id 7)"

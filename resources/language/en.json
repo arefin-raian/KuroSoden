@@ -251,6 +251,7 @@
   "torrent_map_title": "📦 <b>Torrent → Franchise Mapping</b>",
   "torrent_map_confirm": "{title}\n\n{mapping}\n\n<i>Review the mapping above. Confirm to queue the download, or edit to adjust.</i>",
   "torrent_map_btn_confirm": "✅ Confirm Mapping",
+  "torrent_map_btn_full": "📋 Full Mapping",
   "torrent_map_btn_detail": "📋 Details",
   "torrent_map_btn_edit": "✏️ Edit",
   "torrent_map_btn_toggle": "👁 Toggle Entry",

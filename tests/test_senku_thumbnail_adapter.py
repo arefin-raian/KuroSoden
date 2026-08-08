@@ -211,3 +211,119 @@ async def test_render_entry_refuses_without_all_assets(adapter):
     await adapter.store_pick("REQ-1", 1, "logo", 1)  # only logo
     entry = await adapter.cache.get_entry("REQ-1", 1)
     assert await adapter.render_entry("REQ-1", entry) is None
+
+
+# ── render_entry mirrors the render to the image hosts AT RENDER TIME ────────────
+#
+# Regression: the rendered card was only ever uploaded at publish time (the
+# publisher bridge), so a render that never reached publish existed nowhere but
+# the local disk — the "rendered but never uploaded" bug. render_entry now
+# uploads the bytes immediately and stores the public URL; the DM preview still
+# uses the local path it returns.
+
+
+def _stub_renderer(adapter, tmp_path):
+    """Wire a fake Playwright renderer that writes a local .webp and return it."""
+    webp = tmp_path / "thumb.webp"
+    webp.write_bytes(b"WEBPRENDER")
+
+    class _FakeRenderer:
+        async def render_thumbnail(self, **kw):
+            return webp
+
+    adapter._render = _FakeRenderer()
+    return webp
+
+
+async def _seed_assets(adapter):
+    """Give entry 1 all three asset picks without touching TMDB."""
+    await adapter.cache.set_entries("REQ-1", _entries())
+    await adapter.cache.set_selection("REQ-1", 1, asset="logo", value="http://img/logo1.png")
+    await adapter.cache.set_selection("REQ-1", 1, asset="poster", value="http://img/p1.webp")
+    await adapter.cache.set_selection("REQ-1", 1, asset="bg", value="http://img/bg1.webp")
+
+
+@pytest.fixture(autouse=True)
+def _patch_render_deps(monkeypatch):
+    """Stub the enrichment/persist helpers so render tests never touch the DB."""
+    import nekofetch.services.thumbnail_service as ts
+
+    async def fake_gather(*a, **k):
+        return {}
+
+    async def fake_persist(*a, **k):
+        return None
+
+    monkeypatch.setattr(ts, "gather_thumbnail_fields", fake_gather)
+    monkeypatch.setattr(ts, "persist_thumbnail_source", fake_persist)
+
+
+@pytest.mark.asyncio
+async def test_render_entry_hosts_thumbnail_at_render_time(adapter, monkeypatch, tmp_path):
+    await _seed_assets(adapter)
+    webp = _stub_renderer(adapter, tmp_path)
+
+    uploaded: dict = {}
+
+    async def fake_backup_bytes(container, blob, *, mime="image/jpeg", source_url=""):
+        from kurosoden.shared.image_backup import BackupImage
+        uploaded["bytes"] = blob
+        uploaded["mime"] = mime
+        return BackupImage(source_url=source_url,
+                           catbox_url="https://files.catbox.moe/thumb123.webp")
+
+    import kurosoden.shared.image_backup as image_backup
+    monkeypatch.setattr(image_backup, "backup_bytes", fake_backup_bytes)
+
+    entry = await adapter.cache.get_entry("REQ-1", 1)
+    out = await adapter.render_entry("REQ-1", entry)
+
+    # The DM preview keeps using the LOCAL path …
+    assert out == webp
+    # … but the stored selection is the PUBLIC mirror, and the real bytes + webp
+    # mime went to the hosts.
+    sel = await adapter.cache.get_selection("REQ-1", 1)
+    assert sel.thumbnail_url == "https://files.catbox.moe/thumb123.webp"
+    assert uploaded["bytes"] == b"WEBPRENDER"
+    assert uploaded["mime"] == "image/webp"
+
+
+@pytest.mark.asyncio
+async def test_render_entry_falls_back_to_file_when_hosts_reject(adapter, monkeypatch, tmp_path):
+    await _seed_assets(adapter)
+    webp = _stub_renderer(adapter, tmp_path)
+
+    async def all_hosts_down(container, blob, *, mime="image/jpeg", source_url=""):
+        from kurosoden.shared.image_backup import BackupImage
+        return BackupImage(source_url=source_url)  # every mirror is None
+
+    import kurosoden.shared.image_backup as image_backup
+    monkeypatch.setattr(image_backup, "backup_bytes", all_hosts_down)
+
+    entry = await adapter.cache.get_entry("REQ-1", 1)
+    out = await adapter.render_entry("REQ-1", entry)
+
+    # A failed host upload must NOT fail the render — the publisher bridge still
+    # understands file:// and mirrors it at publish time.
+    assert out == webp
+    sel = await adapter.cache.get_selection("REQ-1", 1)
+    assert sel.thumbnail_url == f"file://{webp}"
+
+
+@pytest.mark.asyncio
+async def test_render_entry_host_failure_is_nonfatal(adapter, monkeypatch, tmp_path):
+    """A throwing host layer must not turn a good render into a failure."""
+    await _seed_assets(adapter)
+    webp = _stub_renderer(adapter, tmp_path)
+
+    async def explode(*a, **k):
+        raise RuntimeError("imgbb down")
+
+    import kurosoden.shared.image_backup as image_backup
+    monkeypatch.setattr(image_backup, "backup_bytes", explode)
+
+    entry = await adapter.cache.get_entry("REQ-1", 1)
+    out = await adapter.render_entry("REQ-1", entry)
+    assert out == webp
+    sel = await adapter.cache.get_selection("REQ-1", 1)
+    assert sel.thumbnail_url == f"file://{webp}"

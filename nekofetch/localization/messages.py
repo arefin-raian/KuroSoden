@@ -367,6 +367,7 @@ class M:
     TORRENT_MAP_TITLE = "torrent_map_title"
     TORRENT_MAP_CONFIRM = "torrent_map_confirm"
     TORRENT_MAP_BTN_CONFIRM = "torrent_map_btn_confirm"
+    TORRENT_MAP_BTN_FULL = "torrent_map_btn_full"
     TORRENT_MAP_BTN_DETAIL = "torrent_map_btn_detail"
     TORRENT_MAP_BTN_EDIT = "torrent_map_btn_edit"
     TORRENT_MAP_BTN_TOGGLE = "torrent_map_btn_toggle"

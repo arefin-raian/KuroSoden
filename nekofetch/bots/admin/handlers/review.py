@@ -81,6 +81,34 @@ def _esc(text: str) -> str:
     return _html.escape(text or "", quote=False)
 
 
+def _torrent_map_kb(L, code: str, map_url: str, *, with_fix: bool = True) -> InlineKeyboardMarkup:
+    """Mapping card keyboard: the Telegraph Full Mapping page as a URL button.
+
+    The full mapping is an external page, so it gets a real URL button as the
+    FIRST row (the operator asked for a button instead of a caption hyperlink)
+    with the Confirm / Details / Toggle (/ Fix) action rows below it. ``L`` is
+    the active localizer (``container.localizer.get``).
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    if map_url:
+        rows.append([InlineKeyboardButton(L(M.TORRENT_MAP_BTN_FULL), url=map_url)])
+    rows.append([
+        InlineKeyboardButton(L(M.TORRENT_MAP_BTN_CONFIRM),
+                             callback_data=cb("staff", "rtmapok", code)),
+        InlineKeyboardButton(L(M.TORRENT_MAP_BTN_DETAIL),
+                             callback_data=cb("staff", "rtmapdet", code, 0)),
+    ])
+    toggle = [InlineKeyboardButton(L(M.TORRENT_MAP_BTN_TOGGLE),
+                                   callback_data=cb("staff", "rtmaptgl", code, 0))]
+    if with_fix:
+        toggle.append(InlineKeyboardButton(L(M.TORRENT_MAP_BTN_FIX),
+                                           callback_data=cb("staff", "rtmapfix", code)))
+    rows.append(toggle)
+    rows.append([InlineKeyboardButton(L(M.BTN_BACK),
+                                      callback_data=cb("staff", "rdetail", code))])
+    return InlineKeyboardMarkup(rows)
+
+
 async def _anime_backdrop(container, req) -> str | None:
     """Rotating artwork for the anime behind a request.
 
@@ -1332,15 +1360,7 @@ def register(client: Client, container: Container) -> None:
 
         text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
                  mapping=summary)
-        if map_url:
-            text += f'\n\n<a href="{map_url}">📋 Full mapping (with file numbers)</a>'
-        kb = keyboard(
-            [(L(M.TORRENT_MAP_BTN_CONFIRM), cb("staff", "rtmapok", code)),
-             (L(M.TORRENT_MAP_BTN_DETAIL), cb("staff", "rtmapdet", code, 0))],
-            [(L(M.TORRENT_MAP_BTN_TOGGLE), cb("staff", "rtmaptgl", code, 0)),
-             (L(M.TORRENT_MAP_BTN_FIX), cb("staff", "rtmapfix", code))],
-            [(L(M.BTN_BACK), cb("staff", "rdetail", code))],
-        )
+        kb = _torrent_map_kb(L, code, map_url or "")
         await show(client, msg, text, kb)
 
     async def _torrent_enqueue(
@@ -1456,14 +1476,7 @@ def register(client: Client, container: Container) -> None:
 
         text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
                  mapping=summary)
-        if data.get("map_url"):
-            text += f'\n\n<a href="{data["map_url"]}">📋 Full mapping (with file numbers)</a>'
-        kb = keyboard(
-            [(L(M.TORRENT_MAP_BTN_CONFIRM), cb("staff", "rtmapok", code)),
-             (L(M.TORRENT_MAP_BTN_DETAIL), cb("staff", "rtmapdet", code, 0))],
-            [(L(M.TORRENT_MAP_BTN_TOGGLE), cb("staff", "rtmaptgl", code, 0))],
-            [(L(M.BTN_BACK), cb("staff", "rdetail", code))],
-        )
+        kb = _torrent_map_kb(L, code, data.get("map_url") or "", with_fix=False)
         await show(client, q.message, text, kb)
 
     @client.on_callback_query(filters.regex(r"^staff\|rtmaptgl"))
@@ -1756,15 +1769,7 @@ def register(client: Client, container: Container) -> None:
 
         text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
                  mapping=summary)
-        if data.get("map_url"):
-            text += f'\n\n<a href="{data["map_url"]}">📋 Full mapping (with file numbers)</a>'
-        kb = keyboard(
-            [(L(M.TORRENT_MAP_BTN_CONFIRM), cb("staff", "rtmapok", code)),
-             (L(M.TORRENT_MAP_BTN_DETAIL), cb("staff", "rtmapdet", code, 0))],
-            [(L(M.TORRENT_MAP_BTN_TOGGLE), cb("staff", "rtmaptgl", code, 0)),
-             (L(M.TORRENT_MAP_BTN_FIX), cb("staff", "rtmapfix", code))],
-            [(L(M.BTN_BACK), cb("staff", "rdetail", code))],
-        )
+        kb = _torrent_map_kb(L, code, data.get("map_url") or "")
         await show(client, q.message, text, kb)
 
     @client.on_callback_query(filters.regex(r"^staff\|rsiteprio"))
