@@ -50,6 +50,20 @@ log = get_logger(__name__)
 
 BOT = "senku"
 
+
+def _thumbnail_preview_source(path, thumbnail_url: str | None):
+    """Choose the reliable source for the inline Telegram thumbnail preview.
+
+    ``render_entry`` stores the render's public mirror in ``thumbnail_url``.
+    Passing that HTTP URL makes Pyrogram use Telegram's external-photo path (the
+    same path the distribution channel already uses successfully). A local JPEG
+    is only the fallback when every mirror was unavailable.
+    """
+    if isinstance(thumbnail_url, str) and thumbnail_url.startswith(("http://", "https://")):
+        return thumbnail_url
+    return webp_to_jpeg(path) or path
+
+
 # FSM state: waiting for the admin to send the created channel's @username / id.
 STATE_AWAIT_CHANNEL = "senku:wiz:await_channel"
 
@@ -730,27 +744,60 @@ def register(client: Client, container: Container) -> None:
                 old_msg=q.message,
             )
             return
-        # Upload the rendered card so the admin sees the result inline, but do not
-        # advance until the operator explicitly approves this entry.
-        #
-        # Telegram's photo endpoint is unreliable with the rendered .webp (the
-        # sticker format) — sends can hang or be rejected, which is exactly the
-        # "Gallery didn't load" preview bug: the render succeeded and the image
-        # hosts accepted it, only the DM send failed. Convert to a JPEG for the
-        # send; the stored artifact stays WebP.
-        preview = webp_to_jpeg(path) or path
+
+        # render_entry has already mirrored the finished card and persisted its
+        # public URL in the same Redis selection used by the publisher. Use that
+        # URL for the DM preview too: Telegram can fetch a public image directly,
+        # while Pyrogram's local-file upload uses a separate MTProto upload path
+        # and was the actual failing boundary. The local JPEG is only a fallback
+        # when every image host rejected the render.
+        rendered_selection = await cache.get_selection(code, index)
+        has_public_preview = isinstance(rendered_selection.thumbnail_url, str) and \
+            rendered_selection.thumbnail_url.startswith(("http://", "https://"))
+        local_preview = None if has_public_preview else (webp_to_jpeg(path) or path)
+        preview = (rendered_selection.thumbnail_url
+                   if has_public_preview else local_preview)
+        markup = keyboard([
+            [(V.BTN_THUMB_APPROVE,
+              cb(BOT, "wiz", "thumbok", code, str(index))),
+             (V.BTN_THUMB_REDO,
+              cb(BOT, "wiz", "thumbredo", code, str(index)))],
+        ])
         try:
             await client.send_photo(
-                q.message.chat.id, str(preview),
-                reply_markup=keyboard([
-                    [(V.BTN_THUMB_APPROVE,
-                      cb(BOT, "wiz", "thumbok", code, str(index))),
-                     (V.BTN_THUMB_REDO,
-                      cb(BOT, "wiz", "thumbredo", code, str(index)))],
-                ]),
+                q.message.chat.id, str(preview), reply_markup=markup,
             )
         except Exception as exc:  # noqa: BLE001 — keep the Generate card usable
-            log.debug("senku.wiz.thumb_preview_failed", code=code, error=str(exc))
+            # If Telegram cannot fetch the public mirror, make one last attempt
+            # with the local JPEG. This protects against a host that accepted the
+            # upload but is temporarily unreachable from Telegram's DCs.
+            log.warning(
+                "senku.wiz.thumb_preview_failed",
+                code=code, entry=index, preview_source=("public_url"
+                    if has_public_preview else "local_file"),
+                path=str(path), error=repr(exc),
+            )
+            if has_public_preview:
+                # Build the local fallback only after the public URL has failed;
+                # the normal path should not do the extra conversion.
+                local_fallback = webp_to_jpeg(path) or path
+                try:
+                    await client.send_photo(
+                        q.message.chat.id, str(local_fallback), reply_markup=markup,
+                    )
+                    log.warning(
+                        "senku.wiz.thumb_preview_public_fallback_ok",
+                        code=code, entry=index, path=str(local_fallback),
+                    )
+                except Exception as fallback_exc:  # noqa: BLE001
+                    log.warning(
+                        "senku.wiz.thumb_preview_local_fallback_failed",
+                        code=code, entry=index, path=str(local_fallback),
+                        error=repr(fallback_exc),
+                    )
+                else:
+                    await q.message.delete()
+                    return
             await send_screen(
                 client, q.message.chat.id,
                 card(V.THUMB_GALLERY_FAIL, image=pick_artwork(BOT), bot_name=BOT,
