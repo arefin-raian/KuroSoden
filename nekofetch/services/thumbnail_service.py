@@ -96,6 +96,45 @@ def _genre_pill(label: str) -> str:
     )
 
 
+def webp_to_jpeg(path: str | Path, *, quality: int = 92) -> Path | None:
+    """Convert a rendered ``.webp`` card to a JPEG Telegram can show as a photo.
+
+    The renderer outputs WebP (small, lossy-95) but Telegram's photo endpoint is
+    unreliable with WebP — it is the sticker format, so ``send_photo`` of a
+    ``.webp`` can hang or be rejected (the "Gallery didn't load" preview bug:
+    the render succeeded, the image hosts accepted it, and only the DM preview
+    failed). Every photo ``send_photo``/``edit_message_media`` path converts
+    through here first; the stored/published artifact stays WebP.
+
+    Writes ``<stem>.jpg`` next to the source and returns its ``Path``; ``None``
+    when the source is missing or PIL can't decode it (callers fall back to the
+    original path so a conversion failure never regresses the send).
+    """
+    src = Path(path)
+    try:
+        from PIL import Image
+
+        with Image.open(src) as im:
+            # Flatten any alpha (RGBA/P) onto white so JPEG has nothing to drop.
+            if im.mode in ("RGBA", "LA", "P"):
+                im = im.convert("RGBA")
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[-1])
+                im = bg
+            else:
+                im = im.convert("RGB")
+            dest = src.with_suffix(".jpg")
+            # Already a JPEG (or the suffix collides): there is nothing to
+            # convert, and saving over the source is fragile on Windows.
+            if dest.resolve() == src.resolve():
+                return src
+            im.save(dest, format="JPEG", quality=quality, optimize=True)
+            return dest
+    except Exception as exc:
+        log.warning("thumbnail.webp_to_jpeg.failed", path=str(src), error=str(exc))
+        return None
+
+
 async def _download_image(url: str, dest: Path) -> Path | None:
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as cli:

@@ -12,6 +12,7 @@ available, the metadata enrichment layer (genres, overview, poster, studio tag).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from pyrogram.enums import ParseMode
 from pyrogram.types import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,6 +29,7 @@ from nekofetch.infrastructure.database.postgres.models import (
     StoragePack,
 )
 from nekofetch.infrastructure.database.postgres.session import session_scope
+from nekofetch.services.thumbnail_service import webp_to_jpeg
 from nekofetch.ui import templates
 
 log = get_logger(__name__)
@@ -560,10 +562,13 @@ class MainChannelService:
                 log.warning("mainchannel.thumbnail_refresh.no_caption",
                             anime=anime_doc_id)
                 return False
+            # The webp card is the sticker format to Telegram's media endpoint,
+            # so the live edit sends a JPEG conversion of the same render.
+            photo = webp_to_jpeg(image_path) or Path(image_path)
             await client.edit_message_media(
                 chat_id,
                 message_id,
-                InputMediaPhoto(str(image_path), caption=caption,
+                InputMediaPhoto(str(photo), caption=caption,
                                 parse_mode=ParseMode.HTML),
             )
         except Exception as exc:  # noqa: BLE001 - editor reports a safe failure

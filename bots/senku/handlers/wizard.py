@@ -38,6 +38,7 @@ from nekofetch.ui.artwork import (
 )
 from nekofetch.ui.components import cb, keyboard
 from nekofetch.ui.screens import Screen, card, send_screen
+from nekofetch.services.thumbnail_service import webp_to_jpeg
 
 from kurosoden.shared import senku_voice as V
 from kurosoden.shared.channel_essentials import build_channel_essentials
@@ -731,9 +732,16 @@ def register(client: Client, container: Container) -> None:
             return
         # Upload the rendered card so the admin sees the result inline, but do not
         # advance until the operator explicitly approves this entry.
+        #
+        # Telegram's photo endpoint is unreliable with the rendered .webp (the
+        # sticker format) — sends can hang or be rejected, which is exactly the
+        # "Gallery didn't load" preview bug: the render succeeded and the image
+        # hosts accepted it, only the DM send failed. Convert to a JPEG for the
+        # send; the stored artifact stays WebP.
+        preview = webp_to_jpeg(path) or path
         try:
             await client.send_photo(
-                q.message.chat.id, str(path),
+                q.message.chat.id, str(preview),
                 reply_markup=keyboard([
                     [(V.BTN_THUMB_APPROVE,
                       cb(BOT, "wiz", "thumbok", code, str(index))),

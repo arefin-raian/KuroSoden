@@ -94,6 +94,81 @@ async def test_main_thumbnail_refresh_preserves_caption_and_updates_backup(
 
 
 @pytest.mark.asyncio
+async def test_distribution_thumbnail_refresh_sends_jpeg_for_webp_render(
+    sessionmaker, monkeypatch, tmp_path: Path,
+):
+    """A rendered .webp card is converted to JPEG before the live media edit.
+
+    Telegram's media endpoint treats webp as the sticker format, so the preview
+    send must carry a JPEG conversion of the render — the stored artifact stays
+    webp. This is the "Gallery didn't load" preview fix: the render succeeded
+    and the hosts accepted it, only the Telegram send failed.
+    """
+    import io
+    from PIL import Image
+
+    client = FakeClient()
+    # Distinct ids from the caption/backup test below so both can run together
+    # without the ``.one()`` lookups seeing each other's rows.
+    client.messages[(-2003, 99)] = SimpleNamespace(caption="<b>Season caption</b>")
+    webp = tmp_path / "card.webp"
+    buf = io.BytesIO()
+    Image.new("RGBA", (80, 40), (200, 30, 60, 255)).save(buf, format="WEBP")
+    webp.write_bytes(buf.getvalue())
+    async with sessionmaker() as session:
+        bot = DistributionBot(
+            kind="distribution", name="Senku", encrypted_token="x",
+            anime_doc_id="anime-3", enabled=True, is_channel=True, chat_id=-2003,
+        )
+        session.add(bot)
+        await session.flush()
+        session.add(ChannelLayout(
+            channel_bot_id=bot.id, seq=1, kind="season_card",
+            tg_message_id=99, anilist_id=2222,
+        ))
+        session.add(BotContentPost(
+            bot_id=bot.id, post_type="season_card", caption="<b>Season caption</b>",
+            image_url="https://old.example/old.webp",
+            image_cached_url="https://old.example/old.webp",
+            anilist_id=2222, tg_message_id=99, order=1,
+        ))
+        await session.commit()
+
+    class Mirror:
+        catbox_url = None
+        telegraph_url = "https://telegraph.example/card.jpg"
+        imgbb_url = None
+
+        @property
+        def primary(self):
+            return self.telegraph_url
+
+    async def mirror_bytes(*args, **kwargs):
+        return Mirror()
+
+    monkeypatch.setattr(image_backup, "backup_bytes", mirror_bytes)
+    svc = ThumbnailChannelService(_container(sessionmaker, client))
+    assert await svc.refresh_published_thumbnail("anime-3", 2222, str(webp)) is True
+    assert len(client.media_edits) == 1
+    media = client.media_edits[0][2]
+    # The live edit carries the JPEG conversion, not the raw webp.
+    assert media.media == str(webp.with_suffix(".jpg"))
+    assert webp.with_suffix(".jpg").exists()
+
+    # The test DB is shared across this file's tests, and the caption/backup
+    # test below queries BotContentPost/ChannelContentBackup with unfiltered
+    # ``.one()`` — remove our rows (children first) so it sees exactly its own.
+    async with sessionmaker() as session:
+        post = (await session.execute(select(BotContentPost))).scalars().one()
+        layout = (await session.execute(select(ChannelLayout))).scalars().one()
+        bot = (await session.execute(select(DistributionBot))).scalars().one()
+        await session.delete(post)
+        await session.delete(layout)
+        await session.delete(bot)
+        await session.commit()
+
+
+@pytest.mark.asyncio
 async def test_distribution_thumbnail_refresh_preserves_caption_and_backup(
     sessionmaker, monkeypatch, tmp_path: Path,
 ):

@@ -51,7 +51,7 @@ from nekofetch.providers.metadata.tmdb_assets import (
 from nekofetch.ui import thumbnail_sections as S
 from nekofetch.ui.components import cb
 from nekofetch.ui.screens import MESSAGE_LIMIT, _truncate_html
-from nekofetch.services.thumbnail_service import ThumbnailRenderService
+from nekofetch.services.thumbnail_service import ThumbnailRenderService, webp_to_jpeg
 
 log = get_logger(__name__)
 
@@ -324,9 +324,12 @@ class ThumbnailChannelService:
                 log.warning("thumbcc.published_refresh.no_caption",
                             anime=anime_doc_id, anilist_id=anilist_id)
                 return False
+            # The webp card is the sticker format to Telegram's media endpoint,
+            # so the live edit sends a JPEG conversion of the same render.
+            photo = webp_to_jpeg(image_path) or Path(image_path)
             await client.edit_message_media(
                 chat_id, message_id,
-                InputMediaPhoto(str(image_path), caption=caption,
+                InputMediaPhoto(str(photo), caption=caption,
                                 parse_mode=ParseMode.HTML),
             )
         except Exception as exc:  # noqa: BLE001 - one live surface must not abort the edit
@@ -1529,9 +1532,13 @@ class ThumbnailChannelService:
         # coordinates in the durable source row so /edit_thumbnail can replace
         # this exact Telegram message instead of creating an orphaned card.
         source_fields["thumbnail_chat_id"] = self.cfg.channel_id
+        # Telegram's photo endpoint is unreliable with the rendered .webp (the
+        # sticker format), so the channel reference card is sent as a JPEG — the
+        # stored artifact stays the original WebP.
+        preview = webp_to_jpeg(thumbnail_path) or Path(thumbnail_path)
         try:
             photo_msg = await self._client.send_photo(
-                self.cfg.channel_id, str(thumbnail_path),
+                self.cfg.channel_id, str(preview),
                 caption=f"<b>{title}</b> — <i>{entry.label}</i>\n\n"
                         f"<b>Logo:</b> {entry.logo_url[:60]}...\n"
                         f"<b>Poster:</b> {entry.poster_url[:60]}...\n"
