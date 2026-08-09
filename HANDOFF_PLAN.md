@@ -1102,6 +1102,35 @@ Part-
 -
 -
 
+### PHASE 10 — Text-logo builder: expand fonts, add color picker, add font upload — ✅ done
+
+> **Executor status (2026-08-09).** All §10.1–§10.10 items are implemented and verified against the
+> working tree: full suite 867 passed / 13 failed / 5 skipped (the 13 failures are the pre-existing
+> Kage SQLite DB failures in `test_admin_assignment.py` / `test_integration.py` /
+> `test_edge_cases.py` / `test_management_service.py` — they fail identically with Phase-10 changes
+> stashed, so they are NOT a regression; they pass under PostgreSQL). Phase-10 focused tests
+> (`tests/test_text_logo.py`, `tests/test_senku_wizard_routing.py`, `tests/test_senku_text_logo_flow.py`,
+> `tests/test_senku_thumbnail_adapter.py`) are all green.
+>
+> - **§10.1** 60 bundled OFL-1.1 fonts (≥10 per category × 6 categories), each with its
+>   `OFL-1.1-<slug>.txt` sibling (incl. the pre-existing Playfair Display license gap); renderer stays
+>   offline. Fetched from the google/fonts GitHub mirror; 5 Apache-2.0 families (Satisfy, Yellowtail,
+>   Ultra, Chewy, Permanent Marker, Rock Salt) were swapped for OFL-1.1 visual equivalents (Great
+>   Vibes, Parisienne, Passion One, Shrikhand, Gloria Hallelujah, Caveat Brush) per the plan's
+>   all-OFL requirement.
+> - **§10.2** Category grid renders 2/row with an `⬆️ Upload your own` full-width row beneath.
+> - **§10.3** One-shot upload flow: `.ttf`/`.otf` staged under `data/text_logos/uploaded/`
+>   (content-hash name), `custom_font_path` in FSM, `render_text_logo(..., font_path=...)` bypasses
+>   the bundled index, temp font unlinked on Use-this and Cancel, never added to `FONTS`.
+> - **§10.4/§10.5** `TextLogoColor` model (white/black first, 12 swatches), `STATE_TEXT_COLORS` step
+>   between font pick and preview, `textcolor` router action, `color_rgb` threaded through the
+>   renderer + digest key (different colors → different output paths).
+> - **§10.7** `BTN_TEXT_UPLOAD_FONT` + `thumb_text_*` voice builders added in `senku_voice.py`.
+> - **§10.8** Longest `textfont` callback verified ≤64 bytes by guard test.
+> - **§10.9** Tests drive the real code paths (real client build, real router dispatch, real renderer).
+> - **§10.10** `py_compile` clean; Back/Cancel at every new step; `_text_state_matches` guards every
+>   new callback.
+
 
 ## 9. CORRECTIVE DIRECTIVES — build these THIS way (supersedes the "still open" notes above)
 
@@ -1281,3 +1310,153 @@ Every directive: reuse the cited symbol (no parallel re-
 impl); test drives the REAL code path (§9.7 rule applies to ALL new tests); `py_compile` clean; full suite green and NOT below 799 passed / 5 skipped; DB writes update the matching backup snapshot; operator-
 facing copy stays en.json-
 driven where the surrounding code already is. Update §8A's status line for each item you complete (🟡/❌ → ✅) so the record stays honest.
+
+
+---
+
+## 10. PHASE — Text-logo builder: expand fonts, add color picker, add font upload
+
+> **Context for the executor.** A text-logo flow ALREADY EXISTS (commit `2d40a95 "feat(senku): add text logo thumbnail flow"`). Read it fully before touching anything:
+> - `shared/text_logo.py` — the renderer (`render_text_logo(text, font_key)`), `CATEGORIES`, `FONTS`, `sanitize_text`, `fonts_for_category`, `get_font`, `get_category`.
+> - `bots/senku/handlers/wizard.py` — the wizard UI: `_thumb_asset_card` (the logo card with the `upload_row` = `[⬆️ Upload][✍️ Text]`), `_thumb_text_categories`, `_thumb_text_fonts`, `_thumb_text_preview`, the router actions `text/textcat/textfont/textbackcat/textbackfont/textcancel/textuse/upl` (~lines 1224-1348), the text-capture handler `_channel_text` (group=2, `STATE_AWAIT_TEXT`, ~line 1401 — ALREADY deletes the admin's message at line 1418), and the upload handler `_upload_media` (group=2, `STATE_AWAIT_UPLOAD`, ~line 1469).
+> - `shared/senku_thumbnail_adapter.py` — `store_text_logo(code, index, path)` (mirrors the PNG into the `logo_url` selection field via `image_backup.backup_bytes`) and `store_upload(...)`.
+> - `shared/senku_voice.py` — the `BTN_TEXT_*` / `BTN_UPLOAD_OWN` labels + `thumb_text_*` voice builders (~lines 617-621 and the `thumb_text_categories`/`thumb_text_fonts`/`thumb_text_preview`/`thumb_text_prompt` functions).
+> - `tests/test_text_logo.py`, `tests/test_senku_thumbnail_adapter.py`, `tests/test_senku_wizard_routing.py` — the existing coverage you must keep green and extend.
+>
+> **This is an EXTENSION, not a rebuild.** The owner reviewed the existing flow and asked for four concrete additions. Do NOT re-architect the working parts (text capture + message delete + Use-this persistence into `logo_url` all work and are correct). Match the existing code's style, the `card(...)`/`send_screen(...)` UI conventions, the `cb(BOT,"wiz",<action>,...)` callback shape, the FSM state pattern (`STATE_TEXT_*`), and the `_text_state_matches` guard used on every text-flow callback.
+
+### 10.0 — What the owner asked for (plain language, so intent isn't lost)
+The final flow, in order:
+1. On the **logo** asset card, the row reads `[⬆️ Upload]` on the LEFT and `[✍️ Text]` on the RIGHT. *(Already true — `wizard.py:786-790` builds `upload_row` as `[BTN_UPLOAD_OWN, BTN_TEXT_LOGO]`. Keep it. If the labels ever get reordered, upload stays left, text stays right.)*
+2. Tap **Text** → the bot asks "which text?" → admin sends it → bot **captures the value and DELETES the admin's message**. *(Already true — `STATE_AWAIT_TEXT` + `_channel_text` delete at `wizard.py:1418`. Keep it.)*
+3. Then show **font categories, TWO per row**, ~6 (up to 8) categories: elegant, modern/sans, cursive/script, bold display, retro, handwritten. **Below the category grid, add an `⬆️ Upload your own` button** (its own full-width row) to upload a one-shot TTF/OTF. *(Categories exist but render ONE per row and there's NO upload-font button — §10.2 + §10.3.)*
+4. Pick a category → show its fonts, **TWO per row, ≥10 fonts per category**. *(Only 1 font per category exists today — §10.1.)*
+5. Pick a font → **NEW: ask for color.** Show a named emoji-swatch grid, **white and black FIRST**, 2 per row, covering all primary colors. *(Does not exist — §10.4.)*
+6. Pick a color → **Next** → render the logo → preview with `[⇐ Back][✅ Use this]` and `[✗ Cancel]`. *(Preview exists; must now thread the chosen color into the render — §10.4/§10.5.)*
+7. **Use this** → store into `logo_url` exactly as today (`store_text_logo`) → advance to the next asset. *(Already correct — keep `textuse` → `store_text_logo` → `_thumb_next`.)*
+8. The **upload-your-own-font** path (from step 3): admin uploads a `.ttf`/`.otf`, the bot uses it for **this one render only — NO saving, NO adding to the bundled set**, then proceeds to the color step like any font. *(§10.3.)*
+
+### 10.1 — Add ≥10 fonts per category (font collection)
+**Where:** `shared/text_logo.py` `FONTS` tuple + `resources/fonts/text_logo/`.
+**Do:**
+- For EACH of the 6 categories, bundle **at least 10** Google-Fonts (OFL-1.1) families. That's ~60 `.ttf` files. Use variable-weight (`[wght]`) files where the family ships them (already the pattern: `PlayfairDisplay[wght].ttf`), else the `-Regular.ttf` static.
+- For EVERY family, drop its `OFL.txt` license next to it named `OFL-1.1-<family-slug>.txt` (the existing convention — see `OFL-1.1-bebas-neue.txt`). This is a licensing REQUIREMENT, not optional; a family without its license file must not ship.
+- Extend the `FONTS` tuple with a `TextLogoFont(key, name, category, description, filename)` per family. `key` must be unique, lowercase, stable (it's in callback data — keep it short; `cb` output must stay ≤64 bytes: `senku|wiz|textfont|<code>|<index>|<category>|<key>` — verify the longest key fits).
+- Suggested families (all Google Fonts, OFL — the executor may substitute equivalents, but keep the category's VISUAL character):
+  - **elegant (serif):** Playfair Display, Cormorant Garamond, EB Garamond, Cinzel, Libre Baskerville, Cardo, Spectral, Marcellus, Prata, DM Serif Display.
+  - **modern (sans):** Montserrat, Poppins, Inter, Work Sans, Raleway, Oswald, Archivo, Manrope, Barlow, Rubik.
+  - **script (cursive):** Pacifico, Dancing Script, Great Vibes, Satisfy, Sacramento, Allura, Parisienne, Yellowtail, Kaushan Script, Cookie.
+  - **bold (display):** Bebas Neue, Anton, Teko, Fjalla One, Alfa Slab One, Archivo Black, Passion One, Titan One, Bowlby One, Staatliches.
+  - **retro (display):** Bungee, Monoton, Bungee Inline, Lobster, Righteous, Fredoka, Bevan, Ultra, Chewy, Shrikhand.
+  - **handwritten:** Caveat, Shadows Into Light, Indie Flower, Patrick Hand, Kalam, Gloria Hallelujah, Architects Daughter, Permanent Marker, Nanum Pen Script, Reenie Beanie.
+- **How to fetch (document the method in the commit body):** download each family's release `.ttf` + `OFL.txt` from the Google Fonts GitHub mirror (`github.com/google/fonts/tree/main/ofl/<family>`). Do NOT hotlink at runtime — the renderer loads local files only (`_font_path`), and that must stay true (offline-safe, no network in `render_text_logo`).
+- **Guard test** (`tests/test_text_logo.py`): assert every `TextLogoFont.filename` resolves to an existing file under `_FONT_DIR`; assert each of the 6 categories has `len(fonts_for_category(cat)) >= 10`; assert every font file has a sibling `OFL-1.1-*.txt`; assert the longest `senku|wiz|textfont|...` callback string is ≤64 bytes.
+
+### 10.2 — Category grid: two per row (+ keep it ≤8 categories)
+**Where:** `bots/senku/handlers/wizard.py::_thumb_text_categories` (~line 696).
+**Do:** change the one-per-row build to two-per-row. Current:
+```python
+for category in text_logo_categories():
+    rows.append([(category.name, cb(BOT, "wiz", "textcat", code, str(index), category.key))])
+```
+Replace with a pair-chunked build (mirror any existing 2-col helper in the repo; if none, inline it):
+```python
+cats = list(text_logo_categories())
+row = []
+for cat in cats:
+    row.append((cat.name, cb(BOT, "wiz", "textcat", code, str(index), cat.key)))
+    if len(row) == 2:
+        rows.append(row); row = []
+if row:
+    rows.append(row)
+```
+Then append (in this order): the **`⬆️ Upload your own` font row** (§10.3), then the existing `[✗ Cancel]` row. If the owner later grows `CATEGORIES` beyond 8, the 2-col layout still holds — no cap logic needed, but do not exceed 8 (owner's stated ceiling).
+
+### 10.3 — Upload-your-own font (one-shot, NOT saved)
+**Intent:** from the category screen, an `⬆️ Upload your own` button lets the admin send a `.ttf`/`.otf` used for THIS render only. No persistence, no new bundled entry.
+**Do:**
+1. **Voice:** add `BTN_TEXT_UPLOAD_FONT = "⬆️ Upload your own"` to `senku_voice.py` and a `thumb_text_font_upload_prompt()` builder ("Send me a `.ttf` or `.otf` font file — I'll use it for this logo only.").
+2. **Category card:** append `[[ (V.BTN_TEXT_UPLOAD_FONT, cb(BOT,"wiz","textupfont", code, str(index))) ]]` between the category grid and the Cancel row (§10.2).
+3. **Router:** add `elif action == "textupfont":` — guard with `_text_state_matches(..., STATE_TEXT_CATEGORIES, ...)`, then `fsm.set(user_id, STATE_AWAIT_FONT_UPLOAD, code=..., index=..., text=<carried>)` and show a prompt card with only `[✗ Cancel]`. Add the new state constant `STATE_AWAIT_FONT_UPLOAD = "senku:wiz:await_font_upload"`.
+4. **Capture the font file:** extend the existing `_upload_media` handler (`wizard.py:1469`, group=2). It currently only handles `STATE_AWAIT_UPLOAD` (images). Add a branch for `STATE_AWAIT_FONT_UPLOAD`:
+   - Accept ONLY `message.document` whose filename ends `.ttf`/`.otf` (case-insensitive) OR mime in `{font/ttf, font/otf, application/x-font-ttf, application/font-sfnt, application/octet-stream}` — reject anything else with a voiced error and stay armed.
+   - Download to a TEMP path under `data/text_logos/uploaded/` (NOT `resources/fonts/text_logo/` — that dir is the bundled, committed set; an upload must never land there). Name it by a content hash so concurrent admins don't collide.
+   - **Delete the admin's uploaded message** (consistent with the text-capture UX and the owner's standing "delete my message" rule).
+   - Store the temp font path in FSM (`custom_font_path`) and jump STRAIGHT to the **color step** (§10.4) — an uploaded font skips category/font pick (they already chose it by uploading).
+5. **Render with a custom font:** `render_text_logo` currently resolves a bundled font via `get_font(font_key)`+`_font_path`. Add an optional param `font_path: Path | None = None` that, when provided, is used directly (bypassing `_FONT_BY_KEY`); `font_key` becomes optional in that call path. Keep the bundled path unchanged when `font_path is None`. **One-shot cleanup:** after `store_text_logo` succeeds (Use this), best-effort `unlink()` the uploaded temp font — it's served its single use. If the admin cancels, the 15-min FSM TTL + a periodic temp sweep (or an `unlink` in the cancel handler) reclaims it. Never register it in `FONTS`.
+6. **Test:** in `tests/test_senku_wizard_routing.py` assert `textupfont` routes; in `tests/test_text_logo.py` assert `render_text_logo("Hi", None, font_path=<a bundled ttf>)` renders (reuse a bundled file as the "uploaded" fixture so the test needs no external asset).
+
+### 10.4 — NEW color step (emoji swatch + name, white/black first)
+**Owner's chosen UI (confirmed):** emoji-swatch + name buttons, TWO per row, white and black FIRST, then the primary spectrum. Telegram inline buttons can't render a real color fill, so the leading emoji IS the swatch.
+**Do:**
+1. **Color model — put it in `shared/text_logo.py`** (next to `FONTS`, same dataclass discipline) so the renderer and UI share one source of truth:
+```python
+@dataclass(frozen=True, slots=True)
+class TextLogoColor:
+    key: str            # short, stable, in callback data: "white","black","red",...
+    name: str           # "White"
+    emoji: str          # "⚪"
+    rgb: tuple[int, int, int]   # (255,255,255)
+
+COLORS: tuple[TextLogoColor, ...] = (
+    TextLogoColor("white",  "White",  "⚪", (255, 255, 255)),
+    TextLogoColor("black",  "Black",  "⚫", (0, 0, 0)),
+    TextLogoColor("red",    "Red",    "🔴", (220, 38, 38)),
+    TextLogoColor("blue",   "Blue",   "🔵", (37, 99, 235)),
+    TextLogoColor("green",  "Green",  "🟢", (22, 163, 74)),
+    TextLogoColor("yellow", "Yellow", "🟡", (234, 179, 8)),
+    TextLogoColor("orange", "Orange", "🟠", (234, 88, 12)),
+    TextLogoColor("purple", "Purple", "🟣", (147, 51, 234)),
+    TextLogoColor("pink",   "Pink",   "🩷", (236, 72, 153)),
+    TextLogoColor("brown",  "Brown",  "🟤", (120, 72, 40)),
+    TextLogoColor("gray",   "Gray",   "🌫", (107, 114, 128)),
+    TextLogoColor("cyan",   "Cyan",   "🟦", (6, 182, 212)),
+)
+_COLOR_BY_KEY = {c.key: c for c in COLORS}
+def colors() -> tuple[TextLogoColor, ...]: return COLORS
+def get_color(key: str) -> TextLogoColor | None: return _COLOR_BY_KEY.get(key)
+```
+   White and black MUST be indices 0 and 1 (owner: "main color should be first… white… black"). The rest is the primary spectrum; the executor may extend toward ~16 but keep the emoji↔rgb honest (the button emoji should visually match the fill).
+2. **Stroke auto-contrast:** the renderer currently hardcodes a dark stroke (`stroke_fill=(0,0,0,180)`), which is right for white text but wrong for black text (black-on-transparent with a black stroke vanishes on a dark poster). Make the stroke the CONTRAST of the fill: luminance of the chosen rgb < 128 → light stroke `(255,255,255,180)`, else dark `(0,0,0,180)`. This keeps every color legible in the thumbnail's allocated logo slot.
+3. **New wizard screen `_thumb_text_colors(chat_id, user_id, code, index, *, old_msg)`** (model it on `_thumb_text_fonts`): build a 2-per-row grid of `(f"{c.emoji} {c.name}", cb(BOT,"wiz","textcolor", code, str(index), c.key))`, then a `[⇐ Back]` row (back to the font list — or back to the category grid when arriving from an uploaded font, since there's no font list in that path; carry an `origin` flag in FSM to route Back correctly) and a `[✗ Cancel]` row. Add `STATE_TEXT_COLORS = "senku:wiz:text_colors"` and set it here, carrying `code,index,text,font(=key or None),custom_font_path(or None)`.
+4. **Flow rewiring — color comes AFTER font/upload, BEFORE preview:**
+   - `textfont` action (bundled font pick): instead of jumping to `_thumb_text_preview`, now go to `_thumb_text_colors` (carry `font=font_key`).
+   - uploaded-font path (§10.3.4): after storing `custom_font_path`, go to `_thumb_text_colors` (carry `font=None`).
+   - **New `textcolor` action:** guard `STATE_TEXT_COLORS`; resolve `get_color(key)`; then call `_thumb_text_preview(...)` passing the color through. The preview card keeps its existing `[⇐ Back][✅ Use this]` + `[✗ Cancel]` — **Back from preview now returns to the COLOR grid** (not the font list), since color is the immediately-prior step. (Owner said "after I select the color, then I press next and you make a logo" — the render happens on entering the preview; the preview's "Use this" is that Next/confirm. Do NOT add a separate Next button if the preview already renders on arrival — that matches the existing pattern and avoids an extra tap. If the executor prefers an explicit Next before rendering, that's acceptable ONLY if it stays one extra tap and is labeled `➡️ Next`.)
+5. **Persist the choice** in FSM at `STATE_TEXT_PREVIEW` (add `color=<key>`) so a Back-and-forth keeps the picked color.
+
+### 10.5 — Thread color into the renderer
+**Where:** `shared/text_logo.py::render_text_logo` and its callers.
+**Do:** add `color_rgb: tuple[int,int,int] = (255,255,255)` param. Use it as the `fill=(*color_rgb, 255)` in `draw.multiline_text`, and compute the auto-contrast `stroke_fill` (§10.4.2). Update the digest so the cache key includes the color (else two colors of the same text+font collide on the same PNG path): `digest = sha256(f"{font_id}\0{color_key}\0{clean}")` where `font_id` is `font_key` or the uploaded font's content hash. Callers:
+- `wizard.py::_thumb_text_preview` — accept `color_key`/`color_rgb` and a `font_path` (for uploads), resolve via `get_color`, pass both into `render_text_logo`.
+- Keep the existing `(FileNotFoundError, ValueError, OSError)` guard around the render — an uploaded font that PIL can't parse must voice `thumb_text_error()` and return to the color grid, not crash the wizard.
+
+### 10.6 — "Which text?" ordering is already correct — verify, don't rebuild
+The owner restated the intended order (Text → ask text → capture+delete → categories). This ALREADY matches `action=="text"` → `STATE_AWAIT_TEXT` → `_channel_text` (deletes at 1418) → `_thumb_text_categories`. **Verify it still holds after your changes** and that the message-delete stays. No rebuild.
+
+### 10.7 — Voice/label additions (keep the existing terse style)
+Add to `shared/senku_voice.py`, matching the existing `BTN_TEXT_*` tone (short, one glyph + word):
+- `BTN_TEXT_UPLOAD_FONT = "⬆️ Upload your own"`
+- `thumb_text_font_upload_prompt()` — the TTF/OTF ask.
+- `thumb_text_colors()` — the color-step header ("Pick the logo color.").
+- (reuse `thumb_text_error`, `BTN_TEXT_BACK`, `BTN_TEXT_CANCEL`, `BTN_TEXT_USE` as-is.)
+Keep everything English/en-style consistent with the surrounding voice module. Do NOT introduce a new localization file; `senku_voice.py` is where these live.
+
+### 10.8 — Callback-size + collision checks (do BEFORE finalizing keys)
+Every new callback rides `cb(BOT,"wiz",<action>,<code>,<index>,<key>)`. `code` can be a full request code. Verify the LONGEST string stays ≤64 bytes for: `textfont|<code>|<index>|<category>|<fontkey>`, `textcolor|<code>|<index>|<colorkey>`, `textupfont|<code>|<index>`. If any risk overflow, shorten keys (e.g. color keys are already short; the risk is long font keys + long categories — cap font `key` at ~10 chars). Add an assertion in the font/color guard test.
+
+### 10.9 — Tests (all must drive REAL code, per §9.7 — no shadow tests)
+- `tests/test_text_logo.py`: ≥10 fonts/category; every filename + OFL sibling exists; `render_text_logo` honors `color_rgb` (render two colors of the same text+font → assert DIFFERENT output paths AND differing center-pixel color); `font_path` override renders; longest callback ≤64 bytes.
+- `tests/test_senku_wizard_routing.py`: `textupfont`, `textcolor` route; `textfont` now leads to the color step (assert the color screen state is set, not preview).
+- `tests/test_senku_thumbnail_adapter.py`: keep green; `store_text_logo` still writes `logo_url` (unchanged).
+- A small render/UX test that an uploaded-font path reaches the color step and, on Use-this, `store_text_logo` is called and the temp font is unlinked.
+
+### 10.10 — Definition of done (this phase)
+- Logo row still `[⬆️ Upload][✍️ Text]` (upload left, text right). Text → ask → capture → **delete admin msg** (unchanged, verified).
+- Categories render **2/row**, 6-8 of them, with an `⬆️ Upload your own` font row beneath; each category exposes **≥10 fonts, 2/row**.
+- After font (or uploaded font) → **color grid** (emoji+name, white/black first, 2/row) → preview → **Use this** → stored into `logo_url` via the existing `store_text_logo` (unchanged downstream; the thumbnail's allocated logo slot consumes it exactly as a TMDB pick).
+- Uploaded fonts are **one-shot**: temp file, used for one render, unlinked after use, NEVER added to `FONTS` or `resources/fonts/text_logo/`.
+- Every bundled font ships its `OFL-1.1-*.txt`. Renderer stays offline (local files only).
+- `py_compile` clean; full suite green and **NOT below the current count** (check the number first with a full run, then never regress it); new tests drive real code.
+- Back/Cancel work at every new step; FSM `_text_state_matches` guards every new callback; no callback string exceeds 64 bytes.
+- Matches existing UI/voice/callback conventions exactly — a reviewer should not be able to tell the color/upload steps were added later.

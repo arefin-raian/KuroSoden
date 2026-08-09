@@ -23,7 +23,9 @@ to the Phase 3 handler once it lands.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import secrets
+from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
@@ -47,10 +49,13 @@ from kurosoden.shared import franchise_map
 from kurosoden.shared.senku_thumbnail_adapter import SenkuThumbnailAdapter
 from kurosoden.shared.text_logo import (
     categories as text_logo_categories,
+    colors as text_logo_colors,
     fonts_for_category,
     get_category as get_text_logo_category,
+    get_color as get_text_logo_color,
     get_font as get_text_logo_font,
     render_text_logo,
+    uploaded_font_dir,
 )
 
 log = get_logger(__name__)
@@ -88,7 +93,9 @@ STATE_ASSET_PICKER = "senku:wiz:asset_picker"
 STATE_AWAIT_TEXT = "senku:wiz:await_text"
 STATE_TEXT_CATEGORIES = "senku:wiz:text_categories"
 STATE_TEXT_FONTS = "senku:wiz:text_fonts"
+STATE_TEXT_COLORS = "senku:wiz:text_colors"
 STATE_TEXT_PREVIEW = "senku:wiz:text_preview"
+STATE_AWAIT_FONT_UPLOAD = "senku:wiz:await_font_upload"
 
 # FSM state: after a userbot created the channel, waiting for the operator to JOIN
 # it via the invite link — you can only promote an existing member, so they must
@@ -135,6 +142,20 @@ def register(client: Client, container: Container) -> None:
             if str(data.get(key, "")) != str(value):
                 return False, data
         return True, data
+
+    def _cleanup_custom_font(data: dict) -> None:
+        """One-shot uploaded fonts die after their single use (best-effort).
+
+        Called on Use-this (after the logo is stored) and on Cancel — never
+        registered in ``FONTS``, never inside the bundled set.
+        """
+        path = data.get("custom_font_path") or None
+        if not path:
+            return
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as exc:  # noqa: BLE001
+            log.debug("senku.wiz.custom_font_cleanup_failed", error=str(exc))
 
     async def _art(franchise: dict | None, title: str):
         """This franchise's rotating backdrop, or Senku's character art.
@@ -693,10 +714,21 @@ def register(client: Client, container: Container) -> None:
             text = existing.get("text", "")
         await fsm.set(user_id, STATE_TEXT_CATEGORIES, code=code, index=index,
                       text=text)
-        rows = []
+        # Two categories per row (the plan's grid ceiling is ~8; the 2-col layout
+        # holds even if the set grows), then the one-shot font upload row, then
+        # Cancel.
+        rows: list[list[tuple[str, str]]] = []
+        row: list[tuple[str, str]] = []
         for category in text_logo_categories():
-            rows.append([(category.name, cb(BOT, "wiz", "textcat", code,
-                                            str(index), category.key))])
+            row.append((category.name, cb(BOT, "wiz", "textcat", code,
+                                          str(index), category.key)))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([(V.BTN_TEXT_UPLOAD_FONT, cb(BOT, "wiz", "textupfont", code,
+                                                 str(index)))])
         rows.append([(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code,
                                             str(index)))])
         await send_screen(
@@ -718,12 +750,21 @@ def register(client: Client, container: Container) -> None:
             return
         await fsm.set(user_id, STATE_TEXT_FONTS, code=code, index=index,
                       category=category, text=text)
-        rows = [[(font.name, cb(BOT, "wiz", "textfont", code, str(index),
-                                  category, font.key))] for font in fonts]
-        rows.append([(V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackcat", code,
-                                          str(index)))])
-        rows.append([(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code,
-                                            str(index)))])
+        # ≥10 fonts per category, two per row.
+        rows: list[list[tuple[str, str]]] = []
+        row: list[tuple[str, str]] = []
+        for font in fonts:
+            row.append((font.name, cb(BOT, "wiz", "textfont", code, str(index),
+                                      category, font.key)))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([
+            (V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackcat", code, str(index))),
+            (V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code, str(index))),
+        ])
         category_obj = get_text_logo_category(category)
         await send_screen(
             client, chat_id,
@@ -734,40 +775,102 @@ def register(client: Client, container: Container) -> None:
             old_msg=old_msg,
         )
 
+    async def _thumb_text_colors(chat_id: int, user_id: int, code: str,
+                                 index: int, *, old_msg: Message | None,
+                                 text: str | None = None,
+                                 font_key: str | None = None,
+                                 custom_font_path: str | None = None,
+                                 origin: str | None = None,
+                                 category: str | None = None) -> None:
+        """The color-swatch step: emoji+name grid (2/row), white/black first.
+
+        ``origin`` records how we arrived — ``"fonts"`` (bundled picker; Back
+        returns to the font list) or ``"upload"`` (one-shot uploaded font; Back
+        returns to the category grid). The picked color is not stored here — the
+        ``textcolor`` transition carries it into the preview.
+        """
+        _state, existing = await fsm.get(user_id)
+        if text is None:
+            text = existing.get("text", "")
+        if font_key is None:
+            font_key = existing.get("font") or None
+        if custom_font_path is None:
+            custom_font_path = existing.get("custom_font_path") or None
+        if origin is None:
+            origin = existing.get("origin", "fonts")
+        if category is None:
+            category = existing.get("category", "")
+        await fsm.set(user_id, STATE_TEXT_COLORS, code=code, index=index,
+                      text=text, font=font_key or "",
+                      custom_font_path=custom_font_path or "",
+                      origin=origin, category=category)
+        rows: list[list[tuple[str, str]]] = []
+        row: list[tuple[str, str]] = []
+        for color in text_logo_colors():
+            row.append((f"{color.emoji} {color.name}",
+                        cb(BOT, "wiz", "textcolor", code, str(index), color.key)))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([
+            (V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackfont", code, str(index))),
+            (V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code, str(index))),
+        ])
+        await send_screen(
+            client, chat_id,
+            card(V.thumb_text_colors(), image=pick_artwork(BOT), bot_name=BOT,
+                 buttons=rows),
+            old_msg=old_msg,
+        )
+
     async def _thumb_text_preview(chat_id: int, user_id: int, code: str,
-                                  index: int, text: str, font_key: str,
-                                  *, old_msg: Message | None) -> None:
-        font = get_text_logo_font(font_key)
-        if font is None:
-            await _thumb_text_categories(chat_id, user_id, code, index,
-                                         old_msg=old_msg, text=text)
-            return
+                                  index: int, text: str, font_key: str | None,
+                                  color_key: str, *,
+                                  custom_font_path: str | None = None,
+                                  old_msg: Message | None = None) -> None:
+        """Render the preview with the chosen color (+ optional uploaded font).
+
+        Back from this card returns to the COLOR grid (color is the immediately
+        prior step); Use-this persists exactly as before via ``store_text_logo``.
+        """
+        color = get_text_logo_color(color_key) or get_text_logo_color("white")
+        font = get_text_logo_font(font_key) if font_key else None
+        font_name = font.name if font else V.TEXT_FONT_CUSTOM
+        font_path = Path(custom_font_path) if custom_font_path else None
         try:
-            path = render_text_logo(text, font_key)
+            path = render_text_logo(text, font_key, color_rgb=color.rgb,
+                                    font_path=font_path)
         except (FileNotFoundError, ValueError, OSError) as exc:
             log.warning("senku.wiz.text_logo_failed", code=code, entry=index,
                         error=str(exc))
             await send_screen(
                 client, chat_id,
                 card(V.thumb_text_error(), image=pick_artwork(BOT), bot_name=BOT,
-                     buttons=[[(V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackfont",
-                                                     code, str(index), font.category))],
-                              [(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
-                                                      code, str(index)))]]),
+                     buttons=[[(V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackcolor",
+                                                     code, str(index))),
+                               (V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
+                                                       code, str(index)))]]),
                 old_msg=old_msg,
             )
             return
+        _state, existing = await fsm.get(user_id)
         await fsm.set(user_id, STATE_TEXT_PREVIEW, code=code, index=index,
-                      text=text, font=font_key, path=str(path))
+                      text=text, font=font_key or "", color=color_key,
+                      custom_font_path=custom_font_path or "",
+                      origin=existing.get("origin", "fonts"),
+                      category=existing.get("category", ""),
+                      path=str(path))
         await send_screen(
             client, chat_id,
-            card(V.thumb_text_preview(font.name, text), image=path, bot_name=BOT,
-                 buttons=[[(V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackfont", code,
-                                                 str(index), font.category)),
-                            (V.BTN_TEXT_USE, cb(BOT, "wiz", "textuse", code,
-                                                str(index)))],
-                          [(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code,
-                                                  str(index)))]]),
+            card(V.thumb_text_preview(font_name, text), image=path, bot_name=BOT,
+                 buttons=[[(V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackcolor", code,
+                                                 str(index))),
+                            (V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code,
+                                                  str(index)))],
+                          [(V.BTN_TEXT_USE, cb(BOT, "wiz", "textuse", code,
+                                                str(index)))]]),
             old_msg=old_msg,
         )
 
@@ -1275,9 +1378,58 @@ def register(client: Client, container: Container) -> None:
                 await q.answer("That font choice is invalid.", show_alert=True)
                 return
             await q.answer()
+            # Color comes AFTER the font pick and BEFORE the preview (Phase 10).
+            await _thumb_text_colors(chat_id, q.from_user.id, code, index,
+                                     old_msg=q.message,
+                                     text=data.get("text", ""),
+                                     font_key=font_key, origin="fonts",
+                                     category=category)
+        elif action == "textcolor":
+            try:
+                index, color_key = int(parts[4]), parts[5]
+            except (IndexError, ValueError):
+                await q.answer("Bad color.", show_alert=True)
+                return
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_COLORS, code, index,
+            )
+            if not valid:
+                await q.answer("That color menu has expired.", show_alert=True)
+                return
+            color = get_text_logo_color(color_key)
+            if color is None:
+                await q.answer("That color is invalid.", show_alert=True)
+                return
+            await q.answer()
             await _thumb_text_preview(chat_id, q.from_user.id, code, index,
-                                      data.get("text", ""), font_key,
+                                      data.get("text", ""),
+                                      data.get("font") or None,
+                                      color_key,
+                                      custom_font_path=data.get("custom_font_path") or None,
                                       old_msg=q.message)
+        elif action == "textupfont":
+            try:
+                index = int(parts[4])
+            except (IndexError, ValueError):
+                await q.answer("Bad entry.", show_alert=True)
+                return
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_CATEGORIES, code, index,
+            )
+            if not valid:
+                await q.answer("That font menu has expired.", show_alert=True)
+                return
+            await fsm.set(q.from_user.id, STATE_AWAIT_FONT_UPLOAD, code=code,
+                          index=index, text=data.get("text", ""))
+            await q.answer()
+            await send_screen(
+                client, chat_id,
+                card(V.thumb_text_font_upload_prompt(), image=pick_artwork(BOT),
+                     bot_name=BOT,
+                     buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
+                                                         code, str(index)))]]),
+                old_msg=q.message,
+            )
         elif action == "textbackcat":
             index = int(parts[4])
             valid, data = await _text_state_matches(
@@ -1290,7 +1442,30 @@ def register(client: Client, container: Container) -> None:
             await _thumb_text_categories(chat_id, q.from_user.id, code, index,
                                          old_msg=q.message, text=data.get("text", ""))
         elif action == "textbackfont":
-            index, category = int(parts[4]), parts[5]
+            # Back from the COLOR grid: to the font list (bundled pick), or to
+            # the category grid when the font arrived as a one-shot upload.
+            index = int(parts[4])
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_COLORS, code, index,
+            )
+            if not valid:
+                await q.answer("That color menu has expired.", show_alert=True)
+                return
+            await q.answer()
+            if data.get("origin") == "upload":
+                # Back abandons the one-shot upload before another font is
+                # chosen; do not leave the staged file until TTL cleanup.
+                _cleanup_custom_font(data)
+                await _thumb_text_categories(chat_id, q.from_user.id, code, index,
+                                             old_msg=q.message,
+                                             text=data.get("text", ""))
+            else:
+                await _thumb_text_fonts(chat_id, q.from_user.id, code, index,
+                                        data.get("category", ""),
+                                        old_msg=q.message)
+        elif action == "textbackcolor":
+            # Back from the PREVIEW: color is the immediately-prior step.
+            index = int(parts[4])
             valid, data = await _text_state_matches(
                 q.from_user.id, STATE_TEXT_PREVIEW, code, index,
             )
@@ -1298,8 +1473,13 @@ def register(client: Client, container: Container) -> None:
                 await q.answer("That preview has expired.", show_alert=True)
                 return
             await q.answer()
-            await _thumb_text_fonts(chat_id, q.from_user.id, code, index, category,
-                                    old_msg=q.message)
+            await _thumb_text_colors(chat_id, q.from_user.id, code, index,
+                                     old_msg=q.message,
+                                     text=data.get("text", ""),
+                                     font_key=data.get("font") or None,
+                                     custom_font_path=data.get("custom_font_path") or None,
+                                     origin=data.get("origin", "fonts"),
+                                     category=data.get("category", ""))
         elif action == "textcancel":
             index = int(parts[4])
             current_state, _data = await fsm.get(q.from_user.id)
@@ -1308,14 +1488,18 @@ def register(client: Client, container: Container) -> None:
             )
             if not valid or current_state not in {
                 STATE_AWAIT_TEXT, STATE_TEXT_CATEGORIES, STATE_TEXT_FONTS,
-                STATE_TEXT_PREVIEW,
+                STATE_TEXT_COLORS, STATE_TEXT_PREVIEW, STATE_AWAIT_FONT_UPLOAD,
             }:
                 await q.answer("That text-logo flow has expired.", show_alert=True)
                 return
             await q.answer("Cancelled.")
+            _cleanup_custom_font(_data)
+            # Always leave the text-logo flow, even if the distribution entry
+            # was removed while the admin's card was open. Navigation back to
+            # the asset card is best-effort and requires the entry to exist.
+            await fsm.clear(q.from_user.id)
             entry = await cache.get_entry(code, index)
             if entry is not None:
-                await fsm.clear(q.from_user.id)
                 await _thumb_asset_card(chat_id, code, entry, "logo", old_msg=q.message)
         elif action == "textuse":
             index = int(parts[4])
@@ -1333,6 +1517,8 @@ def register(client: Client, container: Container) -> None:
                             entry=index, error=str(exc))
                 await q.answer("Couldn't save that logo. Try again.", show_alert=True)
                 return
+            # The uploaded font served its one render — reclaim the temp file.
+            _cleanup_custom_font(data)
             await fsm.clear(q.from_user.id)
             await q.answer("Text logo locked in.")
             await _thumb_next(chat_id, code, old_msg=q.message)
@@ -1462,6 +1648,76 @@ def register(client: Client, container: Container) -> None:
         await _verify_and_store(message.chat.id, message.from_user.id, code, raw)
 
     # ── Manual asset upload (group=2, only while awaiting an uploaded image) ────
+    async def _reject_font_upload(message: Message, code: str, index: int) -> None:
+        """Voiced rejection for a non-font document; stays armed for the next one."""
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001 — best-effort (needs delete rights)
+            pass
+        await send_screen(
+            client, message.chat.id,
+            card(V.thumb_text_font_upload_bad(), image=pick_artwork(BOT),
+                 bot_name=BOT,
+                 buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
+                                                     code, str(index)))]]),
+        )
+
+    async def _capture_uploaded_font(message: Message, code: str, index: int,
+                                     text: str) -> None:
+        """Consume a one-shot .ttf/.otf upload (STATE_AWAIT_FONT_UPLOAD).
+
+        Validates the document, stages the bytes under ``data/text_logos/uploaded``
+        (named by content hash so concurrent admins never collide), deletes the
+        admin's message, then jumps STRAIGHT to the color step — an uploaded font
+        already chose itself, so it skips the category/font pickers. It is never
+        added to ``FONTS`` and is unlinked after its single use.
+        """
+        doc = message.document
+        fname = (doc.file_name or "") if doc else ""
+        mime = (doc.mime_type or "") if doc else ""
+        is_font = (
+            fname.lower().endswith((".ttf", ".otf"))
+            or mime in {"font/ttf", "font/otf", "application/x-font-ttf",
+                        "application/font-sfnt", "application/octet-stream"}
+        )
+        if not is_font:
+            await _reject_font_upload(message, code, index)
+            return
+        try:
+            buf = await client.download_media(message, in_memory=True)
+            font_bytes = buf.getvalue()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("senku.wiz.font_upload_download_failed", code=code,
+                        error=str(exc))
+            await message.reply(V.THUMB_UPLOAD_FAILED)
+            return
+        # A real TTF/OTF header is required — never stage an arbitrary document.
+        if len(font_bytes) < 1024 or font_bytes[:4] not in (b"\x00\x01\x00\x00",
+                                                             b"OTTO"):
+            await _reject_font_upload(message, code, index)
+            return
+        digest = hashlib.sha256(font_bytes).hexdigest()[:20]
+        suffix = ".otf" if fname.lower().endswith(".otf") else ".ttf"
+        target = uploaded_font_dir() / f"{digest}{suffix}"
+        try:
+            target.write_bytes(font_bytes)
+        except OSError as exc:  # noqa: BLE001 — disk hiccup
+            log.warning("senku.wiz.font_upload_stage_failed", code=code,
+                        error=str(exc))
+            await message.reply(V.THUMB_UPLOAD_FAILED)
+            return
+        # Owner's standing rule: the wizard stays one evolving card — consume the
+        # admin's upload exactly like the text-capture step consumes their text.
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001 — best-effort (needs delete rights)
+            pass
+        await fsm.set(message.from_user.id, STATE_TEXT_COLORS, code=code,
+                      index=index, text=text, font="",
+                      custom_font_path=str(target), origin="upload", category="")
+        await _thumb_text_colors(message.chat.id, message.from_user.id, code,
+                                 index, old_msg=None)
+
     @client.on_message(
         (filters.photo | filters.document) & filters.private,
         group=2,
@@ -1470,12 +1726,18 @@ def register(client: Client, container: Container) -> None:
         if not message.from_user:
             return
         state, data = await fsm.get(message.from_user.id)
-        if state != STATE_AWAIT_UPLOAD:
+        if state not in (STATE_AWAIT_UPLOAD, STATE_AWAIT_FONT_UPLOAD):
             return  # not our turn
         if not _staff(message):
             return
         code = data.get("code", "")
         index = int(data.get("index", 0))
+
+        if state == STATE_AWAIT_FONT_UPLOAD:
+            await _capture_uploaded_font(message, code, index,
+                                         text=data.get("text", ""))
+            return
+
         asset = data.get("asset", "")
 
         # A document must actually be an image — reject PDFs, archives, etc.

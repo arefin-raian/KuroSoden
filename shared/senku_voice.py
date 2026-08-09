@@ -417,6 +417,31 @@ def thumb_text_error() -> str:
     )
 
 
+def thumb_text_colors() -> str:
+    return (
+        f"{ICON} <b>Pick the logo color</b>\n\n"
+        "White and black lead, then the full spectrum. The swatch is the button "
+        "— choose the fill and I'll render the preview."
+    )
+
+
+def thumb_text_font_upload_prompt() -> str:
+    return (
+        f"{ICON} <b>Send me a font file</b>\n\n"
+        "Send a <code>.ttf</code> or <code>.otf</code> file and I'll use it for "
+        "this logo only — nothing gets saved to the bundled set. Then we pick a "
+        "color."
+    )
+
+
+def thumb_text_font_upload_bad() -> str:
+    return (
+        f"{ICON} <b>That's not a font file.</b>\n\n"
+        "Send a <code>.ttf</code> or <code>.otf</code> file and I'll use it for "
+        "this logo only."
+    )
+
+
 def thumb_upload_prompt(asset: str) -> str:
     words = {"logo": "logo", "poster": "poster", "bg": "backdrop"}
     a = words.get(asset, asset)
@@ -619,6 +644,8 @@ BTN_TEXT_LOGO = "✍️ Text"
 BTN_TEXT_CANCEL = "✗ Cancel"
 BTN_TEXT_USE = "✅ Use this"
 BTN_TEXT_BACK = "⇐ Back"
+BTN_TEXT_UPLOAD_FONT = "⬆️ Upload your own"
+TEXT_FONT_CUSTOM = "Uploaded font"
 BTN_GENERATE = "⚗️ Generate Thumbnail"
 BTN_THUMB_APPROVE = "✅ Approve"
 BTN_THUMB_REDO = "↻ Redo"
