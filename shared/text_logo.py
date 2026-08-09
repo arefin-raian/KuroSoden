@@ -18,10 +18,10 @@ import hashlib
 import re
 import textwrap
 from math import ceil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +34,10 @@ _MAX_WIDTH = 1500
 _MIN_FONT_SIZE = 44
 _START_FONT_SIZE = 220
 _STROKE_WIDTH = 3
+_SHADOW_DX = 0
+_SHADOW_DY = 6
+_SHADOW_ALPHA = 120
+_SHADOW_BLUR = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +47,8 @@ class TextLogoFont:
     category: str
     description: str
     filename: str
+    variable: bool = False
+    has_italic: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,9 +165,43 @@ COLORS: tuple[TextLogoColor, ...] = (
     TextLogoColor("cyan", "Cyan", "🟦", (6, 182, 212)),
 )
 
+def _axis_name(axis: dict) -> str:
+    raw = axis.get("name", "")
+    if isinstance(raw, bytes):
+        raw = raw.decode("ascii", "ignore")
+    return str(raw).strip().lower()
+
+
+def _font_capabilities(path: Path) -> tuple[bool, bool]:
+    """Return (has_weight_axis, has_italic_or_slant_axis) for a real font file."""
+    try:
+        probe = ImageFont.truetype(path, size=24)
+        axes = probe.get_variation_axes()
+    except (OSError, AttributeError, TypeError, ValueError):
+        return False, False
+    names = {_axis_name(axis) for axis in axes}
+    has_weight = bool(names & {"weight", "wght"}) or "[wght" in path.name.lower()
+    has_italic = bool(names & {"italic", "ital", "slant", "slnt"})
+    return has_weight, has_italic
+
+
+# Probe the committed files once at import time. Capability flags are derived from
+# the actual OpenType axes; filename hints only cover Pillow builds that expose a
+# variable font with a less descriptive axis name.
+def _with_capabilities(font: TextLogoFont) -> TextLogoFont:
+    variable, has_italic = _font_capabilities(_FONT_DIR / font.filename)
+    return replace(font, variable=variable, has_italic=has_italic)
+
+
+FONTS = tuple(_with_capabilities(font) for font in FONTS)
 _FONT_BY_KEY = {font.key: font for font in FONTS}
 _CATEGORY_BY_KEY = {category.key: category for category in CATEGORIES}
 _COLOR_BY_KEY = {color.key: color for color in COLORS}
+
+_WEIGHT_CHOICES: tuple[tuple[str, int], ...] = (
+    ("Regular", 400), ("Medium", 500), ("SemiBold", 600),
+    ("Bold", 700), ("Black", 900),
+)
 
 
 def categories() -> tuple[TextLogoCategory, ...]:
@@ -190,6 +230,27 @@ def get_font(font_key: str) -> TextLogoFont | None:
     return _FONT_BY_KEY.get(font_key)
 
 
+def font_weights(font: TextLogoFont) -> tuple[tuple[str, int], ...]:
+    """Return meaningful, clamped weight choices for a variable font."""
+    if not font.variable:
+        return ()
+    try:
+        axes = ImageFont.truetype(_font_path(font), size=24).get_variation_axes()
+        weight_axis = next(
+            axis for axis in axes if _axis_name(axis) in {"weight", "wght"}
+        )
+        minimum = int(weight_axis["minimum"])
+        maximum = int(weight_axis["maximum"])
+    except (OSError, AttributeError, StopIteration, TypeError, ValueError):
+        minimum, maximum = 100, 900
+    out: list[tuple[str, int]] = []
+    for label, value in _WEIGHT_CHOICES:
+        clamped = max(minimum, min(maximum, value))
+        if not out or out[-1][1] != clamped:
+            out.append((label, clamped))
+    return tuple(out)
+
+
 def uploaded_font_dir() -> Path:
     """The one-shot uploaded-font staging dir (never inside the bundled set)."""
     _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -201,9 +262,12 @@ def sanitize_text(value: str) -> str:
     value = str(value or "")
     value = "".join(ch for ch in value if ch in "\n\t" or not ord(ch) < 32)
     value = value.replace("\t", " ")
-    lines = [re.sub(r"[ ]+", " ", line).strip() for line in value.splitlines()]
-    lines = [line for line in lines if line]
-    cleaned = "\n".join(lines)
+    raw_lines = [re.sub(r"[ ]+", " ", line).strip() for line in value.split("\n")]
+    # Preserve explicit line positions (including an intentional blank line), but
+    # reject an input that contains no visible text at all.
+    if not any(raw_lines):
+        return ""
+    cleaned = "\n".join(raw_lines)
     return cleaned[:_MAX_TEXT].rstrip()
 
 
@@ -221,7 +285,13 @@ def _bbox(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) ->
 
 
 def _wrap_to_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> str:
-    """Wrap words and long unbroken titles until they fit the logo canvas."""
+    """Preserve the admin's lines; wrapping is only a last-resort fallback."""
+    return "\n".join(text.splitlines()[:_MAX_LINES])
+
+
+def _last_resort_wrap(draw: ImageDraw.ImageDraw, text: str,
+                      font: ImageFont.FreeTypeFont) -> str:
+    """Split an impossible single line only after the minimum size is reached."""
     out: list[str] = []
     for original in text.splitlines()[:_MAX_LINES]:
         words = original.split() or [original]
@@ -233,7 +303,6 @@ def _wrap_to_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTyp
                 out.append(current)
                 current = word
             elif not current and right - left > _MAX_WIDTH:
-                # A URL/code-like word has no spaces; split it conservatively.
                 pieces = textwrap.wrap(word, width=18, break_long_words=True,
                                        break_on_hyphens=False) or [word]
                 out.extend(pieces[:-1])
@@ -262,6 +331,8 @@ def render_text_logo(
     color_rgb: tuple[int, int, int] = (255, 255, 255),
     font_path: Path | None = None,
     output_dir: Path | None = None,
+    weight: int | None = None,
+    italic: bool = False,
 ) -> Path:
     """Render ``text`` as a centered transparent PNG and return its path.
 
@@ -289,12 +360,47 @@ def render_text_logo(
         # if two admins' temp paths differ.
         font_id = hashlib.sha256(source.read_bytes()).hexdigest()[:20]
 
+    def _load(size: int) -> tuple[ImageFont.FreeTypeFont, bool, bool, int | None, bool]:
+        candidate = ImageFont.truetype(source, size=size)
+        try:
+            axes = candidate.get_variation_axes()
+        except (OSError, AttributeError, TypeError, ValueError):
+            return candidate, False, False, None, False
+        names = [_axis_name(axis) for axis in axes]
+        has_weight = bool(set(names) & {"weight", "wght"}) or "[wght" in source.name.lower()
+        has_italic = bool(set(names) & {"italic", "ital", "slant", "slnt"})
+        if not (has_weight or has_italic):
+            return candidate, False, False, None, False
+        values: list[float | int] = []
+        applied_weight: int | None = None
+        for axis, name in zip(axes, names):
+            minimum = axis.get("minimum", 0)
+            default = axis.get("default", minimum)
+            maximum = axis.get("maximum", default)
+            if name in {"weight", "wght"}:
+                applied_weight = int(max(minimum, min(maximum, weight if weight is not None else default)))
+                values.append(applied_weight)
+            elif name in {"italic", "ital"}:
+                values.append(max(minimum, min(maximum, 1 if italic else default)))
+            elif name in {"slant", "slnt"}:
+                values.append(max(minimum, min(maximum, maximum if italic else default)))
+            else:
+                values.append(default)
+        try:
+            candidate.set_variation_by_axes(values)
+        except (OSError, AttributeError, TypeError, ValueError):
+            pass
+        return candidate, has_weight, has_italic, applied_weight, bool(italic and has_italic)
+
     probe = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
     probe_draw = ImageDraw.Draw(probe)
     chosen: ImageFont.FreeTypeFont | None = None
     wrapped = clean
+    has_weight_axis = has_italic_axis = False
+    applied_weight = None
+    applied_italic = False
     for size in range(_START_FONT_SIZE, _MIN_FONT_SIZE - 1, -4):
-        candidate = ImageFont.truetype(source, size=size)
+        candidate, has_weight_axis, has_italic_axis, applied_weight, applied_italic = _load(size)
         wrapped_candidate = _wrap_to_width(probe_draw, clean, candidate)
         left, top, right, bottom = _bbox(probe_draw, wrapped_candidate, candidate)
         if right - left <= _MAX_WIDTH and bottom - top <= 430:
@@ -302,18 +408,39 @@ def render_text_logo(
             wrapped = wrapped_candidate
             break
     if chosen is None:
-        chosen = ImageFont.truetype(source, size=_MIN_FONT_SIZE)
+        chosen, has_weight_axis, has_italic_axis, applied_weight, applied_italic = _load(_MIN_FONT_SIZE)
         wrapped = _wrap_to_width(probe_draw, clean, chosen)
+        left, _top, right, _bottom = _bbox(probe_draw, wrapped, chosen)
+        if "\n" not in clean and right - left > _MAX_WIDTH:
+            wrapped = _last_resort_wrap(probe_draw, clean, chosen)
 
+    effective_weight = applied_weight if has_weight_axis else None
+    effective_italic = applied_italic if has_italic_axis else False
     left, top, right, bottom = _bbox(probe_draw, wrapped, chosen)
     text_width = max(1, right - left)
     text_height = max(1, bottom - top)
     # Pillow may return float coordinates from ``multiline_textbbox`` (notably
     # with variable fonts). Image.new and the draw origin require integer sizes;
     # round upward so fractional glyph extents are never clipped.
-    width = int(ceil(max(720, min(_MAX_WIDTH + 120, text_width + 120))))
+    # Explicit line breaks are sacred. If a line is still wider than the normal
+    # canvas at the minimum size, widen the transparent canvas instead of
+    # inventing another break or clipping the operator's text. Single-line input
+    # takes the last-resort wrapping path above, so it remains within the normal
+    # width ceiling.
+    width_limit = None if "\n" in clean else _MAX_WIDTH + 120
+    width = int(ceil(max(720, text_width + 120) if width_limit is None
+                    else max(720, min(width_limit, text_width + 120))))
     height = int(ceil(max(260, min(600, text_height + 100))))
     image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow)
+    shadow_draw.multiline_text(
+        (width // 2 + _SHADOW_DX, height // 2 + _SHADOW_DY), wrapped,
+        font=chosen, fill=(0, 0, 0, _SHADOW_ALPHA), spacing=12,
+        align="center", anchor="mm",
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(_SHADOW_BLUR))
+    image = Image.alpha_composite(image, shadow)
     draw = ImageDraw.Draw(image)
     draw.multiline_text(
         (width // 2, height // 2), wrapped, font=chosen,
@@ -326,7 +453,7 @@ def render_text_logo(
     target_dir = output_dir or _OUTPUT_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(
-        f"{font_id}\0{color_rgb}\0{clean}".encode("utf-8"),
+        f"{font_id}\0{color_rgb}\0{clean}\0{effective_weight}\0{effective_italic}".encode("utf-8"),
     ).hexdigest()[:20]
     path = target_dir / f"text_logo_{digest}.png"
     image.save(path, format="PNG", optimize=True)

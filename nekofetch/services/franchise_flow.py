@@ -130,13 +130,32 @@ _PART_IN_TITLE = re.compile(r"\b(?:part|pt|cour)\s*[\.:]?\s*(\d+)\b", re.IGNOREC
 _FINAL_SEASON = re.compile(r"\b(?:the\s+)?final\s+season\b", re.IGNORECASE)
 
 
+def strip_season_tokens(title: str) -> str:
+    """Remove trailing season/part markers while preserving display casing.
+
+    TMDB stores franchise artwork under the base title, not under labels such as
+    ``Vanitas Part 2``. This deliberately strips only trailing markers so inner
+    words and the original capitalization remain intact for provider search.
+    """
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    patterns = (
+        r"\s*[-:()]?\s*(?:the\s+)?final\s+season(?:\s+(?:part|pt|cour)\s*\d+)?\s*$",
+        r"\s*[-:()]?\s*season\s+(?:\d+|[IVXLCDM]+)(?:\s+(?:part|pt|cour)\s*\d+)?\s*$",
+        r"\s*[-:()]?\s*(?:part|pt|cour)\s*\d+\s*$",
+        r"\s*[-:()]?\s*(?:season\s+)?[IVXLCDM]+\s+season\s*$",
+    )
+    previous = None
+    while value and value != previous:
+        previous = value
+        for pattern in patterns:
+            value = re.sub(pattern, "", value, flags=re.IGNORECASE).strip(" -:()")
+    return value or str(title or "").strip()
+
+
 def _base_title_key(title: str) -> str:
     """Normalize a title for continuation matching: strip season/part/final
     tokens + punctuation so "Vanitas" and "Vanitas Part 2" share a base key."""
-    t = title or ""
-    t = _SEASON_IN_TITLE.sub(" ", t)
-    t = _PART_IN_TITLE.sub(" ", t)
-    t = _FINAL_SEASON.sub(" ", t)
+    t = strip_season_tokens(title)
     return re.sub(r"[^a-z0-9]+", "", t.lower())
 
 

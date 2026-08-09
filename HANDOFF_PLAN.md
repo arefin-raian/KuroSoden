@@ -1460,3 +1460,127 @@ Every new callback rides `cb(BOT,"wiz",<action>,<code>,<index>,<key>)`. `code` c
 - `py_compile` clean; full suite green and **NOT below the current count** (check the number first with a full run, then never regress it); new tests drive real code.
 - Back/Cancel work at every new step; FSM `_text_state_matches` guards every new callback; no callback string exceeds 64 bytes.
 - Matches existing UI/voice/callback conventions exactly — a reviewer should not be able to tell the color/upload steps were added later.
+
+
+---
+
+## 11. PHASE — Text-logo polish (shadow, line-breaks, sizing, weights) + TMDB assets per franchise + reuse-previous-logo
+
+> **Context.** §10 shipped (commits `2d40a95` + `62b31a0`): the text-logo flow, ~10 fonts/category, the color grid, one-shot font upload. Read `shared/text_logo.py`, `bots/senku/handlers/wizard.py` (text-logo actions + `_thumb_text_*` screens), `thumbnail/index.html` (the logo slot), `nekofetch/providers/metadata/tmdb.py` (`search`/`details`/`_logo`/`_confirm_backdrop`), and `nekofetch/services/thumbnail_service.py::gather_thumbnail_fields` BEFORE editing. This phase is 7 concrete refinements the owner asked for after using the shipped flow. Reuse `_base_title_key` (`nekofetch/services/franchise_flow.py:133`) — do NOT write a second season-stripper.
+
+### 11.1 — Text logo: soft black drop shadow (mild, not a hard stroke)
+**Problem:** the render uses only a hard contrast stroke (`_contrast_stroke`, `text_logo.py:248`). The owner wants a **mild, soft black drop shadow** behind the glyphs so a light logo stays visible on a bright poster — softer than the current outline.
+**Where:** `shared/text_logo.py::render_text_logo` (~line 316-324).
+**Do:**
+- Before drawing the fill text, draw the SAME `wrapped` text onto a separate transparent layer in near-black `(0,0,0,alpha)` with a small positive offset, then Gaussian-blur that layer and composite it under the fill text. Concretely:
+```python
+from PIL import ImageFilter
+shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+sdraw = ImageDraw.Draw(shadow)
+sdraw.multiline_text((width//2 + _SHADOW_DX, height//2 + _SHADOW_DY), wrapped,
+    font=chosen, fill=(0, 0, 0, _SHADOW_ALPHA), spacing=12, align="center", anchor="mm")
+shadow = shadow.filter(ImageFilter.GaussianBlur(_SHADOW_BLUR))
+image = Image.alpha_composite(image, shadow)   # shadow UNDER the fill
+# then draw the fill text on top (existing draw.multiline_text call)
+```
+- New constants near the others (`text_logo.py:31-36`): `_SHADOW_DX = 0`, `_SHADOW_DY = 6`, `_SHADOW_ALPHA = 120` (mild — NOT 255), `_SHADOW_BLUR = 8`. Keep it subtle; the owner said "very mild, not a very dark one."
+- **Keep the contrast stroke too** but consider dropping its alpha (e.g. 180→120) so shadow + stroke don't stack into a heavy outline. The shadow is the primary legibility aid now.
+- **Digest:** fold the shadow params into the cache digest only if you make them configurable; as fixed constants they don't need to be in the key (same input → same output). Leave the digest as-is.
+- **Test** (`tests/test_text_logo.py`): assert a rendered logo has non-zero alpha pixels BELOW/around the glyph baseline that are darker than the fill (evidence a shadow layer composited). Keep it tolerant (assert "some dark semi-transparent pixels exist outside the stroke band"), not pixel-exact.
+
+### 11.2 — Respect the admin's line breaks; don't invent wrapping
+**Problem:** `_wrap_to_width` (`text_logo.py:223`) ALWAYS re-wraps to `_MAX_WIDTH`, so a single-line title the admin typed with no breaks can still get split. Owner: "if I give you the text without any line break, then you do not add any line break… generate how it is."
+**Rule the executor must implement:**
+- If `sanitize_text(text)` contains **no `\n`** → treat it as ONE line. Do NOT word-wrap. Instead shrink the font (the existing `_START_FONT_SIZE→_MIN_FONT_SIZE` loop) until that single line fits `_MAX_WIDTH`. Only if it STILL overflows at `_MIN_FONT_SIZE` (an extreme edge case) fall back to the current word-wrap as a last resort — a giant unbroken string must not blow the canvas.
+- If the admin's text **has `\n`** → honor EXACTLY those breaks. Render each line as the admin wrote it; do not merge or re-wrap lines (still enforce `_MAX_LINES` and the per-line width-shrink).
+**Where:** refactor `_wrap_to_width` into "honor-explicit-breaks" mode. The auto-wrap branch (splitting on spaces to `_MAX_WIDTH`) becomes the LAST-RESORT path for a single token/line that overflows even at min size — not the default. Keep the URL/long-token `textwrap` splitter only inside that last-resort path.
+**Test:** `render_text_logo("One Piece", ...)` → the wrapped intermediate has exactly 1 line; `render_text_logo("Line A\nLine B", ...)` → exactly 2 lines matching the input; a pathological no-space 400-char string still renders (last-resort wrap fires) without exceeding `_MAX_LINES`.
+
+### 11.3 — Widen + slightly enlarge the logo slot in index.html
+**Problem:** the logo `<img>` (`thumbnail/index.html:61`) is `h-[3.5rem] w-auto` with no max-width, so a wide text logo gets visually cramped/shrunk relative to the synopsis column. Owner wants the logo's allowed WIDTH to reach the synopsis's right edge, and the logo a touch BIGGER — "not much, just a bit."
+**Reference widths in the file:** synopsis `<p>` is `max-w-[520px]` (`index.html:96`); poster is `w-[12vw]`; the logo sits in `<div class="ml-1 mb-2">` above the poster+synopsis row.
+**Do (conservative, owner said "just a bit"):**
+- Change the logo `<img>` class from `h-[3.5rem] w-auto object-contain …` to about `h-[4.5rem] w-auto max-w-[820px] object-contain …`. Height bump ~3.5→4.5rem is the "a bit bigger"; `max-w` lets a wide logo extend toward the synopsis's right edge instead of being pinched. (820px ≈ poster `w-[12vw]` + gap + synopsis 520px on the 1280-wide render — the executor should open the rendered WebP once and nudge `max-w` so the logo's right edge lands near the synopsis end-line, per the owner's "same width as the end line of synopsis.")
+- Keep the existing `drop-shadow-[…]` on the img (that's the CSS shadow of the whole logo image; §11.1's baked shadow is for the transparent text PNG — they don't conflict; a TMDB logo.png keeps only the CSS shadow).
+- Do NOT change the poster or synopsis sizes. One dimension only: logo height + max-width.
+- **Verify** by rendering one thumbnail (a long-title anime) and eyeballing the WebP; adjust `h-[…]`/`max-w-[…]` by small steps. Note in the commit that these are visual constants tuned against a 1280×720 render.
+
+---
+
+## 10-REVIEW — Audit of the executor's §10 delivery (commits `2d40a95`, `62b31a0`)
+
+> **Not written by the planner.** These two commits were made by the executor AI running §10. Reviewed against the §10 spec on 2026-08-08 by reading `shared/text_logo.py`, `bots/senku/handlers/wizard.py`, and the font assets. Verdict up front: **§10 was delivered faithfully and completely.** Status legend: ✅ done · 🟡 partial · ❌ missing.
+
+**What was done (verified):**
+- ✅ **≥10 fonts per category** — exactly 10 each across all 6 categories (elegant/modern/script/bold/retro/handwritten), **60 total**, each an OFL Google font under `resources/fonts/text_logo/` with its `OFL-1.1-*.txt` sibling. Matches §10.1.
+- ✅ **Color step** — 12 colors, white+black first, emoji-swatch + name, 2/row. `TextLogoColor` model in `text_logo.py`, `STATE_TEXT_COLORS`, `textcolor` action. Matches §10.4 and the auto-contrast stroke (`_contrast_stroke`).
+- ✅ **Category grid 2/row + "Upload your own"** — `_thumb_text_categories` chunks 2-per-row and appends `BTN_TEXT_UPLOAD_FONT` (`textupfont`). Matches §10.2/§10.3.
+- ✅ **One-shot font upload** — `STATE_AWAIT_FONT_UPLOAD`, temp dir `data/text_logos/uploaded/` (NOT the bundled set), `render_text_logo(font_path=…)` override with content-hash identity. Matches §10.3's "used once, not saved."
+- ✅ **Color threaded into renderer + digest** — `color_rgb` fill, digest includes color so two colors don't collide. Matches §10.5.
+- ✅ **Text capture + message delete + Use-this → `store_text_logo` → logo_url** — unchanged and correct (the pre-existing behavior §10 said to keep).
+
+**Misunderstandings / deviations — NONE material.** The executor did not over-build or skip anything in §10 scope. Minor notes for the next executor (these become §11 work, they were NOT §10 failures):
+- The weight step (Regular→Black) was correctly ABSENT — it was never in §10; it's §11.4.
+- The renderer still uses a hard contrast stroke with no soft drop shadow — again not a §10 miss; the shadow is §11.1.
+- `_MAX_LINES`/`_wrap_to_width` still auto-wraps even single-line input — that's the §11.2 refinement, not a §10 defect.
+
+**One thing to double-check (not a bug, a caution):** commit `62b31a0` also rewrote large stretches of `HANDOFF_PLAN.md` (the diff shows ~2745 lines touched). Confirm that was only the executor updating §8A/§10 status lines and not an accidental clobber of §9/§11 planner content — `grep -nE "^## (8|9|10|11)\." HANDOFF_PLAN.md` should still show every section intact. (At review time §11 had not yet been written, so nothing was lost; just verify on the next pass.)
+
+**Net:** §10 is ✅ complete and consistent with the wizard's conventions. Proceed to §11.
+
+### 11.4 — Weight step after font pick (Regular / Bold / Black …) + Italic when the font supports it
+**Problem:** every logo renders at one fixed weight, so text "looks so small"/thin. Owner wants a weight choice per font (regular, bold, black…), **and an Italic option — but ONLY for fonts that actually have italic; if a font has no italic, don't show it.**
+**Key facts the executor MUST account for:**
+- Many bundled families are **variable fonts** (`[wght]` in the filename, e.g. `Montserrat[wght].ttf`, `PlayfairDisplay[wght].ttf`, `Fredoka[wdth,wght].ttf`, `Inter[opsz,wght].ttf`). Weight is set via the variation axis — Pillow's `FreeTypeFont.set_variation_by_axes([...])` or `set_variation_by_name("Bold")`. There is NO variable-font handling today — add it.
+- Some families are **static single-weight** (`-Regular.ttf`: Bebas Neue, Pacifico, Lobster, Anton, most scripts). No weight axis → offering "Black" is meaningless. For statics, **hide the weight step** and render as-is (do NOT fake bold with stroke — it muddies script/display faces).
+- **Italic is a SEPARATE axis** (`ital` or `slnt`). The single `[wght]` Google releases bundled here mostly do NOT carry an italic axis, so italic is NOT universally available. The owner's rule is exactly right: **offer Italic only when the font file exposes an italic/slant axis (or ships a separate italic file); otherwise omit it.**
+**How to detect capability (do this at load, per font):**
+- Weight axis: `font.get_variation_axes()` (Pillow ≥ 8.3) returns the axis list; a `wght` axis (or filename containing `[wght]`) ⇒ show weights. Wrap in try/except — static fonts raise `OSError` on `get_variation_axes()`; treat that as "no axes → static, no weight step."
+- Italic axis: an `ital` or `slnt` axis present in `get_variation_axes()` ⇒ Italic is real. If absent ⇒ no Italic button for that font. (None of the current bundled single-axis files are expected to pass this, which is fine — the button simply won't appear until an italic-capable font is added. That's the owner's intent.)
+- Cache the detected capability on the `TextLogoFont` at module load (compute once): add fields `variable: bool`, `has_italic: bool` — or a helper `font_capabilities(font) -> (weights: tuple[str,...], has_italic: bool)` memoized by `font.key`. Do the probe against the real file so it never lies about what the TTF supports.
+**Design:**
+1. **Renderer:** add `weight: int | None = None` and `italic: bool = False` to `render_text_logo`. When `weight` set and the font is variable: `font.set_variation_by_axes([weight])` (try/except → fall back to plain). When `italic=True` and the font has an `ital`/`slnt` axis: set that axis too (e.g. `ital=1` or the slant's max). If a caller passes `italic=True` for a font that can't do it, IGNORE it (never synthesize a fake oblique). Fold BOTH `weight` and `italic` into the digest so Bold≠Regular and Italic≠upright don't collide on one PNG.
+2. **Wizard flow — weight/style step BETWEEN font and color** (order: text → category → font → **weight/style** → color → preview):
+   - New `_thumb_text_weights(...)` screen (model on `_thumb_text_fonts`). Reached ONLY when the picked font is variable (has a `wght` axis). Buttons, 2/row: one per weight label (Regular/Medium/SemiBold/Bold/Black → 400/500/600/700/900), each `cb(BOT,"wiz","textweight", code, index, font_key, wght, "0")` where the trailing flag is italic=off. **If `has_italic`**, append a parallel set OR a toggle: simplest is a second short row of italic variants `cb(...,"textweight",…, wght, "1")` labeled "Bold Italic" etc. — but to keep the grid small, prefer a single **`𝑰 Italic` toggle button** that flips an `ital` flag carried in FSM, re-rendering the same weight grid with the flag on (label the toggle "Italic: off/on"). Only render that toggle when `has_italic`. Then Back(→fonts)/Cancel. Add `STATE_TEXT_WEIGHTS`.
+   - `textfont` action: if the picked font is variable → `_thumb_text_weights`; else skip straight to the color grid (carry default weight, italic=False).
+   - New `textweight` action → color grid, carrying `font` + `weight` + `italic`.
+   - `textcolor` → preview, passing `weight` + `italic` into `render_text_logo`.
+   - Fix Back targets: preview→color, color→weight (if variable) else fonts, weight→fonts.
+3. **Callback size:** `textweight|<code>|<index>|<fontkey>|<wght>|<ital>` — verify ≤64 bytes with the longest code+fontkey (§10.8). `<ital>` is one char.
+4. **Test:** `render_text_logo("Hi","montserrat",weight=900)` vs `weight=400` → DIFFERENT paths; a static font (`bebas`) with `weight=900` renders without crashing (variation ignored); `italic=True` on a font WITHOUT an italic axis produces the SAME output as `italic=False` (proving no fake oblique); routing: variable font → weight screen, static font → skips it, and the Italic toggle only appears for an italic-capable font (add such a font, or assert the toggle is absent for all current bundled fonts).
+
+### 11.5 — TMDB assets are franchise-level: search the BASE title + include adult
+**Problem (owner + API log `GET /search/tv?query=The Case Study of Vanitas Part 2&include_adult=false`):** TMDB stores assets per FRANCHISE, not per season, so a seasoned query finds nothing/wrong. R-rated anime also need `include_adult=true`.
+**Where:** `nekofetch/providers/metadata/tmdb.py::search` (line 103) + callers passing a per-entry title (`thumbnail_service.gather_thumbnail_fields:211`, `enrich_with_tmdb`, `bots/admin/handlers/*`).
+**Do:**
+1. **Search the base franchise title.** Add `strip_season_tokens(title) -> str` in `nekofetch/services/franchise_flow.py` (reuse the season/part regex from `_parse_season_part`/`_base_title_key`, but PRESERVE original case and inner words — `_base_title_key` lowercases, which is wrong for a display query). Remove trailing `Season N` / `Part N` / `Cour N` / `Final Season` / roman-numeral season tokens. Call it at the top of `tmdb.search`. **Fallback:** if the stripped search returns no candidates, retry once with the raw title (so a show whose real TMDB name legitimately contains a number still resolves).
+2. **`include_adult=true`** at `tmdb.py:117` (was `"false"`). Owner explicitly wants R-rated anime to resolve.
+3. **Keep the anime bias** — don't weaken `_is_anime`/`_is_jp`/`rank()`; just feed it the base title.
+4. **Test** (`tests/test_tmdb_search.py` new or extend): stub `_get`, assert "…Vanitas Part 2" issues `query="The Case Study of Vanitas"` with `include_adult="true"`; assert the raw-title retry fires when the stripped search yields `results: []`; assert a JP-anime still out-ranks a live-action namesake.
+
+### 11.6 — Later seasons reuse the first entry's TMDB assets
+**Follow-on from 11.5:** TMDB has ONE franchise entry, so Season 2/Part 2 have no distinct posters/backdrops/logos. Owner: later entries show the SAME assets as entry 1.
+**Where:** per-entry asset gathering in the Senku wizard / `senku_thumbnail_adapter` (`asset_step` and the numbered TMDB logo/poster/backdrop galleries).
+**Do:** this is mostly a NATURAL consequence of 11.5 (every entry searches the same base title → identical galleries). **Verify** the wizard/adapter doesn't cache the per-entry asset list under the SEASONED title (which would break reuse); key the TMDB asset cache by the base title or `anime_doc_id` so entry 2 hits entry 1's set. AniList per-entry fields (seasonal poster, per-season synopsis) still come from AniList per entry — do NOT collapse those; this is ONLY the TMDB logo/backdrop galleries. **Test:** stubbed TMDB returns a fixed set for the base title → entry 0 and entry 1 of a 2-season franchise get the SAME logo/backdrop URL lists.
+
+### 11.7 — "Reuse the previously generated text logo?" on later entries
+**Owner:** when adding a TEXT logo for a later entry, tapping **Text** should FIRST ask "Use the previously generated logo?" showing the LATEST text logo made this session; Yes → adopt + skip the build; No → normal ask-text flow.
+**Where:** `action == "text"` (`wizard.py:1224`-ish) + request-scoped state.
+**Do:**
+1. **Remember the latest generated text-logo PNG per request** — on every successful `render_text_logo`/`textuse`, stash `last_text_logo` (local path, and its text/font for display) under a REQUEST-scoped key (Redis/DistributionCache keyed by `code`, e.g. `nf:senku:<code>:last_text_logo`), NOT per-user FSM (which clears). Overwrite each time so it's always the latest.
+2. **Gate the text entry:** in `action=="text"`, if a valid `last_text_logo` exists for this `code` → show a NEW card FIRST: the previous logo IMAGE + `[✅ Use previous][✍️ New text]` + `[✗ Cancel]`. New actions `textprev_yes`/`textprev_no`:
+   - `textprev_yes` → `thumbs.store_text_logo(code, index, <stored path>)` → `_thumb_next`. Skip text/category/font/weight/color entirely.
+   - `textprev_no` → fall through to the existing `STATE_AWAIT_TEXT` prompt.
+   - No prior logo → skip the question, straight to `STATE_AWAIT_TEXT` as today.
+3. **Show the actual logo** in the card (owner: "show the logo there, the latest one") — use the stored PNG as the card image.
+4. **Voice:** `thumb_text_reuse_prompt()`, `BTN_TEXT_REUSE_YES="✅ Use previous"`, `BTN_TEXT_REUSE_NO="✍️ New text"` in `senku_voice.py`.
+5. **Test:** routing for `textprev_yes`/`textprev_no`; after generating a logo for entry 0, entering Text on entry 1 finds the stored `last_text_logo` and Yes calls `store_text_logo` with that path (stub store, assert path).
+
+### 11.8 — Definition of done (this phase)
+- Text logos carry a **mild soft black drop shadow** (subtler than the stroke); light logos stay legible on bright posters.
+- **No-line-break input renders on one line** (font shrinks to fit); explicit `\n` honored exactly; pathological unbroken strings still render via last-resort wrap.
+- index.html logo slot is **a bit taller and can span toward the synopsis's right edge**; poster/synopsis unchanged; verified against a real render.
+- After font pick, **variable fonts offer a weight step** (Regular→Black); **Italic appears ONLY when the font truly supports it**; static fonts skip the step; weight+italic thread into the render + digest; fake oblique is never synthesized.
+- TMDB search uses the **base franchise title** (season/part stripped, case preserved) with **`include_adult=true`** + raw-title fallback; anime ranking preserved; later entries reuse entry 0's TMDB galleries.
+- Adding a **text logo on a later entry first offers "use the previously generated logo"** (shows the latest); Yes adopts + skips, No continues.
+- All new callbacks ≤64 bytes + `_text_state_matches`-guarded; Back/Cancel correct everywhere; `py_compile` clean; **full suite green and not below the current count** (run it first); every new test drives REAL code (§9.7); UI/voice/callback conventions match the existing wizard exactly.

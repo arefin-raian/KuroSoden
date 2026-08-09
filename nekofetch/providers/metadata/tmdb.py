@@ -102,7 +102,7 @@ class TmdbClient:
 
     async def search(self, title: str, *, prefer_media: str | None = None,
                      anime: bool = True) -> TmdbResult | None:
-        """Best match for ``title``.
+        """Best match for the franchise base title, with a raw-title fallback.
 
         ``anime=True`` (the default for this pipeline) biases results toward
         Japanese-origin animation so a generically-named anime doesn't lose to a
@@ -110,14 +110,24 @@ class TmdbClient:
         "K-drama backdrops" bug). ``prefer_media`` ("tv"/"movie") nudges the
         media type when the caller already knows it (e.g. a movie entry).
         """
-        candidates: list[dict] = []
-        try:
+        from nekofetch.services.franchise_flow import strip_season_tokens
+
+        base_title = strip_season_tokens(title)
+
+        async def _search(query: str) -> list[dict]:
+            found: list[dict] = []
             for media in ("tv", "movie"):
-                data = await self._get(f"/search/{media}", query=title,
-                                       include_adult="false", language="en-US")
+                data = await self._get(f"/search/{media}", query=query,
+                                       include_adult="true", language="en-US")
                 for item in data.get("results", [])[:8]:
                     item["_media"] = media
-                    candidates.append(item)
+                    found.append(item)
+            return found
+
+        try:
+            candidates = await _search(base_title)
+            if not candidates and base_title != title:
+                candidates = await _search(title)
         except (httpx.HTTPError, ValueError) as exc:
             log.warning("tmdb.search.failed", title=title, error=str(exc))
             return None

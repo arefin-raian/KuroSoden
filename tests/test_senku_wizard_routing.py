@@ -107,7 +107,12 @@ WIZARD_CALLBACKS = [
     f"senku|wiz|pick|{CODE}|1|logo|2",   # numbered asset pick
     f"senku|wiz|text|{CODE}|1",       # logo → text input
     f"senku|wiz|textcat|{CODE}|1|elegant",  # category picker
-    f"senku|wiz|textfont|{CODE}|1|elegant|playfair",  # font picker → color step
+    f"senku|wiz|textfont|{CODE}|1|elegant|playfair",  # font picker → weight step
+    f"senku|wiz|textweight|{CODE}|1|playfair|400|0",  # weight → color step
+    f"senku|wiz|textitalic|{CODE}|1|playfair|400|1",  # native italic toggle when available
+    f"senku|wiz|textbackweight|{CODE}|1",  # weight → font list
+    f"senku|wiz|textprev_yes|{CODE}|1",  # reuse latest logo
+    f"senku|wiz|textprev_no|{CODE}|1",  # make a new logo
     f"senku|wiz|textcolor|{CODE}|1|white",  # color swatch → preview
     f"senku|wiz|textupfont|{CODE}|1",  # upload-your-own font row
     f"senku|wiz|textbackcat|{CODE}|1",  # back to categories
@@ -295,13 +300,12 @@ class TestWizardTextLogoFlow:
         await _dispatch_callback(client, f"senku|wiz|textfont|{CODE}|1|elegant|playfair")
 
         state, data = await fsm.get(USER_ID)
-        assert state == wiz.STATE_TEXT_COLORS, f"expected color step, got {state}"
+        assert state == wiz.STATE_TEXT_WEIGHTS, f"expected weight step, got {state}"
         assert data.get("font") == "playfair"
-        assert data.get("origin") == "fonts"
         assert data.get("category") == "elegant"
-        assert sent, "the color card was never rendered"
+        assert sent, "the weight card was never rendered"
         keyboard = sent[-1].keyboard.inline_keyboard
-        assert all(len(row) == 2 for row in keyboard[:-1])
+        assert [len(row) for row in keyboard[:-1]] == [2, 2, 1]
         assert [button.text for button in keyboard[-1]] == [
             wiz.V.BTN_TEXT_BACK, wiz.V.BTN_TEXT_CANCEL,
         ]
@@ -393,6 +397,67 @@ class TestWizardTextLogoFlow:
             wiz.V.BTN_TEXT_BACK, wiz.V.BTN_TEXT_CANCEL,
         ]
 
+    async def test_invalid_weight_callback_is_rejected(self, monkeypatch):
+        redis = FakeRedis()
+        client = build_senku(FlowContainer(redis), token="1:AAAA")
+        for _ in range(20):
+            await asyncio.sleep(0)
+        import kurosoden.bots.senku.handlers.wizard as wiz
+        from nekofetch.bots.fsm import FSM
+        fsm = FSM(redis, bot="senku")
+        await fsm.set(USER_ID, wiz.STATE_TEXT_WEIGHTS, code=CODE, index=1,
+                      text="Vanitas", font="playfair", category="elegant",
+                      weight="400", italic="0")
+        await _dispatch_callback(client, f"senku|wiz|textweight|{CODE}|1|playfair|401|0")
+        state, _ = await fsm.get(USER_ID)
+        assert state == wiz.STATE_TEXT_WEIGHTS
+
+    async def test_weight_callback_reaches_color_step(self, monkeypatch):
+        redis = FakeRedis()
+        client = build_senku(FlowContainer(redis), token="1:AAAA")
+        for _ in range(20):
+            await asyncio.sleep(0)
+        import kurosoden.bots.senku.handlers.wizard as wiz
+        from nekofetch.bots.fsm import FSM
+        fsm = FSM(redis, bot="senku")
+        await fsm.set(USER_ID, wiz.STATE_TEXT_WEIGHTS, code=CODE, index=1,
+                      text="Vanitas", font="playfair", category="elegant",
+                      weight="400", italic="0")
+        async def fake_send_screen(_c, chat_id, screen, old_msg=None):
+            return _SimpleNamespace(id=9, chat=_SimpleNamespace(id=chat_id))
+        monkeypatch.setattr(wiz, "send_screen", fake_send_screen)
+        await _dispatch_callback(client, f"senku|wiz|textweight|{CODE}|1|playfair|400|0")
+        state, data = await fsm.get(USER_ID)
+        assert state == wiz.STATE_TEXT_COLORS
+        assert data.get("weight") == "400"
+        assert data.get("italic") == "0"
+
+    async def test_italic_toggle_is_hidden_for_fonts_without_native_italic(self, monkeypatch):
+        import kurosoden.bots.senku.handlers.wizard as wiz
+        font = wiz.get_text_logo_font("playfair")
+        if not font.has_italic:
+            # This is the required behavior: no faux-italic control is exposed.
+            return
+        redis = FakeRedis()
+        client = build_senku(FlowContainer(redis), token="1:AAAA")
+        for _ in range(20):
+            await asyncio.sleep(0)
+        import kurosoden.bots.senku.handlers.wizard as wiz
+        from nekofetch.bots.fsm import FSM
+        fsm = FSM(redis, bot="senku")
+        await fsm.set(USER_ID, wiz.STATE_TEXT_WEIGHTS, code=CODE, index=1,
+                      text="Vanitas", font="playfair", category="elegant",
+                      weight="400", italic="1")
+        sent = []
+        async def fake_send_screen(_c, chat_id, screen, old_msg=None):
+            sent.append(screen)
+            return _SimpleNamespace(id=9, chat=_SimpleNamespace(id=chat_id))
+        monkeypatch.setattr(wiz, "send_screen", fake_send_screen)
+        await _dispatch_callback(client, f"senku|wiz|textitalic|{CODE}|1|playfair|400|0")
+        state, data = await fsm.get(USER_ID)
+        assert state == wiz.STATE_TEXT_WEIGHTS
+        assert data.get("italic") == "0"
+
     async def test_preview_keyboard_keeps_back_and_cancel_together(self, monkeypatch, tmp_path):
         redis = FakeRedis()
         client = build_senku(FlowContainer(redis), token="1:AAAA")
@@ -403,8 +468,8 @@ class TestWizardTextLogoFlow:
 
         fsm = FSM(redis, bot="senku")
         await fsm.set(USER_ID, wiz.STATE_TEXT_COLORS, code=CODE, index=1,
-                      text="Vanitas", font="playfair", custom_font_path="",
-                      origin="fonts", category="elegant")
+                      text="Vanitas", font="bebas", custom_font_path="",
+                      origin="fonts", category="bold")
         real_render = wiz.render_text_logo
         def _render_to_tmp(text, font_key=None, **kw):
             return real_render(text, font_key, output_dir=tmp_path, **kw)
@@ -435,8 +500,8 @@ class TestWizardTextLogoFlow:
 
         fsm = FSM(redis, bot="senku")
         await fsm.set(USER_ID, wiz.STATE_TEXT_COLORS, code=CODE, index=1,
-                      text="Vanitas", font="playfair", custom_font_path="",
-                      origin="fonts", category="elegant")
+                      text="Vanitas", font="bebas", custom_font_path="",
+                      origin="fonts", category="bold")
         def _fail_render(*_args, **_kwargs):
             raise ValueError("synthetic renderer failure")
         monkeypatch.setattr(wiz, "render_text_logo", _fail_render)
@@ -495,8 +560,8 @@ class TestWizardTextLogoFlow:
 
         fsm = FSM(redis, bot="senku")
         await fsm.set(USER_ID, wiz.STATE_TEXT_COLORS, code=CODE, index=1,
-                      text="Vanitas", font="playfair", custom_font_path="",
-                      origin="fonts", category="elegant")
+                      text="Vanitas", font="bebas", custom_font_path="",
+                      origin="fonts", category="bold")
         sent: list = []
         async def fake_send_screen(_c, chat_id, screen, old_msg=None):
             sent.append(screen)
@@ -507,7 +572,7 @@ class TestWizardTextLogoFlow:
 
         state, data = await fsm.get(USER_ID)
         assert state == wiz.STATE_TEXT_FONTS
-        assert data.get("category") == "elegant"
+        assert data.get("category") == "bold"
         keyboard = sent[-1].keyboard.inline_keyboard
         assert all(len(row) == 2 for row in keyboard[:-1])
         assert [button.text for button in keyboard[-1]] == [

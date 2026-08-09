@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from nekofetch.core.container import Container
@@ -43,8 +44,11 @@ _K_FRANCHISE = "nf:dist:{code}:franchise"
 _K_ENTRIES = "nf:dist:{code}:entries"
 _K_SELECTIONS = "nf:dist:{code}:selections"
 _K_CHANNEL = "nf:dist:{code}:channel"
+_K_LAST_TEXT_LOGO = "nf:dist:{code}:last_text_logo"
+_K_TMDB_ASSETS = "nf:dist:{code}:tmdb_assets"
 
-_ALL_KEYS = (_K_FRANCHISE, _K_ENTRIES, _K_SELECTIONS, _K_CHANNEL)
+_ALL_KEYS = (_K_FRANCHISE, _K_ENTRIES, _K_SELECTIONS, _K_CHANNEL,
+             _K_LAST_TEXT_LOGO, _K_TMDB_ASSETS)
 
 
 @dataclass
@@ -394,6 +398,61 @@ class DistributionCache:
             ex=_DEFAULT_TTL, label="dist_cache.channel.set",
         )
 
+    async def set_last_text_logo(self, code: str, *, path: str, text: str,
+                                 font: str | None = None) -> None:
+        """Remember the latest generated text logo for this request only."""
+        await safe_redis_set(
+            self._redis, _K_LAST_TEXT_LOGO.format(code=code),
+            json.dumps({"path": path, "text": text, "font": font or ""}),
+            ex=_DEFAULT_TTL, label="dist_cache.last_text_logo.set",
+        )
+
+    async def get_last_text_logo(self, code: str) -> dict | None:
+        """Return a usable latest-logo record, rejecting stale local files."""
+        raw = await safe_redis_get(
+            self._redis, _K_LAST_TEXT_LOGO.format(code=code),
+            label="dist_cache.last_text_logo.get",
+        )
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+            path = value.get("path")
+            if not path or not Path(path).is_file():
+                return None
+            return value
+        except (TypeError, ValueError):
+            return None
+
+    async def get_tmdb_assets(self, code: str, asset_type: str) -> list[dict] | None:
+        raw = await safe_redis_get(
+            self._redis, _K_TMDB_ASSETS.format(code=code),
+            label="dist_cache.tmdb_assets.get",
+        )
+        if not raw:
+            return None
+        try:
+            values = json.loads(raw).get(asset_type)
+            return values if isinstance(values, list) else None
+        except (TypeError, ValueError):
+            return None
+
+    async def set_tmdb_assets(self, code: str, asset_type: str,
+                              assets: list[dict]) -> None:
+        raw = await safe_redis_get(
+            self._redis, _K_TMDB_ASSETS.format(code=code),
+            label="dist_cache.tmdb_assets.read_modify_write",
+        )
+        try:
+            values = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            values = {}
+        values[asset_type] = assets
+        await safe_redis_set(
+            self._redis, _K_TMDB_ASSETS.format(code=code), json.dumps(values),
+            ex=_DEFAULT_TTL, label="dist_cache.tmdb_assets.set",
+        )
+
     async def all_done(self, code: str) -> bool:
         """True when every cached entry has a rendered thumbnail (or none exist)."""
         entries = await self.get_entries(code)
@@ -405,9 +464,25 @@ class DistributionCache:
     # ── Teardown ──────────────────────────────────────────────────────────────
 
     async def clear(self, code: str) -> None:
-        """Drop every cache key for ``code`` — called once the info card is posted."""
-        for tmpl in _ALL_KEYS:
+        """Drop every request-scoped key for ``code`` after publishing.
+
+        The root-scoped TMDB gallery is intentionally retained for sibling
+        requests/entries in the same franchise; it expires via the normal TTL.
+        Callers that retire a franchise entirely can remove that root key with
+        :meth:`clear_tmdb_assets`.
+        """
+        for tmpl in (_K_FRANCHISE, _K_ENTRIES, _K_SELECTIONS, _K_CHANNEL,
+                     _K_LAST_TEXT_LOGO):
             await safe_redis_delete(
                 self._redis, tmpl.format(code=code), label="dist_cache.clear",
             )
         log.info("dist_cache.cleared", code=code)
+
+    async def clear_tmdb_assets(self, anime_doc_id: str) -> None:
+        """Retire a franchise-root gallery explicitly when its source is removed."""
+        if not anime_doc_id:
+            return
+        await safe_redis_delete(
+            self._redis, _K_TMDB_ASSETS.format(code=anime_doc_id),
+            label="dist_cache.tmdb_assets.clear",
+        )

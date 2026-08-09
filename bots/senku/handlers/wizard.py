@@ -54,6 +54,7 @@ from kurosoden.shared.text_logo import (
     get_category as get_text_logo_category,
     get_color as get_text_logo_color,
     get_font as get_text_logo_font,
+    font_weights as get_text_logo_weights,
     render_text_logo,
     uploaded_font_dir,
 )
@@ -93,8 +94,10 @@ STATE_ASSET_PICKER = "senku:wiz:asset_picker"
 STATE_AWAIT_TEXT = "senku:wiz:await_text"
 STATE_TEXT_CATEGORIES = "senku:wiz:text_categories"
 STATE_TEXT_FONTS = "senku:wiz:text_fonts"
+STATE_TEXT_WEIGHTS = "senku:wiz:text_weights"
 STATE_TEXT_COLORS = "senku:wiz:text_colors"
 STATE_TEXT_PREVIEW = "senku:wiz:text_preview"
+STATE_TEXT_REUSE = "senku:wiz:text_reuse"
 STATE_AWAIT_FONT_UPLOAD = "senku:wiz:await_font_upload"
 
 # FSM state: after a userbot created the channel, waiting for the operator to JOIN
@@ -775,13 +778,65 @@ def register(client: Client, container: Container) -> None:
             old_msg=old_msg,
         )
 
+    async def _thumb_text_weights(chat_id: int, user_id: int, code: str,
+                                  index: int, *, old_msg: Message | None,
+                                  text: str | None = None,
+                                  font_key: str | None = None,
+                                  category: str | None = None,
+                                  weight: int | None = None,
+                                  italic: bool = False) -> None:
+        font = get_text_logo_font(font_key or "")
+        if font is None or not font.variable:
+            await _thumb_text_colors(chat_id, user_id, code, index,
+                                     old_msg=old_msg, text=text,
+                                     font_key=font_key, category=category,
+                                     weight=weight, italic=italic)
+            return
+        _state, existing = await fsm.get(user_id)
+        text = text if text is not None else existing.get("text", "")
+        category = category or existing.get("category", "")
+        choices = get_text_logo_weights(font)
+        await fsm.set(user_id, STATE_TEXT_WEIGHTS, code=code, index=index,
+                      text=text, font=font.key, category=category or "",
+                      weight=str((weight or choices[0][1]) if choices else ""),
+                      italic="1" if italic else "0")
+        rows: list[list[tuple[str, str]]] = []
+        row: list[tuple[str, str]] = []
+        for label, value in choices:
+            row.append((label, cb(BOT, "wiz", "textweight", code, str(index),
+                                  font.key, str(value), "1" if italic else "0")))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        if font.has_italic:
+            rows.append([(
+                V.BTN_TEXT_ITALIC_ON if italic else V.BTN_TEXT_ITALIC_OFF,
+                cb(BOT, "wiz", "textitalic", code, str(index), font.key,
+                   str(weight or (choices[0][1] if choices else 400)),
+                   "0" if italic else "1"),
+            )])
+        rows.append([
+            (V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackweight", code, str(index))),
+            (V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code, str(index))),
+        ])
+        await send_screen(
+            client, chat_id,
+            card(V.thumb_text_weights(font.name, [label for label, _ in choices], italic),
+                 image=pick_artwork(BOT), bot_name=BOT, buttons=rows),
+            old_msg=old_msg,
+        )
+
     async def _thumb_text_colors(chat_id: int, user_id: int, code: str,
                                  index: int, *, old_msg: Message | None,
                                  text: str | None = None,
                                  font_key: str | None = None,
                                  custom_font_path: str | None = None,
                                  origin: str | None = None,
-                                 category: str | None = None) -> None:
+                                 category: str | None = None,
+                                 weight: int | None = None,
+                                 italic: bool = False) -> None:
         """The color-swatch step: emoji+name grid (2/row), white/black first.
 
         ``origin`` records how we arrived — ``"fonts"`` (bundled picker; Back
@@ -800,10 +855,18 @@ def register(client: Client, container: Container) -> None:
             origin = existing.get("origin", "fonts")
         if category is None:
             category = existing.get("category", "")
+        if weight is None:
+            raw_weight = existing.get("weight")
+            weight = int(raw_weight) if str(raw_weight or "").isdigit() else None
+        # ``italic`` is explicit for the weight/style screen; only restore the
+        # prior FSM value when this helper was called without a style decision.
+        if "italic" not in existing and not italic:
+            italic = False
         await fsm.set(user_id, STATE_TEXT_COLORS, code=code, index=index,
                       text=text, font=font_key or "",
                       custom_font_path=custom_font_path or "",
-                      origin=origin, category=category)
+                      origin=origin, category=category,
+                      weight=str(weight or ""), italic="1" if italic else "0")
         rows: list[list[tuple[str, str]]] = []
         row: list[tuple[str, str]] = []
         for color in text_logo_colors():
@@ -829,6 +892,8 @@ def register(client: Client, container: Container) -> None:
                                   index: int, text: str, font_key: str | None,
                                   color_key: str, *,
                                   custom_font_path: str | None = None,
+                                  weight: int | None = None,
+                                  italic: bool = False,
                                   old_msg: Message | None = None) -> None:
         """Render the preview with the chosen color (+ optional uploaded font).
 
@@ -841,7 +906,8 @@ def register(client: Client, container: Container) -> None:
         font_path = Path(custom_font_path) if custom_font_path else None
         try:
             path = render_text_logo(text, font_key, color_rgb=color.rgb,
-                                    font_path=font_path)
+                                    font_path=font_path, weight=weight,
+                                    italic=italic)
         except (FileNotFoundError, ValueError, OSError) as exc:
             log.warning("senku.wiz.text_logo_failed", code=code, entry=index,
                         error=str(exc))
@@ -861,7 +927,10 @@ def register(client: Client, container: Container) -> None:
                       custom_font_path=custom_font_path or "",
                       origin=existing.get("origin", "fonts"),
                       category=existing.get("category", ""),
+                      weight=str(weight or ""), italic="1" if italic else "0",
                       path=str(path))
+        await cache.set_last_text_logo(code, path=str(path), text=text,
+                                       font=font_key)
         await send_screen(
             client, chat_id,
             card(V.thumb_text_preview(font_name, text), image=path, bot_name=BOT,
@@ -1336,6 +1405,68 @@ def register(client: Client, container: Container) -> None:
             if not valid:
                 await q.answer("That logo picker has expired.", show_alert=True)
                 return
+            previous = await cache.get_last_text_logo(code)
+            await q.answer()
+            if previous:
+                await fsm.set(q.from_user.id, STATE_TEXT_REUSE, code=code, index=index,
+                              path=previous["path"], text=previous.get("text", ""),
+                              font=previous.get("font", ""))
+                await send_screen(
+                    client, chat_id,
+                    card(V.thumb_text_reuse_prompt(), image=previous["path"],
+                         bot_name=BOT,
+                         buttons=[[(V.BTN_TEXT_REUSE_YES,
+                                    cb(BOT, "wiz", "textprev_yes", code, str(index))),
+                                   (V.BTN_TEXT_REUSE_NO,
+                                    cb(BOT, "wiz", "textprev_no", code, str(index)))],
+                                  [(V.BTN_TEXT_CANCEL,
+                                    cb(BOT, "wiz", "textcancel", code, str(index)))]]),
+                    old_msg=q.message,
+                )
+            else:
+                await fsm.set(q.from_user.id, STATE_AWAIT_TEXT, code=code, index=index,
+                              prompt_msg_id=q.message.id, prompt_chat_id=chat_id)
+                await send_screen(
+                    client, chat_id,
+                    card(V.thumb_text_prompt(), image=pick_artwork(BOT), bot_name=BOT,
+                         buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
+                                                             code, str(index)))]]),
+                    old_msg=q.message,
+                )
+        elif action == "textprev_yes":
+            try:
+                index = int(parts[4])
+            except (IndexError, ValueError):
+                await q.answer("Bad entry.", show_alert=True)
+                return
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_REUSE, code, index,
+            )
+            if not valid:
+                await q.answer("That previous-logo prompt has expired.", show_alert=True)
+                return
+            try:
+                await thumbs.store_text_logo(code, index, data.get("path"))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("senku.wiz.previous_text_logo_failed", code=code,
+                            entry=index, error=str(exc))
+                await q.answer("Couldn't reuse that logo. Try a new one.", show_alert=True)
+                return
+            await fsm.clear(q.from_user.id)
+            await q.answer("Previous text logo locked in.")
+            await _thumb_next(chat_id, code, old_msg=q.message)
+        elif action == "textprev_no":
+            try:
+                index = int(parts[4])
+            except (IndexError, ValueError):
+                await q.answer("Bad entry.", show_alert=True)
+                return
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_REUSE, code, index,
+            )
+            if not valid:
+                await q.answer("That previous-logo prompt has expired.", show_alert=True)
+                return
             await fsm.set(q.from_user.id, STATE_AWAIT_TEXT, code=code, index=index,
                           prompt_msg_id=q.message.id, prompt_chat_id=chat_id)
             await q.answer()
@@ -1378,12 +1509,17 @@ def register(client: Client, container: Container) -> None:
                 await q.answer("That font choice is invalid.", show_alert=True)
                 return
             await q.answer()
-            # Color comes AFTER the font pick and BEFORE the preview (Phase 10).
-            await _thumb_text_colors(chat_id, q.from_user.id, code, index,
-                                     old_msg=q.message,
-                                     text=data.get("text", ""),
-                                     font_key=font_key, origin="fonts",
-                                     category=category)
+            if font.variable:
+                await _thumb_text_weights(chat_id, q.from_user.id, code, index,
+                                          old_msg=q.message,
+                                          text=data.get("text", ""),
+                                          font_key=font_key, category=category)
+            else:
+                await _thumb_text_colors(chat_id, q.from_user.id, code, index,
+                                         old_msg=q.message,
+                                         text=data.get("text", ""),
+                                         font_key=font_key, origin="fonts",
+                                         category=category)
         elif action == "textcolor":
             try:
                 index, color_key = int(parts[4]), parts[5]
@@ -1401,12 +1537,70 @@ def register(client: Client, container: Container) -> None:
                 await q.answer("That color is invalid.", show_alert=True)
                 return
             await q.answer()
+            raw_weight = data.get("weight")
+            weight = int(raw_weight) if str(raw_weight or "").isdigit() else None
             await _thumb_text_preview(chat_id, q.from_user.id, code, index,
                                       data.get("text", ""),
                                       data.get("font") or None,
                                       color_key,
                                       custom_font_path=data.get("custom_font_path") or None,
+                                      weight=weight,
+                                      italic=str(data.get("italic", "0")) == "1",
                                       old_msg=q.message)
+        elif action == "textweight":
+            try:
+                index, font_key, weight, italic = int(parts[4]), parts[5], int(parts[6]), parts[7] == "1"
+            except (IndexError, ValueError):
+                await q.answer("Bad weight.", show_alert=True)
+                return
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_WEIGHTS, code, index, font=font_key,
+            )
+            font = get_text_logo_font(font_key)
+            allowed_weights = {value for _, value in get_text_logo_weights(font)} if font else set()
+            if (not valid or font is None or not font.variable
+                    or weight not in allowed_weights):
+                await q.answer("That weight choice is invalid.", show_alert=True)
+                return
+            await q.answer()
+            await _thumb_text_colors(chat_id, q.from_user.id, code, index,
+                                     old_msg=q.message, text=data.get("text", ""),
+                                     font_key=font_key, origin="fonts",
+                                     category=data.get("category", ""), weight=weight,
+                                     italic=italic)
+        elif action == "textitalic":
+            try:
+                index, font_key, weight, italic = int(parts[4]), parts[5], int(parts[6]), parts[7] == "1"
+            except (IndexError, ValueError):
+                await q.answer("Bad style.", show_alert=True)
+                return
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_WEIGHTS, code, index, font=font_key,
+            )
+            font = get_text_logo_font(font_key)
+            if not valid or font is None or not font.variable or not font.has_italic:
+                await q.answer("That italic option is unavailable.", show_alert=True)
+                return
+            await q.answer()
+            await _thumb_text_weights(chat_id, q.from_user.id, code, index,
+                                      old_msg=q.message, text=data.get("text", ""),
+                                      font_key=font_key, category=data.get("category", ""),
+                                      weight=weight, italic=italic)
+        elif action == "textbackweight":
+            try:
+                index = int(parts[4])
+            except (IndexError, ValueError):
+                await q.answer("Bad font.", show_alert=True)
+                return
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_TEXT_WEIGHTS, code, index,
+            )
+            if not valid:
+                await q.answer("That weight menu has expired.", show_alert=True)
+                return
+            await q.answer()
+            await _thumb_text_fonts(chat_id, q.from_user.id, code, index,
+                                    data.get("category", ""), old_msg=q.message)
         elif action == "textupfont":
             try:
                 index = int(parts[4])
@@ -1453,12 +1647,13 @@ def register(client: Client, container: Container) -> None:
                 return
             await q.answer()
             if data.get("origin") == "upload":
-                # Back abandons the one-shot upload before another font is
-                # chosen; do not leave the staged file until TTL cleanup.
                 _cleanup_custom_font(data)
                 await _thumb_text_categories(chat_id, q.from_user.id, code, index,
                                              old_msg=q.message,
                                              text=data.get("text", ""))
+            elif data.get("font") and (font := get_text_logo_font(data.get("font", ""))) and font.variable:
+                await _thumb_text_fonts(chat_id, q.from_user.id, code, index,
+                                        data.get("category", ""), old_msg=q.message)
             else:
                 await _thumb_text_fonts(chat_id, q.from_user.id, code, index,
                                         data.get("category", ""),
@@ -1479,7 +1674,9 @@ def register(client: Client, container: Container) -> None:
                                      font_key=data.get("font") or None,
                                      custom_font_path=data.get("custom_font_path") or None,
                                      origin=data.get("origin", "fonts"),
-                                     category=data.get("category", ""))
+                                     category=data.get("category", ""),
+                                     weight=int(data["weight"]) if str(data.get("weight", "")).isdigit() else None,
+                                     italic=str(data.get("italic", "0")) == "1")
         elif action == "textcancel":
             index = int(parts[4])
             current_state, _data = await fsm.get(q.from_user.id)
@@ -1488,7 +1685,8 @@ def register(client: Client, container: Container) -> None:
             )
             if not valid or current_state not in {
                 STATE_AWAIT_TEXT, STATE_TEXT_CATEGORIES, STATE_TEXT_FONTS,
-                STATE_TEXT_COLORS, STATE_TEXT_PREVIEW, STATE_AWAIT_FONT_UPLOAD,
+                STATE_TEXT_WEIGHTS, STATE_TEXT_COLORS, STATE_TEXT_PREVIEW,
+                STATE_TEXT_REUSE, STATE_AWAIT_FONT_UPLOAD,
             }:
                 await q.answer("That text-logo flow has expired.", show_alert=True)
                 return

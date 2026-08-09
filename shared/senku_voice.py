@@ -409,6 +409,25 @@ def thumb_text_preview(font_name: str, text: str) -> str:
     )
 
 
+def thumb_text_weights(font_name: str, weights: list[str], italic: bool = False) -> str:
+    mode = "on" if italic else "off"
+    return (
+        f"{ICON} <b>Choose text weight</b>\n\n"
+        f"Font: <b>{esc(font_name)}</b>\n"
+        "Pick a native weight — no fake bolding, no muddy glyphs.\n"
+        + "\n".join(f"• {esc(label)}" for label in weights)
+        + (f"\n\nItalic: <b>{mode}</b>" if weights else "")
+    )
+
+
+def thumb_text_reuse_prompt() -> str:
+    return (
+        f"{ICON} <b>Use the previously generated logo?</b>\n\n"
+        "I found the latest text logo from this request. It is shown above. "
+        "Use it for this entry, or make a new one."
+    )
+
+
 def thumb_text_error() -> str:
     return (
         f"{ICON} <b>I couldn't make that logo.</b>\n\n"
@@ -645,6 +664,10 @@ BTN_TEXT_CANCEL = "✗ Cancel"
 BTN_TEXT_USE = "✅ Use this"
 BTN_TEXT_BACK = "⇐ Back"
 BTN_TEXT_UPLOAD_FONT = "⬆️ Upload your own"
+BTN_TEXT_REUSE_YES = "✅ Use previous"
+BTN_TEXT_REUSE_NO = "✍️ New text"
+BTN_TEXT_ITALIC_OFF = "𝑰 Italic: off"
+BTN_TEXT_ITALIC_ON = "𝑰 Italic: on"
 TEXT_FONT_CUSTOM = "Uploaded font"
 BTN_GENERATE = "⚗️ Generate Thumbnail"
 BTN_THUMB_APPROVE = "✅ Approve"

@@ -167,6 +167,17 @@ class SenkuThumbnailAdapter:
         (the Senku wizard keys its own state by request code, which is NOT the
         folder key)."""
         cache_type = "backdrop" if asset_type in ("bg", "backdrop") else asset_type
+        # Request-scoped cache is deliberately keyed by the franchise root, not
+        # the season label. Every entry therefore receives the same TMDB gallery
+        # while AniList-specific fields remain per-entry.
+        if anime_doc_id:
+            try:
+                cached = await self.cache.get_tmdb_assets(str(anime_doc_id), cache_type)
+                if cached is not None:
+                    log.info("senku.thumb.cache_hit", type=asset_type, count=len(cached))
+                    return cached
+            except Exception as exc:  # noqa: BLE001 — cache miss → live below
+                log.debug("senku.thumb.request_asset_cache_failed", error=str(exc))
         if anime_doc_id:
             try:
                 from nekofetch.services.metadata_prefetch import load_cached_tmdb_assets
@@ -175,6 +186,7 @@ class SenkuThumbnailAdapter:
                     self._c, anime_doc_id, cache_type,
                     anime_doc_id=anime_doc_id, tmdb_id=tmdb_id)
                 if cached is not None:
+                    await self.cache.set_tmdb_assets(str(anime_doc_id), cache_type, cached)
                     log.info("senku.thumb.cache_hit", type=asset_type,
                              count=len(cached))
                     return cached
@@ -182,11 +194,16 @@ class SenkuThumbnailAdapter:
                 log.debug("senku.thumb.cache_failed", error=str(exc))
         try:
             if asset_type == "logo":
-                return await fetch_logos(self._c.tmdb, tmdb_id, media_type)
-            if asset_type == "poster":
-                return await fetch_posters_ranked(self._c.tmdb, tmdb_id, media_type)
-            if asset_type in ("bg", "backdrop"):
-                return await fetch_backdrops_ranked(self._c.tmdb, tmdb_id, media_type)
+                assets = await fetch_logos(self._c.tmdb, tmdb_id, media_type)
+            elif asset_type == "poster":
+                assets = await fetch_posters_ranked(self._c.tmdb, tmdb_id, media_type)
+            elif asset_type in ("bg", "backdrop"):
+                assets = await fetch_backdrops_ranked(self._c.tmdb, tmdb_id, media_type)
+            else:
+                assets = []
+            if assets and anime_doc_id:
+                await self.cache.set_tmdb_assets(str(anime_doc_id), cache_type, assets)
+            return assets
         except Exception as exc:  # noqa: BLE001
             log.warning("senku.thumb.fetch_failed", type=asset_type, error=str(exc))
         return []
