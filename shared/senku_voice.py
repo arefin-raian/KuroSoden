@@ -673,6 +673,6 @@ BTN_GENERATE = "⚗️ Generate Thumbnail"
 BTN_THUMB_APPROVE = "✅ Approve"
 BTN_THUMB_REDO = "↻ Redo"
 
-BTN_ORDER_CORRECT = "✅ Order is correct"
+BTN_ORDER_CORRECT = "✅ Order correct"
 BTN_ORDER_EDIT = "✏️ Edit order"
 BTN_PUBLISH = "📢 Publish"

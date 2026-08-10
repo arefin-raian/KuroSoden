@@ -53,6 +53,26 @@ _NUMS_PER_ROW = 3
 _ASSET_FIELD = {"logo": "logo_url", "poster": "poster_url", "bg": "backdrop_url"}
 
 
+def _entry_variant_key(entry: EntryData) -> str:
+    """A per-entry disambiguator for the render output path.
+
+    Cour splits (e.g. Vanitas S1P1 + S1P2) carry the SAME franchise title AND the
+    same AniList id, so a title-only render path made the second entry overwrite
+    the first's assets/webp — both cards then showed one thumbnail. Keying on
+    ``season_part`` (plus the index as a final tiebreak) keeps them separate.
+    """
+    season = getattr(entry, "season_number", None)
+    part = getattr(entry, "season_part", None)
+    idx = getattr(entry, "index", None)
+    bits = []
+    if season is not None:
+        bits.append(f"s{season}")
+    if part is not None:
+        bits.append(f"p{part}")
+    bits.append(f"e{idx if idx is not None else 0}")
+    return "_".join(bits)
+
+
 class SenkuThumbnailAdapter:
     """Per-request thumbnail loop over the cached entries, rendered in Senku's DM.
 
@@ -97,10 +117,14 @@ class SenkuThumbnailAdapter:
     async def _resolve_tmdb(self, code: str, entry: EntryData) -> tuple[int | None, str]:
         """Resolve this entry to a TMDB (id, media_type), caching the id back.
 
-        Sequels are distinct TMDB titles, so we search on the entry's own title
-        (falling back to its label) — never the franchise root — so the assets
-        offered belong to the right season/movie. The resolved id is persisted on
-        the entry so repeat steps don't re-hit TMDB.
+        TMDB lists assets at the FRANCHISE level, not per season/cour — a search
+        for "… Season 2 Part 2" finds nothing or the wrong show. ``tmdb.search``
+        strips season/part tokens down to the base franchise title, so every
+        entry of a franchise resolves to the SAME TMDB id and therefore the same
+        logo/poster/backdrop galleries (which is what we want: a cour split shows
+        the franchise's assets). Per-season distinction is carried by AniList
+        fields + the render ``variant_key``, not by a different TMDB lookup. The
+        resolved id is persisted on the entry so repeat steps don't re-hit TMDB.
         """
         if entry.tmdb_id:
             return entry.tmdb_id, entry.media_type
@@ -381,6 +405,7 @@ class SenkuThumbnailAdapter:
                 logo_url=sel.logo_url,
                 poster_url=sel.poster_url,
                 bg_url=sel.backdrop_url,
+                variant_key=_entry_variant_key(entry),
                 **fields,
             )
             await persist_thumbnail_source(

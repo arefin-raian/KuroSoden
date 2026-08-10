@@ -38,6 +38,11 @@ _SHADOW_DX = 0
 _SHADOW_DY = 6
 _SHADOW_ALPHA = 120
 _SHADOW_BLUR = 8
+# Transparent breathing room around the glyph bbox — must hold the stroke, the
+# shadow offset, and the blur spread (~2-3× radius) so neither clips. Kept tight
+# so the logo is mostly glyphs: a padded canvas gets shrunk by the thumbnail's
+# object-contain and the lettering reads small.
+_CANVAS_PAD = _STROKE_WIDTH + max(abs(_SHADOW_DX), abs(_SHADOW_DY)) + 3 * _SHADOW_BLUR
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,15 +427,22 @@ def render_text_logo(
     # Pillow may return float coordinates from ``multiline_textbbox`` (notably
     # with variable fonts). Image.new and the draw origin require integer sizes;
     # round upward so fractional glyph extents are never clipped.
+    #
+    # Hug the actual glyph bbox with only a small pad (enough for the stroke +
+    # soft shadow). Large minimum floors here made a short logo occupy a mostly
+    # transparent canvas; the thumbnail's ``object-contain`` then scaled that
+    # whole empty canvas down, so the lettering read tiny in its slot. A tight
+    # canvas lets the slot fill with actual glyphs.
+    #
     # Explicit line breaks are sacred. If a line is still wider than the normal
     # canvas at the minimum size, widen the transparent canvas instead of
     # inventing another break or clipping the operator's text. Single-line input
     # takes the last-resort wrapping path above, so it remains within the normal
     # width ceiling.
-    width_limit = None if "\n" in clean else _MAX_WIDTH + 120
-    width = int(ceil(max(720, text_width + 120) if width_limit is None
-                    else max(720, min(width_limit, text_width + 120))))
-    height = int(ceil(max(260, min(600, text_height + 100))))
+    width_limit = None if "\n" in clean else _MAX_WIDTH + 2 * _CANVAS_PAD
+    width = int(ceil(text_width + 2 * _CANVAS_PAD if width_limit is None
+                    else min(width_limit, text_width + 2 * _CANVAS_PAD)))
+    height = int(ceil(text_height + 2 * _CANVAS_PAD))
     image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow)

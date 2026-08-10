@@ -487,6 +487,12 @@ class ThumbnailRenderService:
         output_dir: str | Path | None = None,
         # Back-compat: older callers passed ``entry_label`` for the meta bar.
         entry_label: str = "",
+        # Disambiguates the on-disk asset dir + output file so two entries that
+        # share a title (e.g. a cour split — "Vanitas" S1P1 and S1P2 both carry
+        # the franchise title) don't render into the SAME ``assets_<title>``
+        # folder and clobber each other's logo/poster/webp. Pass a per-entry
+        # value (anilist id, or "<season>_<part>"); falls back to the title.
+        variant_key: str | int | None = None,
     ) -> Path | None:
         """Render a thumbnail image from the tokenized HTML template.
 
@@ -503,6 +509,13 @@ class ThumbnailRenderService:
         work_dir = Path(output_dir or _OUTPUT_DIR)
         work_dir.mkdir(parents=True, exist_ok=True)
         safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in title)[:40]
+        # Suffix a per-entry token so same-titled entries (cour splits) get their
+        # own asset dir + output file instead of overwriting one another.
+        if variant_key not in (None, ""):
+            vk = "".join(
+                c if c.isalnum() or c in "-_" else "_" for c in str(variant_key)
+            )[:24]
+            safe_name = f"{safe_name}_{vk}" if safe_name else vk
         images_dir = work_dir / f"assets_{safe_name}"
         images_dir.mkdir(parents=True, exist_ok=True)
 

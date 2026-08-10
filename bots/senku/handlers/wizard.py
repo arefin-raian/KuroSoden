@@ -1225,8 +1225,8 @@ def register(client: Client, container: Container) -> None:
             card(V.watch_order_card(title, order_html, rendered=rendered),
                  image=await _art(franchise, title), bot_name=BOT,
                  buttons=[
-                     [(V.BTN_ORDER_CORRECT, cb(BOT, "wiz", "post", code))],
-                     [(V.BTN_ORDER_EDIT, cb(BOT, "wiz", "oedit", code))],
+                     [(V.BTN_ORDER_CORRECT, cb(BOT, "wiz", "post", code)),
+                      (V.BTN_ORDER_EDIT, cb(BOT, "wiz", "oedit", code))],
                      [(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))],
                  ]),
             old_msg=old_msg,
