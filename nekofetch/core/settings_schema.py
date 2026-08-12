@@ -460,6 +460,8 @@ FIELD_DOCS: dict[str, FieldDoc] = {
     # ── storage channel (the database channel) ────────────────────────────────
     "storage_channel.enabled": FieldDoc(
         desc="Enable the private database channel that stores content packs."),
+    "storage_channel.stats_message_enabled": FieldDoc(
+        desc="Automatically publish/update the pinned database statistics message. Off keeps stats available only through manual dashboards."),
     "storage_channel.channel_id": FieldDoc(
         desc="Telegram id (-100…) of the private database channel.",
         example="-1001234567890"),

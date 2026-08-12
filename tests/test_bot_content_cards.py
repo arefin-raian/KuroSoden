@@ -25,6 +25,7 @@ class _Pack:
     resolution: str = "1080p"
     audio: AudioType = AudioType.SUBBED
     season: int | None = 1
+    season_part: int | None = None
     episode_from: int | None = 1
     episode_to: int | None = 12
     file_count: int | None = 12
@@ -79,6 +80,73 @@ def test_multi_episode_entry_renders_season_card():
     caption, _ = svc._build_season_card(meta, season=1, packs=packs)
     # Season card carries the episode count, not a runtime.
     assert "12" in caption
+
+
+def test_split_season_uses_local_count_not_global_episode_to():
+    svc = _svc()
+    # Part 2 is globally located at episodes 13–24 but contains 12 files.
+    packs = [_Pack(season=1, episode_from=13, episode_to=24, file_count=12)]
+    caption, _ = svc._build_season_card(
+        {"title": "Vanitas Part 2", "entry_episodes": 12},
+        season=1, season_part=2, packs=packs,
+    )
+    assert "EPISODES:</b> 12" in caption
+    assert "EPISODES:</b> 24" not in caption
+
+
+def test_split_season_watch_guide_uses_local_count():
+    from types import SimpleNamespace
+
+    part1 = SimpleNamespace(anilist_id=131646, format="TV", season_part=1, episodes=12)
+    part2 = SimpleNamespace(anilist_id=135136, format="TV", season_part=2, episodes=12)
+    packs = [
+        _Pack(season=1, episode_from=1, episode_to=12, file_count=12),
+        _Pack(season=1, episode_from=13, episode_to=24, file_count=12),
+    ]
+    fmt = PostFormatConfig(
+        watch_guide_template="{seasons}",
+        watch_guide_season_line="{season_label}={episodes}",
+    )
+    svc = _svc(fmt)
+    svc._tv_entry_identities = lambda entries: {
+        part1.anilist_id: (1, 1), part2.anilist_id: (1, 2),
+    }
+    guide = svc._build_franchise_watch_guide(
+        {}, packs, {"tv": [part1, part2], "all": [part1, part2]},
+    )
+    assert "Season 01 Part 1=12" in guide
+    assert "Season 01 Part 2=12" in guide
+    assert "=24" not in guide
+
+
+def test_split_season_range_fallback_counts_local_episodes():
+    svc = _svc()
+    packs = [_Pack(season=1, episode_from=13, episode_to=24, file_count=0)]
+    caption, _ = svc._build_season_card(
+        {"title": "Vanitas Part 2", "entry_episodes": 12},
+        season=1, season_part=2, packs=packs,
+    )
+    assert "EPISODES:</b> 12" in caption
+    assert "EPISODES:</b> 24" not in caption
+
+
+def test_pack_only_split_guide_sums_parts_once():
+    svc = _svc()
+    packs = [
+        _Pack(season=1, season_part=1, episode_from=1, episode_to=12, file_count=12),
+        _Pack(season=1, season_part=1, episode_from=1, episode_to=12, file_count=12,
+              resolution="720p"),
+        _Pack(season=1, season_part=2, episode_from=13, episode_to=24, file_count=12),
+        _Pack(season=1, season_part=2, episode_from=13, episode_to=24, file_count=12,
+              resolution="720p"),
+    ]
+    fmt = PostFormatConfig(
+        watch_guide_template="{seasons}",
+        watch_guide_season_line="{season_label}={episodes}",
+    )
+    guide = _svc(fmt)._build_watch_guide_fallback({}, packs)
+    assert "Season 01=24" in guide
+    assert "Season 01=12" not in guide
 
 
 def test_multi_episode_ova_is_not_a_movie():

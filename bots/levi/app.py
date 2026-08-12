@@ -60,10 +60,13 @@ def _home_rows(container: Container, actor) -> list[list[tuple[str, str]]]:
 
 
 async def publish_commands(client: Client) -> None:
-    # Staff-only bot → empty global menu (a stranger sees nothing). Staff/owner
-    # get their menu per-chat on /start via command_menu.apply_for_user.
-    from kurosoden.shared.command_menu import default_commands
+    # Keep owner-only commands out of the global menu, but seed the configured
+    # owner's chat scope at startup so /packcaptions is visible immediately.
+    from kurosoden.shared.command_menu import (
+        default_commands, publish_owner_commands,
+    )
     await client.set_bot_commands(default_commands("levi"))
+    await publish_owner_commands(client, getattr(client, "container", None), "levi")
 
 
 def build_levi(container: Container, token: str) -> Client:

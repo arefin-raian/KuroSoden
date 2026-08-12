@@ -26,6 +26,7 @@ import asyncio
 import hashlib
 import secrets
 from pathlib import Path
+from types import SimpleNamespace
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
@@ -145,6 +146,32 @@ def register(client: Client, container: Container) -> None:
             if str(data.get(key, "")) != str(value):
                 return False, data
         return True, data
+
+    def _message_ref(chat_id: int, message_id: int | str | None):
+        """Build a minimal old-message reference for prompt cards held by id.
+
+        Free-text/media updates do not receive the prompt ``Message`` object, but
+        ``send_screen`` still needs an async ``delete`` method for its safe
+        delete-after-send replacement fallback.
+        """
+        if not str(message_id or "").isdigit():
+            return None
+        async def _delete() -> None:
+            try:
+                await client.delete_messages(chat_id, int(message_id))
+            except Exception:  # noqa: BLE001 — replacement cleanup is best-effort
+                pass
+        return SimpleNamespace(
+            id=int(message_id), chat=SimpleNamespace(id=chat_id), delete=_delete,
+        )
+
+    async def _remember_prompt(user_id: int, state: str, data: dict,
+                               message) -> None:
+        """Persist the current evolving card's Telegram reference in the FSM."""
+        updated = dict(data)
+        updated["prompt_msg_id"] = message.id
+        updated["prompt_chat_id"] = message.chat.id
+        await fsm.set(user_id, state, **updated)
 
     def _cleanup_custom_font(data: dict) -> None:
         """One-shot uploaded fonts die after their single use (best-effort).
@@ -711,12 +738,20 @@ def register(client: Client, container: Container) -> None:
 
     async def _thumb_text_categories(chat_id: int, user_id: int, code: str,
                                      index: int, *, old_msg: Message | None,
-                                     text: str | None = None) -> None:
+                                     text: str | None = None,
+                                     in_place_message_id: int | None = None) -> None:
         _state, existing = await fsm.get(user_id)
         if text is None:
             text = existing.get("text", "")
-        await fsm.set(user_id, STATE_TEXT_CATEGORIES, code=code, index=index,
-                      text=text)
+        await fsm.set(
+            user_id,
+            STATE_TEXT_CATEGORIES,
+            code=code,
+            index=index,
+            text=text,
+            prompt_msg_id=existing.get("prompt_msg_id", ""),
+            prompt_chat_id=existing.get("prompt_chat_id", ""),
+        )
         # Two categories per row (the plan's grid ceiling is ~8; the 2-col layout
         # holds even if the set grows), then the one-shot font upload row, then
         # Cancel.
@@ -734,12 +769,30 @@ def register(client: Client, container: Container) -> None:
                                                  str(index)))])
         rows.append([(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code,
                                             str(index)))])
-        await send_screen(
-            client, chat_id,
-            card(V.thumb_text_categories(), image=pick_artwork(BOT), bot_name=BOT,
-                 buttons=rows),
-            old_msg=old_msg,
-        )
+        screen = card(V.thumb_text_categories(), image=pick_artwork(BOT),
+                      bot_name=BOT, buttons=rows)
+        if in_place_message_id:
+            try:
+                await client.edit_message_caption(
+                    chat_id, in_place_message_id,
+                    caption=screen.caption, parse_mode=screen.parse_mode,
+                    reply_markup=screen.keyboard,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 — fall back to replacement
+                log.debug("senku.wiz.text_prompt_edit_failed", error=str(exc))
+                try:
+                    await client.delete_messages(chat_id, in_place_message_id)
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
+        replacement = await send_screen(client, chat_id, screen, old_msg=old_msg)
+        if in_place_message_id:
+            _current, current_data = await fsm.get(user_id)
+            current_data.update(
+                prompt_msg_id=replacement.id,
+                prompt_chat_id=replacement.chat.id,
+            )
+            await fsm.set(user_id, STATE_TEXT_CATEGORIES, **current_data)
 
     async def _thumb_text_fonts(chat_id: int, user_id: int, code: str,
                                 index: int, category: str,
@@ -752,7 +805,9 @@ def register(client: Client, container: Container) -> None:
                                          old_msg=old_msg, text=text)
             return
         await fsm.set(user_id, STATE_TEXT_FONTS, code=code, index=index,
-                      category=category, text=text)
+                      category=category, text=text,
+                      prompt_msg_id=existing.get("prompt_msg_id", ""),
+                      prompt_chat_id=existing.get("prompt_chat_id", ""))
         # ≥10 fonts per category, two per row.
         rows: list[list[tuple[str, str]]] = []
         row: list[tuple[str, str]] = []
@@ -769,14 +824,16 @@ def register(client: Client, container: Container) -> None:
             (V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code, str(index))),
         ])
         category_obj = get_text_logo_category(category)
-        await send_screen(
+        replacement = await send_screen(
             client, chat_id,
             card(V.thumb_text_fonts(
                 category_obj.name if category_obj else category,
-                [font.name for font in fonts],
             ), image=pick_artwork(BOT), bot_name=BOT, buttons=rows),
             old_msg=old_msg,
         )
+        await _remember_prompt(user_id, STATE_TEXT_FONTS, {
+            "code": code, "index": index, "category": category, "text": text,
+        }, replacement)
 
     async def _thumb_text_weights(chat_id: int, user_id: int, code: str,
                                   index: int, *, old_msg: Message | None,
@@ -799,7 +856,9 @@ def register(client: Client, container: Container) -> None:
         await fsm.set(user_id, STATE_TEXT_WEIGHTS, code=code, index=index,
                       text=text, font=font.key, category=category or "",
                       weight=str((weight or choices[0][1]) if choices else ""),
-                      italic="1" if italic else "0")
+                      italic="1" if italic else "0",
+                      prompt_msg_id=existing.get("prompt_msg_id", ""),
+                      prompt_chat_id=existing.get("prompt_chat_id", ""))
         rows: list[list[tuple[str, str]]] = []
         row: list[tuple[str, str]] = []
         for label, value in choices:
@@ -821,12 +880,17 @@ def register(client: Client, container: Container) -> None:
             (V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackweight", code, str(index))),
             (V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code, str(index))),
         ])
-        await send_screen(
+        replacement = await send_screen(
             client, chat_id,
             card(V.thumb_text_weights(font.name, [label for label, _ in choices], italic),
                  image=pick_artwork(BOT), bot_name=BOT, buttons=rows),
             old_msg=old_msg,
         )
+        await _remember_prompt(user_id, STATE_TEXT_WEIGHTS, {
+            "code": code, "index": index, "text": text, "font": font.key,
+            "category": category or "", "weight": str(weight or ""),
+            "italic": "1" if italic else "0",
+        }, replacement)
 
     async def _thumb_text_colors(chat_id: int, user_id: int, code: str,
                                  index: int, *, old_msg: Message | None,
@@ -866,7 +930,9 @@ def register(client: Client, container: Container) -> None:
                       text=text, font=font_key or "",
                       custom_font_path=custom_font_path or "",
                       origin=origin, category=category,
-                      weight=str(weight or ""), italic="1" if italic else "0")
+                      weight=str(weight or ""), italic="1" if italic else "0",
+                      prompt_msg_id=existing.get("prompt_msg_id", ""),
+                      prompt_chat_id=existing.get("prompt_chat_id", ""))
         rows: list[list[tuple[str, str]]] = []
         row: list[tuple[str, str]] = []
         for color in text_logo_colors():
@@ -881,12 +947,18 @@ def register(client: Client, container: Container) -> None:
             (V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackfont", code, str(index))),
             (V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel", code, str(index))),
         ])
-        await send_screen(
+        replacement = await send_screen(
             client, chat_id,
             card(V.thumb_text_colors(), image=pick_artwork(BOT), bot_name=BOT,
                  buttons=rows),
             old_msg=old_msg,
         )
+        await _remember_prompt(user_id, STATE_TEXT_COLORS, {
+            "code": code, "index": index, "text": text, "font": font_key or "",
+            "custom_font_path": custom_font_path or "", "origin": origin,
+            "category": category, "weight": str(weight or ""),
+            "italic": "1" if italic else "0",
+        }, replacement)
 
     async def _thumb_text_preview(chat_id: int, user_id: int, code: str,
                                   index: int, text: str, font_key: str | None,
@@ -911,7 +983,7 @@ def register(client: Client, container: Container) -> None:
         except (FileNotFoundError, ValueError, OSError) as exc:
             log.warning("senku.wiz.text_logo_failed", code=code, entry=index,
                         error=str(exc))
-            await send_screen(
+            replacement = await send_screen(
                 client, chat_id,
                 card(V.thumb_text_error(), image=pick_artwork(BOT), bot_name=BOT,
                      buttons=[[(V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackcolor",
@@ -920,6 +992,9 @@ def register(client: Client, container: Container) -> None:
                                                        code, str(index)))]]),
                 old_msg=old_msg,
             )
+            _state, existing = await fsm.get(user_id)
+            await _remember_prompt(user_id, _state or STATE_TEXT_COLORS,
+                                   existing, replacement)
             return
         _state, existing = await fsm.get(user_id)
         await fsm.set(user_id, STATE_TEXT_PREVIEW, code=code, index=index,
@@ -928,10 +1003,12 @@ def register(client: Client, container: Container) -> None:
                       origin=existing.get("origin", "fonts"),
                       category=existing.get("category", ""),
                       weight=str(weight or ""), italic="1" if italic else "0",
-                      path=str(path))
+                      path=str(path),
+                      prompt_msg_id=existing.get("prompt_msg_id", ""),
+                      prompt_chat_id=existing.get("prompt_chat_id", ""))
         await cache.set_last_text_logo(code, path=str(path), text=text,
                                        font=font_key)
-        await send_screen(
+        replacement = await send_screen(
             client, chat_id,
             card(V.thumb_text_preview(font_name, text), image=path, bot_name=BOT,
                  buttons=[[(V.BTN_TEXT_BACK, cb(BOT, "wiz", "textbackcolor", code,
@@ -942,6 +1019,16 @@ def register(client: Client, container: Container) -> None:
                                                 str(index)))]]),
             old_msg=old_msg,
         )
+        _state, existing = await fsm.get(user_id)
+        await _remember_prompt(user_id, STATE_TEXT_PREVIEW, {
+            **existing, "code": code, "index": index, "text": text,
+            "font": font_key or "", "color": color_key,
+            "custom_font_path": custom_font_path or "",
+            "origin": existing.get("origin", "fonts"),
+            "category": existing.get("category", ""),
+            "weight": str(weight or ""), "italic": "1" if italic else "0",
+            "path": str(path),
+        }, replacement)
 
     async def _thumb_asset_card(chat_id: int, code: str, entry, asset: str,
                                 *, old_msg: Message | None) -> None:
@@ -1004,12 +1091,21 @@ def register(client: Client, container: Container) -> None:
         await fsm.set(user_id, STATE_AWAIT_UPLOAD, code=code, index=index, asset=asset)
         franchise = await cache.get_franchise(code)
         title = await _title_of(code, franchise)
-        await send_screen(
+        prompt = await send_screen(
             client, chat_id,
             card(V.thumb_upload_prompt(asset), image=await _art(franchise, title),
                  bot_name=BOT,
                  buttons=[[(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))]]),
             old_msg=old_msg,
+        )
+        await fsm.set(
+            user_id,
+            STATE_AWAIT_UPLOAD,
+            code=code,
+            index=index,
+            asset=asset,
+            prompt_msg_id=prompt.id,
+            prompt_chat_id=prompt.chat.id,
         )
 
     async def _thumb_generate_card(chat_id: int, code: str, entry,
@@ -1424,15 +1520,15 @@ def register(client: Client, container: Container) -> None:
                     old_msg=q.message,
                 )
             else:
-                await fsm.set(q.from_user.id, STATE_AWAIT_TEXT, code=code, index=index,
-                              prompt_msg_id=q.message.id, prompt_chat_id=chat_id)
-                await send_screen(
+                prompt = await send_screen(
                     client, chat_id,
                     card(V.thumb_text_prompt(), image=pick_artwork(BOT), bot_name=BOT,
                          buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
                                                              code, str(index)))]]),
                     old_msg=q.message,
                 )
+                await fsm.set(q.from_user.id, STATE_AWAIT_TEXT, code=code, index=index,
+                              prompt_msg_id=prompt.id, prompt_chat_id=prompt.chat.id)
         elif action == "textprev_yes":
             try:
                 index = int(parts[4])
@@ -1614,7 +1710,8 @@ def register(client: Client, container: Container) -> None:
                 await q.answer("That font menu has expired.", show_alert=True)
                 return
             await fsm.set(q.from_user.id, STATE_AWAIT_FONT_UPLOAD, code=code,
-                          index=index, text=data.get("text", ""))
+                          index=index, text=data.get("text", ""),
+                          prompt_msg_id=q.message.id, prompt_chat_id=chat_id)
             await q.answer()
             await send_screen(
                 client, chat_id,
@@ -1804,26 +1901,32 @@ def register(client: Client, container: Container) -> None:
             pass
 
         if state == STATE_AWAIT_TEXT:
+            prompt_msg_id = data.get("prompt_msg_id")
+            prompt_chat_id = data.get("prompt_chat_id") or message.chat.id
             if not raw:
-                await send_screen(
+                replacement = await send_screen(
                     client, message.chat.id,
                     card(V.thumb_text_error(), image=pick_artwork(BOT), bot_name=BOT,
                          buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
                                                              code, str(data.get("index", 0))))]]),
+                    old_msg=_message_ref(prompt_chat_id, prompt_msg_id),
+                )
+                await fsm.set(
+                    message.from_user.id,
+                    STATE_AWAIT_TEXT,
+                    **{**data, "prompt_msg_id": replacement.id,
+                       "prompt_chat_id": replacement.chat.id},
                 )
                 return
-            prompt_msg_id = data.get("prompt_msg_id")
-            prompt_chat_id = data.get("prompt_chat_id") or message.chat.id
-            if prompt_msg_id:
-                try:
-                    await client.delete_messages(prompt_chat_id, int(prompt_msg_id))
-                except Exception:  # noqa: BLE001 — best-effort replacement
-                    pass
-            await fsm.set(message.from_user.id, STATE_TEXT_FONTS,
-                          code=code, index=int(data.get("index", 0)), text=raw)
+            await fsm.set(message.from_user.id, STATE_TEXT_CATEGORIES,
+                          code=code, index=int(data.get("index", 0)), text=raw,
+                          prompt_msg_id=prompt_msg_id,
+                          prompt_chat_id=prompt_chat_id)
             await _thumb_text_categories(
                 message.chat.id, message.from_user.id, code,
                 int(data.get("index", 0)), old_msg=None, text=raw,
+                in_place_message_id=(int(prompt_msg_id)
+                                     if str(prompt_msg_id or "").isdigit() else None),
             )
             return
 
@@ -1846,18 +1949,20 @@ def register(client: Client, container: Container) -> None:
         await _verify_and_store(message.chat.id, message.from_user.id, code, raw)
 
     # ── Manual asset upload (group=2, only while awaiting an uploaded image) ────
-    async def _reject_font_upload(message: Message, code: str, index: int) -> None:
+    async def _reject_font_upload(message: Message, code: str, index: int,
+                                  *, old_msg: Message | None = None) -> Message:
         """Voiced rejection for a non-font document; stays armed for the next one."""
         try:
             await message.delete()
         except Exception:  # noqa: BLE001 — best-effort (needs delete rights)
             pass
-        await send_screen(
+        return await send_screen(
             client, message.chat.id,
             card(V.thumb_text_font_upload_bad(), image=pick_artwork(BOT),
                  bot_name=BOT,
                  buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
                                                      code, str(index)))]]),
+            old_msg=old_msg,
         )
 
     async def _capture_uploaded_font(message: Message, code: str, index: int,
@@ -1878,8 +1983,21 @@ def register(client: Client, container: Container) -> None:
             or mime in {"font/ttf", "font/otf", "application/x-font-ttf",
                         "application/font-sfnt", "application/octet-stream"}
         )
+        _state, state_data = await fsm.get(message.from_user.id)
+        old_prompt = _message_ref(
+            state_data.get("prompt_chat_id") or message.chat.id,
+            state_data.get("prompt_msg_id"),
+        )
         if not is_font:
-            await _reject_font_upload(message, code, index)
+            replacement = await _reject_font_upload(
+                message, code, index, old_msg=old_prompt,
+            )
+            await fsm.set(
+                message.from_user.id,
+                STATE_AWAIT_FONT_UPLOAD,
+                **{**state_data, "prompt_msg_id": replacement.id,
+                   "prompt_chat_id": replacement.chat.id},
+            )
             return
         try:
             buf = await client.download_media(message, in_memory=True)
@@ -1887,12 +2005,32 @@ def register(client: Client, container: Container) -> None:
         except Exception as exc:  # noqa: BLE001
             log.warning("senku.wiz.font_upload_download_failed", code=code,
                         error=str(exc))
-            await message.reply(V.THUMB_UPLOAD_FAILED)
+            replacement = await send_screen(
+                client, message.chat.id,
+                card(V.THUMB_UPLOAD_FAILED, image=pick_artwork(BOT), bot_name=BOT,
+                     buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
+                                                         code, str(index)))]]),
+                old_msg=old_prompt,
+            )
+            await fsm.set(
+                message.from_user.id,
+                STATE_AWAIT_FONT_UPLOAD,
+                **{**state_data, "prompt_msg_id": replacement.id,
+                   "prompt_chat_id": replacement.chat.id},
+            )
             return
         # A real TTF/OTF header is required — never stage an arbitrary document.
         if len(font_bytes) < 1024 or font_bytes[:4] not in (b"\x00\x01\x00\x00",
                                                              b"OTTO"):
-            await _reject_font_upload(message, code, index)
+            replacement = await _reject_font_upload(
+                message, code, index, old_msg=old_prompt,
+            )
+            await fsm.set(
+                message.from_user.id,
+                STATE_AWAIT_FONT_UPLOAD,
+                **{**state_data, "prompt_msg_id": replacement.id,
+                   "prompt_chat_id": replacement.chat.id},
+            )
             return
         digest = hashlib.sha256(font_bytes).hexdigest()[:20]
         suffix = ".otf" if fname.lower().endswith(".otf") else ".ttf"
@@ -1902,7 +2040,19 @@ def register(client: Client, container: Container) -> None:
         except OSError as exc:  # noqa: BLE001 — disk hiccup
             log.warning("senku.wiz.font_upload_stage_failed", code=code,
                         error=str(exc))
-            await message.reply(V.THUMB_UPLOAD_FAILED)
+            replacement = await send_screen(
+                client, message.chat.id,
+                card(V.THUMB_UPLOAD_FAILED, image=pick_artwork(BOT), bot_name=BOT,
+                     buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
+                                                         code, str(index)))]]),
+                old_msg=old_prompt,
+            )
+            await fsm.set(
+                message.from_user.id,
+                STATE_AWAIT_FONT_UPLOAD,
+                **{**state_data, "prompt_msg_id": replacement.id,
+                   "prompt_chat_id": replacement.chat.id},
+            )
             return
         # Owner's standing rule: the wizard stays one evolving card — consume the
         # admin's upload exactly like the text-capture step consumes their text.
@@ -1912,9 +2062,14 @@ def register(client: Client, container: Container) -> None:
             pass
         await fsm.set(message.from_user.id, STATE_TEXT_COLORS, code=code,
                       index=index, text=text, font="",
-                      custom_font_path=str(target), origin="upload", category="")
-        await _thumb_text_colors(message.chat.id, message.from_user.id, code,
-                                 index, old_msg=None)
+                      custom_font_path=str(target), origin="upload", category="",
+                      prompt_msg_id=state_data.get("prompt_msg_id", ""),
+                      prompt_chat_id=state_data.get("prompt_chat_id", ""))
+        await _thumb_text_colors(
+            message.chat.id, message.from_user.id, code, index,
+            old_msg=old_prompt,
+        )
+
 
     @client.on_message(
         (filters.photo | filters.document) & filters.private,
@@ -1930,6 +2085,10 @@ def register(client: Client, container: Container) -> None:
             return
         code = data.get("code", "")
         index = int(data.get("index", 0))
+        old_prompt = _message_ref(
+            data.get("prompt_chat_id") or message.chat.id,
+            data.get("prompt_msg_id"),
+        )
 
         if state == STATE_AWAIT_FONT_UPLOAD:
             await _capture_uploaded_font(message, code, index,
@@ -1940,7 +2099,22 @@ def register(client: Client, container: Container) -> None:
 
         # A document must actually be an image — reject PDFs, archives, etc.
         if message.document and not (message.document.mime_type or "").startswith("image/"):
-            await message.reply(V.THUMB_UPLOAD_BAD)
+            try:
+                await message.delete()
+            except Exception:  # noqa: BLE001 — best-effort (needs delete rights)
+                pass
+            replacement = await send_screen(
+                client, message.chat.id,
+                card(V.THUMB_UPLOAD_BAD, image=pick_artwork(BOT), bot_name=BOT,
+                     buttons=[[(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))]]),
+                old_msg=old_prompt,
+            )
+            await fsm.set(
+                message.from_user.id,
+                STATE_AWAIT_UPLOAD,
+                **{**data, "prompt_msg_id": replacement.id,
+                   "prompt_chat_id": replacement.chat.id},
+            )
             return
 
         try:
@@ -1948,20 +2122,56 @@ def register(client: Client, container: Container) -> None:
             file_bytes = buf.getvalue()
         except Exception as exc:  # noqa: BLE001
             log.warning("senku.wiz.upload_download_failed", code=code, error=str(exc))
-            await message.reply(V.THUMB_UPLOAD_FAILED)
+            try:
+                await message.delete()
+            except Exception:  # noqa: BLE001 — best-effort (needs delete rights)
+                pass
+            replacement = await send_screen(
+                client, message.chat.id,
+                card(V.THUMB_UPLOAD_FAILED, image=pick_artwork(BOT), bot_name=BOT,
+                     buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
+                                                         code, str(index)))]]),
+                old_msg=old_prompt,
+            )
+            await fsm.set(
+                message.from_user.id,
+                STATE_AWAIT_UPLOAD,
+                **{**data, "prompt_msg_id": replacement.id,
+                   "prompt_chat_id": replacement.chat.id},
+            )
             return
 
         try:
             await thumbs.store_upload(code, index, asset, file_bytes)
         except Exception as exc:  # noqa: BLE001 — catbox host hiccup
             log.warning("senku.wiz.upload_store_failed", code=code, error=str(exc))
-            await message.reply(V.THUMB_UPLOAD_FAILED)
+            try:
+                await message.delete()
+            except Exception:  # noqa: BLE001 — best-effort (needs delete rights)
+                pass
+            replacement = await send_screen(
+                client, message.chat.id,
+                card(V.THUMB_UPLOAD_FAILED, image=pick_artwork(BOT), bot_name=BOT,
+                     buttons=[[(V.BTN_TEXT_CANCEL, cb(BOT, "wiz", "textcancel",
+                                                         code, str(index)))]]),
+                old_msg=old_prompt,
+            )
+            await fsm.set(
+                message.from_user.id,
+                STATE_AWAIT_UPLOAD,
+                **{**data, "prompt_msg_id": replacement.id,
+                   "prompt_chat_id": replacement.chat.id},
+            )
             return
 
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001 — best-effort (needs delete rights)
+            pass
         await fsm.clear(message.from_user.id)
-        await message.reply(V.thumb_uploaded(asset))
-        # Advance to the next asset (or the Generate card) just like a numbered pick.
-        await _thumb_next(message.chat.id, code, old_msg=None)
+        # Advance to the next asset (or the Generate card) by replacing the upload
+        # prompt; do not leave a standalone "uploaded" reply beside the wizard.
+        await _thumb_next(message.chat.id, code, old_msg=old_prompt)
 
 
 async def _latest_task(container: Container, message: Message) -> str | None:

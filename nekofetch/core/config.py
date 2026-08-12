@@ -361,6 +361,9 @@ class StorageChannelConfig(BaseModel):
     """The database channel where content packs live (header -> files -> end sticker)."""
 
     enabled: bool = False
+    # Keep the pinned database-statistics message disabled until explicitly enabled.
+    # This does not disable pack storage or the manual Gojo stats dashboard.
+    stats_message_enabled: bool = False
     channel_id: int = 0                       # -100... id of the database channel
     # Header text posted before each pack. Variables: {title} {season} {resolution}
     # {language} {episode_from} {episode_to} {content_type} {group}

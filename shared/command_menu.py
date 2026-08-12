@@ -122,6 +122,42 @@ def _role_tier(bot: str, *, is_staff: bool, is_owner: bool) -> list[BotCommand]:
     return user
 
 
+async def publish_owner_commands(
+    client: Client, container: Container | None, bot: str,
+) -> None:
+    """Seed the owner-scoped menu during bot startup.
+
+    Telegram keeps a chat-scoped command list until it is explicitly replaced;
+    waiting for the owner to send ``/start`` therefore leaves the owner seeing
+    only the staff/global tier (or a stale cached menu). Startup knows the
+    configured owner ids, so publish the complete owner tier proactively while
+    keeping owner-only commands out of the global menu.
+    """
+    from nekofetch.services.auth_service import AuthService
+
+    if container is None:
+        log.debug("command_menu.owner_publish_skipped", bot=bot, reason="no_container")
+        return
+    try:
+        owner_ids = AuthService(container).owner_ids()
+    except Exception as exc:  # noqa: BLE001 - startup menu must never block a bot
+        log.warning("command_menu.owner_ids_failed", bot=bot, error=str(exc))
+        return
+    commands = _role_tier(bot, is_staff=True, is_owner=True)
+    if not commands:
+        return
+    for user_id in owner_ids:
+        try:
+            await client.set_bot_commands(
+                commands, scope=BotCommandScopeChat(chat_id=user_id),
+            )
+        except Exception as exc:  # noqa: BLE001 - menu publication is best-effort
+            log.warning(
+                "command_menu.owner_publish_failed",
+                bot=bot, user=user_id, error=str(exc),
+            )
+
+
 async def apply_for_user(
     client: Client, container: Container, bot: str, user_id: int, nf_user,
 ) -> None:

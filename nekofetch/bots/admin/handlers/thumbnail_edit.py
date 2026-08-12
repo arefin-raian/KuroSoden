@@ -69,20 +69,25 @@ def _source_rows(rows: list[ThumbnailSource]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+async def show_editor(client: Client, container: Container, target: Message) -> None:
+    """Open the durable thumbnail editor from a command or inline menu."""
+    rows = await _sources(container)
+    if not rows:
+        await target.reply_text("No durable thumbnails have been generated yet.")
+        return
+    await target.reply_text(
+        "<b>Edit a saved thumbnail</b>\n\nChoose the card you want to change.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_source_rows(rows),
+    )
+
+
 def register(client: Client, container: Container) -> None:
     @client.on_message(filters.command("edit_thumbnail"), group=4)
     async def _command(_: Client, message: Message) -> None:
         if not is_owner(container, message):
             return
-        rows = await _sources(container)
-        if not rows:
-            await message.reply_text("No durable thumbnails have been generated yet.")
-            return
-        await message.reply_text(
-            "<b>Edit a saved thumbnail</b>\n\nChoose the card you want to change.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_source_rows(rows),
-        )
+        await show_editor(client, container, message)
 
     @client.on_callback_query(filters.regex(r"^thumbedit\|(?!field\|)"), group=4)
     async def _callback(_: Client, query: CallbackQuery) -> None:

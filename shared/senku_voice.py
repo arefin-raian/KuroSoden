@@ -391,12 +391,11 @@ def thumb_text_categories() -> str:
     )
 
 
-def thumb_text_fonts(category: str, fonts: list[str]) -> str:
+def thumb_text_fonts(category: str, fonts: list[str] | None = None) -> str:
     return (
         f"{ICON} <b>{esc(category)}</b>\n\n"
         "Choose a font to preview your logo. Every option here is bundled under the "
-        "SIL Open Font License.\n\n"
-        + "\n".join(f"• {esc(name)}" for name in fonts)
+        "SIL Open Font License."
     )
 
 

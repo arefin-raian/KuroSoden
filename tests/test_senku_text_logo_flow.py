@@ -118,9 +118,12 @@ class _FlowMessage:
         self.id = 5
         self.chat = _FlowChat()
         self.text = None
+        self.caption = None
+        self.command = None
         self.photo = None
         self.document = document
         self.from_user = _FlowUser()
+        self.nf_user = SimpleNamespace(role="staff")
         self.deleted = False
         self.replied = None
 
@@ -198,6 +201,9 @@ async def flow_client(monkeypatch):
     monkeypatch.setattr(AuthService, "resolve_user", fake_resolve_user)
 
     client = build_senku(container, token="1:AAAA")
+    # The offline dispatcher evaluates ``~filters.command`` for text messages;
+    # provide the same minimal ``me`` object a started Pyrogram client exposes.
+    client.me = SimpleNamespace(username=None, usernames=[])
     # Pyrogram's add_handler schedules registration tasks on the loop — tick it
     # until every handler lands in the dispatcher (same pattern as the routing
     # test), otherwise the group lists are empty when we dispatch.
@@ -234,12 +240,93 @@ def font_bytes() -> bytes:
 # ── the flow ──────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
+async def test_text_submission_edits_existing_prompt_card(flow_client, monkeypatch):
+    """Typed logo text replaces the prompt card instead of creating another one."""
+    redis = flow_client._test_redis
+    fsm = FSM(redis, bot="senku")
+    await fsm.set(_USER_ID, wiz.STATE_AWAIT_TEXT, code=_CODE, index=1,
+                  prompt_msg_id=42, prompt_chat_id=_CHAT_ID)
+
+    edits: list[dict] = []
+
+    async def fake_edit_message_caption(chat_id, message_id, **kwargs):
+        edits.append({"chat_id": chat_id, "message_id": message_id, **kwargs})
+        return SimpleNamespace(id=message_id, chat=SimpleNamespace(id=chat_id))
+
+    monkeypatch.setattr(flow_client, "edit_message_caption", fake_edit_message_caption)
+    message = _FlowMessage()
+    message.text = "Vanitas"
+
+    await _dispatch_message(flow_client, message)
+
+    assert message.deleted
+    assert edits and edits[0]["message_id"] == 42
+    assert "Choose a lettering style" in edits[0]["caption"]
+    # The successful edit path must not send a replacement screen.
+    assert edits[0]["reply_markup"] is not None
+    state, data = await fsm.get(_USER_ID)
+    assert state == wiz.STATE_TEXT_CATEGORIES
+    assert data.get("text") == "Vanitas"
+
+
+@pytest.mark.asyncio
+async def test_empty_text_replaces_prompt_and_updates_fsm_reference(flow_client):
+    redis = flow_client._test_redis
+    fsm = FSM(redis, bot="senku")
+    await fsm.set(_USER_ID, wiz.STATE_AWAIT_TEXT, code=_CODE, index=1,
+                  prompt_msg_id=42, prompt_chat_id=_CHAT_ID)
+
+    message = _FlowMessage()
+    # Telegram will not deliver a truly empty text message; whitespace still
+    # reaches the text handler and becomes empty after the production trim.
+    message.text = " "
+    await _dispatch_message(flow_client, message)
+
+    state, data = await fsm.get(_USER_ID)
+    assert state == wiz.STATE_AWAIT_TEXT
+    assert data.get("prompt_msg_id") == 9
+    assert data.get("prompt_chat_id") == _CHAT_ID
+
+
+@pytest.mark.asyncio
+async def test_font_caption_does_not_repeat_button_labels():
+    caption = wiz.V.thumb_text_fonts("Elegant serif", ["Playfair Display"])
+    assert "Playfair Display" not in caption
+    assert "Choose a font to preview your logo" in caption
+
+
+@pytest.mark.asyncio
+async def test_text_submission_replaces_prompt_when_caption_edit_fails(
+    flow_client, monkeypatch,
+):
+    redis = flow_client._test_redis
+    fsm = FSM(redis, bot="senku")
+    await fsm.set(_USER_ID, wiz.STATE_AWAIT_TEXT, code=_CODE, index=1,
+                  prompt_msg_id=42, prompt_chat_id=_CHAT_ID)
+
+    async def fail_edit(*_args, **_kwargs):
+        raise RuntimeError("synthetic edit failure")
+
+    monkeypatch.setattr(flow_client, "edit_message_caption", fail_edit)
+    message = _FlowMessage()
+    message.text = "Vanitas"
+
+    await _dispatch_message(flow_client, message)
+
+    state, data = await fsm.get(_USER_ID)
+    assert message.deleted
+    assert state == wiz.STATE_TEXT_CATEGORIES
+    assert data.get("prompt_msg_id") == 9
+    assert data.get("prompt_chat_id") == _CHAT_ID
+
+
+@pytest.mark.asyncio
 async def test_font_upload_reaches_color_step(flow_client, monkeypatch,
                                               tmp_path, font_bytes):
     redis = flow_client._test_redis
     fsm = FSM(redis, bot="senku")
     await fsm.set(_USER_ID, wiz.STATE_AWAIT_FONT_UPLOAD, code=_CODE, index=1,
-                  text="Vanitas")
+                  text="Vanitas", prompt_msg_id=42, prompt_chat_id=_CHAT_ID)
 
     staged_dir = tmp_path / "uploaded"
     staged_dir.mkdir()
@@ -259,6 +346,8 @@ async def test_font_upload_reaches_color_step(flow_client, monkeypatch,
     state, data = await fsm.get(_USER_ID)
     assert state == wiz.STATE_TEXT_COLORS, f"expected color step, got {state}"
     assert data.get("origin") == "upload"
+    assert data.get("prompt_msg_id") == 9
+    assert data.get("prompt_chat_id") == _CHAT_ID
     staged = Path(data.get("custom_font_path", ""))
     assert staged.is_file() and staged.parent == staged_dir
     assert staged.read_bytes() == font_bytes
@@ -271,7 +360,7 @@ async def test_font_upload_rejects_non_font_and_stays_armed(flow_client,
     redis = flow_client._test_redis
     fsm = FSM(redis, bot="senku")
     await fsm.set(_USER_ID, wiz.STATE_AWAIT_FONT_UPLOAD, code=_CODE, index=1,
-                  text="Vanitas")
+                  text="Vanitas", prompt_msg_id=42, prompt_chat_id=_CHAT_ID)
 
     message = _FlowMessage(document=SimpleNamespace(
         file_name="notes.pdf", mime_type="application/pdf",
@@ -282,6 +371,8 @@ async def test_font_upload_rejects_non_font_and_stays_armed(flow_client,
     state, data = await fsm.get(_USER_ID)
     assert state == wiz.STATE_AWAIT_FONT_UPLOAD
     assert not data.get("custom_font_path")
+    assert data.get("prompt_msg_id") == 9
+    assert data.get("prompt_chat_id") == _CHAT_ID
 
 
 @pytest.mark.asyncio
@@ -303,7 +394,7 @@ async def test_use_this_persists_logo_and_unlinks_temp_font(flow_client,
 
     monkeypatch.setattr(flow_client, "download_media", fake_download_media)
     await fsm.set(_USER_ID, wiz.STATE_AWAIT_FONT_UPLOAD, code=_CODE, index=1,
-                  text="Vanitas")
+                  text="Vanitas", prompt_msg_id=42, prompt_chat_id=_CHAT_ID)
     message = _FlowMessage(document=SimpleNamespace(
         file_name="MyFont.ttf", mime_type="font/ttf",
     ))
@@ -320,6 +411,8 @@ async def test_use_this_persists_logo_and_unlinks_temp_font(flow_client,
     state, data = await fsm.get(_USER_ID)
     assert state == wiz.STATE_TEXT_PREVIEW
     assert data.get("color") == "blue"
+    assert data.get("prompt_msg_id") == 9
+    assert data.get("prompt_chat_id") == _CHAT_ID
     preview = Path(data["path"])
     assert preview.is_file()
 

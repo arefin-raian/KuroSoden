@@ -86,9 +86,13 @@ def _home_rows(container: Container, obj) -> list[list[tuple[str, str]]]:
 
 
 async def publish_commands(client: Client) -> None:
-    # Staff-only bot → empty global menu; staff/owner get theirs per-chat on /start.
-    from kurosoden.shared.command_menu import default_commands
+    # Keep owner-only commands out of the global menu while seeding the owner's
+    # chat scope at startup, avoiding a stale/blank owner menu.
+    from kurosoden.shared.command_menu import (
+        default_commands, publish_owner_commands,
+    )
     await client.set_bot_commands(default_commands("gojo"))
+    await publish_owner_commands(client, getattr(client, "container", None), "gojo")
 
 
 def build_gojo(container: Container, token: str) -> Client:

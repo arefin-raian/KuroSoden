@@ -32,6 +32,21 @@ log = get_logger(__name__)
 T = TypeVar("T")
 
 
+def is_transport_error(exc: BaseException) -> bool:
+    """Return whether an error indicates a dead Telegram transport/handler."""
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    text = str(exc).casefold()
+    return any(marker in text for marker in (
+        "tcptransport closed",
+        "transport closed",
+        "handler is closed",
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+    ))
+
+
 @dataclass
 class Account:
     """One user account. Prefer ``session_string`` (portable); a file session
@@ -125,12 +140,32 @@ class UserbotPool:
         return Client(acc.name, **kwargs)
 
     async def acquire(self) -> Client:
-        """Return a started client, trying each account until one works."""
+        """Return a started, responsive client, trying each account until one works.
+
+        ``is_connected`` can remain true briefly after Pyrogram's underlying
+        handler/transport has closed. Probe the cached active client before
+        returning it; otherwise one stale session can poison every caller with
+        repeated ``TCPTransport closed`` errors.
+        """
         async with self._lock:
-            if self._active is not None and self._active.is_connected:
-                return self._active
+            retired_names: set[str] = set()
+            active = self._active
+            if active is not None and active.is_connected:
+                try:
+                    await active.get_me()
+                    return active
+                except Exception as exc:  # noqa: BLE001 — stale transport/session
+                    log.warning("userbot.active_unhealthy", error=str(exc))
+                    if len(self.accounts) > 1:
+                        for account in self.accounts:
+                            if self._clients.get(account.name) is active:
+                                retired_names.add(account.name)
+                                break
+                    await self._retire(active)
             errors: list[str] = []
             for acc in self.accounts:
+                if acc.name in retired_names:
+                    continue
                 client = self._clients.get(acc.name) or self._build(acc)
                 self._clients[acc.name] = client
                 try:
@@ -143,9 +178,17 @@ class UserbotPool:
                 except Exception as exc:  # noqa: BLE001 - try the next account
                     errors.append(f"{acc.name}: {exc}")
                     log.warning("userbot.account.failed", account=acc.name, error=str(exc))
+                    retired_names.add(acc.name)
+                    await self._retire(client)
             raise RuntimeError(f"no usable userbot account: {errors}")
 
-    async def execute(self, fn: Callable[[Client], Awaitable[T]], *, retries: int = 1) -> T:
+    async def execute(
+        self,
+        fn: Callable[[Client], Awaitable[T]],
+        *,
+        retries: int = 1,
+        retry_on: Callable[[BaseException], bool] | None = None,
+    ) -> T:
         """Run ``fn`` with a working client; on failure, fall back to another
         account and retry (handles flood-wait / session death mid-operation)."""
         last: Exception | None = None
@@ -156,6 +199,8 @@ class UserbotPool:
             except Exception as exc:  # noqa: BLE001
                 last = exc
                 log.warning("userbot.execute.failed", error=str(exc))
+                if retry_on is not None and not retry_on(exc):
+                    raise
                 # drop the active client so acquire() rolls to the next account
                 await self._retire(client)
         raise RuntimeError(f"userbot.execute exhausted all accounts: {last}")

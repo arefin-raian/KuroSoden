@@ -148,6 +148,9 @@ security:
 # use this new caption; set a legacy "{title} — …" template to opt back out.
 storage_channel:
   enabled: true
+  # Automatic database-statistics message is intentionally off for now.
+  # Set true later to re-enable startup/publish refreshes.
+  stats_message_enabled: false
   channel_id: -1002383780897
   header_template: ""
   movie_header_template: ""

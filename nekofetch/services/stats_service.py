@@ -1,10 +1,11 @@
 """Stats service — dynamic dataset statistics.
 
 Actually visits the index channel to extract real published titles,
-cross-references against the 148 canonical names, and maintains a
+cross-references against the 148 canonical names, and can maintain a
 pinned stats message with structured breakdown.
 
-Auto-refreshes on publish and at startup.
+Automatic publication is opt-in via ``storage_channel.stats_message_enabled``;
+manual Gojo dashboards and direct ``StatsService.refresh()`` remain available.
 """
 
 from __future__ import annotations
@@ -49,6 +50,23 @@ def _load_canonical_map() -> dict[str, dict]:
     except Exception as exc:
         log.warning("stats.canonical_map.load_failed", error=str(exc))
         return {}
+
+
+async def refresh_automatic(container: Container) -> int | None:
+    """Refresh the storage-channel stats message only when explicitly enabled.
+
+    Database pack storage and the manual Gojo dashboard are independent of this
+    switch. Keeping the gate here gives every automatic caller the same safe,
+    opt-in behavior and makes future re-enablement a single configuration change.
+    """
+    config = getattr(container, "config", None)
+    storage = getattr(config, "storage_channel", None)
+    if not (
+        getattr(storage, "enabled", False)
+        and getattr(storage, "stats_message_enabled", False)
+    ):
+        return None
+    return await StatsService(container).refresh()
 
 
 class StatsService:

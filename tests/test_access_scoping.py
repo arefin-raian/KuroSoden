@@ -7,7 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from kurosoden.shared.access_gate import is_owner, is_staff
-from kurosoden.shared.command_menu import apply_for_user, default_commands
+from kurosoden.shared.command_menu import (
+    apply_for_user, default_commands, publish_owner_commands,
+)
 
 
 class _Client:
@@ -55,6 +57,39 @@ def test_lelouch_global_menu_is_plain_user_only():
     assert "batch" not in names
     assert "admin" not in names
     assert "settings" not in names
+
+
+@pytest.mark.asyncio
+async def test_startup_seeds_owner_scoped_commands():
+    client = _Client()
+    await publish_owner_commands(client, _container(owner_id=100), "senku")
+
+    commands, scope = client.calls[-1]
+    assert scope.chat_id == 100
+    assert {"edit_thumbnail", "settings"}.issubset(_command_names(commands))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bot", "owner_command"),
+    [("senku", "edit_thumbnail"), ("levi", "packcaptions")],
+)
+async def test_actual_pipeline_publish_commands_seed_owner_menu(bot, owner_command):
+    client = _Client()
+    client.container = _container(owner_id=100)
+    if bot == "senku":
+        from kurosoden.bots.senku.app import publish_commands
+    else:
+        from kurosoden.bots.levi.app import publish_commands
+
+    await publish_commands(client)
+    global_commands, global_scope = client.calls[0]
+    owner_commands, owner_scope = client.calls[-1]
+
+    assert global_scope is None
+    assert owner_scope.chat_id == 100
+    assert owner_command not in _command_names(global_commands)
+    assert owner_command in _command_names(owner_commands)
 
 
 @pytest.mark.asyncio

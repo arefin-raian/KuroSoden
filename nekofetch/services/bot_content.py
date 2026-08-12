@@ -585,18 +585,81 @@ class BotContentService:
         except Exception as exc:  # noqa: BLE001 — cache is best-effort
             log.debug("bot.content.cache.read_failed", error=str(exc))
 
+        # A numeric AniList document id may have no prefetch directory (for
+        # example after an interrupted acceptance). Recover the human title from
+        # the durable relational records before treating the id as unsearchable.
+        if _looks_like_code and not title_hint:
+            try:
+                from sqlalchemy import select as _select
+                from nekofetch.infrastructure.database.postgres.models import (
+                    DistributionBot, Request, StoragePack,
+                )
+                from nekofetch.infrastructure.database.postgres.session import session_scope
+
+                lookup_ids = {anime_doc_id}
+                if anime_doc_id.startswith("anilist:"):
+                    lookup_ids.add(anime_doc_id[len("anilist:"):])
+                else:
+                    lookup_ids.add(f"anilist:{anime_doc_id}")
+                async with session_scope(self._c.pg_sessionmaker) as _session:
+                    title_candidates = []
+                    for model, column in (
+                        (Request, Request.anime_title),
+                        (StoragePack, StoragePack.anime_title),
+                        (DistributionBot, DistributionBot.name),
+                    ):
+                        value = (await _session.execute(
+                            _select(column).where(
+                                model.anime_doc_id.in_(lookup_ids),
+                            ).order_by(model.id.desc()).limit(1)
+                        )).scalar_one_or_none()
+                        if value:
+                            title_candidates.append(str(value).strip())
+                    if title_candidates:
+                        search_query = title_candidates[0]
+            except Exception as exc:  # noqa: BLE001 — DB title lookup is best-effort
+                log.debug("bot.content.title_lookup_failed", error=str(exc))
+
         # ── Primary: @acutebot via the userbot pool ──
         # AcuteBot is ALWAYS the primary source for the info card — it returns a
-        # richer card (backdrop + curated fields) than the raw API. Only skip it
-        # when the query still looks like a request code (REQ-#### or bare id)
-        # with no usable title, since AcuteBot returns nothing for those and
-        # would blank the card. A populated prefetch cache is NOT a reason to
-        # skip: we want AcuteBot's answer when available and only fall back to
-        # the cached AniList/TMDB blob if the live probe fails.
+        # richer card (backdrop + curated fields) than the raw API. A stored
+        # anime_doc_id is often ``anilist:<numeric-id>``; that id is not a title,
+        # so recover the real title from the prefetch cache before deciding
+        # whether AcuteBot is safe to call. This is important for titles such as
+        # Vanitas, whose publish path commonly arrives here without title_hint.
+        cached_search = (cached_blob or {}).get("search")
+        if _looks_like_code and not title_hint and cached_search:
+            cached_titles = cached_search.get("titles") or []
+            cached_title = (
+                cached_search.get("english")
+                or cached_search.get("romaji")
+                or (cached_titles[0] if cached_titles else None)
+            )
+            if cached_title:
+                search_query = str(cached_title).strip()
+
         _still_code = bool(
             not search_query.strip()
             or _re.fullmatch(r"REQ-?\d+", search_query, _re.IGNORECASE)
+            or search_query.isdigit()
         )
+        if _still_code and search_query.isdigit() and not title_hint:
+            # Last-resort title recovery for a bare AniList id when both the
+            # prefetch directory and relational records are unavailable. This is
+            # a direct metadata lookup, not a title search, and lets AcuteBot run
+            # for numeric records instead of being silently skipped.
+            try:
+                media = await self._c.anilist._fetch_full(int(search_query))
+                recovered = (
+                    getattr(media, "english", None)
+                    or getattr(media, "romaji", None)
+                    or (getattr(media, "titles", None) or [None])[0]
+                )
+                if recovered:
+                    search_query = str(recovered).strip()
+                    _still_code = False
+            except Exception as exc:  # noqa: BLE001 — AcuteBot remains best-effort
+                log.debug("bot.content.numeric_title_lookup_failed", error=str(exc))
         if not _still_code:
             try:
                 from nekofetch.sources.telegram.userbot import UserbotPool
@@ -1010,6 +1073,49 @@ class BotContentService:
     # ── content builders ─────────────────────────────────────────────────────────
 
     @staticmethod
+    def _pack_episode_count(pack: StoragePack) -> int:
+        """Return the number of episodes represented by one stored pack.
+
+        ``episode_from``/``episode_to`` are global season locators, so a split
+        season's second part can legitimately be stored as 13–24 while still
+        containing only 12 files.  Display surfaces need the pack length, not the
+        global last episode number.  Prefer the persisted file count (the source
+        of truth for delivery) and fall back to an inclusive range for legacy
+        rows that predate ``file_count``.
+        """
+        try:
+            file_count = int(getattr(pack, "file_count", 0) or 0)
+        except (TypeError, ValueError):
+            file_count = 0
+        if file_count > 0:
+            return file_count
+        try:
+            start = int(getattr(pack, "episode_from", 0) or 0)
+            end = int(getattr(pack, "episode_to", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, end - start + 1) if end >= start > 0 else 0
+
+    @classmethod
+    def _packs_episode_count(cls, packs: list[StoragePack]) -> int:
+        """Return the largest concrete episode count represented by ``packs``."""
+        return max((cls._pack_episode_count(pack) for pack in packs), default=0)
+
+    @classmethod
+    def _season_packs_episode_count(cls, packs: list[StoragePack]) -> int:
+        """Count a season once per distinct split part.
+
+        Pack-only fallback data contains one row per resolution/audio. Count the
+        largest row for each ``season_part`` so qualities are not multiplied, then
+        sum distinct parts so a split season still reports its full total.
+        """
+        by_part: dict[int | None, list[StoragePack]] = {}
+        for pack in packs:
+            by_part.setdefault(getattr(pack, "season_part", None), []).append(pack)
+        return sum(cls._packs_episode_count(part_packs)
+                   for part_packs in by_part.values())
+
+    @staticmethod
     def _qual_placeholder(qual_str: str, anilist_id: int | None) -> str:
         """Wrap a quality string in a ``{BOT_QUAL…}`` placeholder.
 
@@ -1062,7 +1168,7 @@ class BotContentService:
                 label = f"Season {s_num:02d}"
                 if season_part:
                     label += f" Part {season_part}"
-                ep_count = max((p.episode_to or p.file_count or 0) for p in ep) if ep else (entry.episodes or 0)
+                ep_count = self._packs_episode_count(ep) if ep else (entry.episodes or 0)
                 quals = sorted(
                     {p.resolution for p in ep if p.resolution},
                     key=lambda r: _RES_ORDER.get(r, 9999),
@@ -1122,7 +1228,7 @@ class BotContentService:
         season_lines = []
         for s in seasons:
             season_packs = [p for p in packs if p.season == s]
-            ep_max = max((p.episode_to or p.file_count or 0) for p in season_packs)
+            ep_max = self._season_packs_episode_count(season_packs)
             quals = sorted(
                 {r for r in {p.resolution for p in season_packs} if r},
                 key=lambda r: _RES_ORDER.get(r, 9999),
@@ -1315,7 +1421,7 @@ class BotContentService:
         count was fed into the duration slot as if it were minutes.
         """
         fmt = self._c.config.post_format
-        ep_max = max((p.episode_to or p.file_count or 0) for p in packs) if packs else 0
+        ep_max = self._packs_episode_count(packs) if packs else 0
         audios = {p.audio for p in packs}
         # Entry-card LANGUAGE label (tighter than the channel-title audio_tag):
         # "Dual Audio [English & Japanese]" / "Sub & Dub [...]" / etc. Empty packs

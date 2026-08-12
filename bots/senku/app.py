@@ -36,9 +36,13 @@ log = get_logger(__name__)
 
 
 async def publish_commands(client: Client) -> None:
-    # Staff-only bot → empty global menu; staff/owner get theirs per-chat on /start.
-    from kurosoden.shared.command_menu import default_commands
+    # Keep owner-only commands out of the global menu, but seed the configured
+    # owner's chat scope at startup so /edit_thumbnail is visible immediately.
+    from kurosoden.shared.command_menu import (
+        default_commands, publish_owner_commands,
+    )
     await client.set_bot_commands(default_commands("senku"))
+    await publish_owner_commands(client, getattr(client, "container", None), "senku")
 
 
 def build_senku(container: Container, token: str) -> Client:
@@ -95,12 +99,17 @@ def build_senku(container: Container, token: str) -> Client:
                 [InlineKeyboardButton("📋 Tasks", callback_data=cb(bot, "tasks")),
                  InlineKeyboardButton("🧪 Generate", callback_data=cb(bot, "generate"))],
                 [InlineKeyboardButton("📢 Create Channel", callback_data=cb(bot, "create"))],
+                [InlineKeyboardButton("✏️ Edit Thumbnail", callback_data=cb(bot, "edit_thumbnail"))],
                 [InlineKeyboardButton("⚙️ Settings", callback_data=cb(bot, "settings"))],
             ]
             if not is_owner(container, q):
                 rows = [
                     row for row in rows
-                    if all("settings" not in (btn.callback_data or "") for btn in row)
+                    if all(
+                        "settings" not in (btn.callback_data or "")
+                        and "edit_thumbnail" not in (btn.callback_data or "")
+                        for btn in row
+                    )
                 ]
             keyboard = InlineKeyboardMarkup(rows)
             await send_screen(client, q.message.chat.id,
@@ -110,6 +119,16 @@ def build_senku(container: Container, token: str) -> Client:
             return
 
         # ¬¬ Tool panels ¬¬
+        if action == "edit_thumbnail":
+            from nekofetch.bots.admin.handlers.thumbnail_edit import show_editor
+            from kurosoden.shared.access_gate import is_owner
+            if not is_owner(container, q):
+                await q.answer("Owner access required.", show_alert=True)
+                return
+            await show_editor(client, container, q.message)
+            await q.answer()
+            return
+
         if action in ("tasks", "create", "generate"):
             titles = {"tasks": "📋 Your Distribution Tasks",
                       "create": "📢 Create a Channel",
@@ -197,6 +216,7 @@ def build_senku(container: Container, token: str) -> Client:
             [("📋 Tasks", cb("senku", "tasks")),
              ("🧪 Generate", cb("senku", "generate"))],
             [("📢 Create Channel", cb("senku", "create"))],
+            [("✏️ Edit Thumbnail", cb("senku", "edit_thumbnail"))],
             [("⚙️ Settings", cb("senku", "settings")),
              ("❓ Help", cb("senku", "help"))],
         ]
@@ -204,7 +224,10 @@ def build_senku(container: Container, token: str) -> Client:
         if not is_owner(container, message):
             rows = [
                 row for row in rows
-                if all("settings" not in data for _label, data in row)
+                if all(
+                    "settings" not in data and "edit_thumbnail" not in data
+                    for _label, data in row
+                )
             ]
         screen = Screen(
             caption=(

@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 from pyrogram.types import InlineKeyboardButton
 
 from nekofetch.core.logging import get_logger
+from nekofetch.sources.telegram.userbot import is_transport_error
 
 if TYPE_CHECKING:
     from pyrogram import Client
@@ -103,8 +104,14 @@ async def fetch_from_acutebot(
         from nekofetch.sources.telegram.userbot import UserbotPool
 
         assert isinstance(pool, UserbotPool)
+        # A transport can die after acquisition but before the first API call
+        # (notably contacts.ResolveUsername while opening @acutebot). Give the
+        # pool one bounded second attempt so a single configured account is
+        # rebuilt instead of surfacing a closed-handler error to the caller.
         return await pool.execute(
-            lambda c: _do_fetch(c, title_query, photo_dir, on_step)
+            lambda c: _do_fetch(c, title_query, photo_dir, on_step),
+            retries=2,
+            retry_on=is_transport_error,
         )
     except Exception as exc:
         log.warning("acutebot.fetch.failed", title=title_query, error=str(exc))

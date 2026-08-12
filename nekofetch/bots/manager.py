@@ -643,12 +643,17 @@ class BotManager:
         )
         log.info("bots.schedule_sweep.scheduled", interval_seconds=60)
 
-        # Stats: refresh the pinned database stats message in the storage channel.
-        if self._c.config.storage_channel.enabled:
+        # Automatic database-statistics publication is opt-in. Pack storage remains
+        # enabled independently, and Gojo's manual stats dashboard still computes
+        # normally; this gate only suppresses the outbound pinned message refresh.
+        if (
+            getattr(self._c.config.storage_channel, "enabled", False)
+            and getattr(self._c.config.storage_channel, "stats_message_enabled", False)
+        ):
             try:
-                from nekofetch.services.stats_service import StatsService
+                from nekofetch.services.stats_service import refresh_automatic
 
-                await StatsService(self._c).refresh()
+                await refresh_automatic(self._c)
                 log.info("stats.refreshed_on_startup")
                 tracker = getattr(self._c, "startup_tracker", None)
                 if tracker:

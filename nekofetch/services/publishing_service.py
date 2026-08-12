@@ -512,16 +512,21 @@ class PublishingService:
             audio=aud, resolution=res,
         )
 
-        # Refresh database stats (pinned message in index channel). Best-effort:
-        # a stats hiccup must never fail an otherwise-successful publish.
-        try:
-            from nekofetch.services.stats_service import StatsService
+        # Automatic database-statistics publication is opt-in. Keep the manual
+        # StatsService/Gojo dashboard available, but do not send or edit the pinned
+        # storage-channel message while this switch is off.
+        if (
+            getattr(self._c.config.storage_channel, "enabled", False)
+            and getattr(self._c.config.storage_channel, "stats_message_enabled", False)
+        ):
+            try:
+                from nekofetch.services.stats_service import refresh_automatic
 
-            await StatsService(self._c).refresh()
-        except Exception as exc:  # noqa: BLE001
-            from nekofetch.core.logging import get_logger
+                await refresh_automatic(self._c)
+            except Exception as exc:  # noqa: BLE001
+                from nekofetch.core.logging import get_logger
 
-            get_logger(__name__).warning("publish.stats_refresh.failed", error=str(exc))
+                get_logger(__name__).warning("publish.stats_refresh.failed", error=str(exc))
 
         if user_id:
             from nekofetch.services.notification_service import NotificationService
