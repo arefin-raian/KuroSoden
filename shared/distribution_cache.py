@@ -45,10 +45,14 @@ _K_ENTRIES = "nf:dist:{code}:entries"
 _K_SELECTIONS = "nf:dist:{code}:selections"
 _K_CHANNEL = "nf:dist:{code}:channel"
 _K_LAST_TEXT_LOGO = "nf:dist:{code}:last_text_logo"
+# The latest logo may be a generated text PNG OR a user-uploaded public URL.
+# Keep this separate from the legacy text-only key so existing sessions remain
+# readable while the logo picker can offer reuse for both paths.
+_K_LAST_LOGO = "nf:dist:{code}:last_logo"
 _K_TMDB_ASSETS = "nf:dist:{code}:tmdb_assets"
 
 _ALL_KEYS = (_K_FRANCHISE, _K_ENTRIES, _K_SELECTIONS, _K_CHANNEL,
-             _K_LAST_TEXT_LOGO, _K_TMDB_ASSETS)
+             _K_LAST_TEXT_LOGO, _K_LAST_LOGO, _K_TMDB_ASSETS)
 
 
 @dataclass
@@ -398,31 +402,59 @@ class DistributionCache:
             ex=_DEFAULT_TTL, label="dist_cache.channel.set",
         )
 
-    async def set_last_text_logo(self, code: str, *, path: str, text: str,
-                                 font: str | None = None) -> None:
-        """Remember the latest generated text logo for this request only."""
+    async def set_last_logo(self, code: str, *, path: str, kind: str,
+                            text: str = "", font: str | None = None) -> None:
+        """Remember the latest text or uploaded logo for this request."""
+        value = {"path": path, "kind": kind, "text": text,
+                 "font": font or ""}
         await safe_redis_set(
-            self._redis, _K_LAST_TEXT_LOGO.format(code=code),
-            json.dumps({"path": path, "text": text, "font": font or ""}),
-            ex=_DEFAULT_TTL, label="dist_cache.last_text_logo.set",
+            self._redis, _K_LAST_LOGO.format(code=code), json.dumps(value),
+            ex=_DEFAULT_TTL, label="dist_cache.last_logo.set",
         )
 
-    async def get_last_text_logo(self, code: str) -> dict | None:
-        """Return a usable latest-logo record, rejecting stale local files."""
+    async def get_last_logo(self, code: str) -> dict | None:
+        """Return the latest reusable logo, accepting local files or public URLs."""
         raw = await safe_redis_get(
-            self._redis, _K_LAST_TEXT_LOGO.format(code=code),
-            label="dist_cache.last_text_logo.get",
+            self._redis, _K_LAST_LOGO.format(code=code),
+            label="dist_cache.last_logo.get",
         )
+        if not raw:
+            # Compatibility with a cache written before the generic logo key.
+            raw = await safe_redis_get(
+                self._redis, _K_LAST_TEXT_LOGO.format(code=code),
+                label="dist_cache.last_text_logo.compat_get",
+            )
         if not raw:
             return None
         try:
             value = json.loads(raw)
-            path = value.get("path")
-            if not path or not Path(path).is_file():
+            path = str(value.get("path") or "")
+            if not path:
                 return None
+            if not path.startswith(("http://", "https://", "file://")) \
+                    and not Path(path).is_file():
+                return None
+            value.setdefault("kind", "text")
             return value
         except (TypeError, ValueError):
             return None
+
+    async def set_last_text_logo(self, code: str, *, path: str, text: str,
+                                 font: str | None = None) -> None:
+        """Remember the latest generated text logo (legacy API + generic key)."""
+        value = {"path": path, "kind": "text", "text": text,
+                 "font": font or ""}
+        await safe_redis_set(
+            self._redis, _K_LAST_TEXT_LOGO.format(code=code), json.dumps(value),
+            ex=_DEFAULT_TTL, label="dist_cache.last_text_logo.set",
+        )
+        await self.set_last_logo(code, path=path, kind="text", text=text,
+                                 font=font)
+
+    async def get_last_text_logo(self, code: str) -> dict | None:
+        """Compatibility reader for callers that specifically request text."""
+        value = await self.get_last_logo(code)
+        return value if value and value.get("kind", "text") == "text" else None
 
     async def get_tmdb_assets(self, code: str, asset_type: str) -> list[dict] | None:
         raw = await safe_redis_get(
@@ -472,7 +504,7 @@ class DistributionCache:
         :meth:`clear_tmdb_assets`.
         """
         for tmpl in (_K_FRANCHISE, _K_ENTRIES, _K_SELECTIONS, _K_CHANNEL,
-                     _K_LAST_TEXT_LOGO):
+                     _K_LAST_TEXT_LOGO, _K_LAST_LOGO):
             await safe_redis_delete(
                 self._redis, tmpl.format(code=code), label="dist_cache.clear",
             )

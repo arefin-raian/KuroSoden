@@ -193,6 +193,37 @@ def _kind_from_format(fmt: str | None) -> ContentKind:
     return ContentKind.SPECIAL
 
 
+# A multi-episode ONA is a real series season (Netflix-style online show), NOT
+# an extra: AniList tags it ONA and a season-less title gets one sequential
+# group → "Season 1". One-shot ONAs (≤1 episode) stay extras. This keeps the
+# mapping, the wizard's watch-order confirm, and the posted watch guide in
+# lock-step (the old code classified every ONA as an extra, so the wizard said
+# "Season 1" but the distribution channel posted "ONA 1").
+_SEASON_FORMATS = {"TV", "TV_SHORT"}
+
+
+def is_season_format(fmt: str | None, episodes: int | None = None) -> bool:
+    """True when an AniList format renders as a season entry (not an extra).
+
+    TV and TV_SHORT are seasons; TV_SPECIAL remains an extra unless a later
+    source-specific rule promotes it. A multi-episode ONA is a full series (e.g.
+    Takopi's Original Sin — 12 eps ONA shown as Season 1), while a one-shot ONA
+    stays an extra.
+    """
+    if fmt in _SEASON_FORMATS:
+        return True
+    return fmt == "ONA" and (episodes or 0) > 1
+
+
+def entry_is_season(entry) -> bool:
+    """Season check on a walk entry (FranchiseEntry) — shared with the card/
+    guide builders so the wizard's watch order matches the posted channel."""
+    return is_season_format(
+        getattr(entry, "format", None),
+        getattr(entry, "episodes", None),
+    )
+
+
 # ── Service ──────────────────────────────────────────────────────────────────
 
 
@@ -317,10 +348,13 @@ class FranchiseFlowService:
         from nekofetch.sources.telegram.anilist import FranchiseEntry
 
         # ── 1. Gather TV entries plus extras ──
+        # Multi-episode ONAs count as seasons (a full series, e.g. Takopi's
+        # Original Sin) so they render as "Season N" everywhere; one-shot ONAs
+        # stay extras with the other OVA/MOVIE/SPECIAL entries.
         tv_entries: list[any] = []
         extra_entries: list[any] = []
         for entry in franchise_entries.values():
-            if entry.format in ("TV", "TV_SHORT"):
+            if entry_is_season(entry):
                 tv_entries.append(entry)
             elif entry.format in ("OVA", "ONA", "MOVIE", "SPECIAL"):
                 extra_entries.append(entry)

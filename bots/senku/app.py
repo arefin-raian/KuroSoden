@@ -27,7 +27,9 @@ SENKU_COMMANDS = [
     BotCommand("tasks", "List active distribution tasks"),
     BotCommand("create", "Create a new distribution channel"),
     BotCommand("generate", "Generate content: /generate REQ-XXXX"),
-    BotCommand("edit_thumbnail", "Edit saved thumbnails (owner)"),
+    BotCommand("edit_thumbnail", "Edit saved thumbnails"),
+    BotCommand("editpost", "Edit a published post"),
+    BotCommand("editcaption", "Edit published post captions"),
     BotCommand("settings", "Configure the distribution bot"),
     BotCommand("help", "How distribution works"),
 ]
@@ -99,15 +101,16 @@ def build_senku(container: Container, token: str) -> Client:
                 [InlineKeyboardButton("📋 Tasks", callback_data=cb(bot, "tasks")),
                  InlineKeyboardButton("🧪 Generate", callback_data=cb(bot, "generate"))],
                 [InlineKeyboardButton("📢 Create Channel", callback_data=cb(bot, "create"))],
-                [InlineKeyboardButton("✏️ Edit Thumbnail", callback_data=cb(bot, "edit_thumbnail"))],
+                [InlineKeyboardButton("✏️ Edit Thumbnail", callback_data=cb(bot, "edit_thumbnail")),
+                 InlineKeyboardButton("📝 Edit Post", callback_data=cb(bot, "edit_post"))],
                 [InlineKeyboardButton("⚙️ Settings", callback_data=cb(bot, "settings"))],
             ]
             if not is_owner(container, q):
+                # Staff keep the edit tools; only the owner-only settings row is hidden.
                 rows = [
                     row for row in rows
                     if all(
                         "settings" not in (btn.callback_data or "")
-                        and "edit_thumbnail" not in (btn.callback_data or "")
                         for btn in row
                     )
                 ]
@@ -121,11 +124,22 @@ def build_senku(container: Container, token: str) -> Client:
         # ¬¬ Tool panels ¬¬
         if action == "edit_thumbnail":
             from nekofetch.bots.admin.handlers.thumbnail_edit import show_editor
-            from kurosoden.shared.access_gate import is_owner
-            if not is_owner(container, q):
-                await q.answer("Owner access required.", show_alert=True)
+            from kurosoden.shared.access_gate import is_staff
+            if not is_staff(q):
+                await q.answer("Staff access required.", show_alert=True)
                 return
             await show_editor(client, container, q.message)
+            await q.answer()
+            return
+
+        if action in ("edit_post", "edit_caption"):
+            from kurosoden.shared.access_gate import is_staff
+            if not is_staff(q):
+                await q.answer("Staff access required.", show_alert=True)
+                return
+            from kurosoden.bots.senku.handlers.post_caption_edit import show_channel_list
+
+            await show_channel_list(client, container, q.message)
             await q.answer()
             return
 
@@ -216,16 +230,18 @@ def build_senku(container: Container, token: str) -> Client:
             [("📋 Tasks", cb("senku", "tasks")),
              ("🧪 Generate", cb("senku", "generate"))],
             [("📢 Create Channel", cb("senku", "create"))],
-            [("✏️ Edit Thumbnail", cb("senku", "edit_thumbnail"))],
+            [("✏️ Edit Thumbnail", cb("senku", "edit_thumbnail")),
+             ("📝 Edit Caption", cb("senku", "edit_caption"))],
             [("⚙️ Settings", cb("senku", "settings")),
              ("❓ Help", cb("senku", "help"))],
         ]
         from kurosoden.shared.access_gate import is_owner
         if not is_owner(container, message):
+            # Staff keep the edit tools; only the owner-only settings row is hidden.
             rows = [
                 row for row in rows
                 if all(
-                    "settings" not in data and "edit_thumbnail" not in data
+                    "settings" not in data
                     for _label, data in row
                 )
             ]

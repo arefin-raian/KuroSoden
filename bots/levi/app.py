@@ -24,7 +24,7 @@ from nekofetch.ui.artwork import pick_artwork
 LEVI_COMMANDS = [
     BotCommand("start", "View your assigned download tasks"),
     BotCommand("tasks", "Open your download tasks and pick a source"),
-    BotCommand("packcaptions", "Edit storage pack captions (owner)"),
+    BotCommand("packcaptions", "Edit storage pack captions"),
     BotCommand("settings", "Configure the downloader bot"),
     BotCommand("help", "How the downloader works"),
 ]
@@ -49,10 +49,12 @@ def _home_rows(container: Container, actor) -> list[list[tuple[str, str]]]:
          ("❓ Help", cb("levi", "help"))],
     ]
     if not is_owner(container, actor):
+        # Staff keep the pack-caption editor; only the owner-only settings row
+        # is hidden.
         rows = [
             row for row in rows
             if all(
-                "settings" not in data and "packcaptions" not in data
+                "settings" not in data
                 for _label, data in row
             )
         ]

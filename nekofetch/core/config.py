@@ -56,6 +56,9 @@ class EnvSettings(BaseSettings):
     telegram_api_hash: str = Field(..., alias="TELEGRAM_API_HASH")
     admin_bot_token: str = Field(..., alias="ADMIN_BOT_TOKEN")
     admin_ids: list[int] = Field(default_factory=list, alias="ADMIN_IDS")
+    # Explicit owner override. When unset, the application falls back to
+    # ``security.owner_id`` from config.yaml and then ADMIN_IDS[0].
+    owner_id: int = Field(0, alias="OWNER_ID")
     request_bot_token: str = Field("", alias="REQUEST_BOT_TOKEN")
     downloader_bot_token: str = Field("", alias="DOWNLOADER_BOT_TOKEN")
     distribution_bot_token: str = Field("", alias="DISTRIBUTION_BOT_TOKEN")

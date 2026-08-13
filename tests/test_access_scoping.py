@@ -45,10 +45,14 @@ def test_staff_only_bots_publish_staff_global_menu():
         assert "start" in names
         assert "tasks" in names
         assert "settings" not in names
-    # Senku's staff tier specifically includes its operational commands.
+    # Senku's staff tier specifically includes its operational commands, and the
+    # edit tools are staff-scoped now (not owner-only) so admins can fix thumbs
+    # and post captions without the owner.
     senku = _command_names(default_commands("senku"))
-    assert {"create", "generate"}.issubset(senku)
-    assert "edit_thumbnail" not in senku
+    assert {"create", "generate", "edit_thumbnail", "editcaption"}.issubset(senku)
+    # Levi's pack-caption editor is staff-scoped too.
+    levi = _command_names(default_commands("levi"))
+    assert "packcaptions" in levi
 
 
 def test_lelouch_global_menu_is_plain_user_only():
@@ -71,10 +75,12 @@ async def test_startup_seeds_owner_scoped_commands():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("bot", "owner_command"),
+    ("bot", "staff_command"),
     [("senku", "edit_thumbnail"), ("levi", "packcaptions")],
 )
-async def test_actual_pipeline_publish_commands_seed_owner_menu(bot, owner_command):
+async def test_actual_pipeline_publish_commands_seed_owner_menu(bot, staff_command):
+    # Edit tools are staff-tier now: they surface in the GLOBAL (staff) menu
+    # AND the owner-scoped menu; only owner settings stays exclusive.
     client = _Client()
     client.container = _container(owner_id=100)
     if bot == "senku":
@@ -88,8 +94,8 @@ async def test_actual_pipeline_publish_commands_seed_owner_menu(bot, owner_comma
 
     assert global_scope is None
     assert owner_scope.chat_id == 100
-    assert owner_command not in _command_names(global_commands)
-    assert owner_command in _command_names(owner_commands)
+    assert staff_command in _command_names(global_commands)
+    assert staff_command in _command_names(owner_commands)
 
 
 @pytest.mark.asyncio
@@ -131,7 +137,27 @@ async def test_owner_gets_senku_thumbnail_editor_command():
 
     commands, scope = client.calls[-1]
     assert scope.chat_id == 100
-    assert {"settings", "edit_thumbnail"}.issubset(_command_names(commands))
+    assert {"settings", "edit_thumbnail", "editcaption"}.issubset(_command_names(commands))
+
+
+@pytest.mark.asyncio
+async def test_staff_gets_edit_tools_without_owner_settings():
+    # A staff (non-owner) member keeps the edit tools but never sees owner
+    # settings — the scoping split that replaced the old owner-only gates.
+    client = _Client()
+    await apply_for_user(client, _container(owner_id=100), "senku", 200, _user("staff", 200))
+
+    commands, scope = client.calls[-1]
+    names = _command_names(commands)
+    assert scope.chat_id == 200
+    assert {"edit_thumbnail", "editcaption"}.issubset(names)
+    assert "settings" not in names
+
+    client2 = _Client()
+    await apply_for_user(client2, _container(owner_id=100), "levi", 200, _user("staff", 200))
+    names2 = _command_names(client2.calls[-1][0])
+    assert "packcaptions" in names2
+    assert "settings" not in names2
 
 
 @pytest.mark.asyncio

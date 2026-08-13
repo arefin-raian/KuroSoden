@@ -53,12 +53,16 @@ class AuthService:
     def owner_ids(self) -> set[int]:
         """The owner(s) — the only identities allowed to touch sensitive config.
 
-        ``security.owner_id`` is authoritative when set; otherwise the first
-        env admin is treated as the owner so a fresh install still has one.
+        ``security.owner_id`` is authoritative when set; otherwise ``OWNER_ID``
+        is used when configured, then the first env admin is treated as the owner
+        so a fresh install still has one.
         """
         configured = self._c.config.security.owner_id
         if configured:
             return {configured}
+        env_owner = int(getattr(self._env, "owner_id", 0) or 0)
+        if env_owner:
+            return {env_owner}
         return set(self._env.admin_ids[:1])
 
     def is_owner(self, user: User | None) -> bool:

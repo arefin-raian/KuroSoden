@@ -41,6 +41,9 @@ def _owner_id(container: Container) -> int | None:
     configured = int(getattr(container.config.security, "owner_id", 0) or 0)
     if configured:
         return configured
+    env_owner = int(getattr(container.env, "owner_id", 0) or 0)
+    if env_owner:
+        return env_owner
     admin_ids = list(getattr(container.env, "admin_ids", []) or [])
     return int(admin_ids[0]) if admin_ids else None
 

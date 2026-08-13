@@ -1,7 +1,7 @@
-"""Owner-only editor for already-rendered durable thumbnails.
+"""Staff-scoped editor for already-rendered durable thumbnails.
 
 The normal thumbnail workflow is intentionally restart-safe, but it used to stop
-at generation: an owner could not correct a saved title or artwork without
+at generation: staff could not correct a saved title or artwork without
 starting the whole asset-picking flow again. This small editor works from the
 persisted ``ThumbnailSource.fields`` record, re-renders the card, and edits the
 existing thumbnail-channel message when its message id is known.
@@ -29,7 +29,7 @@ from nekofetch.services.thumbnail_service import (
     render_fields,
 )
 from nekofetch.ui.components import cb
-from kurosoden.shared.access_gate import is_owner
+from kurosoden.shared.access_gate import is_staff
 
 log = get_logger(__name__)
 _STATE = "admin_thumbnail_edit"
@@ -85,14 +85,14 @@ async def show_editor(client: Client, container: Container, target: Message) -> 
 def register(client: Client, container: Container) -> None:
     @client.on_message(filters.command("edit_thumbnail"), group=4)
     async def _command(_: Client, message: Message) -> None:
-        if not is_owner(container, message):
+        if not is_staff(message):
             return
         await show_editor(client, container, message)
 
     @client.on_callback_query(filters.regex(r"^thumbedit\|(?!field\|)"), group=4)
     async def _callback(_: Client, query: CallbackQuery) -> None:
-        if query.message is None or not is_owner(container, query):
-            await query.answer("Owner access required.", show_alert=True)
+        if query.message is None or not is_staff(query):
+            await query.answer("Staff access required.", show_alert=True)
             return
         parts = (query.data or "").split("|")
         action = parts[1] if len(parts) > 1 else ""
@@ -131,8 +131,8 @@ def register(client: Client, container: Container) -> None:
 
     @client.on_callback_query(filters.regex(r"^thumbedit\|field\|"), group=4)
     async def _field(_: Client, query: CallbackQuery) -> None:
-        if query.message is None or not is_owner(container, query):
-            await query.answer("Owner access required.", show_alert=True)
+        if query.message is None or not is_staff(query):
+            await query.answer("Staff access required.", show_alert=True)
             return
         parts = (query.data or "").split("|")
         if len(parts) < 4 or parts[3] not in _EDITABLE:
@@ -159,7 +159,7 @@ def register(client: Client, container: Container) -> None:
 
     @client.on_message(filters.text & ~filters.command(["start", "edit_thumbnail"]), group=16)
     async def _consume(_: Client, message: Message) -> None:
-        if not message.from_user or not is_owner(container, message) or container.redis is None:
+        if not message.from_user or not is_staff(message) or container.redis is None:
             return
         state, data = await peek_reply(container.redis, message.chat.id)
         if state != _STATE:

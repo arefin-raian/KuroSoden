@@ -74,3 +74,34 @@ def test_three_part_season_groups_together():
         _entry(3, "Split Cour Part 3", 12, 2022),
     ])
     assert _seasons(m) == [(1, 1, 12), (1, 2, 12), (1, 3, 12)]
+
+
+def test_multi_episode_ona_is_a_season_not_an_extra():
+    # Takopi-style: a lone multi-episode ONA is the show itself → Season 1,
+    # matching the wizard's watch-order confirm (previously the posted guide
+    # said "ONA 1" while the wizard said "Season 1").
+    m = _build([
+        _entry(100, "Takopi's Original Sin", 12, 2025, fmt="ONA"),
+    ])
+    assert _seasons(m) == [(1, None, 12)]
+    assert len(m.entries) == 1
+
+
+def test_single_episode_ona_stays_an_extra():
+    from nekofetch.domain.enums import ContentKind
+
+    m = _build([
+        _entry(101, "One-Shot ONA Special", 1, 2024, fmt="ONA"),
+    ])
+    assert _seasons(m) == []
+    assert all(e.kind != ContentKind.SEASON for e in m.entries)
+    assert m.entries[0].kind == ContentKind.SPECIAL
+
+
+def test_ona_plus_tv_season_orders_ona_first_then_season():
+    # A multi-episode ONA alongside a TV season: both are seasons, in air order.
+    m = _build([
+        _entry(200, "Original Sin ONA", 12, 2025, fmt="ONA"),
+        _entry(201, "Show TV Season", 12, 2026, fmt="TV"),
+    ])
+    assert _seasons(m) == [(1, None, 12), (2, None, 12)]

@@ -20,10 +20,15 @@ def register_all(client: Client, container: Container) -> None:
     from kurosoden.shared.settings_ui import register_settings
 
     install_auth_middleware(client, container, staff_only_bot="senku")
-    # Reuse the durable editor on Senku as the owner-facing /edit_thumbnail
+    # Reuse the durable editor on Senku as the staff-facing /edit_thumbnail
     # command. Its callbacks/state are namespace-isolated from the wizard and its
-    # existing owner gate remains in force.
+    # gate now uses the shared staff role.
     thumbnail_edit.register(client, container)
+    # Staff-facing post-caption editor: pick a published channel, pick a post,
+    # send the replacement caption — live message + DB rows are both updated.
+    from kurosoden.bots.senku.handlers.post_caption_edit import register as register_caption_edit
+
+    register_caption_edit(client, container)
     register_wizard(client, container)
     register_tasks(client, container)
 

@@ -31,5 +31,9 @@ def test_tv_special_counts_as_extra():
     assert format_episode_summary(_entries(("season", 25), ("tv_special", 2))) == "25 + 2 extras"
 
 
+def test_multi_episode_ona_is_a_season():
+    assert format_episode_summary(_entries(("ona", 12))) == "12"
+
+
 def test_empty_franchise_is_unknown():
     assert format_episode_summary([]) == "—"

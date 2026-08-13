@@ -96,6 +96,23 @@ class ScheduleService:
             row.status = "cancelled"
             return True
 
+    async def cancel_for_request(self, request_code: str) -> int:
+        """Cancel every pending schedule for a request (e.g. after a force
+        publish, so the scheduled time can't double-post later). Returns the
+        number of rows cancelled."""
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            rows = (
+                await session.execute(
+                    select(ScheduledPost).where(
+                        ScheduledPost.request_code == request_code,
+                        ScheduledPost.status == "pending",
+                    )
+                )
+            ).scalars().all()
+            for row in rows:
+                row.status = "cancelled"
+            return len(rows)
+
     # ── queries ──────────────────────────────────────────────────────────────
 
     async def list_pending(self) -> list[ScheduledPost]:

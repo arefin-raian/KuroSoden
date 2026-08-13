@@ -306,8 +306,9 @@ class PublishingService:
         admin-edited caption and/or suppress the channel notification.
 
         New flow per operator feedback:
-          1. Mark the request PUBLISHED (file.published=True, DB row updated).
-          2. Call ThumbnailOrchestratorService so the bot/cards use
+          1. Prepare the request and wait for the external publish steps to succeed.
+          2. Mark the request PUBLISHED (file.published=True, DB row updated).
+          3. Call ThumbnailOrchestratorService so the bot/cards use
              admin-generated thumbnails (logo/poster/bg → Playwright render).
              Polls the workflow state and either waits it out OR marks the
              pipeline ready once the admin clicks "Skip Custom Thumbnails".
@@ -324,9 +325,6 @@ class PublishingService:
                 raise NotFound(code)
             user_id = req.user_id
             files = await self._files_for_request(session, req.id)
-            for f in files:
-                f.published = True
-            req.status = RequestStatus.PUBLISHED
             count = len(files)
             from nekofetch.services.download_service import _safe_anime_doc_id
             anime_doc_id = _safe_anime_doc_id(req)
@@ -341,12 +339,6 @@ class PublishingService:
             fd = req.franchise_data or {}
             is_update_entry = bool(fd.get("update_entry"))
             update_anilist_id = fd.get("anilist_id")
-
-        from nekofetch.services.analytics_service import AnalyticsService
-
-        await AnalyticsService(self._c).record(
-            "publish", anime_doc_id=anime_doc_id, data={"code": code, "files": count}
-        )
 
         # Step 1: Wait for the thumbnail generation step to complete (or time
         # out / be skipped). The orchestrator surfaces the generated thumbnail
@@ -485,9 +477,15 @@ class PublishingService:
             from nekofetch.services.index_channel_service import IndexChannelService
             from nekofetch.services.main_channel_service import MainChannelService
 
-            await MainChannelService(self._c).publish(
+            main_message_id = await MainChannelService(self._c).publish(
                 anime_doc_id, caption_override=caption_override, silent=silent,
             )
+            if main_message_id is None:
+                # Do not mark Gojo's task complete or refresh the index when the
+                # main post was not actually created/edited. MainChannelService
+                # already repairs stale MESSAGE_ID_INVALID rows; this guard keeps
+                # any remaining Telegram failure visible to Gojo for retry.
+                raise RuntimeError("main channel publish returned no message id")
             await IndexChannelService(self._c).refresh_letter(
                 IndexChannelService.letter_of(title)
             )
@@ -504,6 +502,25 @@ class PublishingService:
                     "publish.backup.main_index.failed",
                     anime=anime_doc_id, error=str(exc),
                 )
+
+        # Do not mark a request published before Telegram accepts the main post.
+        # The old ordering committed PUBLISHED immediately, so a failed/stale
+        # publish left Gojo with a task that looked complete in request stats even
+        # though no main-channel message existed. All external publish branches
+        # above have now succeeded; persist the relational state at this boundary.
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            req = await RequestRepository(session).get_by_code(code)
+            if req is None:
+                raise NotFound(code)
+            for file in await self._files_for_request(session, req.id):
+                file.published = True
+            req.status = RequestStatus.PUBLISHED
+
+        from nekofetch.services.analytics_service import AnalyticsService
+
+        await AnalyticsService(self._c).record(
+            "publish", anime_doc_id=anime_doc_id, data={"code": code, "files": count}
+        )
 
         from nekofetch.services.log_channel_service import LogChannelService
 
@@ -531,6 +548,29 @@ class PublishingService:
         if user_id:
             from nekofetch.services.notification_service import NotificationService
             await NotificationService(self._c).request_published(user_id, title, code)
+
+        # Task cleanup — a publish is complete the moment it succeeds, on EVERY
+        # path (review button, schedule sweep, force publish). Mark the Gojo
+        # stage task completed (idempotent: no-op when there's no open row) and
+        # cancel any pending schedule for this request, so a force-published
+        # title never lingers in /tasks or double-posts later. Best-effort:
+        # bookkeeping must never fail a successful publish.
+        try:
+            from kurosoden.shared.admin_assignment import AdminAssignmentEngine
+
+            await AdminAssignmentEngine(self._c.pg_sessionmaker).complete_task(code, "gojo")
+        except Exception as exc:  # noqa: BLE001 — bookkeeping only
+            from nekofetch.core.logging import get_logger
+            get_logger(__name__).warning("publish.task_cleanup.failed",
+                                         code=code, error=str(exc))
+        try:
+            from nekofetch.services.schedule_service import ScheduleService
+
+            await ScheduleService(self._c).cancel_for_request(code)
+        except Exception as exc:  # noqa: BLE001 — bookkeeping only
+            from nekofetch.core.logging import get_logger
+            get_logger(__name__).warning("publish.schedule_cleanup.failed",
+                                         code=code, error=str(exc))
         return count
 
     async def _wait_for_thumbnails(self, anime_doc_id: str, title: str) -> None:

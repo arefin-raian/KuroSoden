@@ -1,4 +1,4 @@
-"""Owner-only Levi flow for editing persisted storage-pack headers.
+"""Staff-scoped Levi flow for editing persisted storage-pack headers.
 
 The worker persists the exact HTML header caption when it uploads a pack. This
 handler provides a small, restart-safe editor: select a pack, send the replacement
@@ -21,7 +21,7 @@ from nekofetch.core.logging import get_logger
 from nekofetch.services.storage_channel_service import StorageChannelService
 from nekofetch.ui.components import cb, keyboard, lock_buttons
 from nekofetch.ui.screens import Screen, send_screen
-from kurosoden.shared.access_gate import is_owner
+from kurosoden.shared.access_gate import is_staff
 
 log = get_logger(__name__)
 _STATE = "levi_pack_caption"
@@ -62,7 +62,7 @@ def _pack_card(packs) -> tuple[str, list[list[tuple[str, str]]]]:
 
 
 def register(client: Client, container: Container) -> None:
-    """Register owner-only pack caption list, selection, and text consumer."""
+    """Register staff pack caption list, selection, and text consumer."""
 
     async def _show_pack_list(message: Message) -> None:
         packs = await StorageChannelService(container).list_packs()
@@ -75,14 +75,14 @@ def register(client: Client, container: Container) -> None:
 
     @client.on_message(filters.command("packcaptions"), group=4)
     async def _command(_: Client, message: Message) -> None:
-        if not is_owner(container, message):
+        if not is_staff(message):
             return
         await _show_pack_list(message)
 
     @client.on_callback_query(filters.regex(r"^levi\|packcaptions$"))
     async def _list(_: Client, q: CallbackQuery) -> None:
-        if q.message is None or not is_owner(container, q):
-            await q.answer("Owner access required.", show_alert=True)
+        if q.message is None or not is_staff(q):
+            await q.answer("Staff access required.", show_alert=True)
             return
         await lock_buttons(q)
         await q.answer()
@@ -90,8 +90,8 @@ def register(client: Client, container: Container) -> None:
 
     @client.on_callback_query(filters.regex(r"^levi\|packedit\|"))
     async def _select(_: Client, q: CallbackQuery) -> None:
-        if q.message is None or not is_owner(container, q):
-            await q.answer("Owner access required.", show_alert=True)
+        if q.message is None or not is_staff(q):
+            await q.answer("Staff access required.", show_alert=True)
             return
         if q.message.chat.type != ChatType.PRIVATE:
             await q.answer("Open Levi in a private chat to edit pack captions.", show_alert=True)
@@ -126,7 +126,7 @@ def register(client: Client, container: Container) -> None:
     @client.on_message(filters.text & ~filters.command(["start"]), group=15)
     async def _consume(_: Client, message: Message) -> None:
         redis = container.redis
-        if not message.from_user or not is_owner(container, message):
+        if not message.from_user or not is_staff(message):
             return
         state, data = await peek_reply(redis, message.chat.id)
         if state != _STATE:

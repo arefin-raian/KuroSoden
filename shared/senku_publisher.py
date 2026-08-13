@@ -43,7 +43,16 @@ from kurosoden.shared.distribution_cache import DistributionCache, EntryData
 log = get_logger(__name__)
 
 # TV formats, mirrored from bot_content so we split cached entries the same way.
+# Multi-episode ONAs count as seasons (see franchise_flow.entry_is_season) so
+# the reordered franchise split matches the mapping + guide exactly.
 _TV_FORMATS = {"TV", "TV_SHORT", "TV_SPECIAL"}
+
+
+def _is_season_entry(entry) -> bool:
+    """Season check shared with the franchise mapping / watch guide."""
+    from nekofetch.services.franchise_flow import entry_is_season
+
+    return entry_is_season(entry)
 
 
 class PublishError(RuntimeError):
@@ -440,7 +449,7 @@ class SenkuPublisher:
             gen = generated.get(aid)
             if gen:
                 entry_meta["poster_url"] = gen
-            if entry.format in _TV_FORMATS:
+            if _is_season_entry(entry):
                 season, season_part = identities.get(
                     aid, (tv.index(entry) + 1, getattr(entry, "season_part", None))
                 )
@@ -473,8 +482,8 @@ class SenkuPublisher:
                 continue
             cards.append({
                 "post_type": post_type,
-                "season": season if entry.format in _TV_FORMATS else None,
-                "season_part": season_part if entry.format in _TV_FORMATS else None,
+                "season": season if _is_season_entry(entry) else None,
+                "season_part": season_part if _is_season_entry(entry) else None,
                 "caption": caption,
                 "image": await self._cache_image(image),
                 "button_data": buttons,
@@ -953,7 +962,7 @@ class SenkuPublisher:
                 entry.format in ("OVA", "ONA", "SPECIAL")
                 and (entry.episodes or 0) <= 1
             )
-            caption, image = svc._build_season_card(entry_meta, 1, extra_packs)
+            caption, image = svc._build_season_card(entry_meta, 1, extra_packs or [])
             buttons = await svc._build_season_buttons(extra_packs) if extra_packs else None
             posts.append({
                 "post_type": "movie_card" if is_movie else "season_card",
@@ -1126,8 +1135,8 @@ class SenkuPublisher:
             for k, fe in enumerate(ordered):
                 if k < len(entries):
                     origin_index[id(fe)] = entries[k].index
-        tv = [e for e in ordered if e.format in _TV_FORMATS]
-        extras = [e for e in ordered if e.format not in _TV_FORMATS]
+        tv = [e for e in ordered if _is_season_entry(e)]
+        extras = [e for e in ordered if not _is_season_entry(e)]
         return {"tv": tv, "extras": extras, "all": ordered,
                 "origin_index": origin_index}
 

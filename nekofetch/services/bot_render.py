@@ -113,6 +113,21 @@ def build_audio_keyboard(
     """
     if not button_data:
         return None
+    # Editors may intentionally replace a generated quality keyboard with a
+    # small, explicit set of URL buttons (for example a corrected watch-guide
+    # link). Keep this payload deliberately simple and let the shared renderer
+    # own the Telegram markup shape.
+    if button_data.get("type") == "custom":
+        custom_rows = []
+        for item in button_data.get("buttons", []):
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("text") or "").strip()
+            url = str(item.get("url") or "").strip()
+            if label and url.startswith(("http://", "https://", "tg://")):
+                custom_rows.append([InlineKeyboardButton(label[:64], url=url)])
+        return InlineKeyboardMarkup(custom_rows) if custom_rows else None
+
     links: dict[str, str] = button_data.get("links", {})
     if not links:
         return None

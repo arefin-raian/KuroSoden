@@ -422,8 +422,16 @@ def thumb_text_weights(font_name: str, weights: list[str], italic: bool = False)
 def thumb_text_reuse_prompt() -> str:
     return (
         f"{ICON} <b>Use the previously generated logo?</b>\n\n"
-        "I found the latest text logo from this request. It is shown above. "
+        "I found the latest logo from this request. It is shown above. "
         "Use it for this entry, or make a new one."
+    )
+
+
+def thumb_logo_reuse_prompt() -> str:
+    return (
+        f"{ICON} <b>Use the previously uploaded logo?</b>\n\n"
+        "This request already has a logo from an earlier entry. It is shown above. "
+        "Use it again, or upload a different logo for this entry."
     )
 
 
@@ -665,6 +673,8 @@ BTN_TEXT_BACK = "⇐ Back"
 BTN_TEXT_UPLOAD_FONT = "⬆️ Upload your own"
 BTN_TEXT_REUSE_YES = "✅ Use previous"
 BTN_TEXT_REUSE_NO = "✍️ New text"
+BTN_LOGO_REUSE_YES = "✅ Use previous"
+BTN_LOGO_REUSE_NO = "⬆️ Upload another"
 BTN_TEXT_ITALIC_OFF = "𝑰 Italic: off"
 BTN_TEXT_ITALIC_ON = "𝑰 Italic: on"
 TEXT_FONT_CUSTOM = "Uploaded font"

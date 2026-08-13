@@ -99,6 +99,7 @@ STATE_TEXT_WEIGHTS = "senku:wiz:text_weights"
 STATE_TEXT_COLORS = "senku:wiz:text_colors"
 STATE_TEXT_PREVIEW = "senku:wiz:text_preview"
 STATE_TEXT_REUSE = "senku:wiz:text_reuse"
+STATE_LOGO_REUSE = "senku:wiz:logo_reuse"
 STATE_AWAIT_FONT_UPLOAD = "senku:wiz:await_font_upload"
 
 # FSM state: after a userbot created the channel, waiting for the operator to JOIN
@@ -112,7 +113,8 @@ STATE_AWAIT_UBOT_JOIN = "senku:wiz:await_ubot_join"
 STATE_AWAIT_UBOT_DONE = "senku:wiz:await_ubot_done"
 
 # Commands that must never be swallowed by the free-text channel step.
-_RESERVED = ["start", "tasks", "create", "generate", "settings", "help", "cancel"]
+_RESERVED = ["start", "tasks", "create", "generate", "edit_thumbnail",
+              "editpost", "editcaption", "settings", "help", "cancel"]
 
 
 def register(client: Client, container: Container) -> None:
@@ -1501,12 +1503,12 @@ def register(client: Client, container: Container) -> None:
             if not valid:
                 await q.answer("That logo picker has expired.", show_alert=True)
                 return
-            previous = await cache.get_last_text_logo(code)
+            previous = await cache.get_last_logo(code)
             await q.answer()
             if previous:
                 await fsm.set(q.from_user.id, STATE_TEXT_REUSE, code=code, index=index,
-                              path=previous["path"], text=previous.get("text", ""),
-                              font=previous.get("font", ""))
+                              path=previous["path"], kind=previous.get("kind", "text"),
+                              text=previous.get("text", ""), font=previous.get("font", ""))
                 await send_screen(
                     client, chat_id,
                     card(V.thumb_text_reuse_prompt(), image=previous["path"],
@@ -1542,7 +1544,11 @@ def register(client: Client, container: Container) -> None:
                 await q.answer("That previous-logo prompt has expired.", show_alert=True)
                 return
             try:
-                await thumbs.store_text_logo(code, index, data.get("path"))
+                if data.get("kind", "text") == "text":
+                    await thumbs.store_text_logo(code, index, data.get("path"))
+                else:
+                    await cache.set_selection(code, index, asset="logo",
+                                              value=data.get("path"))
             except Exception as exc:  # noqa: BLE001
                 log.warning("senku.wiz.previous_text_logo_failed", code=code,
                             entry=index, error=str(exc))
@@ -1551,6 +1557,37 @@ def register(client: Client, container: Container) -> None:
             await fsm.clear(q.from_user.id)
             await q.answer("Previous text logo locked in.")
             await _thumb_next(chat_id, code, old_msg=q.message)
+        elif action == "logoprev_yes":
+            try:
+                index = int(parts[4])
+            except (IndexError, ValueError):
+                await q.answer("Bad entry.", show_alert=True)
+                return
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_LOGO_REUSE, code, index,
+            )
+            if not valid:
+                await q.answer("That previous-logo prompt has expired.", show_alert=True)
+                return
+            await cache.set_selection(code, index, asset="logo", value=data.get("path"))
+            await fsm.clear(q.from_user.id)
+            await q.answer("Previous logo locked in.")
+            await _thumb_next(chat_id, code, old_msg=q.message)
+        elif action == "logoprev_no":
+            try:
+                index = int(parts[4])
+            except (IndexError, ValueError):
+                await q.answer("Bad entry.", show_alert=True)
+                return
+            valid, data = await _text_state_matches(
+                q.from_user.id, STATE_LOGO_REUSE, code, index,
+            )
+            if not valid:
+                await q.answer("That previous-logo prompt has expired.", show_alert=True)
+                return
+            await q.answer()
+            await _ask_upload(chat_id, q.from_user.id, code, index, "logo",
+                              old_msg=q.message)
         elif action == "textprev_no":
             try:
                 index = int(parts[4])
@@ -1783,7 +1820,7 @@ def register(client: Client, container: Container) -> None:
             if not valid or current_state not in {
                 STATE_AWAIT_TEXT, STATE_TEXT_CATEGORIES, STATE_TEXT_FONTS,
                 STATE_TEXT_WEIGHTS, STATE_TEXT_COLORS, STATE_TEXT_PREVIEW,
-                STATE_TEXT_REUSE, STATE_AWAIT_FONT_UPLOAD,
+                STATE_TEXT_REUSE, STATE_LOGO_REUSE, STATE_AWAIT_FONT_UPLOAD,
             }:
                 await q.answer("That text-logo flow has expired.", show_alert=True)
                 return
@@ -1824,9 +1861,32 @@ def register(client: Client, container: Container) -> None:
             except (IndexError, ValueError):
                 await q.answer("Bad asset.", show_alert=True)
                 return
-            await _ask_upload(chat_id, q.from_user.id, code, index, asset,
-                              old_msg=q.message)
             await q.answer()
+            if asset == "logo":
+                previous_logo = await cache.get_last_logo(code)
+                if previous_logo:
+                    await fsm.set(
+                        q.from_user.id, STATE_LOGO_REUSE, code=code, index=index,
+                        path=previous_logo["path"],
+                    )
+                    await send_screen(
+                        client, chat_id,
+                        card(V.thumb_logo_reuse_prompt(), image=previous_logo["path"],
+                             bot_name=BOT,
+                             buttons=[[(V.BTN_LOGO_REUSE_YES,
+                                        cb(BOT, "wiz", "logoprev_yes", code, str(index))),
+                                       (V.BTN_LOGO_REUSE_NO,
+                                        cb(BOT, "wiz", "logoprev_no", code, str(index)))],
+                                      [(V.BTN_TEXT_CANCEL,
+                                        cb(BOT, "wiz", "textcancel", code, str(index)))]]),
+                        old_msg=q.message,
+                    )
+                else:
+                    await _ask_upload(chat_id, q.from_user.id, code, index, asset,
+                                      old_msg=q.message)
+            else:
+                await _ask_upload(chat_id, q.from_user.id, code, index, asset,
+                                  old_msg=q.message)
         elif action == "gen":
             # senku|wiz|gen|<code>|<index>
             try:
@@ -2142,7 +2202,11 @@ def register(client: Client, container: Container) -> None:
             return
 
         try:
-            await thumbs.store_upload(code, index, asset, file_bytes)
+            selection, _ = await thumbs.store_upload(code, index, asset, file_bytes)
+            if asset == "logo" and selection.logo_url:
+                await cache.set_last_logo(
+                    code, path=selection.logo_url, kind="image",
+                )
         except Exception as exc:  # noqa: BLE001 — catbox host hiccup
             log.warning("senku.wiz.upload_store_failed", code=code, error=str(exc))
             try:

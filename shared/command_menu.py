@@ -50,10 +50,10 @@ _LELOUCH_OWNER = _LELOUCH_STAFF + [
 _LEVI_STAFF = [
     _c("start", "Your download tasks"),
     _c("tasks", "Open your download tasks"),
+    _c("packcaptions", "Edit storage pack captions"),
     _c("help", "How the downloader works"),
 ]
 _LEVI_OWNER = _LEVI_STAFF + [
-    _c("packcaptions", "Edit storage pack captions (owner)"),
     _c("settings", "Configure the downloader (owner)"),
 ]
 
@@ -62,10 +62,12 @@ _SENKU_STAFF = [
     _c("tasks", "List active distribution tasks"),
     _c("create", "Create a distribution channel"),
     _c("generate", "Generate content: /generate REQ-XXXX"),
+    _c("edit_thumbnail", "Edit saved thumbnails"),
+    _c("editpost", "Edit a published post"),
+    _c("editcaption", "Edit published post captions"),
     _c("help", "How distribution works"),
 ]
 _SENKU_OWNER = _SENKU_STAFF + [
-    _c("edit_thumbnail", "Edit saved thumbnails (owner)"),
     _c("settings", "Configure distribution (owner)"),
 ]
 

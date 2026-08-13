@@ -159,5 +159,36 @@ async def test_sweep_due_records_failure_without_wedging(sessionmaker, monkeypat
         assert "channel gone" in (row.error or "")
 
 
+async def test_cancel_for_request_cancels_all_pending(sessionmaker):
+    """After a force publish, every pending schedule for the request is
+    cancelled so the set time can't double-post later (Phase 11)."""
+    from datetime import datetime, timedelta, timezone
+
+    svc = ScheduleService(_container(sessionmaker))
+    base = datetime.now(timezone.utc) + timedelta(hours=4)
+    await svc.schedule("REQ-X", 1, base, anime_title="X")
+    await svc.schedule("REQ-Y", 1, base + timedelta(minutes=30), anime_title="Y")
+
+    # Seed a second pending row for REQ-X directly (schedule() supersedes, but
+    # a real duplicate can only exist from older rows — cancel must catch ALL).
+    async with sessionmaker() as s:
+        s.add(ScheduledPost(
+            request_code="REQ-X", admin_telegram_id=1,
+            scheduled_at=base + timedelta(hours=1), status="pending",
+        ))
+        await s.commit()
+
+    cancelled = await svc.cancel_for_request("REQ-X")
+    assert cancelled == 2
+    pending = await svc.list_pending()
+    codes = [r.request_code for r in pending]
+    # REQ-X fully gone; other tests' rows (shared engine) and REQ-Y remain.
+    assert "REQ-X" not in codes
+    assert "REQ-Y" in codes
+
+    # Idempotent: nothing left to cancel the second time.
+    assert await svc.cancel_for_request("REQ-X") == 0
+
+
 async def _noop():
     return None

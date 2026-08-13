@@ -688,7 +688,9 @@ def register(client: Client, container: Container) -> None:
     @client.on_callback_query(filters.regex(r"^gojo\|publish_confirm\|"))
     async def _cb_publish(_: Client, q: CallbackQuery) -> None:
         _, _, code = q.data.split("|", 2)
-        await q.answer("Publishing...")
+        # A callback toast is immediate feedback while the network/database work
+        # below runs; otherwise Telegram appears to have ignored the tap.
+        await q.answer("⏳ Publishing now…")
         # "Publish Now" honours the configured default (some operators prefer
         # silent posts as the norm); the separate "Silent" button always forces it.
         silent = bool(getattr(container.config.main_channel, "silent_default", False))
@@ -697,20 +699,20 @@ def register(client: Client, container: Container) -> None:
     @client.on_callback_query(filters.regex(r"^gojo\|publish_silent\|"))
     async def _cb_publish_silent(_: Client, q: CallbackQuery) -> None:
         _, _, code = q.data.split("|", 2)
-        await q.answer("Publishing silently...")
+        await q.answer("⏳ Publishing silently…")
         await _execute_publish(client, container, q.message, code, silent=True)
 
     @client.on_callback_query(filters.regex(r"^gojo\|publish_edit\|"))
     async def _cb_edit(_: Client, q: CallbackQuery) -> None:
         _, _, code = q.data.split("|", 2)
-        await q.answer()
+        await q.answer("✏️ Opening publish editor…")
         await fsm.set(q.from_user.id, STATE_EDIT_CAPTION, request_code=code)
         await q.message.reply(V.EDIT_CAPTION_PROMPT, parse_mode=ParseMode.HTML)
 
     @client.on_callback_query(filters.regex(r"^gojo\|publish_schedule\|"))
     async def _cb_schedule(_: Client, q: CallbackQuery) -> None:
         _, _, code = q.data.split("|", 2)
-        await q.answer()
+        await q.answer("📅 Opening scheduler…")
         await fsm.set(q.from_user.id, STATE_SCHEDULE, request_code=code)
         tz_name = await _admin_tz(container, q.from_user.id)
         # Prompt in the admin's own timezone, then show the combined queue so they
@@ -1447,11 +1449,6 @@ async def _execute_publish(
                    image=pick_artwork("gojo"),
                    keyboard=keyboard([(V.BTN_TASKS, cb("gojo", "tasks"))])),
         )
-
-        # Mark task as completed.
-        from kurosoden.shared.admin_assignment import AdminAssignmentEngine
-        engine = AdminAssignmentEngine(container.pg_sessionmaker)
-        await engine.complete_task(request_code, "gojo")
 
         # Everything is live (main channel + distribution) — the prefetched
         # artwork on disk is no longer needed. Delete the local image bytes; the

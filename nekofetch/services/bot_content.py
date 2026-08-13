@@ -113,7 +113,17 @@ async def _jikan_search(title: str) -> dict | None:
 
 _RES_ORDER = {"360p": 360, "480p": 480, "540p": 540, "720p": 720, "1080p": 1080}
 _BTN_QUALITIES = ("480p", "720p", "1080p")
+# Season formats for card/guide purposes. A multi-episode ONA is a full series
+# (renders as "Season N"), so the shared helper (franchise_flow) treats it as a
+# season — the wizard's watch-order confirm and the posted guide must agree.
 _TV_FORMATS = {"TV", "TV_SHORT", "TV_SPECIAL"}
+
+
+def _is_season_entry(entry) -> bool:
+    """Season check shared with the franchise mapping (multi-episode ONAs count)."""
+    from nekofetch.services.franchise_flow import entry_is_season
+
+    return entry_is_season(entry)
 
 # AniList synopses (fetched asHtml:false) still embed literal HTML — <br>, <i>,
 # <b>, and a trailing "<source>" fragment. Strip ALL tags before truncating so a
@@ -958,8 +968,9 @@ class BotContentService:
                 log.debug("bot.content.franchise.empty", anime=anime_doc_id)
                 return empty
 
-            # Split and sort.
-            tv_entries = [e for e in entries.values() if e.format in _TV_FORMATS]
+            # Split and sort. Multi-episode ONAs count as seasons (shared helper)
+            # so the walk, cards, and guide all agree with the franchise mapping.
+            tv_entries = [e for e in entries.values() if _is_season_entry(e)]
             tv_entries.sort(key=lambda e: (
                 (e.start_date or {}).get("year", 9999),
                 (e.start_date or {}).get("month", 99),
@@ -1150,13 +1161,13 @@ class BotContentService:
         extra_counts: dict[str, int] = {}
         extra_labels: dict[int, str] = {}
         for e in all_entries:
-            if e.format not in _TV_FORMATS:
+            if not _is_season_entry(e):
                 extra_counts[e.format] = extra_counts.get(e.format, 0) + 1
                 extra_labels[e.anilist_id] = f"{e.format} {extra_counts[e.format]}"
 
         all_lines: list[str] = []
         for entry in all_entries:
-            is_tv = entry.format in _TV_FORMATS
+            is_tv = _is_season_entry(entry)
             if is_tv:
                 s_num, season_part = season_map.get(
                     entry.anilist_id,

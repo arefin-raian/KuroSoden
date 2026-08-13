@@ -37,6 +37,15 @@ log = get_logger(__name__)
 _RES_ORDER = {"360p": 360, "480p": 480, "540p": 540, "720p": 720, "1080p": 1080}
 
 
+def is_stale_message_error(exc: Exception) -> bool:
+    """Return whether Telegram rejected a stored id that should be re-posted."""
+    error = str(exc).upper()
+    return any(token in error for token in (
+        "MESSAGE_ID_INVALID", "MESSAGE_NOT_FOUND",
+        "MESSAGE_ID_NOT_FOUND", "MESSAGE_EMPTY",
+    ))
+
+
 def _avg_score_pct(scores: list[float]) -> str:
     """Average AniList scores → a plain 2-digit percent like ``"82%"``.
 
@@ -65,7 +74,11 @@ def format_episode_summary(entries) -> str:
             continue
         kind = str(entry.get("kind") or entry.get("format") or "").lower()
         episodes = int(entry.get("episodes") or entry.get("episode_count") or 0)
-        if kind in {"season", "tv", "tv_short"}:
+        # A multi-episode ONA is a real season (Netflix-style online series),
+        # not an extra. Keep the same classifier used by the watch-order and
+        # distribution-card builders so Takopi cannot diverge between surfaces.
+        if kind in {"season", "tv", "tv_short"} \
+                or (kind == "ona" and episodes > 1):
             seasonal += episodes
         elif kind in {"movie", "movies"} or kind == "movie".lower():
             movies += 1
@@ -499,22 +512,61 @@ class MainChannelService:
 
         try:
             if existing_id:
-                await client.edit_message_caption(
-                    self.cfg.channel_id, existing_id, caption=caption, reply_markup=markup,
-                    parse_mode=ParseMode.HTML,
-                )
-                message_id = existing_id
-            elif photo_url:
-                sent = await client.send_photo(
-                    self.cfg.channel_id, photo_url, caption=caption, reply_markup=markup,
-                    parse_mode=ParseMode.HTML, disable_notification=silent,
-                )
-                message_id = sent.id
-            else:
-                sent = await client.send_message(
-                    self.cfg.channel_id, caption, reply_markup=markup,
-                    parse_mode=ParseMode.HTML, disable_notification=silent,
-                )
+                try:
+                    # Main posts are normally photos, but a title without usable
+                    # artwork is posted as text. Calling edit_message_caption on
+                    # that text message produces a non-stale Telegram error and
+                    # incorrectly turns a valid retry into a failed publish.
+                    is_media = True
+                    if hasattr(client, "get_messages"):
+                        live = await client.get_messages(self.cfg.channel_id, existing_id)
+                        is_media = any(
+                            getattr(live, kind, None)
+                            for kind in ("photo", "video", "animation", "document")
+                        )
+                    if is_media:
+                        await client.edit_message_caption(
+                            self.cfg.channel_id, existing_id, caption=caption,
+                            reply_markup=markup, parse_mode=ParseMode.HTML,
+                        )
+                    else:
+                        await client.edit_message_text(
+                            self.cfg.channel_id, existing_id, caption,
+                            reply_markup=markup, parse_mode=ParseMode.HTML,
+                        )
+                    message_id = existing_id
+                except Exception as exc:
+                    # A stale ChannelPost row must not turn a first publish into
+                    # a silent no-op. This is the exact failure seen for Vanitas:
+                    # Telegram rejected the old id, then the old code returned
+                    # None without ever sending the new main-channel post.
+                    if not is_stale_message_error(exc):
+                        raise
+                    log.warning("mainchannel.publish.stale_message",
+                                anime=anime_doc_id, message_id=existing_id,
+                                error=str(exc))
+                    async with session_scope(self._c.pg_sessionmaker) as session:
+                        row = (await session.execute(
+                            select(ChannelPost).where(
+                                ChannelPost.anime_doc_id == anime_doc_id
+                            )
+                        )).scalar_one_or_none()
+                        if row is not None:
+                            row.main_message_id = None
+                    existing_id = None
+
+            if not existing_id:
+                if photo_url:
+                    sent = await client.send_photo(
+                        self.cfg.channel_id, photo_url, caption=caption,
+                        reply_markup=markup, parse_mode=ParseMode.HTML,
+                        disable_notification=silent,
+                    )
+                else:
+                    sent = await client.send_message(
+                        self.cfg.channel_id, caption, reply_markup=markup,
+                        parse_mode=ParseMode.HTML, disable_notification=silent,
+                    )
                 message_id = sent.id
         except Exception as exc:  # noqa: BLE001
             log.warning("mainchannel.publish.failed", anime=anime_doc_id, error=str(exc))

@@ -17,6 +17,7 @@ from nekofetch.services.main_channel_service import (
     MainChannelService,
     PublicationFacts,
     _collapse,
+    is_stale_message_error,
 )
 from nekofetch.sources.telegram.anilist import FranchiseEntry, FranchiseTotals
 
@@ -41,6 +42,12 @@ def test_collapse_handles_blank_and_dash():
 
 def test_collapse_squeezes_runs_of_whitespace():
     assert _collapse("A   lot\t\tof   space") == "A lot of space"
+
+
+def test_stale_main_message_errors_are_retryable():
+    assert is_stale_message_error(RuntimeError("MESSAGE_ID_INVALID"))
+    assert is_stale_message_error(RuntimeError("message not found"))
+    assert not is_stale_message_error(RuntimeError("FLOOD_WAIT_10"))
 
 
 # ── _apply_franchise_facts: episode sum + rating average ──

@@ -55,6 +55,13 @@ def test_falls_back_to_first_admin_id():
     assert _owner_id(c) == 111
 
 
+def test_env_owner_id_is_honored_when_yaml_owner_is_unset():
+    c = _container(owner_id=0, admin_ids=[111, 222])
+    c.env.owner_id = 999
+    assert _owner_id(c) == 999
+    assert AuthService(c).owner_ids() == {999}
+
+
 def test_none_when_no_owner_and_no_admins():
     c = _container(owner_id=0, admin_ids=[])
     assert _owner_id(c) is None
