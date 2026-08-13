@@ -181,3 +181,121 @@ class TestLifecycle:
         assert await svc.claim("WRK-nope", 1) is False
         assert await svc.advance("WRK-nope", STAGE_PUBLISH) is False
         assert await svc.complete("WRK-nope") is False
+
+
+# ── Request link (WRK ↔ REQ) ─────────────────────────────────────────────────
+
+class TestRequestLink:
+    async def test_link_sets_and_clears(self, sessionmaker, session):
+        svc = WorkService(sessionmaker)
+        out = await svc.add_batch(1, [{"anime_title": "Linked"}])
+        code = out[0].code
+
+        assert await svc.link(code, "REQ-42") is True
+        w = await svc.get(code)
+        assert w is not None and w.request_code == "REQ-42"
+        assert w.code == code
+
+        assert await svc.link(code, None) is True
+        assert (await svc.get(code)).request_code is None
+
+    async def test_link_missing_code(self, sessionmaker, session):
+        svc = WorkService(sessionmaker)
+        assert await svc.link("WRK-nope", "REQ-1") is False
+        assert await svc.get("WRK-nope") is None
+
+    async def test_count_and_list_filter_by_stage(self, sessionmaker, session):
+        svc = WorkService(sessionmaker)
+        out = await svc.add_batch(1, [{"anime_title": f"T{i}"} for i in range(3)])
+        # Push one item to the publish pool — it must stop counting as download.
+        await svc.advance(out[0].code, STAGE_PUBLISH)
+
+        assert await svc.count_open() == 3                      # all stages
+        assert await svc.count_open(stage=STAGE_DOWNLOAD) == 2  # Levi's pool
+        assert await svc.count_open(stage=STAGE_PUBLISH) == 1
+        assert len(await svc.list_open(stage=STAGE_DOWNLOAD)) == 2
+        assert {w.code for w in await svc.list_open(stage=STAGE_PUBLISH)} == {
+            out[0].code}
+
+    async def test_reconcile_links_orphaned_work_to_live_request(
+        self, sessionmaker, session,
+    ):
+        """A work whose bridge never wrote the link gets linked to the anime's
+        live request (legacy reconciliation), and its stage is synced from the
+        request's completed assignments so it stops counting as download work."""
+        from nekofetch.infrastructure.database.postgres.models import Request
+        from nekofetch.domain.enums import RequestStatus, DownloadScope
+
+        svc = WorkService(sessionmaker)
+        out = await svc.add_batch(1, [{
+            "anime_title": "Legacy",
+            "anime_doc_id": "151514",
+            "franchise_data": {"anilist_id": 151514},
+        }])
+
+        # The bridged request already moved past download (senku is assigned).
+        async with sessionmaker() as s:
+            s.add(Request(code="REQ-1079", user_id=1, anime_doc_id="151514",
+                          anime_title="Legacy", source="", scope=DownloadScope.ENTIRE_SERIES.value,
+                          status=RequestStatus.PROCESSING))
+            await s.commit()
+
+        assert (await svc.get(out[0].code)).request_code is None
+        touched = await svc.reconcile_links()
+        assert touched >= 1
+
+        w = await svc.get(out[0].code)
+        assert w.request_code == "REQ-1079"
+        # No completed levi assignment → still download/open (sync is additive).
+        assert w.stage == STAGE_DOWNLOAD
+        assert w.status == STATUS_OPEN
+
+    async def test_reconcile_syncs_stage_from_completed_assignments(
+        self, sessionmaker, session,
+    ):
+        """A linked work whose request already finished levi is reopened at the
+        distribute stage — it must no longer count as an open download task."""
+        from kurosoden.shared.admin_assignment import AdminAssignment
+        from nekofetch.infrastructure.database.postgres.models import Request
+        from nekofetch.domain.enums import RequestStatus, DownloadScope
+
+        svc = WorkService(sessionmaker)
+        out = await svc.add_batch(1, [{"anime_title": "Moving",
+                                       "anime_doc_id": "doc-x"}])
+        await svc.link(out[0].code, "REQ-500")
+
+        async with sessionmaker() as s:
+            s.add(Request(code="REQ-500", user_id=1, anime_doc_id="doc-x",
+                          anime_title="Moving", source="",
+                          scope=DownloadScope.ENTIRE_SERIES.value,
+                          status=RequestStatus.PROCESSING))
+            s.add(AdminAssignment(admin_telegram_id=1, request_code="REQ-500",
+                                  stage="levi", status="completed"))
+            s.add(AdminAssignment(admin_telegram_id=1, request_code="REQ-500",
+                                  stage="senku", status="assigned"))
+            await s.commit()
+
+        await svc.reconcile_links()
+        w = await svc.get(out[0].code)
+        assert w.stage == STAGE_DISTRIBUTE
+        assert w.status == STATUS_OPEN
+        assert await svc.count_open(stage=STAGE_DOWNLOAD) == 0
+
+    async def test_reconcile_ignores_published_requests(self, sessionmaker, session):
+        """A completed/published request is terminal — a leftover work must NOT
+        be linked to it (the anime is done; the work is stale)."""
+        from nekofetch.infrastructure.database.postgres.models import Request
+        from nekofetch.domain.enums import RequestStatus, DownloadScope
+
+        svc = WorkService(sessionmaker)
+        out = await svc.add_batch(1, [{"anime_title": "Done",
+                                       "anime_doc_id": "doc-done"}])
+        async with sessionmaker() as s:
+            s.add(Request(code="REQ-999", user_id=1, anime_doc_id="doc-done",
+                          anime_title="Done", source="",
+                          scope=DownloadScope.ENTIRE_SERIES.value,
+                          status=RequestStatus.PUBLISHED))
+            await s.commit()
+
+        await svc.reconcile_links()
+        assert (await svc.get(out[0].code)).request_code is None

@@ -106,6 +106,24 @@ class TestFires:
         await make_idle_nudge_job(c)()
         assert {t for t, _ in client.sent} == {1000, 1001}
 
+    async def test_work_past_download_does_not_nudge(self, sessionmaker, session):
+        """A work whose request already left Levi (e.g. redo moved to Senku) is
+        not download detail — it must NOT rouse a downloader. This is the
+        "works left but the board is empty" phantom: the work row still exists
+        but nothing on it is a download task anymore."""
+        from kurosoden.shared.work_service import STAGE_PUBLISH, WorkService
+
+        await _seed_idle_admin(sessionmaker, 1000)
+        svc = WorkService(sessionmaker)
+        out = await svc.add_batch(1, [{"anime_title": "In Flight"}])
+        # Simulate the lifecycle sync: the work moved to the publish pool.
+        await svc.advance(out[0].code, STAGE_PUBLISH)
+
+        client = FakeClient()
+        c = FakeContainer(sessionmaker, redis=FakeRedis(), client=client)
+        await make_idle_nudge_job(c)()
+        assert client.sent == []
+
 
 # ── Suppress ───────────────────────────────────────────────────────────────────
 

@@ -349,10 +349,16 @@ def register(client: Client, container: Container) -> None:
         """Receipt card summarizing the detected stage + action taken."""
         state_label = {
             "published": "Published",
+            "channel_without_posts": "Channel Empty",
             "in_progress": "In Progress",
             "absent": "New",
         }.get(plan.state.value, plan.state.value.title())
-        action = "relink packs in place" if plan.keep_channel else "full re-run"
+        if plan.recreate_distribution:
+            action = "recreate distribution via Senku"
+        elif plan.keep_channel:
+            action = "relink packs in place"
+        else:
+            action = "full re-run"
         caption = V.redo_receipt(title, state_label, action)
         await send_screen(
             client, q.message.chat.id,

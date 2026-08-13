@@ -54,6 +54,12 @@ class WorkItem(Base, PKMixin, TimestampMixin):
     anime_title: Mapped[str] = mapped_column(String(256), nullable=False)
     anime_doc_id: Mapped[str | None] = mapped_column(String(48), index=True)
     franchise_data: Mapped[dict | None] = mapped_column(JSONB)
+    # The ``Request.code`` this work was bridged to (REQ-N). Kept null until the
+    # batch/redo bridge runs; the durable link lets the pipeline advance the work
+    # item's stage/status in step with the request's lifecycle (see
+    # ``AdminAssignmentEngine.complete_task``) and lets Levi lazily bridge legacy
+    # works that predate the bridge.
+    request_code: Mapped[str | None] = mapped_column(String(32), index=True)
     stage: Mapped[str] = mapped_column(String(32), default=STAGE_DOWNLOAD,
                                        index=True, nullable=False)
     status: Mapped[str] = mapped_column(String(16), default=STATUS_OPEN,
@@ -70,12 +76,14 @@ class WorkItemView:
     stage: str
     status: str
     assigned_admin_id: int | None
+    request_code: str | None = None
 
 
 def _view(w: WorkItem) -> WorkItemView:
     return WorkItemView(
         code=w.code, anime_title=w.anime_title, stage=w.stage,
         status=w.status, assigned_admin_id=w.assigned_admin_id,
+        request_code=w.request_code,
     )
 
 
@@ -138,21 +146,155 @@ class WorkService:
                 await session.commit()
         return created
 
-    async def count_open(self, *, _session=None) -> int:
-        """How many work items are still in the line (open or claimed)."""
+    async def count_open(self, *, stage: str | None = None, _session=None) -> int:
+        """How many work items are still in the line (open or claimed).
+
+        ``stage`` narrows the count to one pipeline stage (e.g. the download
+        stage Levi drains); ``None`` counts every open/claimed item.
+        """
         async with self._maybe_session(_session) as session:
+            conds = [WorkItem.status.in_(_OPEN_STATUSES)]
+            if stage is not None:
+                conds.append(WorkItem.stage == stage)
             return int((await session.execute(
-                select(func.count()).select_from(WorkItem)
-                .where(WorkItem.status.in_(_OPEN_STATUSES))
+                select(func.count()).select_from(WorkItem).where(*conds)
             )).scalar_one())
 
-    async def list_open(self, *, limit: int = 50, _session=None) -> list[WorkItemView]:
+    async def list_open(self, *, stage: str | None = None, limit: int = 50,
+                        _session=None) -> list[WorkItemView]:
+        """Open/claimed work items, oldest first; optionally one pipeline stage."""
         async with self._maybe_session(_session) as session:
+            conds = [WorkItem.status.in_(_OPEN_STATUSES)]
+            if stage is not None:
+                conds.append(WorkItem.stage == stage)
             rows = (await session.execute(
-                select(WorkItem).where(WorkItem.status.in_(_OPEN_STATUSES))
+                select(WorkItem).where(*conds)
                 .order_by(WorkItem.created_at.asc()).limit(limit)
             )).scalars().all()
             return [_view(w) for w in rows]
+
+    async def get(self, code: str, *, _session=None) -> WorkItem | None:
+        """Fetch a work item by its WRK- code, detached from its session."""
+        async with self._maybe_session(_session) as session:
+            w = (await session.execute(
+                select(WorkItem).where(WorkItem.code == code)
+            )).scalar_one_or_none()
+            if w is None:
+                return None
+            session.expunge(w)
+            return w
+
+    async def link(self, code: str, request_code: str | None, *,
+                   _session=None) -> bool:
+        """Record the bridged ``Request.code`` (REQ-N) a work item flows into.
+
+        Lets the pipeline advance/complete the work item in step with its request
+        (``AdminAssignmentEngine.complete_task``) and lets Levi resolve the work
+        on open. Setting ``None`` clears the link.
+        """
+        async with self._maybe_session(_session) as session:
+            w = (await session.execute(
+                select(WorkItem).where(WorkItem.code == code)
+            )).scalar_one_or_none()
+            if w is None:
+                return False
+            w.request_code = request_code
+            if _session is None:
+                await session.commit()
+            return True
+
+    async def reconcile_links(self, *, _session=None) -> int:
+        """Self-heal legacy works + keep stage/status honest from the request side.
+
+        Two fixes, both idempotent and best-effort:
+
+        1. **Link orphaned works** — a ``WorkItem`` without ``request_code`` gets
+           linked to the newest non-terminal ``Request`` with the same
+           ``anime_doc_id`` (works created before the bridge existed, or where a
+           bridge failure silently dropped the request).
+        2. **Sync stage/status** — an already-linked work's stage/status is
+           re-derived from its request's completed assignments, so a work whose
+           request already moved past download stops counting as an open
+           download task (the phantom "works left" nudge).
+
+        Returns how many rows were touched. Never raises.
+        """
+        from nekofetch.domain.enums import RequestStatus
+        from nekofetch.infrastructure.database.postgres.models import Request
+        from kurosoden.shared.admin_assignment import AdminAssignment
+
+        touched = 0
+        async with self._maybe_session(_session) as session:
+            works = (await session.execute(
+                select(WorkItem).where(WorkItem.status.in_(_OPEN_STATUSES))
+            )).scalars().all()
+            for w in works:
+                changed = False
+                if w.request_code is None:
+                    doc = w.anime_doc_id
+                    if not doc:
+                        aid = (w.franchise_data or {}).get("anilist_id")
+                        doc = f"{aid}" if aid is not None else None
+                    if doc:
+                        req = (await session.execute(
+                            select(Request).where(
+                                Request.anime_doc_id == doc,
+                                Request.status.notin_([
+                                    RequestStatus.PUBLISHED,
+                                    RequestStatus.REJECTED,
+                                    RequestStatus.FAILED,
+                                ]),
+                            ).order_by(Request.id.desc()).limit(1)
+                        )).scalars().first()
+                        if req is not None:
+                            w.request_code = req.code
+                            changed = True
+                if w.request_code is not None:
+                    stage, status = await self._stage_from_assignments(
+                        session, w.request_code,
+                    )
+                    if stage is not None and (w.stage != stage or w.status != status):
+                        w.stage, w.status = stage, status
+                        changed = True
+                if changed:
+                    touched += 1
+            if touched and _session is None:
+                await session.commit()
+        return touched
+
+    async def _stage_from_assignments(
+        self, session, request_code: str,
+    ) -> tuple[str | None, str | None]:
+        """Derive the work stage/status a request's stage assignments imply.
+
+        A completed gojo assignment means the whole pipeline finished; senku
+        completed means distribution is done and publish awaits; levi completed
+        means download is done. An in-progress levi assignment means a downloader
+        currently holds it. Returns ``(None, None)`` when the request is unknown
+        so the caller leaves the work untouched."""
+        from nekofetch.infrastructure.database.postgres.models import Request
+        from kurosoden.shared.admin_assignment import AdminAssignment
+
+        req = (await session.execute(
+            select(Request).where(Request.code == request_code)
+        )).scalar_one_or_none()
+        if req is None:
+            return None, None
+        rows = (await session.execute(
+            select(AdminAssignment.stage, AdminAssignment.status).where(
+                AdminAssignment.request_code == request_code,
+            )
+        )).all()
+        by_stage = {stage: status for stage, status in rows}
+        if by_stage.get("gojo") == "completed":
+            return STAGE_PUBLISH, STATUS_DONE
+        if by_stage.get("senku") == "completed":
+            return STAGE_PUBLISH, STATUS_OPEN
+        if by_stage.get("levi") == "completed":
+            return STAGE_DISTRIBUTE, STATUS_OPEN
+        if by_stage.get("levi") == "in_progress":
+            return STAGE_DOWNLOAD, STATUS_CLAIMED
+        return STAGE_DOWNLOAD, STATUS_OPEN
 
     async def next_for_stage(self, stage: str, *, _session=None) -> WorkItemView | None:
         """Oldest open item waiting at ``stage`` — the queue-drain primitive.

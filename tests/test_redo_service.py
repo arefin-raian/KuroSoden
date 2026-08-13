@@ -105,7 +105,10 @@ async def test_detect_state_published(session, sessionmaker):
     doc = "anilist:900"
     await _create_request(session, code="REQ-900", anime_doc_id=doc,
                           status="published")
-    await _mk_channel_bot(session, anime_doc_id=doc)
+    bot = await _mk_channel_bot(session, anime_doc_id=doc)
+    # A live card message — the durable "posts exist" signal.
+    await _mk_layout(session, bot_id=bot.id, kind="season_card", seq=0,
+                     tg_message_id=55, anilist_id=900)
 
     plan = await RedoService(_container(sessionmaker)).detect_state(doc)
     assert plan.state is RedoState.PUBLISHED
@@ -127,6 +130,42 @@ async def test_detect_state_published_via_channel_post(session, sessionmaker):
 
     plan = await RedoService(_container(sessionmaker)).detect_state(doc)
     assert plan.state is RedoState.PUBLISHED
+
+
+async def test_detect_state_channel_without_posts(session, sessionmaker):
+    """The channel anchor exists but its cards are gone (posts deleted) → the
+    redo must recreate the distribution via Senku, not relink into thin air."""
+    from kurosoden.shared.redo_service import RedoState, RedoService
+
+    doc = "anilist:903"
+    await _create_request(session, code="REQ-903", anime_doc_id=doc,
+                          status="published")
+    bot = await _mk_channel_bot(session, anime_doc_id=doc)
+    # A layout row WITHOUT tg_message_id means the card never landed — still no
+    # posts to relink into.
+    await _mk_layout(session, bot_id=bot.id, kind="season_card", seq=0,
+                     tg_message_id=None, anilist_id=903)
+
+    plan = await RedoService(_container(sessionmaker)).detect_state(doc)
+    assert plan.state is RedoState.CHANNEL_WITHOUT_POSTS
+    assert plan.keep_channel is False
+    assert plan.recreate_distribution is True
+
+
+async def test_detect_state_channel_with_posts_is_published(session, sessionmaker):
+    """A channel with live card messages is PUBLISHED — relink in place."""
+    from kurosoden.shared.redo_service import RedoState, RedoService
+
+    doc = "anilist:904"
+    await _create_request(session, code="REQ-904", anime_doc_id=doc,
+                          status="published")
+    bot = await _mk_channel_bot(session, anime_doc_id=doc)
+    await _mk_layout(session, bot_id=bot.id, kind="season_card", seq=0,
+                     tg_message_id=55, anilist_id=904)
+
+    plan = await RedoService(_container(sessionmaker)).detect_state(doc)
+    assert plan.state is RedoState.PUBLISHED
+    assert plan.keep_channel is True
 
 
 async def test_detect_state_in_progress(session, sessionmaker):
@@ -255,6 +294,48 @@ async def test_submit_absent_marks_redo_only(session, sessionmaker, tmp_path,
         assert "redo_relink" not in req.franchise_data
 
 
+async def test_submit_channel_without_posts_skips_relink(
+    session, sessionmaker, tmp_path, monkeypatch,
+):
+    """Posts deleted → the re-queued work must NOT carry ``redo_relink``; it
+    goes through the normal Senku distribution flow to rebuild the channel."""
+    from nekofetch.infrastructure.repositories import request_repo
+    from kurosoden.shared import admin_assignment as aa
+    from kurosoden.shared.redo_service import RedoService
+
+    _seq = [2500]
+
+    async def _fake_next_seq(self):
+        _seq[0] += 1
+        return _seq[0]
+
+    async def _fake_assign(self, code, stage):
+        return SimpleNamespace(admin_telegram_id=1, status="assigned")
+
+    monkeypatch.setattr(request_repo.RequestRepository, "next_sequence",
+                        _fake_next_seq)
+    monkeypatch.setattr(aa.AdminAssignmentEngine, "assign", _fake_assign)
+
+    doc = "anilist:925"
+    await _create_request(session, code="REQ-925", anime_doc_id=doc,
+                          status="published")
+    await _mk_channel_bot(session, anime_doc_id=doc)
+
+    svc = RedoService(_container(sessionmaker, tmp_path))
+    plan = await svc.submit(42, "Husk Title", doc, {"anilist_id": 925})
+
+    assert plan.recreate_distribution is True
+    assert plan.keep_channel is False
+    async with sessionmaker() as s:
+        req = (await s.execute(select(Request).where(
+            Request.anime_doc_id == doc,
+            Request.status == RequestStatus.QUEUED))).scalars().first()
+        assert req is not None
+        assert req.franchise_data.get("redo") is True
+        assert "redo_relink" not in req.franchise_data
+        assert req.franchise_data.get("redo_anime_doc_id") is None
+
+
 async def test_submit_published_marks_redo_relink(session, sessionmaker, tmp_path,
                                                   monkeypatch):
     from nekofetch.infrastructure.repositories import request_repo
@@ -277,7 +358,9 @@ async def test_submit_published_marks_redo_relink(session, sessionmaker, tmp_pat
     doc = "anilist:921"
     await _create_request(session, code="REQ-921", anime_doc_id=doc,
                           status="published")
-    await _mk_channel_bot(session, anime_doc_id=doc)
+    bot = await _mk_channel_bot(session, anime_doc_id=doc)
+    await _mk_layout(session, bot_id=bot.id, kind="season_card", seq=0,
+                     tg_message_id=55, anilist_id=921)
 
     svc = RedoService(_container(sessionmaker, tmp_path))
     plan = await svc.submit(42, "Published Title", doc, {"anilist_id": 921})

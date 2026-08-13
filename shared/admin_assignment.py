@@ -904,21 +904,72 @@ class AdminAssignmentEngine:
                     )
                 )
             ).scalar_one_or_none()
-            if assignment is None:
-                return
-            assignment.status = "completed"
-            assignment.completed_at = datetime.now(UTC)
+            if assignment is not None:
+                assignment.status = "completed"
+                assignment.completed_at = datetime.now(UTC)
 
-            from sqlalchemy import update
+                from sqlalchemy import update
 
-            await session.execute(
-                update(AdminAvailability)
-                .where(AdminAvailability.admin_telegram_id == assignment.admin_telegram_id)
-                .values(total_tasks_completed=AdminAvailability.total_tasks_completed + 1)
-            )
+                await session.execute(
+                    update(AdminAvailability)
+                    .where(AdminAvailability.admin_telegram_id == assignment.admin_telegram_id)
+                    .values(total_tasks_completed=AdminAvailability.total_tasks_completed + 1)
+                )
+
+            # Keep the linked work item (WRK-N) in step with the request's
+            # lifecycle, even when no open assignment row exists (e.g. a
+            # force-published redo whose Gojo row was already completed). This
+            # is what stops an already-processed work from counting as "open"
+            # forever in the queue counts / idle nudges.
+            await self._sync_work_item(session, request_code, stage)
 
             if _session is None:
                 await session.commit()
+
+    async def _sync_work_item(
+        self, session, request_code: str, stage: str,
+    ) -> None:
+        """Advance/complete the ``WorkItem`` linked to a finished stage.
+
+        * ``levi`` done  → work reopens at ``distribute`` (Senku's pool)
+        * ``senku`` done → work reopens at ``publish`` (Gojo's pool)
+        * ``gojo`` done  → work is ``done`` (the whole pipeline finished)
+
+        Best-effort: a missing/optional ``work_items`` table never breaks a
+        stage completion.
+        """
+        try:
+            from kurosoden.shared.work_service import (
+                STAGE_DISTRIBUTE,
+                STAGE_PUBLISH,
+                STATUS_DONE,
+                STATUS_OPEN,
+                WorkItem,
+            )
+
+            w = (
+                await session.execute(
+                    select(WorkItem).where(WorkItem.request_code == request_code)
+                )
+            ).scalar_one_or_none()
+            if w is None:
+                return
+            if stage == "levi":
+                w.stage, w.status = STAGE_DISTRIBUTE, STATUS_OPEN
+                w.assigned_admin_id = None
+            elif stage == "senku":
+                w.stage, w.status = STAGE_PUBLISH, STATUS_OPEN
+                w.assigned_admin_id = None
+            elif stage == "gojo":
+                w.status = STATUS_DONE
+                w.assigned_admin_id = None
+        except Exception as exc:  # noqa: BLE001 — bookkeeping must never fail a stage
+            from nekofetch.core.logging import get_logger
+
+            get_logger(__name__).debug(
+                "assignment.work_item_sync_failed",
+                request=request_code, stage=stage, error=str(exc)[:200],
+            )
 
     async def get_active_tasks(
         self, admin_telegram_id: int, *, stage: str | None = None, _session=None

@@ -558,6 +558,21 @@ def register(client: Client, container: Container) -> None:
                 except Exception as exc:  # noqa: BLE001 — recovery sweep still catches it
                     log.warning("lelouch.batch.assign_failed",
                                 code=code, error=str(exc)[:200])
+
+            # Link each work item to its bridged request so the pipeline keeps
+            # the work's stage/status in step as the request advances (see
+            # AdminAssignmentEngine.complete_task). ``created`` and ``codes`` stay
+            # aligned because both skip blank titles the same way. Best-effort —
+            # Levi's board and the lazy bridge (shared/work_bridge.py) cover any
+            # leftover unlinked work.
+            try:
+                wsvc = WorkService(container.pg_sessionmaker)
+                for w_code, r_code in zip(
+                    [w.code for w in created], codes,
+                ):
+                    await wsvc.link(w_code, r_code)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("lelouch.batch.link_failed", error=str(exc)[:200])
         except Exception as exc:  # noqa: BLE001 — batch still shows success; the recovery sweep picks up unassigned items
             log.error("lelouch.batch.bridge_failed", error=str(exc)[:300])
 

@@ -848,9 +848,17 @@ class RequestService:
                 pass
         try:
             from kurosoden.shared.work_service import WorkItem
+            # Work items key the anime by ``anime_doc_id`` (redo-created) OR by
+            # the bridged request code (batch-created works carry no doc id), so
+            # a full wipe must clear both or a batched work would outlive its
+            # request and phantom-count as open forever.
             await session.execute(
                 delete(WorkItem).where(WorkItem.anime_doc_id == anime_doc_id)
             )
+            if codes:
+                await session.execute(
+                    delete(WorkItem).where(WorkItem.request_code.in_(codes))
+                )
         except Exception:  # noqa: BLE001 — work_items optional
             pass
 

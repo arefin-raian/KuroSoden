@@ -20,7 +20,7 @@ async def test_recovery_helper_is_dry_run_without_writing(sessionmaker):
             session,
             code="REQ-VANITAS-DRY",
             user_id=user.id,
-            anime_title="The Case Study of Vanitas",
+            anime_title="The Case Study of Vanitas (Dry Run)",
             anime_doc_id="anilist:48580",
             status="published",
         )
@@ -58,7 +58,7 @@ async def test_recovery_helper_creates_one_open_task_idempotently(sessionmaker):
             session,
             code="REQ-VANITAS-APPLY",
             user_id=user.id,
-            anime_title="The Case Study of Vanitas",
+            anime_title="The Case Study of Vanitas (Apply)",
             anime_doc_id="anilist:48580",
             status="published",
         )
@@ -108,9 +108,10 @@ async def test_title_lookup_prefers_case_insensitive_exact_match(sessionmaker):
             session,
             code="REQ-VANITAS-LOOKUP",
             user_id=user.id,
-            anime_title="The Case Study of Vanitas",
+            anime_title="The Case Study of Vanitas: Lookup Only",
             status="published",
         )
-        rows, kind = await _find_requests(session, "the case study of vanitas")
+        rows, kind = await _find_requests(
+            session, "the case study of vanitas: lookup only")
         assert kind == "exact"
         assert [row.code for row in rows] == ["REQ-VANITAS-LOOKUP"]

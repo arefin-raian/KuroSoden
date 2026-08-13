@@ -38,12 +38,21 @@ _RES_ORDER = {"360p": 360, "480p": 480, "540p": 540, "720p": 720, "1080p": 1080}
 
 
 def is_stale_message_error(exc: Exception) -> bool:
-    """Return whether Telegram rejected a stored id that should be re-posted."""
+    """Return whether Telegram rejected a stored id that should be re-posted.
+
+    Matches both the canonical Pyrogram snake-case names (``MESSAGE_ID_INVALID``)
+    and space-normalized forms (``message not found``) — an error that gets
+    wrapped or reformatted on its way up must still be recognised as stale.
+    """
     error = str(exc).upper()
-    return any(token in error for token in (
+    tokens = (
         "MESSAGE_ID_INVALID", "MESSAGE_NOT_FOUND",
         "MESSAGE_ID_NOT_FOUND", "MESSAGE_EMPTY",
-    ))
+    )
+    if any(token in error for token in tokens):
+        return True
+    normalized = error.replace("_", " ")
+    return any(token.replace("_", " ") in normalized for token in tokens)
 
 
 def _avg_score_pct(scores: list[float]) -> str:

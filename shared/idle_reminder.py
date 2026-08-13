@@ -33,7 +33,13 @@ _COOLDOWN_KEY = "kurosoden:idle_nudge:{admin_id}"
 
 
 async def _pending_work(container: Any) -> int:
-    """Requests awaiting a source + open work items — the "is there work?" signal."""
+    """Requests awaiting a source + open work items — the "is there work?" signal.
+
+    Only *download-stage* work items count: a work whose request already moved
+    past Levi is in Senku/Gojo's pool and is not download detail, so it must not
+    rouse a downloader. Links are reconciled first so a work whose request is
+    in flight stops phantom-counting here (the "works left but the board is
+    empty" complaint)."""
     total = 0
     try:
         from nekofetch.services.request_service import RequestService
@@ -41,8 +47,13 @@ async def _pending_work(container: Any) -> int:
     except Exception:  # noqa: BLE001
         pass
     try:
-        from kurosoden.shared.work_service import WorkService
-        total += await WorkService(container.pg_sessionmaker).count_open()
+        from kurosoden.shared.work_service import STAGE_DOWNLOAD, WorkService
+        svc = WorkService(container.pg_sessionmaker)
+        try:
+            await svc.reconcile_links()
+        except Exception:  # noqa: BLE001 — counting must survive bookkeeping hiccups
+            pass
+        total += await svc.count_open(stage=STAGE_DOWNLOAD)
     except Exception:  # noqa: BLE001
         pass
     return total

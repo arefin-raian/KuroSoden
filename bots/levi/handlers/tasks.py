@@ -206,6 +206,7 @@ def register(client: Client, container: Container) -> None:
                             old_msg: Message | None = None) -> None:
         """Build and send the assigned-tasks screen with one Open button per task."""
         from kurosoden.shared.admin_assignment import AdminAssignmentEngine
+        from kurosoden.shared.work_service import STAGE_DOWNLOAD, WorkService
         from nekofetch.infrastructure.database.postgres.session import session_scope
         from nekofetch.infrastructure.repositories.request_repo import RequestRepository
 
@@ -213,7 +214,20 @@ def register(client: Client, container: Container) -> None:
         active = await engine.get_active_tasks(admin_id, stage="levi")
         offers = await engine.get_pending_offers(admin_id, stage="levi")
 
-        if not active and not offers:
+        # The work line is the shared download queue: works added via Lelouch's
+        # batch (or a redo) that haven't been claimed yet. Reconcile links first
+        # so a work whose request already moved past download stops showing here.
+        wsvc = WorkService(container.pg_sessionmaker)
+        try:
+            await wsvc.reconcile_links()
+        except Exception:  # noqa: BLE001 — the board must never blank on bookkeeping
+            pass
+        try:
+            works = await wsvc.list_open(stage=STAGE_DOWNLOAD, limit=10)
+        except Exception:  # noqa: BLE001 - works table optional/absent
+            works = []
+
+        if not active and not offers and not works:
             screen = Screen(
                 caption=(
                     "<b>⚔️ No download tasks right now.</b>\n\n"
@@ -255,6 +269,17 @@ def register(client: Client, container: Container) -> None:
             lines.append(f"{icon}  <b>{title}</b>  ·  <code>{a.request_code}</code>")
             rows.append((f"▶️ Open · {title[:28]}",
                          cb("levi", "task", a.request_code)))
+        if works:
+            if active:
+                lines.append("")
+            lines.append("<b>Work line</b>")
+            for w in works:
+                icon = "🛠️" if w.status == "open" else "🔨"
+                lines.append(
+                    f"{icon}  <b>{w.anime_title}</b>  ·  <code>{w.code}</code>"
+                )
+                rows.append((f"▶️ Open · {w.anime_title[:28]}",
+                             cb("levi", "task", w.code)))
 
         lines += ["", "<i>Tap a task to pick a source and begin.</i>"]
         # One Open button per row, then a Back control.
@@ -546,6 +571,21 @@ def register(client: Client, container: Container) -> None:
             await q.answer()
             return
         code = (q.data or "").split("|", 2)[2]
+        # A work item (WRK-N) from the shared work line may not have a bridged
+        # request yet (legacy item, or a bridge that failed silently). Resolve
+        # it lazily — reuse the anime's live request when one exists, otherwise
+        # create the bridge — so the review/download flow always gets a REQ.
+        if code.startswith("WRK-"):
+            from kurosoden.shared.work_bridge import ensure_work_request
+
+            req = await ensure_work_request(container, code, q.from_user.id)
+            if req is None:
+                await q.answer("Work item not found.", show_alert=True)
+                await _render_tasks(
+                    q.message.chat.id, q.from_user.id, old_msg=q.message,
+                )
+                return
+            code = req.code
         offered = await _has_pending_offer(q.from_user.id, code)
         await q.answer()
         await _render_detail(q.message.chat.id, code, old_msg=q.message, offered=offered)

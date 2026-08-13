@@ -11,6 +11,10 @@ The behaviour is **stage-aware** (see :meth:`RedoService.detect_state`):
   storage packs + files + jobs, re-run, and RELINK the fresh packs' quality
   buttons into the existing season cards in place (``franchise_data["redo_relink"]``
   → :meth:`SenkuPublisher.relink_packs_in_place` at publish time).
+* ``CHANNEL_WITHOUT_POSTS`` — the channel anchor remains but its posts are gone.
+  Relinking would edit messages that no longer exist, so the redo full-wipes and
+  re-queues WITHOUT ``redo_relink``: the normal Senku distribution request
+  rebuilds the channel content from scratch.
 * ``IN_PROGRESS_PREPUBLISH`` — mid-download / encode / thumbnail, no channel yet.
   Terminate the in-flight job, FULL wipe, notify whoever was on it, re-run fresh.
 * ``ABSENT`` — nothing on record; behaves like a fresh work item.
@@ -36,6 +40,7 @@ class RedoState(str, Enum):
     """Where the target anime sits in the pipeline — decides the redo strategy."""
 
     PUBLISHED = "published"                     # channel + posts exist → relink in place
+    CHANNEL_WITHOUT_POSTS = "channel_without_posts"  # channel exists, posts gone → rebuild via Senku
     IN_PROGRESS_PREPUBLISH = "in_progress"      # mid-pipeline, no channel → full wipe
     ABSENT = "absent"                           # nothing on record → fresh work
 
@@ -55,8 +60,17 @@ class RedoPlan:
 
     @property
     def keep_channel(self) -> bool:
-        """Published redo keeps the channel + posts; everything else full-wipes."""
+        """Published redo keeps the channel + posts; everything else full-wipes.
+
+        ``CHANNEL_WITHOUT_POSTS`` full-wipes too: the channel's posts are gone,
+        so the durable rows are stale and the pipeline must rebuild the
+        distribution from a clean slate (a fresh Senku distribution request)."""
         return self.state is RedoState.PUBLISHED
+
+    @property
+    def recreate_distribution(self) -> bool:
+        """True when the redo must rebuild the distribution posts through Senku."""
+        return self.state is RedoState.CHANNEL_WITHOUT_POSTS
 
 
 @dataclass(slots=True)
@@ -131,20 +145,33 @@ class RedoService:
             post = (await session.execute(
                 select(ChannelPost).where(ChannelPost.anime_doc_id == anime_doc_id)
             )).scalar_one_or_none()
-            published = bool(
-                (bot is not None and bot.chat_id)
-                or (post is not None and post.main_message_id)
-            )
+            # "Posts exist" is decided by the durable card layout: the channel
+            # anchor alone is not enough, because an admin may have deleted the
+            # channel's content — in that case the redo must REBUILD the
+            # distribution via Senku instead of relinking into missing posts.
+            cards_exist = False
             if bot is not None:
                 rows = (await session.execute(
-                    select(ChannelLayout.anilist_id).where(
+                    select(ChannelLayout).where(
                         ChannelLayout.channel_bot_id == bot.id,
                         ChannelLayout.anilist_id.is_not(None),
                     )
                 )).scalars().all()
-                published_ids = sorted({int(a) for a in rows if a is not None})
+                published_ids = sorted({
+                    int(r.anilist_id) for r in rows if r.anilist_id is not None
+                })
+                cards_exist = any(r.tg_message_id is not None for r in rows)
+            channel_exists = bot is not None and bool(bot.chat_id)
 
-        if published:
+        if channel_exists and cards_exist:
+            state = RedoState.PUBLISHED
+        elif channel_exists:
+            # Channel anchor remains but its cards are gone → recreate the
+            # distribution posts through the normal Senku flow.
+            state = RedoState.CHANNEL_WITHOUT_POSTS
+        elif post is not None and post.main_message_id:
+            # Main-channel post live but no distribution channel — keep it and
+            # let the relink no-op (legacy edge, unchanged behaviour).
             state = RedoState.PUBLISHED
         elif codes or running:
             state = RedoState.IN_PROGRESS_PREPUBLISH
@@ -263,7 +290,7 @@ class RedoService:
             from kurosoden.shared.work_service import WorkService
             from types import SimpleNamespace
 
-            await WorkService(self._c.pg_sessionmaker).add_batch(
+            created_works = await WorkService(self._c.pg_sessionmaker).add_batch(
                 owner_id,
                 [{"anime_title": title, "anime_doc_id": anime_doc_id,
                   "franchise_data": franchise_data}],
@@ -295,6 +322,19 @@ class RedoService:
                 )
                 await repo.add(req)
                 await session.flush()
+
+            # Link the work item to its bridged request so the pipeline advances
+            # the WRK row in step with this request (AdminAssignmentEngine
+            # .complete_task), and the queue counts stop treating an in-flight
+            # work as "open at download".
+            if created_works:
+                try:
+                    await WorkService(self._c.pg_sessionmaker).link(
+                        created_works[0].code, code,
+                    )
+                except Exception as exc:  # noqa: BLE001 — board visibility is unaffected
+                    log.warning("redo.work_link_failed", code=code,
+                                error=str(exc)[:200])
 
             try:
                 result = await AdminAssignmentEngine(
