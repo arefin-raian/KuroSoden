@@ -14,18 +14,26 @@ from nekofetch.core.container import Container
 
 def register_all(client: Client, container: Container) -> None:
     from nekofetch.bots.middleware import install_auth_middleware
-    from nekofetch.bots.admin.handlers import thumbnail_edit
     from kurosoden.bots.senku.handlers.tasks import register as register_tasks
     from kurosoden.bots.senku.handlers.wizard import register as register_wizard
     from kurosoden.shared.settings_ui import register_settings
 
     install_auth_middleware(client, container, staff_only_bot="senku")
-    # Reuse the durable editor on Senku as the staff-facing /edit_thumbnail
-    # command. Its callbacks/state are namespace-isolated from the wizard and its
-    # gate now uses the shared staff role.
-    thumbnail_edit.register(client, container)
-    # Staff-facing post-caption editor: pick a published channel, pick a post,
-    # send the replacement caption — live message + DB rows are both updated.
+    # Senku-native thumbnail editor (recurring artwork/voice, franchise list with
+    # pagination, single/multi + main/distribution routing, 13 editable fields,
+    # and an isolated regenerate picker). Replaces the plain admin editor on the
+    # Senku surface; the admin bot keeps its own thumbnail_edit registration.
+    from kurosoden.bots.senku.handlers.thumbnail_edit_senku import (
+        register as register_thumbnail_edit,
+    )
+    from kurosoden.bots.senku.handlers.thumbnail_regen import (
+        register as register_thumbnail_regen,
+    )
+
+    register_thumbnail_edit(client, container)
+    register_thumbnail_regen(client, container)
+    # Staff-facing post editor: paste a post link, then edit its caption or
+    # buttons — live message + DB rows are both updated.
     from kurosoden.bots.senku.handlers.post_caption_edit import register as register_caption_edit
 
     register_caption_edit(client, container)

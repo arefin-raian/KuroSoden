@@ -395,6 +395,23 @@ class DistributionCache:
             label="dist_cache.entries.overwrite",
         )
 
+    async def set_franchise(self, code: str, franchise: dict) -> None:
+        """Seed the franchise blob directly (no Request lookup).
+
+        ``ensure()`` writes this key off a Request row, but standalone flows —
+        e.g. the Edit-Thumbnail regenerate session, keyed by a synthetic
+        ``THUMBEDIT-<anime_doc_id>`` code — have no Request. They seed the
+        franchise (which MUST carry ``anime_doc_id`` so ``render_entry`` →
+        ``persist_thumbnail_source`` actually writes a row) plus entries via
+        :meth:`set_entries`, then drive the picker without ever calling
+        ``ensure()``.
+        """
+        await safe_redis_set(
+            self._redis, _K_FRANCHISE.format(code=code),
+            json.dumps(franchise), ex=_DEFAULT_TTL,
+            label="dist_cache.franchise.overwrite",
+        )
+
     async def set_channel(self, code: str, *, handle: str, chat_id: int | None = None) -> None:
         await safe_redis_set(
             self._redis, _K_CHANNEL.format(code=code),

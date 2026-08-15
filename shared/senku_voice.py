@@ -329,6 +329,106 @@ BTN_POSTEDIT_CAPTION = "📝 Edit caption"
 BTN_POSTEDIT_BUTTONS = "🔘 Replace buttons"
 
 
+# ── Edit Thumbnail (Senku-native thumbnail editor) ───────────────────────────
+
+def editthumb_intro() -> str:
+    return (
+        f"{ICON} <b>Edit a thumbnail</b>\n\n"
+        "Pick the anime whose card you want to change. Every title I've stored is "
+        "here — tap one to edit its values (synopsis, rating, genres, artwork) or "
+        "regenerate it from scratch."
+    )
+
+
+def editthumb_empty() -> str:
+    return (
+        f"{ICON} <b>Nothing to edit yet.</b>\n\n"
+        "No anime have been stored, so there are no thumbnails to work on."
+    )
+
+
+def editthumb_choose_surface(title: str) -> str:
+    return (
+        f"{ICON} <b>{esc(title)}</b>\n\n"
+        "This franchise has several entries. Which thumbnail do you want to edit?\n\n"
+        "• <b>Main-channel post</b> — the single card on the main channel "
+        "(franchise synopsis, averaged rating).\n"
+        "• <b>Distribution entries</b> — the per-season / per-extra cards in the "
+        "distribution channel."
+    )
+
+
+def editthumb_entry_list(title: str) -> str:
+    return (
+        f"{ICON} <b>{esc(title)} — entries</b>\n\n"
+        "Pick the entry to edit, or send a channel post link to jump straight to one."
+    )
+
+
+def editthumb_not_saved(label: str) -> str:
+    return (
+        f"{ICON} <b>{esc(label)} — not saved yet</b>\n\n"
+        "This card was made before I started storing thumbnail values, so there's "
+        "nothing to edit. <b>Regenerate</b> it first — pick a logo, poster and "
+        "backdrop — and then every value becomes editable."
+    )
+
+
+def editthumb_edit_menu(label: str, fields: dict) -> str:
+    """The edit page: show the current values, then a button per field."""
+    def _line(name: str, value) -> str:
+        shown = str(value).strip() if value not in (None, "") else "—"
+        if len(shown) > 60:
+            shown = shown[:59].rstrip() + "…"
+        return f"• <b>{name}</b>: {esc(shown)}"
+
+    rows = [
+        _line("Synopsis", fields.get("synopsis")),
+        _line("TMDB rating", fields.get("tmdb_rating")),
+        _line("AniList score", fields.get("anilist_score")),
+        _line("Genres", ", ".join(fields.get("genres") or [])
+              if isinstance(fields.get("genres"), (list, tuple)) else fields.get("genres")),
+        _line("Studio", fields.get("studio")),
+        _line("Language", fields.get("language")),
+    ]
+    return (
+        f"{ICON} <b>{esc(label)}</b>\n\n"
+        + "\n".join(rows)
+        + "\n\nTap a value to change it. I'll re-render the card and update the "
+        "live post right away."
+    )
+
+
+def editthumb_ask_value(field_label: str) -> str:
+    return (
+        f"{ICON} <b>New {esc(field_label)}</b>\n\n"
+        "Send the new value. For <b>genres</b>, separate them with commas. Reply "
+        "/cancel to keep the current one."
+    )
+
+
+def editthumb_ask_link(title: str) -> str:
+    return (
+        f"{ICON} <b>{esc(title)} — send a post link</b>\n\n"
+        "Paste the link of the distribution-channel post you want to edit. I'll "
+        "confirm it belongs to this franchise's channel, then open its editor."
+    )
+
+
+def editthumb_synopsis_trimmed(shown: str) -> str:
+    return (
+        f"{ICON} That synopsis was longer than the card's space, so I trimmed it to "
+        f"fit:\n\n<i>{esc(shown)}</i>"
+    )
+
+
+BTN_EDITTHUMB_MAIN = "🏠 Main-channel post"
+BTN_EDITTHUMB_DIST = "📺 Distribution entries"
+BTN_EDITTHUMB_REGEN = "🔄 Regenerate"
+BTN_EDITTHUMB_PROVIDE_LINK = "🔗 Provide link"
+BTN_EDITTHUMB_BACK = "⇐ Back"
+
+
 def channel_setup_progress(steps: list[tuple[str, str]]) -> str:
     """A small progress card for the bot-driven finalisation (title, desc, etc.).
 

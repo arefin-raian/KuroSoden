@@ -83,6 +83,14 @@ def build_senku(container: Container, token: str) -> Client:
         arg = parts[2] if len(parts) > 2 else ""
         bot = "senku"
 
+        # Delegated sub-namespaces own their own dedicated handlers in LATER
+        # handler groups (post editor = group 2, thumbnail editor/regen = group
+        # 3). Groups all fire, so without this guard the group-0 fallback would
+        # ALSO answer these callbacks with the "not wired yet" alert before the
+        # real handler runs. Yield silently and let the dedicated handler reply.
+        if action in ("postedit", "thumbedit", "thumbregen"):
+            return
+
         # ¬¬ Home ¬¬
         if action == "home":
             caption = (
@@ -122,13 +130,15 @@ def build_senku(container: Container, token: str) -> Client:
 
         # ¬¬ Tool panels ¬¬
         if action == "edit_thumbnail":
-            from nekofetch.bots.admin.handlers.thumbnail_edit import show_editor
+            from kurosoden.bots.senku.handlers.thumbnail_edit_senku import (
+                _show_franchises,
+            )
             from kurosoden.shared.access_gate import is_staff
             if not is_staff(q):
                 await q.answer("Staff access required.", show_alert=True)
                 return
-            await show_editor(client, container, q.message)
             await q.answer()
+            await _show_franchises(client, container, q, 0, old_msg=q.message)
             return
 
         if action == "edit_post":
