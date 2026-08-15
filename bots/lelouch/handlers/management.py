@@ -24,14 +24,17 @@ Reassignment lives on Levi/Senku/Gojo's task cards (they know the stuck code);
 
 from __future__ import annotations
 
+import re
+
 from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery
 
 from nekofetch.core.container import Container
 from nekofetch.domain.enums import Role
+from nekofetch.bots.fsm import FSM
 from nekofetch.ui.artwork import pick_artwork
 from nekofetch.ui.components import cb
-from nekofetch.ui.screens import Message, card, send_screen
+from nekofetch.ui.screens import Message, card, message_ref, send_screen
 
 from kurosoden.shared import lelouch_voice as V
 from kurosoden.shared.management_service import STAGES, ManagementService
@@ -168,6 +171,7 @@ async def _render_detail(client: Client, container: Container, chat_id: int,
 
 def register(client: Client, container: Container) -> None:
     """Wire the management control plane onto the Pyrogram client."""
+    fsm = FSM(container.redis, bot="lelouch_muster")
 
     async def _guard(q: CallbackQuery) -> bool:
         if q.message is None:
@@ -208,17 +212,22 @@ def register(client: Client, container: Container) -> None:
         candidates = [a for a in env_admins if a not in existing]
         if not candidates:
             caption = (
-                f"{V.ICON} <b>All hands accounted for.</b>\n\n"
-                "Every configured admin is already in the pool. Add more IDs to "
-                "<code>ADMIN_IDS</code> to expand the ranks.\n\n"
-                "<i>A commander works with the army he has.</i>"
+                f"{V.ICON} <b>Muster a rank</b>\n\n"
+                "Every admin already configured in <code>ADMIN_IDS</code> is in the "
+                "pool. To bring in someone new, tap <b>Enter an ID</b> and send "
+                "their Telegram numeric ID — I'll add them to the roster.\n\n"
+                "<i>A commander recruits when the ranks run thin.</i>"
             )
-            rows = [[(V.BTN_BACK_MANAGE, cb("mg", "roster"))]]
+            rows = [
+                [("⌨️ Enter an ID", cb("mg", "addask"))],
+                [(V.BTN_BACK_MANAGE, cb("mg", "roster"))],
+            ]
         else:
             caption = (
                 f"{V.ICON} <b>Muster a rank</b>\n\n"
                 "These configured admins aren't in the pool yet. Tap one to bring "
-                "them in — they'll cover no stages until you assign them.\n\n"
+                "them in — or tap <b>Enter an ID</b> to add someone new by their "
+                "Telegram numeric ID.\n\n"
                 "<i>Choose who fights, and where.</i>"
             )
             # Show each candidate by NAME, not raw id — everyone has a name, not
@@ -233,6 +242,7 @@ def register(client: Client, container: Container) -> None:
                 except Exception:  # noqa: BLE001 — fall back to id if unreachable
                     pass
                 rows.append([(f"➕ {V.esc(label)[:28]}", cb("mg", "addid", aid))])
+            rows.append([("⌨️ Enter an ID", cb("mg", "addask"))])
             rows.append([(V.BTN_BACK_MANAGE, cb("mg", "roster"))])
         await send_screen(client, q.message.chat.id,
                           card(caption, image=_art(), bot_name=BOT, buttons=rows),
@@ -253,6 +263,71 @@ def register(client: Client, container: Container) -> None:
         await _svc(container).ensure_admin(admin_id, name=name)
         await q.answer("Mustered.")
         await _render_detail(client, container, q.message.chat.id, admin_id, q.message)
+
+    # ── Muster by typed ID ────────────────────────────────────────────────────
+    @client.on_callback_query(filters.regex(r"^mg\|addask$"))
+    async def _addask(_: Client, q: CallbackQuery) -> None:
+        if not await _guard(q):
+            return
+        await q.answer()
+        caption = (
+            f"{V.ICON} <b>Enter a Telegram ID</b>\n\n"
+            "Send the numeric Telegram ID of the person to add to the admin pool. "
+            "They'll cover no stages until you assign them.\n\n"
+            "<i>Tip: forward one of their messages to @userinfobot to find the ID.</i>"
+        )
+        prompt = await send_screen(
+            client, q.message.chat.id,
+            card(caption, image=_art(), bot_name=BOT,
+                 buttons=[[("✗ Cancel", cb("mg", "roster"))]]),
+            old_msg=q.message,
+        )
+        await fsm.set(q.from_user.id, "muster:await_id",
+                      prompt_msg_id=prompt.id, prompt_chat_id=prompt.chat.id)
+
+    @client.on_message(filters.text & filters.private, group=4)
+    async def _addid_text(_: Client, message: Message) -> None:
+        if not message.from_user:
+            return
+        state, data = await fsm.get(message.from_user.id)
+        if state != "muster:await_id":
+            return
+        if not _staff(message):
+            return
+        raw = (message.text or "").strip()
+        prompt = message_ref(client, data.get("prompt_chat_id") or message.chat.id,
+                             data.get("prompt_msg_id"))
+        # One card, always updated: drop the typed ID, then evolve the prompt.
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        # Accept a bare id, or a "tg://user?id=" / "@username" the owner pasted.
+        digits = re.sub(r"[^0-9]", "", raw)
+        if not digits or (raw.startswith("@")):
+            await send_screen(
+                client, message.chat.id,
+                card(f"{V.ICON} <b>That's not a numeric ID.</b>\n\nSend the person's "
+                     "Telegram <b>numeric</b> ID (digits only). @usernames can't be "
+                     "resolved to an id reliably — use @userinfobot to get the number.",
+                     image=_art(), bot_name=BOT,
+                     buttons=[[("⌨️ Try again", cb("mg", "addask"))],
+                              [(V.BTN_BACK_MANAGE, cb("mg", "roster"))]]),
+                old_msg=prompt,
+            )
+            return
+        admin_id = int(digits)
+        name = None
+        try:
+            u = await client.get_users(admin_id)
+            name = (u.first_name or "") or (u.username or None)
+        except Exception:  # noqa: BLE001 — unreachable id still gets added by number
+            pass
+        await _svc(container).ensure_admin(admin_id, name=name)
+        await fsm.clear(message.from_user.id)
+        # Land on the new admin's detail card, replacing the prompt in place.
+        await _render_detail(client, container, message.chat.id, admin_id,
+                             prompt)
 
     @client.on_callback_query(filters.regex(r"^mg\|rm\|"))
     async def _remove(_: Client, q: CallbackQuery) -> None:

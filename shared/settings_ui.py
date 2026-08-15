@@ -49,7 +49,7 @@ from nekofetch.services.auth_service import AuthService
 from nekofetch.services.settings_service import SettingsService
 from nekofetch.ui.artwork import pick_artwork
 from nekofetch.ui.components import cb, edit_markup, keyboard
-from nekofetch.ui.screens import Screen, send_screen
+from nekofetch.ui.screens import Screen, message_ref, send_screen
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Input parsing — accept Telegram-native styling, HTML, or Markdown
@@ -716,9 +716,14 @@ def register_settings(
         await fsm.set(q.from_user.id, state_edit, section=section, field=field,
                       widget=widget)
         await q.answer()
-        await send_screen(client, q.message.chat.id,
+        prompt = await send_screen(client, q.message.chat.id,
                           field_screen(bot, section, field, current, kind, widget=widget),
                           old_msg=q.message)
+        # Remember the prompt card so the value-capture step evolves THIS card in
+        # place (delete the user's typed value → edit the card) instead of
+        # dropping a fresh confirmation message below it.
+        await fsm.update(q.from_user.id, prompt_msg_id=prompt.id,
+                         prompt_chat_id=prompt.chat.id)
 
     # ── list manager: show entries with per-entry delete + an Add button ───────
     @client.on_callback_query(filters.regex(rf"^{bot}\|set\|list\|"), group=group)
@@ -748,9 +753,11 @@ def register_settings(
         await fsm.set(q.from_user.id, state_edit, section=section, field=field,
                       widget=widget, mode="append")
         await q.answer()
-        await send_screen(client, q.message.chat.id,
+        prompt = await send_screen(client, q.message.chat.id,
                           list_add_screen(bot, section, field, widget=widget),
                           old_msg=q.message)
+        await fsm.update(q.from_user.id, prompt_msg_id=prompt.id,
+                         prompt_chat_id=prompt.chat.id)
 
     # ── list manager: delete ONE entry by index ─────────────────────────────────
     @client.on_callback_query(filters.regex(rf"^{bot}\|set\|ldel\|"), group=group)
@@ -820,9 +827,27 @@ def register_settings(
         section, field = data.get("section"), data.get("field")
         widget = data.get("widget")
         append = data.get("mode") == "append"
+        # The prompt card to evolve in place, and a tidy-up of the user's input.
+        prompt = message_ref(client, data.get("prompt_chat_id") or message.chat.id,
+                             data.get("prompt_msg_id"))
+
+        async def _reply_screen(caption: str, rows):
+            """Replace the prompt card in place with a result card + delete input."""
+            try:
+                await message.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            await send_screen(
+                client, message.chat.id,
+                Screen(caption=caption, image=pick_artwork(bot),
+                       keyboard=keyboard(*rows) if rows else None),
+                old_msg=prompt,
+            )
+
         if is_owner_only(section) and not auth.is_owner(user):
             await fsm.clear(message.from_user.id)
-            await message.reply("That section is owner-only.", parse_mode=ParseMode.HTML)
+            await _reply_screen("That section is owner-only.",
+                                [[("⇐ Back", cb(bot, "set", "sec", section))]])
             return
 
         # Guided widgets: pull the id out of the sticker / forwarded message before
@@ -842,7 +867,13 @@ def register_settings(
             elif message.text:
                 raw = message.text.strip()
         if raw is None and message.text is None:
-            # e.g. a sticker sent to a text field — guide, don't crash.
+            # e.g. a sticker sent to a text field — guide, don't crash. Keep the
+            # edit state alive (don't clear/consume the prompt) so the next send
+            # still lands; just tidy away the mis-typed input.
+            try:
+                await message.delete()
+            except Exception:  # noqa: BLE001
+                pass
             await message.reply(
                 "That doesn't fit this setting. Send it as text, or /cancel.",
                 parse_mode=ParseMode.HTML,
@@ -865,10 +896,11 @@ def register_settings(
             else:
                 value = await svc.set_typed(section, field, raw)
         except (ValueError, KeyError, TypeError):
-            await message.reply(
+            await _reply_screen(
                 "Hmm, that didn't look right for this setting. "
                 "Check the example on the card and try again.",
-                parse_mode=ParseMode.HTML,
+                [[("↻ Try again", cb(bot, "set", "edit", f"{section}.{field}"))],
+                 [("⇐ Back", cb(bot, "set", "sec", section))]],
             )
             return
 
@@ -876,14 +908,11 @@ def register_settings(
             # List manager: confirm the append and drop the operator back on the
             # manager so they can add/remove more without re-navigating.
             shown = ", ".join(map(str, value)) if isinstance(value, list) else str(value)
-            await message.reply(
+            await _reply_screen(
                 f"✅ Added. <b>{field_label(field, section)}</b> is now: "
                 f"<code>{_html.escape(shown)}</code>",
-                reply_markup=keyboard(
-                    [("＋ Add another", cb(bot, "set", "ladd", f"{section}.{field}"))],
-                    [("⇐ Back", cb(bot, "set", "list", f"{section}.{field}"))],
-                ),
-                parse_mode=ParseMode.HTML,
+                [[("＋ Add another", cb(bot, "set", "ladd", f"{section}.{field}"))],
+                 [("⇐ Back", cb(bot, "set", "list", f"{section}.{field}"))]],
             )
             return
 
@@ -894,10 +923,9 @@ def register_settings(
             confirm += ["", "<b>Preview:</b>", f"<blockquote>{render_sample(value)}</blockquote>"]
         else:
             confirm += ["", f"Now set to: <code>{_html.escape(shown)}</code>"]
-        await message.reply(
+        await _reply_screen(
             "\n".join(confirm),
-            reply_markup=keyboard([("⇐ Back", cb(bot, "set", "sec", section))]),
-            parse_mode=ParseMode.HTML,
+            [[("⇐ Back", cb(bot, "set", "sec", section))]],
         )
 
     # ── /settings opens the hub ───────────────────────────────────────────────

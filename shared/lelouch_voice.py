@@ -611,6 +611,12 @@ REDO_ASK_TITLE = (
     "<i>This overrides the usual 'already have it' refusal. Use it deliberately.</i>"
 )
 
+BTN_REDO_CANCEL = "✗ Cancel"
+
+REDO_CANCELLED = (
+    f"{ICON} <b>Stood down.</b> The redo was cancelled — nothing was touched."
+)
+
 REDO_RETRY_TITLE = (
     f"{ICON} <b>Not that one? Name it again.</b>\n\n"
     "Send the title of the series you want redone."

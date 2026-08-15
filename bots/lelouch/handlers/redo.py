@@ -35,11 +35,12 @@ from nekofetch.ui.artwork import (
     seed_anime_art,
 )
 from nekofetch.ui.components import cb, keyboard, lock_buttons
-from nekofetch.ui.progress import SPINNER, animate_until
+from nekofetch.ui.progress import SPINNER
 from nekofetch.ui.screens import (
     Screen,
     choose_version,
     confirm_franchise,
+    message_ref,
     send_screen,
 )
 
@@ -89,16 +90,25 @@ def register(client: Client, container: Container) -> None:
     fsm = FSM(container.redis, bot="lelouch_redo")
 
     # ── /redo command ──────────────────────────────────────────────────────
+    def _ask_screen() -> Screen:
+        return Screen(
+            caption=V.REDO_ASK_TITLE, image=pick_artwork("lelouch"),
+            keyboard=keyboard([(V.BTN_REDO_CANCEL, cb("redo", "cancel"))]),
+        )
+
+    async def _prompt(chat_id: int, user_id: int, *, old_msg: Message | None) -> None:
+        """Show the 'order a redo' card and remember it so the name-entry step
+        can evolve THIS SAME card in place (delete user text → edit card)."""
+        prompt = await send_screen(client, chat_id, _ask_screen(), old_msg=old_msg)
+        await fsm.set(user_id, STATE_NAME,
+                      prompt_msg_id=prompt.id, prompt_chat_id=prompt.chat.id)
+
     @client.on_message(filters.command("redo") & filters.private)
     async def _redo_cmd(_: Client, message: Message) -> None:
         if not _is_owner(message, container):
             await message.reply(V.OWNER_ONLY, parse_mode=ParseMode.HTML)
             return
-        await fsm.set(message.from_user.id, STATE_NAME)
-        await send_screen(
-            client, message.chat.id,
-            Screen(caption=V.REDO_ASK_TITLE, image=pick_artwork("lelouch")),
-        )
+        await _prompt(message.chat.id, message.from_user.id, old_msg=None)
 
     # ── Callback: redo button from admin panel ────────────────────────────
     @client.on_callback_query(filters.regex(r"^redo\|new"))
@@ -106,13 +116,22 @@ def register(client: Client, container: Container) -> None:
         if not _is_owner(q, container):
             await q.answer(V.OWNER_ONLY, show_alert=True)
             return
-        await fsm.set(q.from_user.id, STATE_NAME)
+        await q.answer()
+        await _prompt(q.message.chat.id, q.from_user.id, old_msg=q.message)
+
+    # ── Callback: cancel the redo ─────────────────────────────────────────
+    @client.on_callback_query(filters.regex(r"^redo\|cancel"))
+    async def _redo_cancel(_: Client, q: CallbackQuery) -> None:
+        if not _is_owner(q, container):
+            await q.answer(V.OWNER_ONLY, show_alert=True)
+            return
+        await fsm.clear(q.from_user.id)
+        await q.answer()
         await send_screen(
             client, q.message.chat.id,
-            Screen(caption=V.REDO_ASK_TITLE, image=pick_artwork("lelouch")),
+            Screen(caption=V.REDO_CANCELLED, image=pick_artwork("lelouch")),
             old_msg=q.message,
         )
-        await q.answer()
 
     # ── Text handler — AniList search (NO dedup guard) ────────────────────
     # group=3 so it runs independently of the request (group 0) and batch
@@ -122,33 +141,55 @@ def register(client: Client, container: Container) -> None:
     async def _text(_: Client, message: Message) -> None:
         if not message.from_user:
             return
-        state, _data = await fsm.get(message.from_user.id)
+        state, data = await fsm.get(message.from_user.id)
         if state in (STATE_NAME, STATE_FRANCHISE):
             if not _is_owner(message, container):
                 return
-            await _search_anilist(message, message.text.strip())
+            query = message.text.strip()
+            # One card, always updated: drop the owner's typed title, then evolve
+            # the existing "Order a redo" prompt card into the confirm card in
+            # place — no separate "searching…" card, nothing orphaned.
+            prompt = message_ref(client, data.get("prompt_chat_id") or message.chat.id,
+                                 data.get("prompt_msg_id"))
+            try:
+                await message.delete()
+            except Exception:  # noqa: BLE001 — best-effort tidy
+                pass
+            await _search_anilist(message, query, prompt=prompt)
 
     # ── AniList search — identical to requests.py but NO dedup ────────────
-    async def _search_anilist(message: Message, query: str) -> None:
+    async def _search_anilist(message: Message, query: str, *, prompt=None) -> None:
         def _frame(f: str) -> str:
             from nekofetch.localization.messages import M, t
             return t(M.SEARCHING, query=_esc_q(query), frame=f)
 
-        msg = await message.reply(_frame(SPINNER[0]), parse_mode=ParseMode.HTML)
+        # Animate the search ON the prompt card (caption edit) when we have it;
+        # otherwise fall back to a fresh status message. Either way the confirm
+        # card replaces this SAME message in place at the end.
+        if prompt is not None:
+            await send_screen(
+                client, message.chat.id,
+                Screen(caption=_frame(SPINNER[0]), image=pick_artwork("lelouch")),
+                old_msg=prompt,
+            )
+            msg = prompt
+        else:
+            msg = await message.reply(_frame(SPINNER[0]), parse_mode=ParseMode.HTML)
 
         # 1. Resolve the title (AniList first)
-        media = await animate_until(msg, container.anilist.search(query), _frame)
+        media = await container.anilist.search(query)
         if media is None:
             from kurosoden.shared.franchise_resolver import resolve_franchise
 
-            franchise_data = await animate_until(
-                msg, resolve_franchise(container, query), _frame
-            )
+            franchise_data = await resolve_franchise(container, query)
             if franchise_data is None:
                 from nekofetch.localization.messages import M, t
-                await msg.edit_text(
-                    t(M.SEARCH_NOT_FOUND, query=_esc_q(query)),
-                    parse_mode=ParseMode.HTML,
+                await send_screen(
+                    client, message.chat.id,
+                    Screen(caption=t(M.SEARCH_NOT_FOUND, query=_esc_q(query)),
+                           image=pick_artwork("lelouch"),
+                           keyboard=keyboard([(V.BTN_REDO_CANCEL, cb("redo", "cancel"))])),
+                    old_msg=msg,
                 )
                 return
             franchise_data["_query"] = query
@@ -156,7 +197,7 @@ def register(client: Client, container: Container) -> None:
                 message.from_user.id, STATE_FRANCHISE, franchise=franchise_data,
             )
             screen = confirm_franchise(franchise_data, namespace="redo")
-            msg = await send_screen(client, message.chat.id, screen, old_msg=msg)
+            await send_screen(client, message.chat.id, screen, old_msg=msg)
             return
 
         # 2. Detect adaptations
@@ -183,7 +224,7 @@ def register(client: Client, container: Container) -> None:
             screen = choose_version(
                 query, versions, namespace="redo_ver", neither_ns="redo",
             )
-            msg = await send_screen(client, message.chat.id, screen, old_msg=msg)
+            await send_screen(client, message.chat.id, screen, old_msg=msg)
             return
 
         # 3. Single match — franchise totals + TMDB
@@ -201,7 +242,7 @@ def register(client: Client, container: Container) -> None:
         screen = confirm_franchise(
             franchise_data, backdrop_path=backdrop_path, namespace="redo",
         )
-        msg = await send_screen(client, message.chat.id, screen, old_msg=msg)
+        await send_screen(client, message.chat.id, screen, old_msg=msg)
 
     # ── Version picker ─────────────────────────────────────────────────────
     @client.on_callback_query(filters.regex(r"^redo_ver_pick\|"))
