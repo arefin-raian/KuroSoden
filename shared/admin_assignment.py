@@ -942,6 +942,7 @@ class AdminAssignmentEngine:
             from kurosoden.shared.work_service import (
                 STAGE_DISTRIBUTE,
                 STAGE_PUBLISH,
+                STATUS_CANCELLED,
                 STATUS_DONE,
                 STATUS_OPEN,
                 WorkItem,
@@ -953,6 +954,12 @@ class AdminAssignmentEngine:
                 )
             ).scalar_one_or_none()
             if w is None:
+                return
+            # Never resurrect a terminal work item. Without this guard a work the
+            # owner cancelled (or one already done) gets flipped back to OPEN the
+            # moment its linked request completes a later stage — the "deleted
+            # WRK rows keep coming back" bug on the Manage board.
+            if w.status in (STATUS_CANCELLED, STATUS_DONE):
                 return
             if stage == "levi":
                 w.stage, w.status = STAGE_DISTRIBUTE, STATUS_OPEN
