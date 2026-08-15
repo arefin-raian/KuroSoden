@@ -24,10 +24,16 @@ class ArtworkPicker:
     def __init__(self, directory: Path = ART_DIR) -> None:
         self.directory = directory
         self._last: Path | None = None
+        self._cache: list[Path] | None = None  # the image pool never changes at runtime
 
     def available(self) -> list[Path]:
-        imgs = sorted(self.directory.glob("art_*.jpg"))
-        return imgs or sorted(self.directory.glob("*.jpg"))
+        # Cache the directory listing: pick() runs on EVERY card render (every
+        # tap), and a fresh glob per render is needless disk I/O on the hot path.
+        # The image pool is static for the life of the process.
+        if self._cache is None:
+            imgs = sorted(self.directory.glob("art_*.jpg"))
+            self._cache = imgs or sorted(self.directory.glob("*.jpg"))
+        return self._cache
 
     def pick(self) -> Path | None:
         imgs = self.available()
