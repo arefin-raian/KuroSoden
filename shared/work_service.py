@@ -280,6 +280,17 @@ class WorkService:
         )).scalar_one_or_none()
         if req is None:
             return None, None
+        # A terminal request (published/rejected/failed) means the pipeline is
+        # over — the work is DONE no matter what the per-stage assignment rows
+        # say. This is essential for the redo-relink path: a redo of a published
+        # title auto-publishes in Levi and SKIPS the Senku/Gojo assignments, so
+        # there's no `gojo=completed` row to detect — without this the work would
+        # stay a phantom open "download" forever (the REQ-1079 stuck-processing
+        # symptom on the Manage board).
+        from nekofetch.domain.enums import RequestStatus as _RS
+        req_status = req.status.value if hasattr(req.status, "value") else str(req.status)
+        if req_status in (_RS.PUBLISHED.value, _RS.REJECTED.value, _RS.FAILED.value):
+            return STAGE_PUBLISH, STATUS_DONE
         rows = (await session.execute(
             select(AdminAssignment.stage, AdminAssignment.status).where(
                 AdminAssignment.request_code == request_code,

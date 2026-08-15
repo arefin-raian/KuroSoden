@@ -299,3 +299,35 @@ class TestRequestLink:
 
         await svc.reconcile_links()
         assert (await svc.get(out[0].code)).request_code is None
+
+    async def test_reconcile_closes_work_when_request_published_no_assignment(
+        self, sessionmaker,
+    ):
+        """A redo-relink of a published title auto-publishes in Levi and SKIPS the
+        Senku/Gojo assignments, so there's no `gojo=completed` row. The linked
+        work must still close (status=done) off the terminal Request.status —
+        otherwise it stays a phantom open 'download' (the REQ-1079 stuck-on-board
+        symptom). Regression for the _stage_from_assignments terminal-status path.
+        """
+        from nekofetch.infrastructure.database.postgres.models import Request
+        from nekofetch.domain.enums import RequestStatus, DownloadScope
+
+        svc = WorkService(sessionmaker)
+        out = await svc.add_batch(1, [{"anime_title": "Relinked",
+                                       "anime_doc_id": "151514"}])
+        await svc.link(out[0].code, "REQ-1079")
+        async with sessionmaker() as s:
+            s.add(Request(code="REQ-1079", user_id=1, anime_doc_id="151514",
+                          anime_title="Relinked", source="",
+                          scope=DownloadScope.ENTIRE_SERIES.value,
+                          status=RequestStatus.PUBLISHED))
+            await s.commit()
+
+        # No AdminAssignment rows at all — mirrors the relink path.
+        await svc.reconcile_links()
+
+        w = await svc.get(out[0].code)
+        assert w.status == STATUS_DONE, "published request must close its work"
+        # And it must no longer appear as open work on the board.
+        assert all(v.code != out[0].code for v in await svc.list_open(limit=200))
+
