@@ -106,7 +106,23 @@ class Container:
 
         log.info("container.startup", db="postgres+mongo+redis")
 
-        self.pg_engine = create_async_engine(self.env.postgres_dsn, pool_pre_ping=True)
+        # Warm, reused pool tuned for a WAN-distant DB (Supabase pooler). Each
+        # ``session_scope`` is a checkout, so keeping connections warm avoids a
+        # TLS re-handshake to the DB region on every query. ``pool_pre_ping`` is
+        # OFF on purpose — it adds a ``SELECT 1`` round-trip before every checkout
+        # (a full extra RTT to the DB region); ``pool_recycle`` reaps stale
+        # connections instead. ``statement_cache_size=0`` is the documented-safe
+        # setting behind a pgbouncer/Supavisor pooler (avoids "prepared statement
+        # already exists" after the pooler rotates a backend); RTT dominates here
+        # so losing prepared-statement reuse is negligible.
+        self.pg_engine = create_async_engine(
+            self.env.postgres_dsn,
+            pool_size=20,
+            max_overflow=10,
+            pool_recycle=1800,
+            pool_pre_ping=False,
+            connect_args={"statement_cache_size": 0},
+        )
         self.pg_sessionmaker = async_sessionmaker(self.pg_engine, expire_on_commit=False)
         if self.env.auto_create_schema:
             await create_all(self.pg_engine)  # dev convenience; Alembic owns prod schema

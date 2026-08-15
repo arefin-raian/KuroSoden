@@ -40,6 +40,34 @@ _LIFECYCLE_KEYS = [
 CAPTION_LIMIT = 1000
 MESSAGE_LIMIT = 4096
 
+# ── Artwork file_id cache ────────────────────────────────────────────────────
+# Sending a card uploads the artwork bytes to Telegram over MTProto EVERY time —
+# a big latency hit on a small pool of recurring images that get reused hundreds
+# of times per run. After the first upload of a given local path / URL we cache
+# the returned ``file_id`` and pass THAT on later sends: Telegram serves the
+# already-hosted photo instantly, no re-upload. Keyed by the exact path/URL
+# string; entries never go stale (a file_id for uploaded media is durable).
+_FILE_ID_CACHE: dict[str, str] = {}
+
+
+def _cached_photo_arg(photo_arg: str | None) -> str | None:
+    """Return a cached ``file_id`` for this asset if we've uploaded it before."""
+    if not photo_arg:
+        return photo_arg
+    return _FILE_ID_CACHE.get(photo_arg, photo_arg)
+
+
+def _remember_file_id(photo_arg: str | None, msg) -> None:
+    """Stash the ``file_id`` Telegram assigned so the next send skips the upload."""
+    if not photo_arg or photo_arg in _FILE_ID_CACHE:
+        return
+    # Don't re-cache a value that already IS a file_id (idempotent).
+    if photo_arg.startswith(("http://", "https://")) or "/" in photo_arg or "\\" in photo_arg:
+        photo = getattr(msg, "photo", None)
+        file_id = getattr(photo, "file_id", None)
+        if file_id:
+            _FILE_ID_CACHE[photo_arg] = file_id
+
 
 @dataclass(slots=True)
 class Screen:
@@ -440,6 +468,31 @@ async def show(
     return await send_screen(client, src_msg.chat.id, screen, old_msg=src_msg)
 
 
+def message_ref(client: Client, chat_id: int, message_id: int | str | None):
+    """A lightweight ``old_msg`` stand-in for a prompt card held only by id.
+
+    Text/media capture handlers usually have the *user's* message, not the prompt
+    ``Message`` they want to update. Store ``prompt_msg_id`` + ``prompt_chat_id``
+    in FSM at arm-time, then pass ``message_ref(client, chat_id, msg_id)`` as
+    ``old_msg`` to :func:`send_screen`, which edits it in place by id (falling
+    back to delete-and-resend via the ``delete`` shim only when editing fails).
+    Returns ``None`` when the id is missing/invalid so callers can send fresh.
+    """
+    if not str(message_id or "").isdigit():
+        return None
+
+    async def _delete() -> None:
+        try:
+            await client.delete_messages(chat_id, int(message_id))
+        except Exception:  # noqa: BLE001 — replacement cleanup is best-effort
+            pass
+
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        id=int(message_id), chat=SimpleNamespace(id=chat_id), delete=_delete,
+    )
+
+
 async def send_screen(
     client: Client,
     chat_id: int,
@@ -494,10 +547,12 @@ async def send_screen(
         # then delete the stale card so we never leave two on screen.
 
     if photo_arg:
+        send_arg = _cached_photo_arg(photo_arg)
         msg = await _send_photo(
-            photo=photo_arg, caption=fitted,
+            photo=send_arg, caption=fitted,
             parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
         )
+        _remember_file_id(photo_arg, msg)
     else:
         msg = await _send_text(
             fitted, parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
@@ -512,61 +567,60 @@ async def send_screen(
 
 
 async def _try_edit_in_place(client, old_msg, screen, photo_arg, fitted):
-    """Edit ``old_msg`` to match ``screen``; return the message or None if impossible.
+    """Edit ``old_msg`` to match ``screen``; return a truthy result or None.
 
-    Returns the edited Message on success (incl. MessageNotModified — the card is
-    already correct), or ``None`` when the edit can't be done and the caller
-    should send a fresh card (message-type change, too old, not ours, etc.).
+    Uses ``client.edit_message_*`` keyed by (chat_id, message_id) so it works
+    whether ``old_msg`` is a real Pyrogram ``Message`` (a live card / q.message)
+    or a lightweight id-only reference (a prompt held across a text-capture hop).
+    Returns the edited message (or the ref) on success — including
+    MessageNotModified, meaning the card already shows this exact content — or
+    ``None`` when an in-place edit is impossible (text↔photo type change, message
+    too old, not ours) so the caller sends a fresh card instead.
     """
     from pyrogram.errors import MessageNotModified
     from pyrogram.types import InputMediaPhoto
 
-    old_has_photo = bool(getattr(old_msg, "photo", None))
+    chat_id = getattr(getattr(old_msg, "chat", None), "id", None)
+    message_id = getattr(old_msg, "id", None)
+    if chat_id is None or message_id is None:
+        return None
+
+    # A card built by card() is always a photo message; a plain-text screen is
+    # not. We can only edit within the same kind. For a real Message we can read
+    # `.photo`; for an id-only ref we assume it matches the screen we're painting
+    # (these refs are only ever created for photo prompt cards).
+    is_ref = not hasattr(old_msg, "edit_media")
+    old_has_photo = True if is_ref else bool(getattr(old_msg, "photo", None))
     want_photo = bool(photo_arg)
-    # Telegram cannot turn a text message into a media message or vice-versa via
-    # edit — those transitions require a fresh send.
     if old_has_photo != want_photo:
         return None
-    try:
+
+    async def _do_edit():
         if want_photo:
-            # Swap the image only when it actually changed; otherwise just edit
-            # the caption (cheaper, and avoids a needless re-upload).
-            old_media = getattr(old_msg, "photo", None)
-            same_image = False
-            if isinstance(photo_arg, str) and old_media is not None:
-                # A cached file_id in the caption? We can't cheaply compare a URL/
-                # path to an uploaded photo, so only skip re-upload when the caller
-                # passed the SAME file_id we already have.
-                same_image = photo_arg == getattr(old_media, "file_id", None)
-            if same_image:
-                return await old_msg.edit_caption(
-                    caption=fitted, parse_mode=screen.parse_mode,
-                    reply_markup=screen.keyboard,
-                )
-            return await old_msg.edit_media(
-                InputMediaPhoto(photo_arg, caption=fitted,
+            edited = await client.edit_message_media(
+                chat_id, message_id,
+                InputMediaPhoto(_cached_photo_arg(photo_arg), caption=fitted,
                                 parse_mode=screen.parse_mode),
                 reply_markup=screen.keyboard,
             )
-        return await old_msg.edit_text(
-            fitted, parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
+            _remember_file_id(photo_arg, edited)
+            return edited
+        return await client.edit_message_text(
+            chat_id, message_id, fitted,
+            parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
         )
+
+    try:
+        return await _do_edit()
     except MessageNotModified:
-        return old_msg  # already showing this exact content — success
+        return old_msg  # already correct — success
     except FloodWait as fw:
         await asyncio.sleep(fw.value + 1)
         try:
-            if want_photo:
-                return await old_msg.edit_media(
-                    InputMediaPhoto(photo_arg, caption=fitted,
-                                    parse_mode=screen.parse_mode),
-                    reply_markup=screen.keyboard,
-                )
-            return await old_msg.edit_text(
-                fitted, parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
-            )
+            return await _do_edit()
         except Exception:  # noqa: BLE001 — give up on in-place, caller sends fresh
             return None
     except Exception:  # noqa: BLE001 — too old / not ours / etc. → caller sends fresh
         return None
+
 

@@ -6,7 +6,7 @@ whitelist always wins), and answers permission checks used by the bot middleware
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from nekofetch.core.config import EnvSettings
 from nekofetch.core.container import Container
@@ -15,6 +15,9 @@ from nekofetch.domain.enums import ROLE_PERMISSIONS, Permission, Role
 from nekofetch.infrastructure.database.postgres.models import User
 from nekofetch.infrastructure.database.postgres.session import session_scope
 from nekofetch.infrastructure.repositories.user_repo import UserRepository
+
+# How stale ``last_seen_at`` must be before we spend a write round-trip on it.
+_LAST_SEEN_THROTTLE = timedelta(minutes=5)
 
 
 class AuthService:
@@ -28,6 +31,7 @@ class AuthService:
         async with session_scope(self._c.pg_sessionmaker) as session:
             repo = UserRepository(session)
             user = await repo.get_by_telegram_id(telegram_id)
+            now = datetime.now(UTC)
             if user is None:
                 role = Role.ADMIN if telegram_id in self._configured_principal_ids() else Role.USER
                 user = User(
@@ -35,6 +39,7 @@ class AuthService:
                     username=username,
                     first_name=first_name,
                     role=role,
+                    last_seen_at=now,
                 )
                 await repo.add(user)
             else:
@@ -42,7 +47,15 @@ class AuthService:
                     user.username = username
                 if first_name and not user.first_name:
                     user.first_name = first_name
-            user.last_seen_at = datetime.now(UTC)
+                # Throttle the last_seen write: this runs on EVERY tap in the
+                # middleware, and a dirty COMMIT is a full round-trip to a
+                # WAN-distant DB. Only touch it when it's stale (>5 min) so the
+                # common case is a read-only transaction — no wasted write RTT.
+                last = user.last_seen_at
+                if last is not None and last.tzinfo is None:
+                    last = last.replace(tzinfo=UTC)
+                if last is None or (now - last) >= _LAST_SEEN_THROTTLE:
+                    user.last_seen_at = now
             await session.flush()
             session.expunge(user)
             return user
