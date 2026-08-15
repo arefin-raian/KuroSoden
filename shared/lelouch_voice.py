@@ -511,6 +511,7 @@ BTN_ADMIN = "🛡 Command"
 BTN_PROFILE = "👤 My Profile"
 BTN_BATCH = "📦 Batch Work"
 BTN_QUEUE = "📋 The Board"
+BTN_OPEN_TASKS = "📋 Open Tasks"  # deep-link to Levi's board after a batch commit
 BTN_HOME = "⇐ Home"
 BTN_BACK_ADMIN = "⇐ Back to Command"
 BTN_PAUSE = "🔴 Pause Requests"
