@@ -12,10 +12,11 @@ from nekofetch.services.franchise_flow import FranchiseFlowService
 from nekofetch.sources.telegram.anilist import FranchiseEntry
 
 
-def _entry(aid, title, eps, year, fmt="TV"):
+def _entry(aid, title, eps, year, fmt="TV", relation=""):
     return FranchiseEntry(
         anilist_id=aid, format=fmt, english_title=title,
         episodes=eps, start_date={"year": year, "month": 1, "day": 1},
+        relation=relation,
     )
 
 
@@ -105,3 +106,43 @@ def test_ona_plus_tv_season_orders_ona_first_then_season():
         _entry(201, "Show TV Season", 12, 2026, fmt="TV"),
     ])
     assert _seasons(m) == [(1, None, 12), (2, None, 12)]
+
+
+def test_root_multi_episode_ona_is_a_season():
+    # The AniList root node carries relation="ROOT" — Takopi in the real walk.
+    # A multi-episode ONA in the main continuity stays a season.
+    m = _build([
+        _entry(100, "Takopi's Original Sin", 12, 2025, fmt="ONA",
+               relation="ROOT"),
+    ])
+    assert _seasons(m) == [(1, None, 12)]
+
+
+def test_side_story_multi_episode_ona_is_an_extra():
+    # A multi-episode ONA attached as a SIDE_STORY is a spin-off, NOT a season —
+    # the episode-count heuristic alone would wrongly promote it. relation is the
+    # signal that keeps a real extra out of the season line.
+    from nekofetch.domain.enums import ContentKind
+
+    m = _build([
+        _entry(300, "Main Show", 12, 2024, fmt="TV"),
+        _entry(301, "Main Show: Side Chronicle", 6, 2025, fmt="ONA",
+               relation="SIDE_STORY"),
+    ])
+    # Only the TV entry is a season; the side-story ONA drops to an extra.
+    assert _seasons(m) == [(1, None, 12)]
+    side = next(e for e in m.entries if e.anilist_id == 301)
+    assert side.kind != ContentKind.SEASON
+
+
+def test_spin_off_multi_episode_ona_is_an_extra():
+    from nekofetch.domain.enums import ContentKind
+
+    m = _build([
+        _entry(400, "Flagship", 24, 2020, fmt="TV"),
+        _entry(401, "Flagship: Chibi Theatre", 12, 2021, fmt="ONA",
+               relation="SPIN_OFF"),
+    ])
+    assert _seasons(m) == [(1, None, 24)]
+    spin = next(e for e in m.entries if e.anilist_id == 401)
+    assert spin.kind != ContentKind.SEASON

@@ -201,18 +201,42 @@ def _kind_from_format(fmt: str | None) -> ContentKind:
 # "Season 1" but the distribution channel posted "ONA 1").
 _SEASON_FORMATS = {"TV", "TV_SHORT"}
 
+# AniList relation types that mean "this node is NOT part of the main season
+# line" — a spin-off / side-story / alternate retelling / recap. A multi-episode
+# ONA reached through one of these stays an *extra* even though its episode count
+# would otherwise promote it to a season. The main continuity (ROOT, SEQUEL,
+# PREQUEL, PARENT — or an unknown/empty relation) is left season-eligible so
+# Takopi's Original Sin (a ROOT ONA) still renders as "Season 1". Kept in sync
+# with the walk's own exclusions in anilist._CONTENT_WALK_RELS.
+_EXTRA_RELATIONS = {
+    "SIDE_STORY", "SPIN_OFF", "ALTERNATIVE", "SUMMARY", "CHARACTER", "OTHER",
+}
 
-def is_season_format(fmt: str | None, episodes: int | None = None) -> bool:
+
+def is_season_format(
+    fmt: str | None,
+    episodes: int | None = None,
+    relation: str | None = None,
+) -> bool:
     """True when an AniList format renders as a season entry (not an extra).
 
     TV and TV_SHORT are seasons; TV_SPECIAL remains an extra unless a later
     source-specific rule promotes it. A multi-episode ONA is a full series (e.g.
     Takopi's Original Sin — 12 eps ONA shown as Season 1), while a one-shot ONA
     stays an extra.
+
+    ``relation`` (the AniList edge that attached this node to the franchise —
+    ROOT/SEQUEL/PREQUEL/SIDE_STORY/…) differentiates a real season from an
+    actual extra: a multi-episode ONA promotes to a season only when it sits in
+    the main continuity, so a multi-episode *spin-off/side-story* ONA is NOT
+    falsely labelled a season. An unknown/empty relation stays season-eligible
+    (preserves behaviour for the single-title root case).
     """
     if fmt in _SEASON_FORMATS:
         return True
-    return fmt == "ONA" and (episodes or 0) > 1
+    if fmt == "ONA" and (episodes or 0) > 1:
+        return (relation or "").upper() not in _EXTRA_RELATIONS
+    return False
 
 
 def entry_is_season(entry) -> bool:
@@ -221,6 +245,7 @@ def entry_is_season(entry) -> bool:
     return is_season_format(
         getattr(entry, "format", None),
         getattr(entry, "episodes", None),
+        getattr(entry, "relation", None),
     )
 
 
