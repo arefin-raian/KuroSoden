@@ -114,7 +114,7 @@ STATE_AWAIT_UBOT_DONE = "senku:wiz:await_ubot_done"
 
 # Commands that must never be swallowed by the free-text channel step.
 _RESERVED = ["start", "tasks", "create", "generate", "edit_thumbnail",
-              "editpost", "editcaption", "settings", "help", "cancel"]
+              "editpost", "settings", "help", "cancel"]
 
 
 def register(client: Client, container: Container) -> None:

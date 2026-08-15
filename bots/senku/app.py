@@ -29,7 +29,6 @@ SENKU_COMMANDS = [
     BotCommand("generate", "Generate content: /generate REQ-XXXX"),
     BotCommand("edit_thumbnail", "Edit saved thumbnails"),
     BotCommand("editpost", "Edit a published post"),
-    BotCommand("editcaption", "Edit published post captions"),
     BotCommand("settings", "Configure the distribution bot"),
     BotCommand("help", "How distribution works"),
 ]
@@ -132,15 +131,15 @@ def build_senku(container: Container, token: str) -> Client:
             await q.answer()
             return
 
-        if action in ("edit_post", "edit_caption"):
+        if action == "edit_post":
             from kurosoden.shared.access_gate import is_staff
             if not is_staff(q):
                 await q.answer("Staff access required.", show_alert=True)
                 return
-            from kurosoden.bots.senku.handlers.post_caption_edit import show_channel_list
+            from kurosoden.bots.senku.handlers.post_caption_edit import start_post_edit
 
-            await show_channel_list(client, container, q.message)
             await q.answer()
+            await start_post_edit(client, container, q.message)
             return
 
         if action in ("tasks", "create", "generate"):
@@ -231,7 +230,7 @@ def build_senku(container: Container, token: str) -> Client:
              ("🧪 Generate", cb("senku", "generate"))],
             [("📢 Create Channel", cb("senku", "create"))],
             [("✏️ Edit Thumbnail", cb("senku", "edit_thumbnail")),
-             ("📝 Edit Caption", cb("senku", "edit_caption"))],
+             ("📝 Edit Post", cb("senku", "edit_post"))],
             [("⚙️ Settings", cb("senku", "settings")),
              ("❓ Help", cb("senku", "help"))],
         ]

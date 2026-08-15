@@ -1,16 +1,17 @@
-"""Senku post-caption editor regression (Phase 11).
+"""Senku post editor regression (link-based flow).
 
-Staff edit the captions of published distribution posts (info card / season
-card / movie card / watch guide / footer). The editor must:
+Staff run ``/editpost``, paste a post LINK, and — once the bot confirms it
+administers that channel — rewrite the caption or replace the buttons. The
+editor must:
 
-  • list only published channels that actually have posts,
-  • list only editable post kinds (dividers excluded),
-  • persist the new caption on the ``BotContentPost`` row AND bump
-    ``content_revision`` (returning /start users get the new text),
-  • attempt the live Telegram edit (best-effort).
+  • parse ``t.me/c/<internal>/<msg>`` and ``t.me/<username>/<msg>`` links,
+  • only proceed when the bot is an admin (with edit rights) of the channel,
+  • live-edit the Telegram message first, then (when tracked) persist the new
+    caption/buttons on ``BotContentPost`` and bump ``content_revision``,
+  • never overwrite the DB when the live edit fails.
 
-The picker screens are pure functions; the persistence path is exercised
-against the SQLite fixture with a fake Telegram client.
+Link parsing is a pure function; the persistence path is exercised against the
+SQLite fixture with a fake Telegram client.
 """
 
 from __future__ import annotations
@@ -20,63 +21,43 @@ from types import SimpleNamespace
 import pytest
 
 from bots.senku.handlers.post_caption_edit import (
-    _channel_screen,
     _edit_buttons,
     _edit_caption,
-    _kind_label,
     _parse_button_lines,
-    _posts_for,
-    _posts_screen,
-    _published_channels,
+    _parse_post_link,
+    _resolve_editable_channel,
 )
 
-pytestmark = pytest.mark.asyncio
+# Only the DB/async tests need the event loop; the pure parsers stay sync.
+_aio = pytest.mark.asyncio
 
 
-# ── pure screen builders ────────────────────────────────────────────────────────
+# ── link parsing (pure) ──────────────────────────────────────────────────────
 
-def test_kind_label_maps_all_editable_kinds():
-    assert _kind_label("info_card") == "Info card"
-    assert _kind_label("season_card") == "Season card"
-    assert _kind_label("movie_card") == "Movie card"
-    assert _kind_label("watch_guide") == "Watch guide"
-    assert _kind_label("footer") == "Footer"
-    # Unknown kinds degrade to a readable title, never crash.
-    assert _kind_label("divider") == "Divider"
-
-
-def test_channel_screen_lists_channels_and_back():
-    channels = [
-        SimpleNamespace(id=1, name="Vanitas Channel", anime_doc_id="doc1", chat_id=-1001),
-        SimpleNamespace(id=2, name=None, anime_doc_id="doc2", chat_id=-1002),
-    ]
-    caption, rows = _channel_screen(channels)
-    # Channel names are the BUTTON labels (the caption is a fixed prompt).
-    assert rows[0][0][0] == "Vanitas Channel"
-    assert rows[1][0][0] == "doc2"  # name-less channel falls back to doc id
-    assert len(rows) == len(channels) + 1  # one row per channel + Back
-    assert rows[-1] == [("⬅ Back", "senku|home")]
-    # Empty state is friendly, not an error.
-    empty_caption, empty_rows = _channel_screen([])
-    assert "No published" in empty_caption
-    assert empty_rows == [[("⬅ Back", "senku|home")]]
+def test_parse_private_channel_link():
+    # t.me/c/<internal>/<msg> → chat id is int("-100" + internal).
+    assert _parse_post_link("https://t.me/c/1699000000/42") == (-1001699000000, 42)
+    # forum/topic link keeps the LAST segment as the message id.
+    assert _parse_post_link("https://t.me/c/1699000000/7/42") == (-1001699000000, 42)
+    # scheme-less and trailing junk tolerated.
+    assert _parse_post_link("t.me/c/1699000000/42?single") == (-1001699000000, 42)
 
 
-def test_posts_screen_lists_editable_posts_with_back():
-    posts = [
-        {"kind": "info_card", "tg_message_id": 101, "caption": "Old caption"},
-        {"kind": "divider", "tg_message_id": 102, "caption": ""},
-        {"kind": "footer", "tg_message_id": 103, "caption": ""},
-    ]
-    caption, rows = _posts_screen("Vanitas", posts)
-    assert "Vanitas" in caption
-    assert "Info card" in caption and "Old caption" in caption
-    # Every post gets its own row, then the Back-to-channels row.
-    assert len(rows) == len(posts) + 1
-    assert rows[-1] == [("⬅ Channels", "senku|capedit|channels")]
+def test_parse_public_channel_link():
+    assert _parse_post_link("https://t.me/AnimeWeebs/123") == ("@AnimeWeebs", 123)
+    assert _parse_post_link("t.me/AnimeWeebs/123") == ("@AnimeWeebs", 123)
 
 
-# ── picker + persistence against the DB ────────────────────────────────────────
+def test_parse_rejects_non_links():
+    assert _parse_post_link("") is None
+    assert _parse_post_link("just some text") is None
+    assert _parse_post_link("https://example.com/foo/1") is None
+    assert _parse_post_link("https://t.me/AnimeWeebs") is None  # no message id
+    assert _parse_post_link("https://t.me/c/notanumber/1") is None
+    assert _parse_post_link("https://t.me/c/1699000000/notanumber") is None
+
+
+# ── channel resolution (edit-rights gate) ────────────────────────────────────
 
 def _container(sessionmaker):
     return SimpleNamespace(
@@ -86,10 +67,99 @@ def _container(sessionmaker):
     )
 
 
+def _member(status, *, can_edit=True):
+    priv = SimpleNamespace(can_edit_messages=can_edit)
+    return SimpleNamespace(status=SimpleNamespace(value=status), privileges=priv)
+
+
+class _ChatClient:
+    """Fake client whose membership status/rights are configurable."""
+
+    def __init__(self, chat_id, member, *, title="A Channel", username=None):
+        self._chat = SimpleNamespace(id=chat_id, title=title, username=username)
+        self._member = member
+
+    async def get_chat(self, ref):
+        return self._chat
+
+    async def get_chat_member(self, chat_id, who):
+        if self._member is None:
+            raise RuntimeError("USER_NOT_PARTICIPANT")
+        return self._member
+
+
+@_aio
+async def test_resolve_requires_admin_with_edit_rights(sessionmaker):
+    # Admin WITH edit rights → resolved (bot_id None: channel not tracked).
+    ok = await _resolve_editable_channel(
+        _ChatClient(-1001, _member("administrator", can_edit=True)),
+        _container(sessionmaker), -1001,
+    )
+    assert ok is not None
+    chat_id, bot_id, title = ok
+    assert chat_id == -1001 and bot_id is None
+
+    # Admin WITHOUT edit rights → rejected.
+    assert await _resolve_editable_channel(
+        _ChatClient(-1002, _member("administrator", can_edit=False)),
+        _container(sessionmaker), -1002,
+    ) is None
+
+    # Plain member → rejected.
+    assert await _resolve_editable_channel(
+        _ChatClient(-1003, _member("member")),
+        _container(sessionmaker), -1003,
+    ) is None
+
+    # Not a participant at all → rejected (no crash).
+    assert await _resolve_editable_channel(
+        _ChatClient(-1004, None), _container(sessionmaker), -1004,
+    ) is None
+
+
+@_aio
+async def test_resolve_maps_tracked_channel_to_bot_id(sessionmaker):
+    from nekofetch.infrastructure.database.postgres.models import DistributionBot
+
+    async with sessionmaker() as s:
+        bot = DistributionBot(
+            name="Vanitas Channel", anime_doc_id="doc-vanitas",
+            encrypted_token="x", is_channel=True, enabled=True,
+            chat_id=-1001234567890,
+        )
+        s.add(bot)
+        await s.commit()
+        bot_id = bot.id
+
+    ok = await _resolve_editable_channel(
+        _ChatClient(-1001234567890, _member("creator")),
+        _container(sessionmaker), -1001234567890,
+    )
+    assert ok is not None
+    chat_id, resolved_bot_id, title = ok
+    assert chat_id == -1001234567890 and resolved_bot_id == bot_id
+
+
+# ── button parsing (pure) ────────────────────────────────────────────────────
+
+def test_button_lines_parse_as_custom_payload():
+    assert _parse_button_lines("Open | https://example.test\nChat | tg://resolve?domain=x") == {
+        "type": "custom",
+        "buttons": [
+            {"text": "Open", "url": "https://example.test"},
+            {"text": "Chat", "url": "tg://resolve?domain=x"},
+        ],
+    }
+    assert _parse_button_lines("none") == {"type": "custom", "buttons": []}
+    with pytest.raises(ValueError):
+        _parse_button_lines("missing separator")
+
+
+# ── persistence against the DB ───────────────────────────────────────────────
+
 async def _seed_channel(sessionmaker):
     from nekofetch.infrastructure.database.postgres.models import (
         BotContentPost,
-        ChannelLayout,
         DistributionBot,
     )
 
@@ -101,44 +171,15 @@ async def _seed_channel(sessionmaker):
         )
         s.add(bot)
         await s.commit()
-        s.add(ChannelLayout(channel_bot_id=bot.id, seq=1, kind="info_card",
-                            tg_message_id=101))
-        s.add(ChannelLayout(channel_bot_id=bot.id, seq=2, kind="divider",
-                            tg_message_id=102))
         s.add(BotContentPost(bot_id=bot.id, post_type="info_card", order=1,
                              caption="Old caption", tg_message_id=101))
         s.add(BotContentPost(bot_id=bot.id, post_type="watch_guide", order=2,
                              caption="Watch order", tg_message_id=103))
         await s.commit()
-        return bot.id
+        return bot.id, -1001234567890
 
 
-async def test_published_channels_requires_layout(sessionmaker):
-    bot_id = await _seed_channel(sessionmaker)
-    channels = await _published_channels(_container(sessionmaker))
-    assert [c.id for c in channels] == [bot_id]
-
-    # A channel with no layout/posts is NOT offered (nothing to edit).
-    from nekofetch.infrastructure.database.postgres.models import DistributionBot
-
-    async with sessionmaker() as s:
-        s.add(DistributionBot(name="Empty", encrypted_token="y", is_channel=True,
-                              enabled=True, chat_id=-10099))
-        await s.commit()
-    channels = await _published_channels(_container(sessionmaker))
-    assert len(channels) == 1  # still only the seeded one
-
-
-async def test_posts_for_prefers_durable_rows_and_skips_dividers(sessionmaker):
-    bot_id = await _seed_channel(sessionmaker)
-    posts = await _posts_for(_container(sessionmaker), bot_id)
-    kinds = {p["kind"] for p in posts}
-    # info_card + watch_guide are editable; divider is not a content row.
-    assert kinds == {"info_card", "watch_guide"}
-    info = next(p for p in posts if p["kind"] == "info_card")
-    assert info["tg_message_id"] == 101 and info["caption"] == "Old caption"
-
-
+@_aio
 async def test_edit_caption_persists_bumps_revision_and_edits_live(
     sessionmaker, monkeypatch,
 ):
@@ -149,7 +190,7 @@ async def test_edit_caption_persists_bumps_revision_and_edits_live(
         DistributionBot,
     )
 
-    bot_id = await _seed_channel(sessionmaker)
+    bot_id, chat_id = await _seed_channel(sessionmaker)
     edited: list[tuple[int, int, str]] = []
 
     class _Client:
@@ -176,7 +217,8 @@ async def test_edit_caption_persists_bumps_revision_and_edits_live(
 
     ok, result = await _edit_caption(
         _Client(), _container(sessionmaker), None,
-        bot_id=bot_id, tg_message_id=101, new_caption="<b>New caption</b>",
+        chat_id=chat_id, bot_id=bot_id, tg_message_id=101,
+        new_caption="<b>New caption</b>",
     )
     assert ok and "Caption updated" in result
 
@@ -196,19 +238,28 @@ async def test_edit_caption_persists_bumps_revision_and_edits_live(
     assert backups == ["doc-vanitas"]
 
 
-def test_button_lines_parse_as_custom_payload():
-    assert _parse_button_lines("Open | https://example.test\nChat | tg://resolve?domain=x") == {
-        "type": "custom",
-        "buttons": [
-            {"text": "Open", "url": "https://example.test"},
-            {"text": "Chat", "url": "tg://resolve?domain=x"},
-        ],
-    }
-    assert _parse_button_lines("none") == {"type": "custom", "buttons": []}
-    with pytest.raises(ValueError):
-        _parse_button_lines("missing separator")
+@_aio
+async def test_edit_caption_untracked_link_is_live_only(sessionmaker, monkeypatch):
+    """A link-edit of an untracked post (bot_id None) live-edits without DB writes."""
+    edited: list[tuple[int, int, str]] = []
+
+    class _Client:
+        async def get_messages(self, chat_id, mid):
+            return SimpleNamespace(photo=True)
+
+        async def edit_message_caption(self, chat_id, mid, caption, **kw):
+            edited.append((chat_id, mid, caption))
+
+    ok, result = await _edit_caption(
+        _Client(), _container(sessionmaker), None,
+        chat_id=-100999, bot_id=None, tg_message_id=7,
+        new_caption="live only",
+    )
+    assert ok and "Caption updated in the channel." == result
+    assert edited == [(-100999, 7, "live only")]
 
 
+@_aio
 async def test_edit_buttons_persists_and_edits_live(sessionmaker, monkeypatch):
     from sqlalchemy import select
 
@@ -217,7 +268,7 @@ async def test_edit_buttons_persists_and_edits_live(sessionmaker, monkeypatch):
         DistributionBot,
     )
 
-    bot_id = await _seed_channel(sessionmaker)
+    bot_id, chat_id = await _seed_channel(sessionmaker)
     edited = []
 
     class _Client:
@@ -235,7 +286,7 @@ async def test_edit_buttons_persists_and_edits_live(sessionmaker, monkeypatch):
 
     monkeypatch.setattr("nekofetch.services.backup_service.BackupService", _FakeBackup)
     ok, result = await _edit_buttons(
-        _Client(), _container(sessionmaker), bot_id=bot_id,
+        _Client(), _container(sessionmaker), chat_id=chat_id, bot_id=bot_id,
         tg_message_id=101,
         button_data={"type": "custom", "buttons": [{
             "text": "Open", "url": "https://example.test",
@@ -258,22 +309,25 @@ async def test_edit_buttons_persists_and_edits_live(sessionmaker, monkeypatch):
         assert (bot.content_revision or 0) == 1
 
 
+@_aio
 async def test_edit_caption_rejects_oversized(sessionmaker):
     from bots.senku.handlers.post_caption_edit import _TEXT_LIMIT
 
-    bot_id = await _seed_channel(sessionmaker)
+    bot_id, chat_id = await _seed_channel(sessionmaker)
     ok, result = await _edit_caption(
         SimpleNamespace(get_messages=None), _container(sessionmaker), None,
-        bot_id=bot_id, tg_message_id=101, new_caption="x" * (_TEXT_LIMIT + 1),
+        chat_id=chat_id, bot_id=bot_id, tg_message_id=101,
+        new_caption="x" * (_TEXT_LIMIT + 1),
     )
     assert not ok and "too long" in result
 
 
+@_aio
 async def test_failed_live_caption_edit_does_not_overwrite_database(sessionmaker):
     from sqlalchemy import select
     from nekofetch.infrastructure.database.postgres.models import BotContentPost
 
-    bot_id = await _seed_channel(sessionmaker)
+    bot_id, chat_id = await _seed_channel(sessionmaker)
 
     class _FailingClient:
         async def get_messages(self, chat_id, mid):
@@ -284,7 +338,8 @@ async def test_failed_live_caption_edit_does_not_overwrite_database(sessionmaker
 
     ok, result = await _edit_caption(
         _FailingClient(), _container(sessionmaker), None,
-        bot_id=bot_id, tg_message_id=101, new_caption="Should not persist",
+        chat_id=chat_id, bot_id=bot_id, tg_message_id=101,
+        new_caption="Should not persist",
     )
     assert not ok and "database was left unchanged" in result
 

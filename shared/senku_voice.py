@@ -275,6 +275,60 @@ CHANNEL_ASK_LINK = (
 )
 
 
+# ── Edit Posts (link-based post editor) ──────────────────────────────────────
+
+POSTEDIT_ASK_LINK = (
+    f"{ICON} <b>Edit a post</b>\n\n"
+    "Paste the <b>link</b> of the post you want to change — copy it from the "
+    "distribution channel (<code>t.me/c/…/123</code> for a private channel, or "
+    "<code>t.me/yourchannel/123</code> for a public one).\n\n"
+    "I'll make sure it's a channel I can edit, then let you rewrite the "
+    "caption or swap the buttons."
+)
+
+
+def postedit_bad_link() -> str:
+    return (
+        f"{ICON} <b>That's not a post link I can read.</b>\n\n"
+        "Send a message link like <code>https://t.me/c/1699000000/42</code> or "
+        "<code>https://t.me/yourchannel/42</code>. Tap a post → <i>Copy Link</i>."
+    )
+
+
+def postedit_not_mine() -> str:
+    return (
+        f"{ICON} <b>I can't edit that one.</b>\n\n"
+        "That post is in a channel where I'm not an admin (or it isn't one of my "
+        "distribution channels). Add me as an admin with edit rights, then send "
+        "the link again."
+    )
+
+
+def postedit_choose(preview: str) -> str:
+    body = esc(preview[:120]) if preview else "<i>(no caption)</i>"
+    return (
+        f"{ICON} <b>Found it.</b>\n\n"
+        f"Current caption: {body}\n\n"
+        "What do you want to change?"
+    )
+
+
+POSTEDIT_ASK_CAPTION = (
+    f"{ICON} <b>Send the new caption.</b>\n\n"
+    "HTML, Markdown or Telegram-formatted text all work — I render it properly "
+    "and save it. Reply /cancel to keep the current one."
+)
+
+POSTEDIT_ASK_BUTTONS = (
+    f"{ICON} <b>Send the buttons.</b>\n\n"
+    "One per line as <code>Label | https://link</code>. Send <code>none</code> "
+    "to remove every button. Reply /cancel to leave them as they are."
+)
+
+BTN_POSTEDIT_CAPTION = "📝 Edit caption"
+BTN_POSTEDIT_BUTTONS = "🔘 Replace buttons"
+
+
 def channel_setup_progress(steps: list[tuple[str, str]]) -> str:
     """A small progress card for the bot-driven finalisation (title, desc, etc.).
 

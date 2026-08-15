@@ -64,7 +64,6 @@ _SENKU_STAFF = [
     _c("generate", "Generate content: /generate REQ-XXXX"),
     _c("edit_thumbnail", "Edit saved thumbnails"),
     _c("editpost", "Edit a published post"),
-    _c("editcaption", "Edit published post captions"),
     _c("help", "How distribution works"),
 ]
 _SENKU_OWNER = _SENKU_STAFF + [

@@ -49,7 +49,7 @@ def test_staff_only_bots_publish_staff_global_menu():
     # edit tools are staff-scoped now (not owner-only) so admins can fix thumbs
     # and post captions without the owner.
     senku = _command_names(default_commands("senku"))
-    assert {"create", "generate", "edit_thumbnail", "editcaption"}.issubset(senku)
+    assert {"create", "generate", "edit_thumbnail", "editpost"}.issubset(senku)
     # Levi's pack-caption editor is staff-scoped too.
     levi = _command_names(default_commands("levi"))
     assert "packcaptions" in levi
@@ -137,7 +137,7 @@ async def test_owner_gets_senku_thumbnail_editor_command():
 
     commands, scope = client.calls[-1]
     assert scope.chat_id == 100
-    assert {"settings", "edit_thumbnail", "editcaption"}.issubset(_command_names(commands))
+    assert {"settings", "edit_thumbnail", "editpost"}.issubset(_command_names(commands))
 
 
 @pytest.mark.asyncio
@@ -150,7 +150,7 @@ async def test_staff_gets_edit_tools_without_owner_settings():
     commands, scope = client.calls[-1]
     names = _command_names(commands)
     assert scope.chat_id == 200
-    assert {"edit_thumbnail", "editcaption"}.issubset(names)
+    assert {"edit_thumbnail", "editpost"}.issubset(names)
     assert "settings" not in names
 
     client2 = _Client()
