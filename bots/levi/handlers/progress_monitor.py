@@ -95,6 +95,10 @@ async def _job_view(container: Container, job_id: int) -> dict | None:
             "code": (req.code if req else ""),
             "started_ts": started.timestamp() if started else None,
             "partial": bool(rs.get("partial_failures")),
+            # A redo of a published title relinks the existing posts instead of
+            # handing off to distribution — the terminal card is a merged
+            # "Redo complete + relinked" card, not the generic hand-off one.
+            "redo": bool((req.franchise_data or {}).get("redo_relink")) if req else False,
             # Coarse stage mirrored onto the row by _push_stage_progress. This is
             # the ONLY truthful stage source once the Redis snapshot's TTL lapses
             # (a single long encode/watermark file can outlive it). Without this
@@ -316,7 +320,13 @@ async def _paint_terminal(client: Client, container: Container, job_id: int,
         # admin sees the anime's own art on "handed to distribution".
         started = view.get("started_ts")
         elapsed = human_elapsed(int(time.time() - started)) if started else "—"
-        text = t(M.DL_CARD_DONE, title=title, job=job_id, elapsed=elapsed)
+        if view.get("redo"):
+            # Merged card: pipeline stats + the relink result, one message. The
+            # separate redo DM in handoff is dropped so this is the only one.
+            from kurosoden.shared import levi_voice as _LV
+            text = _LV.redo_complete_card(title, elapsed, code)
+        else:
+            text = t(M.DL_CARD_DONE, title=title, job=job_id, elapsed=elapsed)
         art = await _completion_art(container, code)
         if art:
             try:

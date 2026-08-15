@@ -1747,10 +1747,32 @@ class DownloadWorker:
         await LogChannelService(self._c).event(
             "processing", "complete", job=job_id, anime=title,
         )
+        # ── Redo of a published title: relink INLINE, before the job goes
+        #    terminal, so the live card shows the real post-upload work and the
+        #    completion card can truthfully say "relinked". A normal job skips
+        #    this and hands off to distribution as usual.
+        is_redo = bool((req.franchise_data or {}).get("redo_relink")) if req else False
+        relinked_ok = False
+        if is_redo and code:
+            from nekofetch.services.publishing_service import PublishingService
+
+            # TODO(storage §1b): a "Deleting old files" stage goes here once the
+            # old-file purge is deferred to post-upload. Today the old packs are
+            # already gone (purged at redo submit), so the only real post-upload
+            # work is the relink.
+            await self._push_stage(job_id, title, "Relinking buttons", 0.0)
+            try:
+                await PublishingService(self._c).publish(code)
+                relinked_ok = True
+            except Exception as exc:  # noqa: BLE001 — fall through to the hook's Gojo fallback
+                log.warning("download.redo_relink.failed", job_id=job_id,
+                            code=code, error=str(exc))
+
         await self._finalize_complete(job_id)
 
-        # Auto-publish when approval is not required.
-        if not needs_approval and code:
+        # Auto-publish when approval is not required (non-redo path; a redo already
+        # published inline above).
+        if not needs_approval and code and not is_redo:
             from nekofetch.services.publishing_service import PublishingService
 
             try:
@@ -1773,9 +1795,14 @@ class DownloadWorker:
         # ``on_download_complete(code, title)`` hook. The download stage owns
         # nothing past this point, so firing the hook here hands the request to
         # the next stage (distribution). Standalone NekoFetch leaves it unset.
+        # ``relinked`` tells the hook the redo relink already ran inline, so it
+        # skips re-publishing and only completes the levi assignment + advances.
         hook = getattr(self._c, "on_download_complete", None)
         if hook is not None and code:
             try:
+                await hook(code, title, relinked_ok)
+            except TypeError:
+                # Back-compat: an older hook signature without the flag.
                 await hook(code, title)
             except Exception as exc:  # noqa: BLE001 - handoff must never fail the job
                 log.warning("download.handoff_hook.failed", job_id=job_id,

@@ -17,15 +17,20 @@ log = get_logger(__name__)
 
 async def handoff_download_to_distribution(
     container: Container, code: str, title: str,
+    *, already_relinked: bool = False,
 ) -> None:
     """Complete Levi and route the work to its next pipeline stage.
 
     Normal works are handed to Senku (distribution). Redo-relink and
     update-entry works SKIP the distribution stage entirely: the channel
     already exists, so the publish step relinks the fresh quality buttons
-    (redo) or appends the new season card (update) in place. Those are
-    auto-published right here, so a redo/update of a live title completes
-    without ever spawning a "Ready for Distribution" task.
+    (redo) or appends the new season card (update) in place.
+
+    ``already_relinked`` means the download finalizer ran the redo relink inline
+    (so the live card could show it + the merged completion card is honest); we
+    then only complete the levi assignment here and skip re-publishing. After
+    routing, we auto-advance the downloader to their next task card so they never
+    open /tasks between jobs.
     """
     from sqlalchemy import select
 
@@ -45,18 +50,17 @@ async def handoff_download_to_distribution(
         req = await RequestRepository(session).get_by_code(code)
         fd = (req.franchise_data or {}) if req is not None else {}
         skip_distribution = bool(fd.get("redo_relink") or fd.get("update_entry"))
-        levi_admin = None
-        if skip_distribution:
-            row = (
-                await session.execute(
-                    select(AdminAssignment).where(
-                        AdminAssignment.request_code == code,
-                        AdminAssignment.stage == "levi",
-                        AdminAssignment.status.in_(ACTIVE_STATUSES),
-                    ).order_by(AdminAssignment.updated_at.desc())
-                )
-            ).scalars().first()
-            levi_admin = row.admin_telegram_id if row is not None else None
+        # The downloader who owned this levi task — for the auto-advance card.
+        row = (
+            await session.execute(
+                select(AdminAssignment).where(
+                    AdminAssignment.request_code == code,
+                    AdminAssignment.stage == "levi",
+                    AdminAssignment.status.in_(ACTIVE_STATUSES),
+                ).order_by(AdminAssignment.updated_at.desc())
+            )
+        ).scalars().first()
+        levi_admin = row.admin_telegram_id if row is not None else None
 
     engine = AdminAssignmentEngine(container.pg_sessionmaker)
     try:
@@ -65,27 +69,34 @@ async def handoff_download_to_distribution(
         log.warning("handoff.levi_complete.failed", code=code, error=str(exc))
 
     if skip_distribution:
-        # The distribution already exists — auto-publish runs the in-place
-        # relink (redo) or card append (update), marks the request PUBLISHED,
-        # and completes the linked work item. No Senku task, no Gojo approval.
-        try:
-            await PublishingService(container).publish(code)
-        except Exception as exc:  # noqa: BLE001 — fall back to a manual Gojo retry
-            log.warning("handoff.auto_publish.failed", code=code, error=str(exc))
+        is_redo = bool(fd.get("redo_relink"))
+        # Redo/update: the distribution already exists. Relink/append in place —
+        # unless the download finalizer already ran the redo relink inline.
+        if not already_relinked:
             try:
-                assignment = await engine.assign(code, "gojo")
-            except Exception as exc2:  # noqa: BLE001
-                log.warning("handoff.fallback_assign.failed", code=code,
-                            error=str(exc2))
-                assignment = None
-            if assignment is not None:
-                await notify_stage_assignment(
-                    container, "gojo", assignment, code, title,
-                )
-            return
-        await _notify_auto_distribution_done(
-            container, code, title, levi_admin, fd,
-        )
+                await PublishingService(container).publish(code)
+            except Exception as exc:  # noqa: BLE001 — fall back to a manual Gojo retry
+                log.warning("handoff.auto_publish.failed", code=code, error=str(exc))
+                try:
+                    assignment = await engine.assign(code, "gojo")
+                except Exception as exc2:  # noqa: BLE001
+                    log.warning("handoff.fallback_assign.failed", code=code,
+                                error=str(exc2))
+                    assignment = None
+                if assignment is not None:
+                    await notify_stage_assignment(
+                        container, "gojo", assignment, code, title,
+                    )
+                await _advance_to_next_task(container, levi_admin, code)
+                return
+        # A REDO's completion is the merged "Redo complete + relinked" card the
+        # Levi monitor paints — no separate DM. An UPDATE-entry has no merged
+        # card, so it still gets its own "card appended" confirmation.
+        if not is_redo:
+            await _notify_auto_distribution_done(
+                container, code, title, levi_admin, fd,
+            )
+        await _advance_to_next_task(container, levi_admin, code)
         return
 
     try:
@@ -95,9 +106,50 @@ async def handoff_download_to_distribution(
         assignment = None
     if assignment is None:
         log.info("handoff.deferred_or_unassigned", code=code, stage="senku")
-        return
+    else:
+        await notify_stage_assignment(container, "senku", assignment, code, title)
 
-    await notify_stage_assignment(container, "senku", assignment, code, title)
+    # Auto-advance the downloader to their next task (all jobs, not just redo).
+    await _advance_to_next_task(container, levi_admin, code)
+
+
+async def _advance_to_next_task(
+    container: Container, admin_id: int | None, just_done_code: str,
+) -> None:
+    """Push the downloader's NEXT single Levi task card, so they never open
+    /tasks between jobs. No-op when the admin is unknown or the queue is empty."""
+    if admin_id is None:
+        return
+    try:
+        from kurosoden.shared.admin_assignment import AdminAssignmentEngine
+
+        engine = AdminAssignmentEngine(container.pg_sessionmaker)
+        active = await engine.get_active_tasks(admin_id, stage="levi")
+        nxt = next(
+            (a for a in active if a.request_code != just_done_code), None
+        )
+        if nxt is None:
+            return
+        next_title = await _title_for_code(container, nxt.request_code)
+        await notify_stage_assignment(
+            container, "levi", nxt, nxt.request_code, next_title,
+        )
+        log.info("handoff.auto_advance.sent", admin=admin_id,
+                 code=nxt.request_code)
+    except Exception as exc:  # noqa: BLE001 — advancing is best-effort, never fatal
+        log.warning("handoff.auto_advance.failed", admin=admin_id, error=str(exc))
+
+
+async def _title_for_code(container: Container, code: str) -> str:
+    from nekofetch.infrastructure.database.postgres.session import session_scope
+    from nekofetch.infrastructure.repositories.request_repo import RequestRepository
+
+    try:
+        async with session_scope(container.pg_sessionmaker) as session:
+            req = await RequestRepository(session).get_by_code(code)
+            return (req.anime_title if req else None) or code
+    except Exception:  # noqa: BLE001
+        return code
 
 
 async def _notify_auto_distribution_done(

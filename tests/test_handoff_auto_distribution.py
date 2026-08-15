@@ -164,9 +164,43 @@ async def test_redo_relink_skips_senku_and_auto_publishes(
             WorkItem.request_code == code))).scalars().first()
         assert w is not None
         assert w.status == STATUS_DONE
-    # The downloader was told the relink happened.
-    assert levi.sent and levi.sent[0][0] == 500
-    assert "Redo complete" in levi.sent[0][1]
+    # A REDO sends NO separate relink DM — the Levi monitor paints the merged
+    # "Redo complete + relinked" completion card instead. The only thing handoff
+    # might DM is the next-task card (none here — single task).
+    assert all("Redo complete" not in (m[1] or "") for m in levi.sent)
+
+
+async def test_redo_relink_already_relinked_skips_republish(
+    session, sessionmaker, monkeypatch,
+):
+    """When the download finalizer already relinked inline, handoff completes
+    the levi task but does NOT publish again."""
+    from nekofetch.services.publishing_service import PublishingService
+    from kurosoden.shared.handoff import handoff_download_to_distribution
+
+    code = "REQ-H1b"
+    await _seed_handoff(
+        session, sessionmaker, code=code, fd={"redo": True, "redo_relink": True},
+    )
+    calls, fake = await _publish_completes_gojo(sessionmaker)
+    monkeypatch.setattr(PublishingService, "publish", fake)
+
+    levi = _FakeLevi()
+    await handoff_download_to_distribution(
+        _container(sessionmaker, pipeline_manager=SimpleNamespace(levi=levi)),
+        code, "Handoff Anime", already_relinked=True,
+    )
+
+    # publish() must NOT run again — the finalizer already did it inline.
+    assert calls == []
+    # Levi's task still completed, no Senku task, no separate DM.
+    async with sessionmaker() as s:
+        senku = (await s.execute(select(AdminAssignment).where(
+            AdminAssignment.request_code == code,
+            AdminAssignment.stage == "senku",
+        ))).scalars().all()
+        assert senku == []
+    assert all("Redo complete" not in (m[1] or "") for m in levi.sent)
 
 
 # ── update_entry: same skip-Senku auto-publish path ──────────────────────────
@@ -287,7 +321,73 @@ def test_redo_relinked_voice_includes_title_and_code():
     msg = V.redo_relinked("Orb <3", "REQ-1079")
     assert "Orb &lt;3" in msg
     assert "REQ-1079" in msg
-    assert "Redo complete" in msg
+
+
+def test_redo_complete_card_merges_stats_and_relink():
+    from kurosoden.shared import levi_voice as V
+
+    card = V.redo_complete_card("Sabikui Bisco", "12m 4s", "REQ-1080")
+    # One card carries BOTH the pipeline stats AND the relink result.
+    assert "Redo Complete" in card
+    assert "relinked" in card.lower()
+    assert "12m 4s" in card
+    assert "REQ-1080" in card
+
+
+# ── auto-advance: after a job, the next assigned task card is pushed ──────────
+
+
+async def test_completion_pushes_next_task_card(session, sessionmaker, monkeypatch):
+    """After a job completes, the downloader's NEXT open Levi task is pushed as a
+    single card so they never open /tasks between jobs."""
+    from nekofetch.services.publishing_service import PublishingService
+    from kurosoden.shared.handoff import handoff_download_to_distribution
+
+    admin = 500
+    # First job (the one just finishing) + a SECOND assigned task for the same admin.
+    await _seed_handoff(session, sessionmaker, code="REQ-N1", doc="anilist:1",
+                        fd={}, levi_admin=admin)
+    await _create_request(session, code="REQ-N2", anime_doc_id="anilist:2",
+                          status="queued")
+    await _create_admin_assignment(
+        session, admin_telegram_id=admin, request_code="REQ-N2", stage="levi",
+    )
+    await session.commit()
+
+    _calls, fake = await _publish_completes_gojo(sessionmaker)
+    monkeypatch.setattr(PublishingService, "publish", fake)
+
+    levi = _FakeLevi()
+    await handoff_download_to_distribution(
+        _container(sessionmaker, pipeline_manager=SimpleNamespace(levi=levi)),
+        "REQ-N1", "First Anime",
+    )
+
+    # The next task (REQ-N2) card was pushed to the same downloader.
+    assert levi.sent and levi.sent[-1][0] == admin
+
+
+async def test_completion_no_next_task_when_queue_empty(
+    session, sessionmaker, monkeypatch,
+):
+    from nekofetch.services.publishing_service import PublishingService
+    from kurosoden.shared.handoff import handoff_download_to_distribution
+
+    admin = 501
+    # Redo (skip_distribution) so there's no Senku handoff card muddying the
+    # count — the ONLY possible card to this admin would be an auto-advance one.
+    await _seed_handoff(session, sessionmaker, code="REQ-ONLY", doc="anilist:9",
+                        fd={"redo": True, "redo_relink": True}, levi_admin=admin)
+    _calls, fake = await _publish_completes_gojo(sessionmaker)
+    monkeypatch.setattr(PublishingService, "publish", fake)
+
+    levi = _FakeLevi()
+    await handoff_download_to_distribution(
+        _container(sessionmaker, pipeline_manager=SimpleNamespace(levi=levi)),
+        "REQ-ONLY", "Only Anime", already_relinked=True,
+    )
+    # Single task, redo (no Senku card, no separate DM) → nothing sent at all.
+    assert levi.sent == []
 
 
 def test_update_appended_voice_includes_title_and_code():

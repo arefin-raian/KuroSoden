@@ -215,6 +215,25 @@ def redo_relinked(title: str, code: str = "") -> str:
     )
 
 
+def redo_complete_card(title: str, elapsed: str, code: str = "") -> str:
+    """The MERGED redo completion card — pipeline stats + the relink result in one.
+
+    Replaces the generic ``dl_card_done`` for a redo so the downloader sees a
+    single card: what the pipeline did, how long it took, AND that the existing
+    posts' quality buttons were relinked in place (no separate follow-up DM)."""
+    job_tag = f"<code>{esc(code)}</code>" if code else ""
+    return (
+        f"<blockquote><b>✅ {esc(title)} @AniXWeebs</b></blockquote>\n\n"
+        "<blockquote><b><u>‣ Redo Complete</u></b>\n"
+        "<b>›</b> Downloaded, branded &amp; encoded\n"
+        "<b>›</b> Fresh quality packs uploaded to storage\n"
+        "<b>›</b> Old files removed, local working files cleaned up\n"
+        "<b>›</b> Quality buttons on the existing posts <b>relinked</b> to the "
+        "new files — no new channel, the posts kept their place</blockquote>\n\n"
+        f"<i>⌛ {esc(elapsed)}  ·  {job_tag}</i>"
+    )
+
+
 def update_appended(title: str, code: str = "") -> str:
     """Levi confirms an update entry was appended to the existing channel."""
     tag = f"<code>{esc(code)}</code> · " if code else ""
