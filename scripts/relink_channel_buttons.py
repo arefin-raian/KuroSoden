@@ -56,7 +56,6 @@ async def _resolve_doc_id(container, target: str) -> str | None:
     """Turn a REQ code or a raw anime_doc_id into the anime_doc_id to relink."""
     from sqlalchemy import select
 
-    from kurosoden.shared.models import Request  # noqa: F401 — registers tables
     from nekofetch.infrastructure.database.postgres.models import Request as Req
     from nekofetch.infrastructure.database.postgres.session import session_scope
 
