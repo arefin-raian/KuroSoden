@@ -29,7 +29,7 @@ from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
 from nekofetch.ui.artwork import pick_artwork
 from nekofetch.ui.components import cb, keyboard
-from nekofetch.ui.screens import Screen, card, send_screen
+from nekofetch.ui.screens import Screen, card, message_ref, send_screen
 
 log = get_logger(__name__)
 
@@ -517,6 +517,37 @@ async def _run_human_recovery(
 def register(client: Client, container: Container) -> None:
     fsm = FSM(container.redis, bot="gojo")
 
+    # ── One-card helpers ──────────────────────────────────────────────────────
+    # House pattern: a typed-value prompt is a recurring artwork card whose id we
+    # remember, so the value-capture step edits THAT SAME card in place (after
+    # deleting the user's typed message) instead of dropping a fresh reply below
+    # it. See nekofetch/ui/screens.message_ref + send_screen(old_msg=...).
+    async def _arm_prompt(user_id: int, state: str, reply_to: Message,
+                          caption: str, **data) -> Message:
+        prompt = await send_screen(
+            client, reply_to.chat.id,
+            Screen(caption=caption, image=pick_artwork("gojo")),
+        )
+        await fsm.set(user_id, state, prompt_msg_id=prompt.id,
+                      prompt_chat_id=prompt.chat.id, **data)
+        return prompt
+
+    async def _result_in_place(message: Message, data: dict, caption: str,
+                               rows=None) -> None:
+        """Delete the user's typed input and replace the prompt card in place."""
+        prompt = message_ref(client, data.get("prompt_chat_id") or message.chat.id,
+                             data.get("prompt_msg_id"))
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        await send_screen(
+            client, message.chat.id,
+            Screen(caption=caption, image=pick_artwork("gojo"),
+                   keyboard=keyboard(*rows) if rows else None),
+            old_msg=prompt,
+        )
+
     async def _render_tasks(chat_id: int, user_id: int,
                             *, old_msg: Message | None = None) -> None:
         """Render the real, actionable task list (offers + assigned).
@@ -706,8 +737,8 @@ def register(client: Client, container: Container) -> None:
     async def _cb_edit(_: Client, q: CallbackQuery) -> None:
         _, _, code = q.data.split("|", 2)
         await q.answer("✏️ Opening publish editor…")
-        await fsm.set(q.from_user.id, STATE_EDIT_CAPTION, request_code=code)
-        await q.message.reply(V.EDIT_CAPTION_PROMPT, parse_mode=ParseMode.HTML)
+        await _arm_prompt(q.from_user.id, STATE_EDIT_CAPTION, q.message,
+                          V.EDIT_CAPTION_PROMPT, request_code=code)
 
     @client.on_callback_query(filters.regex(r"^gojo\|publish_schedule\|"))
     async def _cb_schedule(_: Client, q: CallbackQuery) -> None:
@@ -724,8 +755,7 @@ def register(client: Client, container: Container) -> None:
 
     # ── Universal footer edit — /footer or the gojo|edit_footer button ────────
     async def _arm_footer(user_id: int, reply_to: Message) -> None:
-        await fsm.set(user_id, STATE_EDIT_FOOTER)
-        await reply_to.reply(V.FOOTER_EDIT_PROMPT, parse_mode=ParseMode.HTML)
+        await _arm_prompt(user_id, STATE_EDIT_FOOTER, reply_to, V.FOOTER_EDIT_PROMPT)
 
     @client.on_message(filters.command("footer"))
     async def _footer_cmd(_: Client, message: Message) -> None:
@@ -761,15 +791,15 @@ def register(client: Client, container: Container) -> None:
     @client.on_callback_query(filters.regex(r"^gojo\|change_main$"))
     async def _cb_change_main(_: Client, q: CallbackQuery) -> None:
         await q.answer()
-        await fsm.set(q.from_user.id, STATE_CHANGE_MAIN)
-        await q.message.reply(V.CHANGE_MAIN_PROMPT, parse_mode=ParseMode.HTML)
+        await _arm_prompt(q.from_user.id, STATE_CHANGE_MAIN, q.message,
+                          V.CHANGE_MAIN_PROMPT)
 
     # ── Change index channel — rebuild the whole index on a new channel ───────
     @client.on_callback_query(filters.regex(r"^gojo\|change_index$"))
     async def _cb_change_index(_: Client, q: CallbackQuery) -> None:
         await q.answer()
-        await fsm.set(q.from_user.id, STATE_CHANGE_INDEX)
-        await q.message.reply(V.CHANGE_INDEX_PROMPT, parse_mode=ParseMode.HTML)
+        await _arm_prompt(q.from_user.id, STATE_CHANGE_INDEX, q.message,
+                          V.CHANGE_INDEX_PROMPT)
 
     # ── Index management — list slots, edit text/image/buttons ────────────────
     async def _render_index_slots(edit_target: Message) -> None:
@@ -1189,6 +1219,10 @@ def register(client: Client, container: Container) -> None:
 
             caption = parse_user_markup(message)
             await fsm.clear(message.from_user.id)
+            try:  # tidy the typed caption; _execute_publish renders the next card
+                await message.delete()
+            except Exception:  # noqa: BLE001
+                pass
             await _execute_publish(
                 client, container, message, code,
                 silent=False, caption_override=caption,
@@ -1227,10 +1261,10 @@ def register(client: Client, container: Container) -> None:
             html = parse_user_markup(message)
             await fsm.clear(message.from_user.id)
             result = await FooterService(container).set_footer(html)
-            await message.reply(
+            await _result_in_place(
+                message, data,
                 V.footer_updated(result.ok, result.footers_rewritten,
                                  result.bots_bumped),
-                parse_mode=ParseMode.HTML,
             )
         elif state == STATE_CHANGE_MAIN:
             raw = (message.text or "").strip()
@@ -1239,6 +1273,10 @@ def register(client: Client, container: Container) -> None:
                 await message.reply(V.change_main_bad(raw), parse_mode=ParseMode.HTML)
                 return
             await fsm.clear(message.from_user.id)
+            try:
+                await message.delete()
+            except Exception:  # noqa: BLE001
+                pass
             await _restore_to_channel(client, container, message, new_id)
         elif state == STATE_CHANGE_INDEX:
             raw = (message.text or "").strip()
@@ -1247,6 +1285,10 @@ def register(client: Client, container: Container) -> None:
                 await message.reply(V.change_main_bad(raw), parse_mode=ParseMode.HTML)
                 return
             await fsm.clear(message.from_user.id)
+            try:
+                await message.delete()
+            except Exception:  # noqa: BLE001
+                pass
             await _restore_index_to_channel(client, container, message, new_id)
         elif state == STATE_IDX_SLOT_CAPTION:
             from kurosoden.shared.settings_ui import parse_user_markup
