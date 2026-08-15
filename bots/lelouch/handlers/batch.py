@@ -37,8 +37,8 @@ from nekofetch.core.container import Container
 from nekofetch.domain.enums import Role
 from nekofetch.ui.artwork import pick_artwork
 from nekofetch.ui.components import cb, keyboard, lock_buttons
-from nekofetch.ui.progress import SPINNER, animate_until
-from nekofetch.ui.screens import Screen, card, send_screen
+from nekofetch.ui.progress import SPINNER
+from nekofetch.ui.screens import Screen, card, message_ref, send_screen
 
 from nekofetch.bots.admin.handlers.requests import (
     _media_to_franchise_dict,
@@ -144,12 +144,14 @@ def register(client: Client, container: Container) -> None:
         await _prompt(q.message.chat.id, q.from_user.id, old_msg=q.message)
 
     async def _prompt(chat_id: int, user_id: int, *, old_msg: Message | None) -> None:
-        await fsm.set(user_id, STATE_BATCH_PROMPT)
         screen = card(
             V.BATCH_PROMPT, image=_art(), bot_name=BOT,
             buttons=[[(V.BTN_BATCH_CANCEL, cb("batch", "cancel"))]],
         )
-        await send_screen(client, chat_id, screen, old_msg=old_msg)
+        prompt = await send_screen(client, chat_id, screen, old_msg=old_msg)
+        # Remember the prompt so the title-list step evolves THIS card in place.
+        await fsm.set(user_id, STATE_BATCH_PROMPT,
+                      prompt_msg_id=prompt.id, prompt_chat_id=prompt.chat.id)
 
     # ── Title intake (group=2 so it sits ahead of the single-request text
     #    handler; only fires while this user is in the batch prompt state) ──────
@@ -160,12 +162,18 @@ def register(client: Client, container: Container) -> None:
     async def _batch_text(_: Client, message: Message) -> None:
         if not message.from_user:
             return
-        state, _data = await fsm.get(message.from_user.id)
+        state, data = await fsm.get(message.from_user.id)
         if state != STATE_BATCH_PROMPT:
             return  # not our turn — let the request handler take the message
         if not _staff(message):
             return
         raw = (message.text or "").strip()
+        prompt = message_ref(client, data.get("prompt_chat_id") or message.chat.id,
+                             data.get("prompt_msg_id"))
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001
+            pass
         # Accept both commas and newlines as separators.
         titles = [
             t.strip()
@@ -180,9 +188,10 @@ def register(client: Client, container: Container) -> None:
                 client, message.chat.id,
                 card(V.BATCH_EMPTY, image=_art(), bot_name=BOT,
                      buttons=[[(V.BTN_BATCH_CANCEL, cb("batch", "cancel"))]]),
+                old_msg=prompt,
             )
             return
-        await _resolve(message, titles)
+        await _resolve(message, titles, prompt=prompt)
 
     async def _hydrate(cand: dict, query: str) -> dict | None:
         """Turn a lightweight franchise candidate ({title, anilist_id, format})
@@ -226,7 +235,7 @@ def register(client: Client, container: Container) -> None:
         fr["_query"] = query
         return fr
 
-    async def _resolve(src: Message, titles: list[str]) -> None:
+    async def _resolve(src: Message, titles: list[str], *, prompt=None) -> None:
         """Resolve each title to its franchise(s):
 
           • exactly one franchise  → auto-approve (hydrated straight away);
@@ -263,8 +272,19 @@ def register(client: Client, container: Container) -> None:
                     pending.append({"query": title, "candidates": cands})
             return resolved, pending, skipped
 
-        msg = await src.reply(_frame(SPINNER[0]), parse_mode=ParseMode.HTML)
-        resolved, pending, skipped = await animate_until(msg, _run(), _frame)
+        # Animate the resolve ON the prompt card (a photo card) when we have it;
+        # else fall back to a fresh status message. Downstream cards replace this
+        # same message in place.
+        if prompt is not None:
+            await send_screen(
+                client, src.chat.id,
+                card(_frame(SPINNER[0]), image=_art(), bot_name=BOT),
+                old_msg=prompt,
+            )
+            msg = prompt
+        else:
+            msg = await src.reply(_frame(SPINNER[0]), parse_mode=ParseMode.HTML)
+        resolved, pending, skipped = await _run()
 
         if not resolved and not pending:
             await fsm.clear(user_id)

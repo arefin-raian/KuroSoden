@@ -50,12 +50,13 @@ from nekofetch.ui.artwork import (
     seed_anime_art,
 )
 from nekofetch.ui.components import lock_buttons
-from nekofetch.ui.progress import SPINNER, animate_until
+from nekofetch.ui.progress import SPINNER
 from nekofetch.ui.screens import (
     Screen,
     ask_title,
     choose_version,
     confirm_franchise,
+    message_ref,
     request_received,
     retry_title,
     send_screen,
@@ -125,7 +126,10 @@ def register(client: Client, container: Container) -> None:
             return
         await fsm.set(q.from_user.id, STATE_NAME)
         screen = ask_title()
-        await send_screen(client, q.message.chat.id, screen, old_msg=q.message)
+        prompt = await send_screen(client, q.message.chat.id, screen, old_msg=q.message)
+        # Remember the prompt so the typed-title step evolves THIS card in place.
+        await fsm.set(q.from_user.id, STATE_NAME,
+                      prompt_msg_id=prompt.id, prompt_chat_id=prompt.chat.id)
         await q.answer()
 
     # ── Text handler — anime search with dedup ────────────────────────────────
@@ -135,13 +139,20 @@ def register(client: Client, container: Container) -> None:
     async def _text(_: Client, message: Message) -> None:
         if not message.from_user:
             return
-        state, _data = await fsm.get(message.from_user.id)
+        state, data = await fsm.get(message.from_user.id)
         # In either state a typed message is a (new) title to look up.
         if state in (STATE_NAME, STATE_FRANCHISE):
-            await _search_with_dedup(message, message.text.strip())
+            query = message.text.strip()
+            prompt = message_ref(client, data.get("prompt_chat_id") or message.chat.id,
+                                 data.get("prompt_msg_id"))
+            try:
+                await message.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            await _search_with_dedup(message, query, prompt=prompt)
 
     # ── Lelouch's enhanced search — dedup first, then AniList ─────────────────
-    async def _search_with_dedup(message: Message, query: str) -> None:
+    async def _search_with_dedup(message: Message, query: str, *, prompt=None) -> None:
         """Check dedup before delegating to NekoFetch's AniList search."""
         user_id = message.from_user.id
 
@@ -160,6 +171,7 @@ def register(client: Client, container: Container) -> None:
                 await send_screen(
                     client, message.chat.id,
                     Screen(caption=V.REQUESTS_PAUSED, image=pick_artwork("lelouch")),
+                    old_msg=prompt,
                 )
                 return
             if await _has_pending_request(user_id, container):
@@ -168,6 +180,7 @@ def register(client: Client, container: Container) -> None:
                     client, message.chat.id,
                     Screen(caption=V.limit_reached(active),
                            image=pick_artwork("lelouch")),
+                    old_msg=prompt,
                 )
                 return
 
@@ -207,11 +220,12 @@ def register(client: Client, container: Container) -> None:
             await send_screen(
                 client, message.chat.id,
                 Screen(caption=caption, image=image, keyboard=kb),
+                old_msg=prompt,
             )
             return
 
         # ── 2. Delegate to NekoFetch's existing AniList search ───────────
-        await _search_anilist(message, query)
+        await _search_anilist(message, query, prompt=prompt)
 
     async def _is_staff(message: Message, container: Container) -> bool:
         """Check if the user is staff/admin (can bypass request limits)."""
@@ -267,14 +281,25 @@ def register(client: Client, container: Container) -> None:
     # AniList search — IDENTICAL to NekoFetch's admin handler logic
     # (reuses the same module-level helpers for franchise totals + TMDB)
     # ──────────────────────────────────────────────────────────────────────────
-    async def _search_anilist(message: Message, query: str) -> None:
+    async def _search_anilist(message: Message, query: str, *, prompt=None) -> None:
         def _frame(f: str) -> str:
             return t(M.SEARCHING, query=_esc_q(query), frame=f)
 
-        msg = await message.reply(_frame(SPINNER[0]), parse_mode=ParseMode.HTML)
+        # Animate the search ON the prompt card (a photo card) when we have it;
+        # else fall back to a fresh status message. The confirm card replaces
+        # this same message in place at the end — no separate spinner card.
+        if prompt is not None:
+            await send_screen(
+                client, message.chat.id,
+                Screen(caption=_frame(SPINNER[0]), image=pick_artwork("lelouch")),
+                old_msg=prompt,
+            )
+            msg = prompt
+        else:
+            msg = await message.reply(_frame(SPINNER[0]), parse_mode=ParseMode.HTML)
 
         # --- 1. Resolve the title (AniList first) ---
-        media = await animate_until(msg, container.anilist.search(query), _frame)
+        media = await container.anilist.search(query)
         if media is None:
             # AniList missed. Walk the rest of the unified provider chain
             # (Jikan/MAL is already fused into container.anilist, so this covers
@@ -282,13 +307,13 @@ def register(client: Client, container: Container) -> None:
             # this single-request flow and the batch flow share this resolver.
             from kurosoden.shared.franchise_resolver import resolve_franchise
 
-            franchise_data = await animate_until(
-                msg, resolve_franchise(container, query), _frame
-            )
+            franchise_data = await resolve_franchise(container, query)
             if franchise_data is None:
-                await msg.edit_text(
-                    t(M.SEARCH_NOT_FOUND, query=_esc_q(query)),
-                    parse_mode=ParseMode.HTML,
+                await send_screen(
+                    client, message.chat.id,
+                    Screen(caption=t(M.SEARCH_NOT_FOUND, query=_esc_q(query)),
+                           image=pick_artwork("lelouch")),
+                    old_msg=msg,
                 )
                 return
             franchise_data["_query"] = query
@@ -298,7 +323,7 @@ def register(client: Client, container: Container) -> None:
                 franchise=franchise_data,
             )
             screen = confirm_franchise(franchise_data)
-            msg = await send_screen(client, message.chat.id, screen, old_msg=msg)
+            await send_screen(client, message.chat.id, screen, old_msg=msg)
             return
 
         # --- 2. Detect adaptations via SeriesResolver ---
@@ -326,7 +351,7 @@ def register(client: Client, container: Container) -> None:
                 franchise=franchise_data,
             )
             screen = choose_version(query, versions)
-            msg = await send_screen(client, message.chat.id, screen, old_msg=msg)
+            await send_screen(client, message.chat.id, screen, old_msg=msg)
             return
 
         # --- 3. Single match — franchise totals + TMDB ---
@@ -346,7 +371,7 @@ def register(client: Client, container: Container) -> None:
             query=query,
         )
         screen = confirm_franchise(franchise_data, backdrop_path=backdrop_path)
-        msg = await send_screen(client, message.chat.id, screen, old_msg=msg)
+        await send_screen(client, message.chat.id, screen, old_msg=msg)
 
     # ── Version picker callbacks ──────────────────────────────────────────────
     @client.on_callback_query(filters.regex(r"^ver_pick\|"))
