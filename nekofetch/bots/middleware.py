@@ -53,6 +53,12 @@ def install_auth_middleware(
     async def _rate_limited(user_id: int) -> bool:
         """Returns True when the user is over the rate-limit budget.
 
+        One round-trip: an INCR + a same-pipeline EXPIRE (NX-style — only the
+        first INCR of the window needs the TTL, but re-setting it every time is
+        harmless and keeps it to a single RTT). On a WAN-distant Redis, folding
+        the old INCR-then-conditional-EXPIRE (2 sequential RTTs) into one
+        pipeline halves this check's latency on every tap.
+
         Fails OPEN: if Redis is unreachable (DNS error, connection drop,
         Render-internal hostname only resolvable from a different region),
         we don't rate-limit — better to accept extra messages than to
@@ -62,10 +68,11 @@ def install_auth_middleware(
             return False
         key = REDIS_RATELIMIT.format(user_id=user_id)
         try:
-            count = await container.redis.incr(key)
-            if count == 1:
-                await container.redis.expire(key, 60)
-            return count > rate_limit
+            pipe = container.redis.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, 60)
+            count, _ = await pipe.execute()
+            return int(count) > rate_limit
         except Exception as exc:
             log.warning(
                 "middleware.rate_limit.redis_unreachable",

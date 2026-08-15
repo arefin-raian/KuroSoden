@@ -256,8 +256,9 @@ async def assemble_final(
     the styling renders everywhere. Intermediate ``.ts`` parts are removed on
     success when ``cleanup`` is set. Returns ``(mkv_path, subtitle_meta)``.
     """
-    # True video duration so branding can skip the final 3 minutes.
-    video_ms = _probe_duration_ms(video)
+    # True video duration so branding can skip the final 3 minutes. Offload the
+    # ffprobe so this async fn doesn't block the shared bot loop.
+    video_ms = await asyncio.to_thread(_probe_duration_ms, video)
 
     # Pool every subtitle's cues FIRST so the branding windows are subtitle-free
     # across ALL tracks — a gap in one track that has dialogue in another is never

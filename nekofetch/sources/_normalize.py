@@ -237,8 +237,13 @@ async def normalize_release(src: Path, dest: Path, *, title: str | None = None,
     # Capture the container title — prefer franchise_title, then title, then filename.
     base_title = franchise_title or title or release_title(src.name)
 
-    streams = _ffprobe_streams(src)
-    video_ms = _duration_ms(src)
+    # ffprobe blocks for hundreds of ms–seconds on a multi-GB MKV. This runs on
+    # the SHARED bot event loop (the download worker is a task on it), so a bare
+    # subprocess.run here freezes all four bots and starves Pyrogram's 5s
+    # keepalive → "session disconnected" churn + reconnect stalls. Offload to a
+    # thread so the loop keeps servicing taps + pings.
+    streams = await asyncio.to_thread(_ffprobe_streams, src)
+    video_ms = await asyncio.to_thread(_duration_ms, src)
     audio = [s for s in streams if s.get("codec_type") == "audio"]
     subs = [s for s in streams if s.get("codec_type") == "subtitle"]
 
@@ -260,7 +265,11 @@ async def normalize_release(src: Path, dest: Path, *, title: str | None = None,
                                       "reason": "non-text subtitle"})
             continue
         vtt = work / f".norm.{dest.stem}.{n}.vtt"
-        proc = subprocess.run(  # noqa: ASYNC221 - quick per-track extract
+        # One ffmpeg extract per subtitle track, in a loop — the worst on-loop
+        # freeze of the whole flow. Offload each to a thread so the shared bot
+        # loop keeps servicing taps + Pyrogram's keepalive between tracks.
+        proc = await asyncio.to_thread(
+            subprocess.run,
             [ffmpeg, "-y", "-loglevel", "error", "-i", str(src),
              "-map", f"0:{s['index']}", "-c:s", "webvtt", str(vtt)],
             capture_output=True, text=True,

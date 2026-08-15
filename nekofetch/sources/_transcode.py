@@ -657,10 +657,12 @@ async def transcode_renditions(
         except ValueError:
             src_h = None
     if not src_h:
-        # detect height via ffprobe
+        # detect height via ffprobe — offload so this async fn doesn't freeze
+        # the shared bot loop (starving Pyrogram's keepalive → session drops).
         ffprobe = find_ffprobe()
         if ffprobe:
-            r = subprocess.run(  # noqa: ASYNC221 - quick metadata probe
+            r = await asyncio.to_thread(
+                subprocess.run,
                 [ffprobe, "-v", "quiet", "-select_streams", "v:0",
                  "-show_entries", "stream=height", "-of", "default=nw=1:nk=1", str(src)],
                 capture_output=True, text=True,
