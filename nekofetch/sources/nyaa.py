@@ -110,21 +110,93 @@ class NyaaSource(AnimeSource):
         self.base_url = base_url.rstrip("/")
         self.category = category
         self._http: httpx.AsyncClient | None = None
+        self._cf = None  # lazy curl_cffi fallback (DDoS-Guard bypass)
 
     @property
     def http(self) -> httpx.AsyncClient:
         if self._http is None:
             self._http = httpx.AsyncClient(
                 timeout=30.0,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                  "Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
                 follow_redirects=True,
             )
         return self._http
+
+    @property
+    def cf(self):
+        """curl_cffi client that impersonates Chrome's TLS fingerprint.
+
+        nyaa.si sits behind DDoS-Guard, which intermittently drops/resets plain
+        httpx connections (its TLS fingerprint is detectable). curl_cffi wraps
+        libcurl with browser-impersonation so the handshake looks like a real
+        Chrome — the same fallback ``anizone.py`` uses against Cloudflare. Used
+        only when the httpx path raises a transport error."""
+        if self._cf is None:
+            from curl_cffi import requests as cf_requests
+
+            self._cf = cf_requests.AsyncSession(
+                impersonate="chrome",
+                timeout=60.0,
+                allow_redirects=True,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                  "Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
+        return self._cf
 
     async def close(self) -> None:
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+        if self._cf is not None:
+            try:
+                await self._cf.close()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+            self._cf = None
+
+    async def _fetch_rss(self, params: dict) -> str:
+        """GET the RSS feed, with retries and a curl_cffi fallback.
+
+        DDoS-Guard drops/stalls plain-httpx connections intermittently (the
+        failures surface as httpx transport errors whose ``str()`` is empty).
+        Retry the httpx path a couple of times, then fall back to the
+        Chrome-impersonating curl_cffi client before giving up.
+        """
+        url = f"{self.base_url}/"
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = await self.http.get(url, params=params)
+                resp.raise_for_status()
+                return resp.text
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+        # httpx exhausted — try the browser-impersonation client once.
+        try:
+            resp = await self.cf.get(url, params=params)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"HTTP {resp.status_code} from nyaa via curl_cffi")
+            log.info("nyaa.search.cf_fallback_ok")
+            return resp.text
+        except Exception as exc:  # noqa: BLE001 — surface the ORIGINAL httpx error too
+            log.warning("nyaa.search.cf_fallback_failed",
+                        error=f"{type(exc).__name__}: {exc}")
+            if last_exc is not None:
+                raise last_exc
+            raise
 
     async def _rss(self, query: str) -> list[dict]:
         """Fetch nyaa RSS for a query (Anime category, seeders desc)."""
@@ -132,9 +204,8 @@ class NyaaSource(AnimeSource):
             "page": "rss", "f": "0", "c": self.category,
             "q": query, "s": "seeders", "o": "desc",
         }
-        resp = await self.http.get(f"{self.base_url}/", params=params)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.text)
+        text = await self._fetch_rss(params)
+        root = ET.fromstring(text)
         items: list[dict] = []
         for it in root.iter("item"):
             title = _text(it, "title")
@@ -181,7 +252,11 @@ class NyaaSource(AnimeSource):
         try:
             items = await self._rss(query)
         except (httpx.HTTPError, ET.ParseError) as exc:
-            log.warning("nyaa.search.failed", error=str(exc))
+            # ``type(exc).__name__`` guarantees a non-empty value — httpx
+            # transport errors (ReadTimeout/ConnectError/…) stringify to "",
+            # which is why this used to log a blank ``error=``.
+            log.warning("nyaa.search.failed",
+                        error=f"{type(exc).__name__}: {exc}", exc_info=exc)
             return []
 
         # Fallback hierarchy: if NO release advertises Dual Audio in its title,

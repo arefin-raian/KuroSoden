@@ -446,19 +446,31 @@ async def send_screen(
     screen: Screen,
     old_msg: Message | None = None,
 ) -> Message:
-    """Send a Screen as a photo message, optionally replacing an old message.
+    """Render a Screen as a photo card, editing ``old_msg`` IN PLACE when given.
 
     ``screen.image`` can be a local ``Path`` or an HTTP(S) URL (both work with
-    Pyrogram's ``send_photo``). When no image is available, falls back to plain text.
+    Pyrogram's ``send_photo``/``edit_message_media``). With no image it falls back
+    to a plain text message.
 
-    If ``old_msg`` is provided, it is deleted *after* the new message is sent —
-    this way a :class:`FloodWait` during the send won't lose the existing screen.
+    When ``old_msg`` is supplied we EDIT that message in place — the card keeps
+    its position in the chat, the image isn't re-uploaded, and there's no
+    delete-then-resend flicker. This is the house behaviour for every flow: ask
+    for a value / tap a button → the SAME card updates. We only fall back to
+    send-a-new-card-then-delete-the-old when an in-place edit is impossible:
+      * the message type must change (text card ↔ photo card), which Telegram
+        can't edit across; or
+      * Telegram rejects the edit (message too old / not ours / identical) —
+        MessageNotModified is treated as success (the card is already right).
     """
     caption = screen.caption or ""
     photo = screen.image
+    photo_arg = (str(photo) if isinstance(photo, Path) else photo) if photo else None
+    fitted = (caption if visible_len(caption) <= CAPTION_LIMIT
+              else _truncate_html(caption, CAPTION_LIMIT)) if photo else \
+             _truncate_html(caption, MESSAGE_LIMIT)
 
     async def _send_photo(**kw):
-        for attempt in range(3):
+        for _ in range(3):
             try:
                 return await client.send_photo(chat_id, **kw)
             except FloodWait as fw:
@@ -466,38 +478,95 @@ async def send_screen(
         return await client.send_photo(chat_id, **kw)
 
     async def _send_text(text, **kw):
-        for attempt in range(3):
+        for _ in range(3):
             try:
                 return await client.send_message(chat_id, text, **kw)
             except FloodWait as fw:
                 await asyncio.sleep(fw.value + 1)
         return await client.send_message(chat_id, text, **kw)
 
-    if photo:
-        photo_arg = str(photo) if isinstance(photo, Path) else photo
-        # Always a SINGLE photo message: image + caption + keyboard together. When
-        # the caption is over the photo budget we shrink it to fit rather than
-        # splitting into a bare image + follow-up text — a split left an orphan
-        # captionless photo lingering in the chat (the "image with no caption"
-        # bug). Panels are budgeted to fit; this trim is only a last-resort guard.
-        fitted = caption if visible_len(caption) <= CAPTION_LIMIT else _truncate_html(
-            caption, CAPTION_LIMIT
-        )
+    # ── In-place edit path (preferred whenever we have a message to reuse) ──
+    if old_msg is not None:
+        edited = await _try_edit_in_place(client, old_msg, screen, photo_arg, fitted)
+        if edited is not None:
+            return edited
+        # Edit impossible (type change / rejected) — fall through to send-new,
+        # then delete the stale card so we never leave two on screen.
+
+    if photo_arg:
         msg = await _send_photo(
             photo=photo_arg, caption=fitted,
             parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
         )
     else:
         msg = await _send_text(
-            _truncate_html(caption, MESSAGE_LIMIT),
-            parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
+            fitted, parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
         )
 
-    # Delete the old message only after the new one is safely posted.
     if old_msg is not None:
         try:
             await old_msg.delete()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
-
     return msg
+
+
+async def _try_edit_in_place(client, old_msg, screen, photo_arg, fitted):
+    """Edit ``old_msg`` to match ``screen``; return the message or None if impossible.
+
+    Returns the edited Message on success (incl. MessageNotModified — the card is
+    already correct), or ``None`` when the edit can't be done and the caller
+    should send a fresh card (message-type change, too old, not ours, etc.).
+    """
+    from pyrogram.errors import MessageNotModified
+    from pyrogram.types import InputMediaPhoto
+
+    old_has_photo = bool(getattr(old_msg, "photo", None))
+    want_photo = bool(photo_arg)
+    # Telegram cannot turn a text message into a media message or vice-versa via
+    # edit — those transitions require a fresh send.
+    if old_has_photo != want_photo:
+        return None
+    try:
+        if want_photo:
+            # Swap the image only when it actually changed; otherwise just edit
+            # the caption (cheaper, and avoids a needless re-upload).
+            old_media = getattr(old_msg, "photo", None)
+            same_image = False
+            if isinstance(photo_arg, str) and old_media is not None:
+                # A cached file_id in the caption? We can't cheaply compare a URL/
+                # path to an uploaded photo, so only skip re-upload when the caller
+                # passed the SAME file_id we already have.
+                same_image = photo_arg == getattr(old_media, "file_id", None)
+            if same_image:
+                return await old_msg.edit_caption(
+                    caption=fitted, parse_mode=screen.parse_mode,
+                    reply_markup=screen.keyboard,
+                )
+            return await old_msg.edit_media(
+                InputMediaPhoto(photo_arg, caption=fitted,
+                                parse_mode=screen.parse_mode),
+                reply_markup=screen.keyboard,
+            )
+        return await old_msg.edit_text(
+            fitted, parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
+        )
+    except MessageNotModified:
+        return old_msg  # already showing this exact content — success
+    except FloodWait as fw:
+        await asyncio.sleep(fw.value + 1)
+        try:
+            if want_photo:
+                return await old_msg.edit_media(
+                    InputMediaPhoto(photo_arg, caption=fitted,
+                                    parse_mode=screen.parse_mode),
+                    reply_markup=screen.keyboard,
+                )
+            return await old_msg.edit_text(
+                fitted, parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
+            )
+        except Exception:  # noqa: BLE001 — give up on in-place, caller sends fresh
+            return None
+    except Exception:  # noqa: BLE001 — too old / not ours / etc. → caller sends fresh
+        return None
+
