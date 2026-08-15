@@ -64,3 +64,8 @@ _subs_probe/
 
 # Session continuation logs dumped into the repo root (local scratch).
 *this-session-is-being-continued*.txt
+
+# Claude Code local scratch — session history exports and per-machine settings.
+history [claude].txt
+history*[claude]*.txt
+.claude/

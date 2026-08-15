@@ -85,6 +85,74 @@ def test_reorder_falls_back_when_no_ids(pub):
     assert [e.anilist_id for e in out["all"]] == [101, 102, 201, 202]
 
 
+# ── _resolve_relink_client (redo button relink identity) ─────────────────────────
+#
+# The season cards are authored by Senku (or the userbot), so a relink driven by
+# the caller's admin_client (NekoFetch/Gojo) silently fails to edit them. The
+# resolver must prefer the authoring identity and only fall back to the passed
+# client when no pipeline manager is reachable (e.g. a standalone script).
+
+
+class _PM:
+    def __init__(self, senku):
+        self.senku = senku
+
+
+class _CtnWithPM:
+    redis = None
+
+    def __init__(self, senku):
+        self.pipeline_manager = _PM(senku)
+
+
+@pytest.mark.asyncio
+async def test_relink_client_prefers_senku_over_fallback():
+    senku, fallback = object(), object()
+    pub = SenkuPublisher(_CtnWithPM(senku))
+    got = await pub._resolve_relink_client(fallback, creation_scope="bot",
+                                           userbot_account=None)
+    assert got is senku
+
+
+@pytest.mark.asyncio
+async def test_relink_client_falls_back_without_pipeline_manager():
+    # A standalone relink script has no pipeline_manager: the passed (Senku-token)
+    # client must be used verbatim rather than dropped.
+    fallback = object()
+    pub = SenkuPublisher(_FakeContainer())
+    got = await pub._resolve_relink_client(fallback, creation_scope="bot",
+                                           userbot_account=None)
+    assert got is fallback
+
+
+@pytest.mark.asyncio
+async def test_relink_client_uses_userbot_for_userbot_scope(monkeypatch):
+    ub, senku, fallback = object(), object(), object()
+    pub = SenkuPublisher(_CtnWithPM(senku))
+
+    async def _fake_acquire():
+        return ub
+
+    monkeypatch.setattr(pub, "_acquire_userbot", _fake_acquire)
+    got = await pub._resolve_relink_client(fallback, creation_scope="userbot",
+                                           userbot_account="acct")
+    assert got is ub
+
+
+@pytest.mark.asyncio
+async def test_relink_client_userbot_scope_falls_back_to_senku_when_no_userbot(monkeypatch):
+    senku, fallback = object(), object()
+    pub = SenkuPublisher(_CtnWithPM(senku))
+
+    async def _no_ub():
+        return None
+
+    monkeypatch.setattr(pub, "_acquire_userbot", _no_ub)
+    got = await pub._resolve_relink_client(fallback, creation_scope="userbot",
+                                           userbot_account="acct")
+    assert got is senku
+
+
 # ── build_audio_keyboard (shared render) ─────────────────────────────────────────
 
 def test_flat_buttons_only_emit_linked_qualities():

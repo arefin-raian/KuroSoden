@@ -203,6 +203,29 @@ def upload_done(title: str) -> str:
     )
 
 
+def redo_relinked(title: str, code: str = "") -> str:
+    """Levi confirms a redo's quality links were refreshed on the existing posts."""
+    tag = f"<code>{esc(code)}</code> · " if code else ""
+    return (
+        f"{ICON} <b>Redo complete — links refreshed.</b>\n\n"
+        f"{tag}<b>{esc(title)}</b> is re-uploaded and the quality buttons on "
+        "the existing posts now point at the fresh files. No new channel was "
+        "built — the old posts kept their place.\n\n"
+        "<i>Clean swap. Nothing duplicated.</i>"
+    )
+
+
+def update_appended(title: str, code: str = "") -> str:
+    """Levi confirms an update entry was appended to the existing channel."""
+    tag = f"<code>{esc(code)}</code> · " if code else ""
+    return (
+        f"{ICON} <b>Update landed — card appended.</b>\n\n"
+        f"{tag}<b>{esc(title)}</b>'s new entry is on the channel and the main "
+        "post got a reply. The channel grew; nothing was rebuilt.\n\n"
+        "<i>Same channel, one more season.</i>"
+    )
+
+
 # ── Errors / misc ─────────────────────────────────────────────────────────────
 
 GENERIC_FAIL = (

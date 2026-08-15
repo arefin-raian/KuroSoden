@@ -18,12 +18,77 @@ log = get_logger(__name__)
 async def handoff_download_to_distribution(
     container: Container, code: str, title: str,
 ) -> None:
-    """Complete Levi, assign Senku, then send the distribution card."""
-    try:
-        from kurosoden.shared.admin_assignment import AdminAssignmentEngine
+    """Complete Levi and route the work to its next pipeline stage.
 
-        engine = AdminAssignmentEngine(container.pg_sessionmaker)
+    Normal works are handed to Senku (distribution). Redo-relink and
+    update-entry works SKIP the distribution stage entirely: the channel
+    already exists, so the publish step relinks the fresh quality buttons
+    (redo) or appends the new season card (update) in place. Those are
+    auto-published right here, so a redo/update of a live title completes
+    without ever spawning a "Ready for Distribution" task.
+    """
+    from sqlalchemy import select
+
+    from nekofetch.infrastructure.database.postgres.session import session_scope
+    from nekofetch.infrastructure.repositories.request_repo import RequestRepository
+    from nekofetch.services.publishing_service import PublishingService
+    from kurosoden.shared.admin_assignment import (
+        ACTIVE_STATUSES,
+        AdminAssignment,
+        AdminAssignmentEngine,
+    )
+
+    # A redo of a published title carries ``redo_relink``; an update entry
+    # carries ``update_entry``. Both mean the distribution posts already exist
+    # (or are appended in place) — never a fresh Senku channel build.
+    async with session_scope(container.pg_sessionmaker) as session:
+        req = await RequestRepository(session).get_by_code(code)
+        fd = (req.franchise_data or {}) if req is not None else {}
+        skip_distribution = bool(fd.get("redo_relink") or fd.get("update_entry"))
+        levi_admin = None
+        if skip_distribution:
+            row = (
+                await session.execute(
+                    select(AdminAssignment).where(
+                        AdminAssignment.request_code == code,
+                        AdminAssignment.stage == "levi",
+                        AdminAssignment.status.in_(ACTIVE_STATUSES),
+                    ).order_by(AdminAssignment.updated_at.desc())
+                )
+            ).scalars().first()
+            levi_admin = row.admin_telegram_id if row is not None else None
+
+    engine = AdminAssignmentEngine(container.pg_sessionmaker)
+    try:
         await engine.complete_task(code, "levi")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("handoff.levi_complete.failed", code=code, error=str(exc))
+
+    if skip_distribution:
+        # The distribution already exists — auto-publish runs the in-place
+        # relink (redo) or card append (update), marks the request PUBLISHED,
+        # and completes the linked work item. No Senku task, no Gojo approval.
+        try:
+            await PublishingService(container).publish(code)
+        except Exception as exc:  # noqa: BLE001 — fall back to a manual Gojo retry
+            log.warning("handoff.auto_publish.failed", code=code, error=str(exc))
+            try:
+                assignment = await engine.assign(code, "gojo")
+            except Exception as exc2:  # noqa: BLE001
+                log.warning("handoff.fallback_assign.failed", code=code,
+                            error=str(exc2))
+                assignment = None
+            if assignment is not None:
+                await notify_stage_assignment(
+                    container, "gojo", assignment, code, title,
+                )
+            return
+        await _notify_auto_distribution_done(
+            container, code, title, levi_admin, fd,
+        )
+        return
+
+    try:
         assignment = await engine.assign(code, "senku")
     except Exception as exc:  # noqa: BLE001
         log.warning("handoff.assign.failed", code=code, error=str(exc))
@@ -33,6 +98,35 @@ async def handoff_download_to_distribution(
         return
 
     await notify_stage_assignment(container, "senku", assignment, code, title)
+
+
+async def _notify_auto_distribution_done(
+    container: Container,
+    code: str,
+    title: str,
+    admin_id: int | None,
+    franchise_data: dict,
+) -> None:
+    """Tell the downloader their redo/update completed without a Senku stage.
+
+    Best-effort: a failed DM never affects the already-finished work.
+    """
+    if admin_id is None:
+        return
+    notifier = _stage_notifier(container, "levi")
+    if notifier is None:
+        return
+    try:
+        from kurosoden.shared import levi_voice as V
+
+        if franchise_data.get("redo_relink"):
+            text = V.redo_relinked(title, code)
+        else:
+            text = V.update_appended(title, code)
+        await notifier.send_message(admin_id, text, parse_mode=ParseMode.HTML)
+        log.info("handoff.auto_done.notified", code=code, admin=admin_id)
+    except Exception as exc:  # noqa: BLE001 — a completion DM never blocks the handoff
+        log.warning("handoff.auto_done_notify.failed", code=code, error=str(exc))
 
 
 async def handoff_distribution_to_publish(

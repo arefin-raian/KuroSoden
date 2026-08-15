@@ -225,6 +225,42 @@ class SenkuPublisher:
                             anime=anime_doc_id, error=str(exc))
         return {"appended": appended, "chat_id": chat_id}
 
+    async def _resolve_relink_client(
+        self, fallback, creation_scope: str | None, userbot_account: str | None,
+    ):
+        """Return the client that can EDIT the season cards, or ``fallback``.
+
+        Season/movie cards are authored by Senku (bot-scoped channels) or by the
+        userbot (userbot-scoped channels). A bot cannot edit a channel message it
+        didn't author unless it's a channel admin with edit-of-others rights, so
+        editing with the caller's ``admin_client`` (NekoFetch/Gojo) silently
+        fails per card → ``relinked=0`` (the ORB symptom). Resolve the authoring
+        identity in-process:
+
+          * userbot scope → the userbot pool client that posted the cards;
+          * otherwise     → Senku's live client via the pipeline manager.
+
+        Falls back to ``fallback`` (the passed client) when the authoring client
+        can't be reached — e.g. a standalone relink script that has no running
+        pipeline manager. Never raises: a resolution hiccup just uses fallback.
+        """
+        if (creation_scope or "").lower() == "userbot":
+            try:
+                ub = await self._acquire_userbot()
+                if ub is not None:
+                    log.info("senku.relink.client", identity="userbot",
+                             account=userbot_account)
+                    return ub
+            except Exception as exc:  # noqa: BLE001 — fall back to the passed client
+                log.info("senku.relink.userbot_unavailable", error=str(exc))
+        pm = getattr(self._c, "pipeline_manager", None)
+        senku = getattr(pm, "senku", None) if pm is not None else None
+        if senku is not None:
+            log.info("senku.relink.client", identity="senku")
+            return senku
+        log.info("senku.relink.client", identity="fallback")
+        return fallback
+
     async def relink_packs_in_place(
         self, client, anime_doc_id: str,
     ) -> dict:
@@ -273,6 +309,8 @@ class SenkuPublisher:
                 return {"relinked": 0, "chat_id": None}
             bot_id = bot.id
             chat_id = int(bot.chat_id)
+            creation_scope = bot.creation_scope
+            userbot_account = bot.userbot_account
             cards = (
                 await session.execute(
                     select(ChannelLayout)
@@ -292,6 +330,19 @@ class SenkuPublisher:
         if not card_rows:
             log.info("senku.relink.no_cards", anime=anime_doc_id)
             return {"relinked": 0, "chat_id": chat_id}
+
+        # 1b. Pick the client that can actually edit these cards. Telegram only
+        #     lets a bot edit a channel message it AUTHORED (or that its admin
+        #     rights explicitly allow it to edit-of-others). The season cards were
+        #     posted by Senku — or, for a userbot-scoped channel, by the userbot —
+        #     NOT by the ``admin_client`` (NekoFetch/Gojo) the caller passes. So a
+        #     relink driven by ``admin_client`` silently no-ops (edit_failed per
+        #     card → relinked=0), which is exactly the ORB symptom. Prefer the
+        #     authoring identity and fall back to whatever the caller handed us
+        #     (e.g. a standalone script with no pipeline_manager).
+        edit_client = await self._resolve_relink_client(
+            client, creation_scope, userbot_account,
+        )
 
         # 2. Load the FRESH packs + franchise walk, and map each entry's anilist
         #    id to its packs exactly as the full publish does (TV by season index,
@@ -348,7 +399,7 @@ class SenkuPublisher:
                 continue
             markup = build_audio_keyboard(buttons, fmt)
             try:
-                await client.edit_message_reply_markup(chat_id, mid, reply_markup=markup)
+                await edit_client.edit_message_reply_markup(chat_id, mid, reply_markup=markup)
             except Exception as exc:  # noqa: BLE001 — stale/identical markup, keep going
                 log.warning("senku.relink.edit_failed", aid=aid, mid=mid, error=str(exc))
                 continue
