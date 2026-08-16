@@ -105,6 +105,10 @@ async def _job_view(container: Container, job_id: int) -> dict | None:
             # the card fell back to stage=None → "Downloading 0%" and froze.
             "stage": rs.get("stage"),
         }
+        # The failure reason (job.error) — surfaced on the recovery card so the
+        # admin knows whether to Retry (transient) or Provide a fresh link (a
+        # dead DDL link / "not an archive").
+        view["error"] = getattr(job, "error", None)
     snap = await container.progress.get(job_id) if container.progress else None
     if snap is not None:
         # Live snapshot wins for the fast-moving fields; status too, since the
@@ -305,6 +309,31 @@ async def _completion_art(container: Container, code: str) -> str | None:
         return None
 
 
+def _fail_reason(view: dict) -> str:
+    """A short, admin-actionable reason line appended to the failed card.
+
+    Turns the raw ``job.error`` into a hint: a dead/expired DDL link or a
+    non-archive download points the admin at 'Provide' (paste a fresh link);
+    anything else reads as transient -> 'Retry'. Best-effort and always safe."""
+    import html
+
+    err = (view.get("error") or "").strip()
+    if not err:
+        return ""
+    low = err.lower()
+    if "not an archive" in low or "returned a web page" in low:
+        hint = "The link looks expired — tap <b>Provide</b> and paste a fresh one."
+    elif "no video files found" in low:
+        hint = ("The archive held no video (samples/subs only, or password-"
+                "protected) — try a different link via <b>Provide</b>.")
+    elif "0 files" in low or "produced 0" in low:
+        hint = "Nothing downloaded — <b>Retry</b>, or <b>Provide</b> a fresh link."
+    else:
+        hint = "Transient error — <b>Retry</b>, or switch source."
+    snippet = html.escape(err[:180], quote=False)
+    return f"\n\n<blockquote>⚠️ {snippet}\n\n<i>{hint}</i></blockquote>"
+
+
 async def _paint_terminal(client: Client, container: Container, job_id: int,
                           chat_id: int, msg_id: int, view: dict) -> None:
     title, code, status = view["title"], view.get("code", ""), view["status"]
@@ -314,7 +343,7 @@ async def _paint_terminal(client: Client, container: Container, job_id: int,
         text = t(M.DL_CARD_FAILED, title=title, job=job_id)
         kb = await _recovery_keyboard(container, code)
     elif status == JobStatus.FAILED.value:
-        text = t(M.DL_CARD_FAILED, title=title, job=job_id)
+        text = t(M.DL_CARD_FAILED, title=title, job=job_id) + _fail_reason(view)
         kb = await _recovery_keyboard(container, code)
     else:
         # Success — paint a proper completion card with a cover backdrop, not a
