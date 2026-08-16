@@ -112,6 +112,7 @@ async def fetch_from_acutebot(
             lambda c: _do_fetch(c, title_query, photo_dir, on_step),
             retries=2,
             retry_on=is_transport_error,
+            max_attempts=3,  # owner spec: try @acutebot at most 3 times, then give up
         )
     except Exception as exc:
         log.warning("acutebot.fetch.failed", title=title_query, error=str(exc))

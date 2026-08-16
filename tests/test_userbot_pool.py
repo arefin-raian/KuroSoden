@@ -91,9 +91,10 @@ async def test_acute_fetch_requests_bounded_second_attempt(monkeypatch):
     pool = UserbotPool(12345, "hash", [Account("primary")])
     observed: dict[str, int] = {}
 
-    async def execute(_fn, *, retries=1, retry_on=None):
+    async def execute(_fn, *, retries=1, retry_on=None, max_attempts=None):
         observed["retries"] = retries
         observed["retry_on"] = retry_on
+        observed["max_attempts"] = max_attempts
         return None
 
     monkeypatch.setattr(pool, "execute", execute)
@@ -102,6 +103,8 @@ async def test_acute_fetch_requests_bounded_second_attempt(monkeypatch):
     assert result is None
     assert observed["retries"] == 2
     assert observed["retry_on"] is is_transport_error
+    # Owner spec: @acutebot is hard-capped at 3 total attempts.
+    assert observed["max_attempts"] == 3
 
 
 @pytest.mark.asyncio
@@ -122,3 +125,31 @@ async def test_execute_does_not_retry_non_transport_errors():
 
     assert calls == 1
     assert client.stopped == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_max_attempts_caps_total_tries(monkeypatch):
+    # Many accounts × retries would allow >3 tries, but max_attempts=3 caps it.
+    accounts = [Account(f"acc{i}") for i in range(5)]
+    pool = UserbotPool(12345, "hash", accounts)
+    calls = 0
+
+    async def _acquire():
+        return _FakeClient(name="x", healthy=True)
+
+    monkeypatch.setattr(pool, "acquire", _acquire)
+    monkeypatch.setattr(pool, "_retire", lambda *_a, **_k: _noop())
+
+    async def operation(_client):
+        nonlocal calls
+        calls += 1
+        raise ConnectionError("transport closed")  # transport error → retryable
+
+    with pytest.raises(RuntimeError):
+        await pool.execute(operation, retries=2, retry_on=is_transport_error,
+                           max_attempts=3)
+    assert calls == 3  # hard-capped, not 5*2=10
+
+
+async def _noop():
+    return None

@@ -188,11 +188,19 @@ class UserbotPool:
         *,
         retries: int = 1,
         retry_on: Callable[[BaseException], bool] | None = None,
+        max_attempts: int | None = None,
     ) -> T:
         """Run ``fn`` with a working client; on failure, fall back to another
-        account and retry (handles flood-wait / session death mid-operation)."""
+        account and retry (handles flood-wait / session death mid-operation).
+
+        ``max_attempts`` hard-caps the TOTAL number of tries regardless of how
+        many accounts are configured (e.g. @acutebot is capped at 3 so a title
+        that simply isn't there doesn't hammer the bot across every account)."""
         last: Exception | None = None
-        for _ in range(len(self.accounts) * max(1, retries)):
+        attempts = len(self.accounts) * max(1, retries)
+        if max_attempts is not None:
+            attempts = min(attempts, max(1, max_attempts))
+        for _ in range(attempts):
             client = await self.acquire()
             try:
                 return await fn(client)
