@@ -180,10 +180,14 @@ class MyAnimeListClient:
     def _session(self):
         """The transport used for Jikan calls.
 
-        Prefers ``curl_cffi`` with Chrome impersonation — Jikan's Cloudflare edge
-        serves a synthetic 504 to Python's stock TLS fingerprint (httpx/urllib),
-        so a plain httpx client fails *every* request. curl_cffi's browser-like
-        handshake gets 200s. Falls back to httpx only if curl_cffi is missing.
+        Uses ``curl_cffi`` with Chrome impersonation as a sensible default for a
+        Cloudflare-fronted API, falling back to httpx only if curl_cffi is missing.
+
+        Note (measured 2026-08): the browser handshake is NOT a cure for Jikan's
+        504s. The search route (``/anime?q=``) gateway-times-out server-side under
+        load on *both* curl_cffi and httpx, while by-id routes (``/anime/{id}/full``)
+        return 200 on both. So the reliable pattern is to resolve an id via another
+        tier (dataset / AniList) and hit Jikan's by-id routes, not its search.
         """
         if cf_requests is None:
             return self.http
@@ -227,14 +231,20 @@ class MyAnimeListClient:
 
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
-    async def _get(self, endpoint: str, params: dict | None = None) -> dict | None:
+    async def _get(self, endpoint: str, params: dict | None = None) -> dict | list | None:
         """GET a Jikan endpoint with backoff on 429 / 5xx / transient errors.
 
         Jikan sits behind Cloudflare and routinely answers with 502/503/**504
-        Gateway Time-out** under load — those are transient and clear on a short
-        retry, so we treat them like a rate-limit rather than a hard failure.
-        Up to 3 attempts with exponential backoff. Returns the parsed JSON
-        ``data`` dict (without the wrapper key), or ``None`` on hard failure.
+        Gateway Time-out** under load — those are transient (or, for the search
+        route, currently persistent) so we treat them like a rate-limit rather
+        than a hard failure. Up to 3 attempts with exponential backoff.
+
+        Returns the **unwrapped** payload: ``payload["data"]`` when present, else
+        the raw ``payload``. That means a by-id call yields a ``dict`` but a
+        search (``/anime?q=``) yields a ``list`` — callers MUST handle both and
+        must NOT unwrap ``["data"]`` again (doing so silently dropped every search
+        result and made Jikan look permanently dead). Returns ``None`` on hard
+        failure / 404.
 
         Uses the curl_cffi (Chrome-TLS) session so Cloudflare doesn't 504 us on
         fingerprint; both curl_cffi and httpx responses expose the same
@@ -288,7 +298,15 @@ class MyAnimeListClient:
         Ranking: exact title match → fuzzy title match → popularity.
         """
         data = await self._get("anime", {"q": query, "limit": 10})
-        results = (data or {}).get("data") if isinstance(data, dict) else []
+        # ``_get`` already unwraps the Jikan envelope (it returns
+        # ``payload["data"] or payload``), so a search HIT arrives here as the
+        # results *list*; only an empty search comes back as the wrapped dict.
+        # Unwrapping ``data`` a second time (the old ``isinstance(data, dict)``
+        # guard) discarded every real result — Jikan then looked permanently dead.
+        if isinstance(data, list):
+            results = data
+        else:
+            results = (data or {}).get("data") or []
         if not results:
             return None
 
