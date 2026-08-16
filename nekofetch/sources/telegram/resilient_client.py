@@ -299,12 +299,14 @@ class ResilientMetadataClient:
         )
         if result is not None:
             return result
-        # Whole chain missed — try the @acutebot userbot tier if armed, then
-        # @AniFluid as the final info-card IMAGE source (only Telegram bots have it).
-        acute = await self._acute_search(query)
-        if acute is not None:
-            return acute
-        return await self._anifluid_search(query)
+        # Whole chain missed — try the @acutebot userbot tier if armed. The
+        # info-card IMAGE otherwise comes from img.anili.st (deterministic from
+        # the anilist id the datasets supply), so no userbot image tier is needed.
+        #
+        # @AniFluid is DORMANT (owner decision): the client + _anifluid_search
+        # are kept for future use but intentionally NOT called here. Re-enable by
+        # restoring the `or await self._anifluid_search(query)` fallback below.
+        return await self._acute_search(query)
 
     async def search_candidates(self, query: str, *, limit: int = 25) -> "list[dict]":
         """Search-page candidates for the franchise picker.

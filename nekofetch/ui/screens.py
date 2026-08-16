@@ -304,7 +304,9 @@ def confirm_franchise(
     ])
     kb = InlineKeyboardMarkup(kb_rows)
 
-    # Image priority: TMDB backdrop → AniList banner → cover → random local art.
+    # Image priority: TMDB backdrop → AniList banner → cover → AniList rendered
+    # info-card (img.anili.st, from just the id — works even when the API is
+    # down, since the datasets supply the id) → random local art.
     image: str | Path | None = None
     if backdrop_path:
         image = backdrop_path  # URL string, sent directly to send_photo
@@ -312,6 +314,9 @@ def confirm_franchise(
         image = media_data["banner_url"]
     elif media_data.get("cover_url"):
         image = media_data["cover_url"]
+    else:
+        from nekofetch.sources.telegram.anilist import anilist_card_image
+        image = anilist_card_image(media_data.get("anilist_id"))
     return Screen(caption=caption, image=image or pick_artwork(), keyboard=kb)
 
 

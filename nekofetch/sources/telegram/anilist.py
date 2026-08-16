@@ -16,6 +16,11 @@ from dataclasses import dataclass, field
 
 import httpx
 
+try:  # Chrome-TLS transport — dodges Cloudflare's 403 wall on stock-Python TLS.
+    from curl_cffi import requests as cf_requests
+except ImportError:  # pragma: no cover - curl_cffi is a hard dep, but be safe
+    cf_requests = None  # type: ignore[assignment]
+
 from nekofetch.core.logging import get_logger
 from nekofetch.sources.telegram.matching import title_matches
 
@@ -23,6 +28,19 @@ log = get_logger(__name__)
 
 ANILIST_URL = "https://graphql.anilist.co"
 ANILIST_SITE = "https://anilist.co/anime"
+# Deterministic rendered info-card image for a media id (no API/userbot needed).
+# Verified image/jpeg; works from just the AniList id, so it's available even
+# when the GraphQL API is down as long as a dataset supplied the id.
+ANILIST_CARD_IMAGE = "https://img.anili.st/media/{id}"
+
+
+def anilist_card_image(anilist_id) -> str | None:
+    """URL of AniList's rendered info-card image for ``anilist_id`` (or None)."""
+    try:
+        aid = int(str(anilist_id).strip())
+    except (TypeError, ValueError):
+        return None
+    return ANILIST_CARD_IMAGE.format(id=aid) if aid > 0 else None
 
 # Candidate search — AniList's SEARCH_MATCH can rank an obscure short above the
 # real show (e.g. "Demon Slayer" → a TV_SHORT with a matching synonym), so we
@@ -323,6 +341,7 @@ class AnilistClient:
 
     def __init__(self) -> None:
         self._http: httpx.AsyncClient | None = None
+        self._cf = None  # curl_cffi.AsyncSession — Chrome-impersonating transport
         # Serialize requests: AniList rate-limits per-IP, and concurrent POSTs
         # from one franchise walk are what tripped the 429 storm.
         self._lock = asyncio.Lock()
@@ -345,10 +364,38 @@ class AnilistClient:
             )
         return self._http
 
+    @property
+    def _session(self):
+        """Transport for GraphQL POSTs.
+
+        Prefers ``curl_cffi`` with Chrome impersonation: AniList sits behind
+        Cloudflare, which periodically serves a **403 "temporarily disabled"** to
+        stock-Python TLS fingerprints (the recurring "AniList is down" the owner
+        hit) while a browser-like handshake still gets 200s. Falls back to plain
+        httpx only when curl_cffi is unavailable. Both expose the same
+        ``.status_code`` / ``.headers`` / ``.json()`` surface, so ``_post`` is
+        transport-agnostic.
+        """
+        if cf_requests is None:
+            return self.http
+        if self._cf is None:
+            self._cf = cf_requests.AsyncSession(
+                impersonate="chrome",
+                timeout=25.0,
+                headers={"Accept": "application/json"},
+            )
+        return self._cf
+
     async def close(self) -> None:
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+        if self._cf is not None:
+            try:
+                await self._cf.close()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            self._cf = None
 
     async def _throttle(self) -> None:
         """Hold a minimum gap between consecutive requests (called under lock).
@@ -383,7 +430,7 @@ class AnilistClient:
             try:
                 async with self._lock:
                     await self._throttle()
-                    resp = await self.http.post(
+                    resp = await self._session.post(
                         ANILIST_URL, json={"query": query, "variables": variables}
                     )
                 # Track the remaining budget AniList reports so the next call's
@@ -414,6 +461,12 @@ class AnilistClient:
                 payload = resp.json()
             except (httpx.HTTPError, ValueError) as exc:
                 log.warning("anilist.request.failed", error=str(exc))
+                if attempt < max_attempts:
+                    await asyncio.sleep(1.5 * attempt)
+                    continue
+                return None
+            except Exception as exc:  # noqa: BLE001 — curl_cffi raises its own types
+                log.warning("anilist.request.failed", error=str(exc)[:200])
                 if attempt < max_attempts:
                     await asyncio.sleep(1.5 * attempt)
                     continue
