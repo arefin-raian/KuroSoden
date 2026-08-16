@@ -132,6 +132,34 @@ def register(client: Client, container: Container) -> None:
                       prompt_msg_id=prompt.id, prompt_chat_id=prompt.chat.id)
         await q.answer()
 
+    @client.on_callback_query(filters.regex(r"^req\|retry$"))
+    async def _retry(_: Client, q: CallbackQuery) -> None:
+        """Replay the last search when the whole metadata chain missed (likely a
+        transient outage). Re-runs the SAME query into the SAME card."""
+        _state, data = await fsm.get(q.from_user.id)
+        query = (data or {}).get("retry_query")
+        if not query:
+            await q.answer("Send the title again to search.", show_alert=True)
+            return
+        await q.answer("Trying again…")
+
+        # _search_with_dedup expects a Message (.chat/.from_user/.nf_user); adapt
+        # the callback. We always pass a prompt, so the reply/delete paths are
+        # never hit — a minimal shim is enough.
+        class _Msg:
+            from_user = q.from_user
+            chat = q.message.chat
+            nf_user = getattr(q, "nf_user", None)
+
+            async def delete(self):  # noqa: D401 — no-op for the shim
+                return None
+
+            async def reply(self, *a, **k):
+                return None
+
+        prompt = message_ref(client, q.message.chat.id, q.message.id)
+        await _search_with_dedup(_Msg(), query, prompt=prompt)
+
     # ── Text handler — anime search with dedup ────────────────────────────────
     @client.on_message(
         filters.text & filters.private & ~filters.command(LELOUCH_COMMANDS)
@@ -309,12 +337,33 @@ def register(client: Client, container: Container) -> None:
 
             franchise_data = await resolve_franchise(container, query)
             if franchise_data is None:
-                await send_screen(
+                # The WHOLE chain missed. This is either a genuine miss or every
+                # source is down/rate-limited at once — we can't tell, so offer a
+                # Try Again button (harmless on a real miss, recovers on an
+                # outage) rather than a dead end. Stash the query so the button
+                # can replay the exact same search into this same card.
+                from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+                from kurosoden.shared import lelouch_voice as V
+
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔄 Try Again", callback_data="req|retry"),
+                ]])
+                shown = await send_screen(
                     client, message.chat.id,
-                    Screen(caption=t(M.SEARCH_NOT_FOUND, query=_esc_q(query)),
-                           image=pick_artwork("lelouch")),
+                    Screen(caption=V.sources_unreachable(query),
+                           image=pick_artwork("lelouch"), keyboard=kb),
                     old_msg=msg,
                 )
+                try:
+                    await fsm.set(
+                        message.from_user.id, STATE_NAME,
+                        retry_query=query,
+                        prompt_chat_id=message.chat.id,
+                        prompt_msg_id=getattr(shown, "id", None),
+                    )
+                except Exception:  # noqa: BLE001 — the button still works via cb
+                    pass
                 return
             franchise_data["_query"] = query
             await fsm.set(

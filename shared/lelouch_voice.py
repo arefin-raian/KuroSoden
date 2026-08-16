@@ -99,6 +99,20 @@ def not_found(query: str) -> str:
     )
 
 
+def sources_unreachable(query: str) -> str:
+    """Shown when the WHOLE metadata chain missed — could be a genuine miss, but
+    just as likely every source (AniList, the datasets, Jikan, Kitsu) is down or
+    rate-limited at once. Offer a retry rather than a dead end."""
+    return (
+        f"{ICON} <b>The archives won't answer — for now.</b>\n\n"
+        f"I couldn't pull <b>{esc(query)}</b> from a single source. Either the "
+        f"name is off, or every intelligence line is down at once. Check the "
+        f"spelling if you like — otherwise the lines usually clear in a moment.\n\n"
+        "<i>Strike again when you're ready; press the button and I'll send the "
+        "same order back down the wire.</i>"
+    )
+
+
 # ── Receipt / dedup ─────────────────────────────────────────────────────────
 
 RECEIPT_CLOSER = (
