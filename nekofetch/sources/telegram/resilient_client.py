@@ -246,6 +246,49 @@ class ResilientMetadataClient:
             log.info("acute.fallback.hit", query=query, anilist_id=media.id)
         return media
 
+    async def _anifluid_search(self, query: str) -> "AnilistMedia | None":
+        """Last-resort INFO-CARD IMAGE via the @AniFluidbot userbot probe.
+
+        Reuses the SAME userbot pool as @acutebot (same session). Image-first:
+        the returned media carries the downloaded card image as ``cover_url`` (so
+        ``confirm_franchise`` can show it) plus best-effort caption text. Returns
+        ``None`` (never raises) when the userbot is unavailable or AniFluid gives
+        no image — so it composes as the final fallback after @acutebot.
+        """
+        env = self._acute_env
+        if env is None:
+            return None
+        try:
+            from nekofetch.providers.anifluid_bot import fetch_image_from_anifluid
+            from nekofetch.sources.telegram.userbot import UserbotPool
+        except Exception:  # noqa: BLE001 — optional dependency surface
+            return None
+
+        pool = self._acute_pool
+        if pool is None:
+            try:
+                pool = UserbotPool.from_env(
+                    env.telegram_api_id, env.telegram_api_hash, str(env.session_path),
+                )
+                self._acute_pool = pool
+            except Exception as exc:  # noqa: BLE001
+                log.debug("anifluid.no_pool", query=query, error=str(exc)[:200])
+                return None
+
+        try:
+            photo_dir = str(env.storage_path / "anifluid_cards")
+            meta = await fetch_image_from_anifluid(query, pool, photo_dir=photo_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("anifluid.fallback.failed", query=query, error=str(exc)[:200])
+            return None
+
+        if not meta:
+            return None
+        media = _acute_meta_to_media(meta)
+        if media is not None:
+            log.info("anifluid.fallback.hit", query=query)
+        return media
+
     async def search(self, query: str) -> "AnilistMedia | None":
         # TEXT/relations chain: AniList → Kaggle (full+relations) → LeoRigasaki
         # (daily seasonal) → Jikan/MAL → Kitsu.
@@ -256,8 +299,12 @@ class ResilientMetadataClient:
         )
         if result is not None:
             return result
-        # Whole chain missed — try the @acutebot userbot tier if armed.
-        return await self._acute_search(query)
+        # Whole chain missed — try the @acutebot userbot tier if armed, then
+        # @AniFluid as the final info-card IMAGE source (only Telegram bots have it).
+        acute = await self._acute_search(query)
+        if acute is not None:
+            return acute
+        return await self._anifluid_search(query)
 
     async def search_candidates(self, query: str, *, limit: int = 25) -> "list[dict]":
         """Search-page candidates for the franchise picker.
