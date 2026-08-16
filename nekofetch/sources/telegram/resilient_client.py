@@ -1,11 +1,13 @@
-"""Resilient metadata client — AniList first, then MyAnimeList, then @acutebot.
+"""Resilient metadata client — AniList first, then MyAnimeList, then Kitsu,
+then @acutebot.
 
 Every public method mirrors ``AnilistClient``'s signature and return types.
-On connection failures, HTTP errors, or when AniList returns ``None``
-(notably a 403 when AniList is down), the call is transparently retried
-against the MyAnimeList (Jikan) fallback.
+On connection failures, HTTP errors, or when a tier returns ``None`` (notably
+a 403 when AniList is down, or Jikan's currently-504ing search route), the call
+falls through the ordered TEXT/relations chain: **AniList → Jikan → Kitsu**.
+(The local datasets, once built, slot in right after AniList.)
 
-When BOTH AniList and Jikan miss — the whole outside world being unreachable,
+When the whole API chain misses — the outside world being unreachable,
 rate-limited, or simply not carrying the title — ``search`` makes one last
 attempt through the @acutebot userbot probe.  That tier is opt-in: the
 container wires it up once via :meth:`enable_acute_fallback`; if the userbot
@@ -15,7 +17,7 @@ and the client behaves exactly as before.
 Usage from container::
 
     self.anilist = ResilientMetadataClient()
-    self.anilist.enable_acute_fallback(env)   # optional third tier
+    self.anilist.enable_acute_fallback(env)   # optional userbot image/probe tier
 
 Every caller that previously did ``await container.anilist.search(…)`` or
 ``await container.anilist.walk_franchise_full(…)`` continues to work without
@@ -29,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 from nekofetch.core.logging import get_logger
 from nekofetch.sources.telegram.anilist import AnilistClient
+from nekofetch.sources.telegram.kitsu import KitsuClient
 from nekofetch.sources.telegram.myanimelist import MyAnimeListClient
 
 if TYPE_CHECKING:
@@ -123,6 +126,7 @@ class ResilientMetadataClient:
     def __init__(self) -> None:
         self.anilist = AnilistClient()
         self.mal = MyAnimeListClient()
+        self.kitsu = KitsuClient()
         # Third tier (opt-in via enable_acute_fallback). Dormant by default.
         self._acute_env: Any = None
         self._acute_pool: Any = None
@@ -140,34 +144,37 @@ class ResilientMetadataClient:
     async def close(self) -> None:
         await self.anilist.close()
         await self.mal.close()
+        await self.kitsu.close()
 
     # ── core fallback logic ───────────────────────────────────────────────────
 
     @staticmethod
-    async def _try_both(
-        primary_method, fallback_method, *args, **kwargs
-    ):
-        """Call ``primary_method``; on ``None`` or exception, call ``fallback_method``."""
-        try:
-            result = await primary_method(*args, **kwargs)
-            if result is not None:
-                return result
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "anilist.fallback",
-                method=getattr(primary_method, "__name__", str(primary_method)),
-                error=str(exc)[:200],
-            )
-        # Fallback
-        try:
-            return await fallback_method(*args, **kwargs)
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "mal.fallback.failed",
-                method=getattr(fallback_method, "__name__", str(fallback_method)),
-                error=str(exc)[:200],
-            )
-            return None
+    async def _try_chain(methods, *args, is_hit=None, **kwargs):
+        """Call each bound method in order; return the first result that *hits*.
+
+        The ordered TEXT/relations tier list. ``is_hit(result)`` decides whether
+        a return value counts as a genuine hit — it defaults to ``result is not
+        None``, but collection methods pass ``bool`` so an EMPTY dict/list from a
+        tier (e.g. a cross-tier id that doesn't resolve on Jikan) is treated as a
+        miss and the next tier is tried rather than short-circuiting on emptiness.
+        A method that raises is logged (not fatal) and the chain continues.
+        """
+        if is_hit is None:
+            def is_hit(result):  # noqa: E306 - local default predicate
+                return result is not None
+        for method in methods:
+            try:
+                result = await method(*args, **kwargs)
+                if is_hit(result):
+                    return result
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "metadata.tier.miss",
+                    method=getattr(method, "__qualname__",
+                                   getattr(method, "__name__", str(method))),
+                    error=str(exc)[:200],
+                )
+        return None
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -216,48 +223,58 @@ class ResilientMetadataClient:
         return media
 
     async def search(self, query: str) -> "AnilistMedia | None":
-        # AniList → Jikan/MAL first.
-        result = await self._try_both(self.anilist.search, self.mal.search, query)
+        # TEXT/relations chain: AniList → Jikan/MAL → Kitsu.
+        # (The local datasets, when built, slot in right after AniList.)
+        result = await self._try_chain(
+            [self.anilist.search, self.mal.search, self.kitsu.search], query
+        )
         if result is not None:
             return result
-        # Both public APIs missed — try the @acutebot userbot tier if armed.
+        # Whole chain missed — try the @acutebot userbot tier if armed.
         return await self._acute_search(query)
 
     async def search_candidates(self, query: str, *, limit: int = 25) -> "list[dict]":
-        """Search-page candidates for the franchise picker. AniList-only: the
-        grouping-into-franchises step just needs id/title/format, and a MAL page
-        shape differs — on any AniList miss/error we return an empty list and the
-        caller falls back to the single-best resolver."""
-        try:
-            return await self.anilist.search_candidates(query, limit=limit)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("resilient.search_candidates.failed",
-                      query=query, error=str(exc)[:200])
-            return []
+        """Search-page candidates for the franchise picker.
+
+        AniList first; on an AniList miss/error we fall through to Kitsu (which
+        also exposes ``search_candidates``) so multi-season detection still works
+        when AniList is down — otherwise the caller falls back to the single-best
+        resolver and the buggy aggregated franchise path. MAL has no candidate
+        page, so it is skipped here.
+        """
+        for client in (self.anilist, self.kitsu):
+            try:
+                res = await client.search_candidates(query, limit=limit)
+                if res:
+                    return res
+            except Exception as exc:  # noqa: BLE001
+                log.debug("resilient.search_candidates.miss",
+                          tier=type(client).__name__, error=str(exc)[:200])
+        return []
 
     async def _fetch_full(self, media_id: int) -> "AnilistMedia | None":
         """Fetch full media data by ID.
 
-        When ``media_id`` is a MAL ID (returned by a previous MAL ``search``)
-        and AniList is unreachable, the call correctly falls through to MAL.
-        If AniList is reachable but ``media_id`` doesn't exist on AniList,
-        the result is ``None`` — the MAL fallback then handles it.
+        Note: ids are tier-specific (an AniList id is not a MAL/Kitsu id), so the
+        fallback tiers only resolve correctly for ids they themselves minted. The
+        chain still tries each in order and returns the first hit.
         """
-        return await self._try_both(
-            self.anilist._fetch_full, self.mal._fetch_full, media_id
+        return await self._try_chain(
+            [self.anilist._fetch_full, self.mal._fetch_full, self.kitsu._fetch_full],
+            media_id,
         )
 
     async def franchise_totals(
         self, root_id: int, *, max_nodes: int = 120
     ) -> "FranchiseTotals":
-        result = await self._try_both(
-            self.anilist.franchise_totals,
-            self.mal.franchise_totals,
-            root_id,
-            max_nodes=max_nodes,
+        # An all-zero totals (nodes==0 & no seasons/episodes) means the tier
+        # didn't resolve this id — treat it as a miss so the chain continues.
+        result = await self._try_chain(
+            [self.anilist.franchise_totals, self.mal.franchise_totals,
+             self.kitsu.franchise_totals],
+            root_id, max_nodes=max_nodes,
+            is_hit=lambda t: t is not None and (t.nodes or t.seasons or t.episodes),
         )
-        # _try_both returns None on total failure, but both clients always
-        # return FranchiseTotals (never None).  We fall back to empty totals.
         from nekofetch.sources.telegram.anilist import FranchiseTotals as FT
 
         return result if result is not None else FT()
@@ -265,16 +282,19 @@ class ResilientMetadataClient:
     async def walk_franchise_full(
         self, root_id: int, *, max_nodes: int = 120
     ) -> "dict[int, FranchiseEntry]":
-        result = await self._try_both(
-            self.anilist.walk_franchise_full,
-            self.mal.walk_franchise_full,
-            root_id,
-            max_nodes=max_nodes,
+        # Empty dict = the tier didn't resolve this id → miss, try the next tier.
+        result = await self._try_chain(
+            [self.anilist.walk_franchise_full, self.mal.walk_franchise_full,
+             self.kitsu.walk_franchise_full],
+            root_id, max_nodes=max_nodes,
+            is_hit=bool,
         )
         return result if result is not None else {}
 
     async def title_variants(self, query: str) -> "list[str]":
-        result = await self._try_both(
-            self.anilist.title_variants, self.mal.title_variants, query
+        result = await self._try_chain(
+            [self.anilist.title_variants, self.mal.title_variants,
+             self.kitsu.title_variants],
+            query,
         )
         return result if result is not None else [query]
