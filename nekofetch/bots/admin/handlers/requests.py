@@ -496,16 +496,18 @@ async def apply_franchise_totals(container: Container, franchise_data: dict) -> 
 
 
 async def enrich_with_tmdb(container: Container, franchise_data: dict, search_title: str) -> str | None:
-    """Layer TMDB presentation assets onto an AniList-built franchise dict.
+    """Layer TMDB **artwork** onto an AniList-built franchise dict.
 
-    Division of labour:
-      * AniList owns titles, relations, episode/season counts, structure.
-      * TMDB owns the franchise-level **synopsis** (its overview describes the
-        whole adaptation, not one season) and the English 16:9 **backdrop**.
+    Division of labour (updated):
+      * AniList/dataset own titles, relations, episode/season counts, structure,
+        AND the info-card **synopsis** — the confirm card and distribution card
+        captions read the per-title AniList synopsis already in ``franchise_data``.
+      * TMDB owns only the English 16:9 **backdrop** here. (The main-channel POST
+        still uses TMDB's overview for its own caption via ``MainChannelService``,
+        which searches TMDB independently — this function no longer touches the
+        synopsis, so it can't flatten every distribution card to the TMDB blurb.)
 
-    TMDB synopsis wins whenever it returns usable text; otherwise we keep the
-    AniList description already in ``franchise_data``. Returns the backdrop URL
-    (English-tagged when available) or ``None``.
+    Returns the backdrop URL (English-tagged when available) or ``None``.
 
     Extracted to module level so the batch handler can reuse the exact same logic.
     """
@@ -515,9 +517,4 @@ async def enrich_with_tmdb(container: Container, franchise_data: dict, search_ti
         return None
     if not match:
         return None
-    if match.overview and match.overview.strip():
-        franchise_data["synopsis"] = match.overview
-        franchise_data["synopsis_url"] = (
-            f"https://www.themoviedb.org/{match.media_type}/{match.id}"
-        )
     return match.backdrop_url
