@@ -56,13 +56,14 @@ class _FakeTier:
         pass
 
 
-def _client(anilist, mal, kitsu, dataset=None) -> ResilientMetadataClient:
+def _client(anilist, mal, kitsu, dataset=None, kaggle=None) -> ResilientMetadataClient:
     c = ResilientMetadataClient()
     c.anilist, c.mal, c.kitsu = anilist, mal, kitsu
-    # Stub the local dataset tier too (default: a miss-everything fake) so unit
-    # tests never touch the network — the real AnimeDatasetClient would download
-    # and index the live CSV snapshot.
+    # Stub the local dataset tiers too (default: miss-everything fakes) so unit
+    # tests never touch the network — the real dataset clients would download and
+    # index the live CSV snapshots.
     c.dataset = dataset if dataset is not None else _FakeTier("dataset")
+    c.kaggle = kaggle if kaggle is not None else _FakeTier("kaggle")
     return c
 
 
@@ -113,11 +114,28 @@ async def test_walk_treats_empty_dict_as_miss_and_continues():
     anilist = _FakeTier("anilist", walk_franchise_full=RuntimeError("down"))
     mal = _FakeTier("mal", walk_franchise_full={})
     kitsu = _FakeTier("kitsu", walk_franchise_full={1: "root", 2: "sequel"})
-    c = _client(anilist, mal, kitsu)
+    # Kaggle sits in the walk chain before MAL — make it miss so we reach Kitsu.
+    kaggle = _FakeTier("kaggle", walk_franchise_full={})
+    c = _client(anilist, mal, kitsu, kaggle=kaggle)
 
     result = await c.walk_franchise_full(43820)
     assert result == {1: "root", 2: "sequel"}
     assert kitsu.calls == ["walk_franchise_full"]
+
+
+@_aio
+async def test_kaggle_walk_hit_short_circuits_before_apis():
+    # Kaggle carries offline relations — a Kaggle walk hit must be used before
+    # ever calling the Jikan/Kitsu APIs.
+    anilist = _FakeTier("anilist", walk_franchise_full=RuntimeError("down"))
+    kaggle = _FakeTier("kaggle", walk_franchise_full={125038: "root", 139093: "s2"})
+    mal = _FakeTier("mal", walk_franchise_full={1: "wrong"})
+    kitsu = _FakeTier("kitsu", walk_franchise_full={2: "wrong"})
+    c = _client(anilist, mal, kitsu, kaggle=kaggle)
+
+    result = await c.walk_franchise_full(125038)
+    assert result == {125038: "root", 139093: "s2"}
+    assert mal.calls == [] and kitsu.calls == []
 
 
 @_aio

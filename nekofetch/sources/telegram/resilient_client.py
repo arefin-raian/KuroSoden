@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 from nekofetch.core.logging import get_logger
 from nekofetch.sources.telegram.anilist import AnilistClient
 from nekofetch.sources.telegram.anime_dataset import AnimeDatasetClient
+from nekofetch.sources.telegram.kaggle_dataset import KaggleDatasetClient
 from nekofetch.sources.telegram.kitsu import KitsuClient
 from nekofetch.sources.telegram.myanimelist import MyAnimeListClient
 
@@ -126,6 +127,10 @@ class ResilientMetadataClient:
 
     def __init__(self) -> None:
         self.anilist = AnilistClient()
+        # Two local dataset tiers: Kaggle (full table WITH relations) then
+        # LeoRigasaki (daily seasonal — catches brand-new titles Kaggle's weekly
+        # snapshot may lag). Both sit right after AniList.
+        self.kaggle = KaggleDatasetClient()
         self.dataset = AnimeDatasetClient()
         self.mal = MyAnimeListClient()
         self.kitsu = KitsuClient()
@@ -134,15 +139,17 @@ class ResilientMetadataClient:
         self._acute_pool: Any = None
 
     def set_storage(self, storage_path) -> None:
-        """Point the local dataset tier at the real storage dir (from container).
+        """Point the local dataset tiers at the real storage dir (from container).
 
-        The dataset caches its CSV snapshot under ``<storage_path>/cache``; until
-        this is called it uses the config-default ``data/storage/cache``.
+        Both datasets cache under ``<storage_path>/cache``; until this is called
+        they use the config-default ``data/storage/cache``.
         """
         from pathlib import Path
 
         try:
-            self.dataset.set_cache_dir(Path(storage_path) / "cache")
+            cache = Path(storage_path) / "cache"
+            self.kaggle.set_cache_dir(cache)
+            self.dataset.set_cache_dir(cache)
         except Exception as exc:  # noqa: BLE001 — never block startup on this
             log.debug("dataset.set_storage.failed", error=str(exc))
 
@@ -158,6 +165,7 @@ class ResilientMetadataClient:
 
     async def close(self) -> None:
         await self.anilist.close()
+        await self.kaggle.close()
         await self.dataset.close()
         await self.mal.close()
         await self.kitsu.close()
@@ -239,9 +247,10 @@ class ResilientMetadataClient:
         return media
 
     async def search(self, query: str) -> "AnilistMedia | None":
-        # TEXT/relations chain: AniList → local dataset → Jikan/MAL → Kitsu.
+        # TEXT/relations chain: AniList → Kaggle (full+relations) → LeoRigasaki
+        # (daily seasonal) → Jikan/MAL → Kitsu.
         result = await self._try_chain(
-            [self.anilist.search, self.dataset.search,
+            [self.anilist.search, self.kaggle.search, self.dataset.search,
              self.mal.search, self.kitsu.search],
             query,
         )
@@ -253,13 +262,13 @@ class ResilientMetadataClient:
     async def search_candidates(self, query: str, *, limit: int = 25) -> "list[dict]":
         """Search-page candidates for the franchise picker.
 
-        AniList → local dataset → Kitsu (all expose a candidate page); on an
-        upstream miss/empty we fall through so multi-season detection still works
-        when AniList is down — otherwise the caller falls back to the single-best
-        resolver and the buggy aggregated franchise path. MAL has no candidate
-        page, so it is skipped here.
+        AniList → Kaggle → LeoRigasaki → Kitsu (all expose a candidate page); on
+        an upstream miss/empty we fall through so multi-season detection still
+        works when AniList is down — otherwise the caller falls back to the
+        single-best resolver and the buggy aggregated franchise path. MAL has no
+        candidate page, so it is skipped here.
         """
-        for client in (self.anilist, self.dataset, self.kitsu):
+        for client in (self.anilist, self.kaggle, self.dataset, self.kitsu):
             try:
                 res = await client.search_candidates(query, limit=limit)
                 if res:
@@ -274,24 +283,25 @@ class ResilientMetadataClient:
 
         Note: ids are tier-specific (an AniList id is not a MAL/Kitsu id), so the
         fallback tiers only resolve correctly for ids they themselves minted. The
-        dataset is keyed by both anime_id AND mal_id, so it bridges either. The
-        chain tries each in order and returns the first hit.
+        datasets are keyed by the AniList id (and Kaggle also by mal id), so they
+        bridge cleanly. The chain tries each in order and returns the first hit.
         """
         return await self._try_chain(
-            [self.anilist._fetch_full, self.dataset._fetch_full,
-             self.mal._fetch_full, self.kitsu._fetch_full],
+            [self.anilist._fetch_full, self.kaggle._fetch_full,
+             self.dataset._fetch_full, self.mal._fetch_full, self.kitsu._fetch_full],
             media_id,
         )
 
     async def franchise_totals(
         self, root_id: int, *, max_nodes: int = 120
     ) -> "FranchiseTotals":
-        # The dataset has no relation graph (returns empty totals), so it self-
-        # skips here; an all-zero totals is treated as a miss so the chain
-        # continues to the API tiers that DO carry relations.
+        # Relation-capable tiers only: AniList → Kaggle (offline relations column)
+        # → Jikan → Kitsu. An all-zero totals is treated as a miss so the chain
+        # continues to a tier that DOES carry relations. (LeoRigasaki has no
+        # relation graph, so it's not in this chain.)
         result = await self._try_chain(
-            [self.anilist.franchise_totals, self.mal.franchise_totals,
-             self.kitsu.franchise_totals],
+            [self.anilist.franchise_totals, self.kaggle.franchise_totals,
+             self.mal.franchise_totals, self.kitsu.franchise_totals],
             root_id, max_nodes=max_nodes,
             is_hit=lambda t: t is not None and (t.nodes or t.seasons or t.episodes),
         )
@@ -303,10 +313,9 @@ class ResilientMetadataClient:
         self, root_id: int, *, max_nodes: int = 120
     ) -> "dict[int, FranchiseEntry]":
         # Empty dict = the tier didn't resolve this id → miss, try the next tier.
-        # (Dataset has no relation graph, so it's not in this chain.)
         result = await self._try_chain(
-            [self.anilist.walk_franchise_full, self.mal.walk_franchise_full,
-             self.kitsu.walk_franchise_full],
+            [self.anilist.walk_franchise_full, self.kaggle.walk_franchise_full,
+             self.mal.walk_franchise_full, self.kitsu.walk_franchise_full],
             root_id, max_nodes=max_nodes,
             is_hit=bool,
         )
@@ -314,8 +323,9 @@ class ResilientMetadataClient:
 
     async def title_variants(self, query: str) -> "list[str]":
         result = await self._try_chain(
-            [self.anilist.title_variants, self.dataset.title_variants,
-             self.mal.title_variants, self.kitsu.title_variants],
+            [self.anilist.title_variants, self.kaggle.title_variants,
+             self.dataset.title_variants, self.mal.title_variants,
+             self.kitsu.title_variants],
             query,
         )
         return result if result is not None else [query]
