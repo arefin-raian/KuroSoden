@@ -240,11 +240,20 @@ class RedoService:
         await self._notify_current_owner(plan, title)
 
         # 3. Clean per plan — published keeps the channel/posts, else full wipe.
+        #    For a published redo we DEFER deleting the old storage messages: the
+        #    pack rows go (so the fresh re-download inserts cleanly), but the
+        #    channel messages stay live so the existing posts' quality buttons
+        #    keep working during the re-download. The captured refs ride on
+        #    franchise_data so the download finalizer deletes them right after the
+        #    new packs upload (then relinks).
+        deferred_messages: list = []
         try:
             from nekofetch.services.request_service import RequestService
-            await RequestService(self._c).purge_all_for_anime(
+            result = await RequestService(self._c).purge_all_for_anime(
                 anime_doc_id, keep_channel=plan.keep_channel,
+                defer_pack_messages=plan.keep_channel,
             )
+            deferred_messages = (result or {}).get("deferred_messages") or []
         except Exception as exc:  # noqa: BLE001 — never block the re-queue on cleanup
             log.error("redo.purge_failed", anime=anime_doc_id, error=str(exc)[:300])
 
@@ -257,6 +266,9 @@ class RedoService:
             # season cards instead of creating a new channel / reposting.
             fr["redo_relink"] = True
             fr["redo_anime_doc_id"] = anime_doc_id
+            # Old storage messages to delete AFTER the new upload (see step 3).
+            if deferred_messages:
+                fr["redo_old_messages"] = deferred_messages
         await self._requeue_as_work(owner_id, title, anime_doc_id, fr)
 
         # 5. Detect entries discovered during redo that are not already on the

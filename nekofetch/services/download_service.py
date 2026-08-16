@@ -1729,6 +1729,10 @@ class DownloadWorker:
             if req is not None:
                 req.status = RequestStatus.PROCESSING
             user_id = req.user_id if req else None
+            # Capture redo state while in-session (the row detaches after).
+            _fd = (req.franchise_data or {}) if req is not None else {}
+            is_redo = bool(_fd.get("redo_relink"))
+            redo_old_messages = _fd.get("redo_old_messages") or []
 
         needs_approval = self._c.config.processing.require_approval_before_publish
         log.info("download.job.all_qualities_done", job_id=job_id)
@@ -1747,19 +1751,29 @@ class DownloadWorker:
         await LogChannelService(self._c).event(
             "processing", "complete", job=job_id, anime=title,
         )
-        # ── Redo of a published title: relink INLINE, before the job goes
-        #    terminal, so the live card shows the real post-upload work and the
-        #    completion card can truthfully say "relinked". A normal job skips
-        #    this and hands off to distribution as usual.
-        is_redo = bool((req.franchise_data or {}).get("redo_relink")) if req else False
+        # ── Redo of a published title: delete the OLD storage messages (kept
+        #    live during the re-download so the buttons never broke), then relink
+        #    INLINE — all before the job goes terminal, so the live card shows the
+        #    real post-upload work and the completion card can truthfully say
+        #    "relinked". A normal job skips this and hands off to distribution.
         relinked_ok = False
         if is_redo and code:
             from nekofetch.services.publishing_service import PublishingService
+            from nekofetch.services.request_service import RequestService
 
-            # TODO(storage §1b): a "Deleting old files" stage goes here once the
-            # old-file purge is deferred to post-upload. Today the old packs are
-            # already gone (purged at redo submit), so the only real post-upload
-            # work is the relink.
+            # Step 1 — delete the old files now that the fresh packs are uploaded.
+            if redo_old_messages:
+                await self._push_stage(job_id, title, "Deleting old files", 0.0)
+                try:
+                    await RequestService(self._c).delete_channel_messages(
+                        [(int(c), [int(m) for m in ids])
+                         for c, ids in redo_old_messages],
+                    )
+                except Exception as exc:  # noqa: BLE001 — never fail the job on cleanup
+                    log.warning("download.redo_old_delete.failed", job_id=job_id,
+                                code=code, error=str(exc))
+
+            # Step 2 — relink the existing season cards to the fresh packs.
             await self._push_stage(job_id, title, "Relinking buttons", 0.0)
             try:
                 await PublishingService(self._c).publish(code)

@@ -232,6 +232,48 @@ async def test_purge_keep_channel_keeps_channel_drops_packs(
             Request.anime_doc_id == doc))).first() is not None
 
 
+async def test_purge_keep_channel_defers_message_deletion(
+    session, sessionmaker, tmp_path,
+):
+    """A published redo with defer_pack_messages=True deletes the pack ROWS (so a
+    fresh re-download inserts cleanly) but KEEPS the channel messages live — their
+    ids are returned for post-upload deletion. delete_channel_messages then
+    removes them via the admin client."""
+    from nekofetch.services.request_service import RequestService
+
+    class _FakeClient:
+        def __init__(self):
+            self.deleted: list[tuple[int, object]] = []
+
+        async def delete_messages(self, chat_id, ids):
+            self.deleted.append((chat_id, ids))
+
+    doc = "anilist:912"
+    req = await _create_request(session, code="REQ-912", anime_doc_id=doc,
+                                status="published")
+    await _mk_pack(session, doc=doc)  # channel -100123, msgs 10..20
+    await session.commit()
+
+    client = _FakeClient()
+    svc = RequestService(_container(sessionmaker, tmp_path, admin_client=client))
+    result = await svc.purge_all_for_anime(
+        doc, keep_channel=True, defer_pack_messages=True,
+    )
+
+    # Pack ROW gone; channel messages NOT deleted yet; refs captured.
+    async with sessionmaker() as s:
+        assert (await s.execute(select(StoragePack).where(
+            StoragePack.anime_doc_id == doc))).first() is None
+    assert client.deleted == []  # nothing deleted during the deferred purge
+    refs = result["deferred_messages"]
+    assert refs and refs[0][0] == -100123
+    assert 10 in refs[0][1] and 20 in refs[0][1]
+
+    # Now the finalizer's post-upload step deletes them.
+    n = await svc.delete_channel_messages(refs)
+    assert n > 0 and client.deleted  # messages actually removed
+
+
 async def test_purge_full_wipe_clears_everything(session, sessionmaker, tmp_path):
     from nekofetch.services.request_service import RequestService
 

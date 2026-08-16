@@ -496,15 +496,24 @@ class RequestService:
                 except Exception:  # noqa: BLE001
                     pass
 
-    async def _purge_request_rows(self, session, req) -> dict:
+    async def _purge_request_rows(self, session, req, *,
+                                  defer_pack_messages: bool = False) -> dict:
         """Tear down everything downstream of a request row, in-session.
 
         Shared teardown for :meth:`delete_request` and :meth:`reassign_fresh`:
         deletes storage packs (channel messages + rows), MediaFile rows + local
         files, and DownloadJob rows for ``req``. Returns
-        ``{"job_ids", "files", "packs", "work_folder"}`` for follow-up cleanup.
-        Does NOT touch the Request row itself — the caller decides whether to
-        delete it (full delete) or recreate a fresh one (reassign)."""
+        ``{"job_ids", "files", "packs", "work_folder", "deferred_messages"}`` for
+        follow-up cleanup. Does NOT touch the Request row itself — the caller
+        decides whether to delete it (full delete) or recreate a fresh one
+        (reassign).
+
+        ``defer_pack_messages`` (redo of a published title): delete the pack ROWS
+        (so a fresh re-download inserts cleanly with no ``uq_storage_pack``
+        collision) but DON'T delete their channel messages yet — the existing
+        posts' quality buttons keep working off them during the re-download. The
+        captured ``[(channel_id, [msg_ids])]`` are returned in ``deferred_messages``
+        so the finalizer can delete them AFTER the new packs are uploaded."""
         from pathlib import Path
 
         from sqlalchemy import delete, select
@@ -528,8 +537,17 @@ class RequestService:
             select(StoragePack).where(StoragePack.anime_doc_id == doc_key)
         )).scalars().all() if doc_key else []
 
-        for pack in packs:
-            await self._purge_pack_messages(pack)
+        deferred_messages: list[tuple[int, list[int]]] = []
+        if defer_pack_messages:
+            # Keep the channel messages live (buttons work during re-download);
+            # capture their ids so the finalizer can delete them post-upload.
+            for pack in packs:
+                mids = self._pack_message_ids(pack)
+                if pack.channel_id and mids:
+                    deferred_messages.append((int(pack.channel_id), mids))
+        else:
+            for pack in packs:
+                await self._purge_pack_messages(pack)
 
         removed_files = 0
         work_folder: str | None = None
@@ -553,7 +571,47 @@ class RequestService:
         return {
             "job_ids": job_ids, "files": removed_files,
             "packs": len(packs), "work_folder": work_folder,
+            "deferred_messages": deferred_messages,
         }
+
+    @staticmethod
+    def _pack_message_ids(pack) -> list[int]:
+        """The channel message ids a pack occupies (header + files + end sticker)."""
+        ids: list[int] = []
+        if pack.header_message_id:
+            ids.append(int(pack.header_message_id))
+        if pack.file_message_ids:
+            ids.extend(int(m) for m in pack.file_message_ids)
+        elif pack.start_message_id and pack.end_message_id:
+            ids.extend(range(int(pack.start_message_id), int(pack.end_message_id) + 1))
+        if pack.end_message_id and int(pack.end_message_id) not in ids:
+            ids.append(int(pack.end_message_id))
+        return ids
+
+    async def delete_channel_messages(self, refs: list[tuple[int, list[int]]]) -> int:
+        """Delete previously-captured storage messages (deferred redo cleanup).
+
+        ``refs`` is ``[(channel_id, [message_ids])]`` from a deferred purge. Runs
+        AFTER the fresh packs are uploaded, so the channel is never left without
+        working files. Best-effort per message; returns how many were deleted."""
+        client = getattr(self._c, "admin_client", None)
+        if client is None:
+            return 0
+        deleted = 0
+        for channel_id, ids in refs:
+            if not channel_id or not ids:
+                continue
+            try:
+                await client.delete_messages(channel_id, ids)
+                deleted += len(ids)
+            except Exception:  # noqa: BLE001 — fall back one-by-one
+                for mid in ids:
+                    try:
+                        await client.delete_messages(channel_id, mid)
+                        deleted += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+        return deleted
 
     async def _clear_assignments(self, session, code: str) -> None:
         """Delete the AdminAssignment rows for ``code`` so a purged/reassigned
@@ -730,6 +788,7 @@ class RequestService:
 
     async def purge_all_for_anime(
         self, anime_doc_id: str, *, keep_channel: bool,
+        defer_pack_messages: bool = False,
     ) -> dict:
         """Wipe an anime's operational data by ``anime_doc_id`` — for the redo flow.
 
@@ -764,6 +823,7 @@ class RequestService:
         codes: list[str] = []
         job_ids: list[int] = []
         work_folders: list[str] = []
+        deferred_messages: list[tuple[int, list[int]]] = []
         totals = {"files": 0, "packs": 0, "requests": 0}
 
         async with session_scope(self._c.pg_sessionmaker) as session:
@@ -773,10 +833,13 @@ class RequestService:
             for req in reqs:
                 codes.append(req.code)
                 work_folders.append(_safe_folder(req))
-                summary = await self._purge_request_rows(session, req)
+                summary = await self._purge_request_rows(
+                    session, req, defer_pack_messages=defer_pack_messages,
+                )
                 job_ids.extend(summary["job_ids"])
                 totals["files"] += summary["files"]
                 totals["packs"] += summary["packs"]
+                deferred_messages.extend(summary.get("deferred_messages") or [])
                 await self._clear_assignments(session, req.code)
             totals["requests"] = len(reqs)
 
@@ -800,7 +863,8 @@ class RequestService:
             keep_channel=keep_channel, **totals,
         )
         return {"anime_doc_id": anime_doc_id, "codes": codes,
-                "keep_channel": keep_channel, **totals}
+                "keep_channel": keep_channel,
+                "deferred_messages": deferred_messages, **totals}
 
     async def _purge_channel_rows(
         self, session, anime_doc_id: str, codes: list[str],
