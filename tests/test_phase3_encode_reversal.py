@@ -231,8 +231,66 @@ async def test_encode_stage_all_tiers_present_encode_nothing(tmp_path: Path):
 
     await stage.process(ctx)
 
-    # Both 720p and 480p were already present → both skipped (notes confirm).
-    assert any("already downloaded" in note and "720p" in note for note in ctx.notes)
-    assert any("already downloaded" in note and "480p" in note for note in ctx.notes)
-    # No new rows added (ctx.files still has only the original three).
+    # All requested tiers already present → EncodeStage early-returns BEFORE the
+    # "Encoding" banner (so a ready DDL pack never shows a false encode pass) and
+    # notes it skipped. No new rows added.
+    assert any("already present" in note for note in ctx.notes)
     assert len(ctx.files) == 3
+
+
+@pytest.mark.asyncio
+async def test_encode_stage_aborts_mid_loop_on_change_source(tmp_path: Path):
+    """'Change source' during encode must halt the stage (raise AbortSource), not
+    finish the transcode. The per-file guard polls the source_abort Redis flag."""
+    from nekofetch.infrastructure.database.postgres.models import MediaFile
+    from nekofetch.services.processing.base import StageContext
+    from nekofetch.services.processing.stages import AbortSource, EncodeStage
+
+    f1080 = tmp_path / "ep1_1080p.mkv"
+    f1080.write_bytes(b"x" * 1000)
+    mf = MediaFile(
+        job_id=7, anime_doc_id="anilist:1", season=1, episode=1,
+        resolution="1080p", audio=AudioType.DUAL_AUDIO,
+        local_path=str(f1080), final_name=f1080.name, size_bytes=1000,
+    )
+
+    class _Redis:  # the source_abort flag is SET for job 7
+        async def get(self, key):
+            return b"1" if key == "nf:job:7:source_abort" else None
+
+    cfg = SimpleNamespace(
+        processing=SimpleNamespace(
+            encode=True, encode_heights=[720, 480], encode_preset="faster",
+        ),
+        downloads=SimpleNamespace(concurrent_downloads=5),
+    )
+    container = SimpleNamespace(config=cfg, redis=_Redis(), progress=None)
+    stage = EncodeStage(container)
+    req = SimpleNamespace(source="nyaa", code="REQ-X", anime_title="T")
+    ctx = StageContext(job_id=7, request=req, files=[mf])
+
+    async def _noop(*a, **k):
+        pass
+    import nekofetch.services.processing.stages as stages_mod
+    stages_mod._push_stage_progress = AsyncMock(side_effect=_noop)
+
+    # 720p/480p are missing so the loop WOULD encode — but the abort flag must
+    # make it raise before doing any work.
+    with pytest.raises(AbortSource):
+        await stage.process(ctx)
+
+
+@pytest.mark.asyncio
+async def test_source_abort_requested_reads_the_flag():
+    from nekofetch.services.processing.stages import source_abort_requested
+
+    class _Redis:
+        def __init__(self, val):
+            self.val = val
+
+        async def get(self, key):
+            return self.val
+
+    assert await source_abort_requested(SimpleNamespace(redis=_Redis(b"1")), 5) is True
+    assert await source_abort_requested(SimpleNamespace(redis=_Redis(None)), 5) is False
+    assert await source_abort_requested(SimpleNamespace(redis=None), 5) is False

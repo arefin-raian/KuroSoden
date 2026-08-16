@@ -1217,6 +1217,13 @@ class DownloadWorker:
                     req.status = RequestStatus.APPROVED
                     title, code = req.anime_title, req.code
                     folder = _safe_folder(req)
+            # Delete this source's MediaFile rows so nothing it saved in the DB
+            # bleeds into the next source pick (the on-disk files are purged
+            # below). The request row survives so the admin can re-source.
+            from sqlalchemy import delete as _delete
+
+            from nekofetch.infrastructure.database.postgres.models import MediaFile
+            await session.execute(_delete(MediaFile).where(MediaFile.job_id == job_id))
         if self._c.progress:
             await self._c.progress.delete(job_id)
         await self._clear_skip(job_id)
@@ -1711,6 +1718,7 @@ class DownloadWorker:
         from nekofetch.services.processing.pipeline import (
             _CancelJob as PipelineCancelJob,
         )
+        from nekofetch.services.processing.stages import AbortSource
         from nekofetch.services.publishing_service import PublishingService
 
         try:
@@ -1729,6 +1737,10 @@ class DownloadWorker:
                 "processing", "quality_stored", job=job_id,
                 anime=title, notes=len(ctx.notes),
             )
+        except AbortSource as exc:
+            # 'Change source' fired mid-processing → abort this source attempt so
+            # _process_job's handler tears down the files + DB rows.
+            raise _AbortSourceAttempt() from exc
         except PipelineCancelJob as exc:
             raise _CancelJob() from exc
         except Exception as exc:  # noqa: BLE001

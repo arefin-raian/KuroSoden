@@ -97,6 +97,16 @@ class ProcessingPipeline:
                 if await self._cancel_requested(job_id):
                     await self._finalize_cancelled(job_id, req)
                     raise _CancelJob()
+                # 'Change source' must halt processing too (not just the download
+                # loop). Bail BEFORE each stage; the worker's _process_and_upload_
+                # quality maps AbortSource → _AbortSourceAttempt → source teardown
+                # (files + DB rows deleted). Heavy per-file stages (encode/
+                # watermark/branding) also poll this mid-stage.
+                from nekofetch.services.processing.stages import (
+                    AbortSource, source_abort_requested,
+                )
+                if await source_abort_requested(self._c, job_id):
+                    raise AbortSource()
                 # Use log_name (not stage.value) so Watermark — which shares the
                 # BRANDING enum with real Branding — reads "watermarking", not a
                 # second "branding" line.

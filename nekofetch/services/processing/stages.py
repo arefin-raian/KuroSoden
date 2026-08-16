@@ -21,6 +21,32 @@ from nekofetch.ui import templates
 log = get_logger(__name__)
 
 
+class AbortSource(BaseException):
+    """Raised inside a processing stage when the admin hit 'Change source'.
+
+    A ``BaseException`` (not ``Exception``) so a stage's broad ``except
+    Exception`` can't swallow it — it must unwind straight out of the pipeline to
+    the worker, which tears down the source attempt (files + DB rows). Mirrors
+    the download loop's ``_AbortSourceAttempt``; kept here so both the pipeline
+    and the per-file stage loops can raise it without a circular import.
+    """
+
+
+async def source_abort_requested(container, job_id: int) -> bool:
+    """True when 'Change source' was requested for ``job_id`` (Redis flag).
+
+    Same key the download loop uses (``nf:job:<id>:source_abort``) so a change
+    requested during processing is seen here too. Best-effort: a Redis blip
+    reads as 'not requested' rather than blocking the pipeline."""
+    redis = getattr(container, "redis", None)
+    if redis is None:
+        return False
+    try:
+        return bool(await redis.get(f"nf:job:{job_id}:source_abort"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def release_key(f):
     """The encode release-order contract: season → season_part → episode.
 
@@ -866,6 +892,8 @@ class BrandingStage(Stage):
         n = len(ctx.files)
         await _push_stage_progress(self.c, ctx, "Branding", 0.0, file_index=0, file_total=n)
         for i, f in enumerate(ctx.files):
+            if await source_abort_requested(self.c, ctx.job_id):
+                raise AbortSource()  # 'Change source' — bail mid-branding
             if not f.local_path or (f.container or "").lower() != "mkv":
                 if f.local_path and (f.container or "").lower() != "mkv":
                     ctx.notes.append(f"branding: skipped non-mkv {f.container}")
@@ -1119,6 +1147,8 @@ class WatermarkStage(Stage):
         n = len(targets)
         await _push_stage_progress(self.c, ctx, "Watermarking", 0.0, file_index=0, file_total=n)
         for i, f in enumerate(targets):
+            if await source_abort_requested(self.c, ctx.job_id):
+                raise AbortSource()  # 'Change source' — bail mid-watermark
             if not f.local_path:
                 continue
             src = Path(f.local_path)
@@ -1473,11 +1503,21 @@ class EncodeStage(Stage):
             and h not in present.get(
                 (f.season, f.season_part, f.episode, f.audio), set()
             )
-        ) or 1
+        )
+        # All requested tiers already shipped (e.g. a DDL pack that provided
+        # 480/720/1080) → there is NOTHING to encode. Return BEFORE the
+        # "Encoding" banner so the card doesn't falsely show an encode pass on a
+        # ready release; the flow goes straight brand → watermark → thumbnail →
+        # store/upload.
+        if total_units == 0:
+            ctx.notes.append("encode: all requested tiers already present — skipped")
+            return
         done_units = 0
         await _push_stage_progress(self.c, ctx, "Encoding", 0.0, file_index=0, file_total=n)
         new_rows: list = []
         for i, f in enumerate(sources):
+            if await source_abort_requested(self.c, ctx.job_id):
+                raise AbortSource()  # 'Change source' — bail mid-encode
             src = Path(f.local_path)
             src_res = f.resolution or "1080p"
             ffmpeg = find_ffmpeg()
