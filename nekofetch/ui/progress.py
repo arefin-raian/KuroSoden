@@ -197,6 +197,7 @@ def download_card_html(
     retry_max: int = 0,
     retry_reason: str | None = None,
     low_disk: bool = False,
+    archive_name: str | None = None,
 ) -> str:
     """Live Levi transfer card for download, retry, processing, and upload stages.
 
@@ -216,6 +217,18 @@ def download_card_html(
     if audio:
         # Normalize underscores → spaces for display (e.g. DUAL_AUDIO → DUAL AUDIO)
         title_bits.append(f"[{_esc(audio.upper().replace('_', ' '))}]")
+    # DDL archive phase (download/extract of the ZIP, before per-episode naming):
+    # show the archive filename + which archive of how many, so the admin SEES
+    # the download+extract happen before being asked for a name. Only when there's
+    # no per-episode context (torrent/normal downloads are unaffected).
+    _stage_l = (stage or "").strip().lower()
+    if archive_name and current_episode is None and _stage_l in (
+        "downloading", "download", "extracting", "extract"
+    ):
+        arc = _esc(archive_name)
+        if episode_index and total_episodes and total_episodes > 1:
+            arc = f"{arc} ({episode_index}/{total_episodes})"
+        title_bits.append(f"\n<i>{arc}</i>")
 
     if retry_attempt and retry_max:
         reason = f" · {_esc(retry_reason)}" if retry_reason else ""

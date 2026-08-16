@@ -202,7 +202,7 @@ class DownloadWorker:
         # Resolve the source chain (preferred site first; both sites for website
         # requests so dual-audio can cross-source). The primary drives the episode
         # list and all non-dual downloads.
-        chain = await self._resolve_chain(req)
+        chain = await self._resolve_chain(req, job_id=job_id)
         source, episodes = chain[0]
         if req.season is not None:
             episodes = [e for e in episodes if e.season == req.season]
@@ -1329,7 +1329,7 @@ class DownloadWorker:
         except Exception:  # noqa: BLE001 - on error, just re-download (safe) not fail
             return False
 
-    async def _resolve_chain(self, req) -> list[tuple]:
+    async def _resolve_chain(self, req, *, job_id: int | None = None) -> list[tuple]:
         """Resolve a request to a priority-ordered chain of ``(source, episodes)``.
 
         Requests carry an AniList discovery ref (``anilist:<id>``), so we search
@@ -1418,7 +1418,17 @@ class DownloadWorker:
                         last_err = f"{name}: no confident title match"
                         continue
                     ref = stub.source_ref
-                episodes = await src.get_episodes(ref)
+                # DDL does its real download+extract inside get_episodes; give it a
+                # progress callback so the live card shows a per-archive download
+                # bar (with the ZIP filename) and an extraction bar BEFORE the
+                # naming prompt. Other sources' get_episodes is a cheap metadata
+                # parse, so they take no callback (torrent stays up-front).
+                if name == "ddl" and job_id is not None:
+                    episodes = await src.get_episodes(
+                        ref, on_progress=self._ddl_progress(job_id, req),
+                    )
+                else:
+                    episodes = await src.get_episodes(ref)
                 if episodes:
                     log.info("download.source.resolved", source=name, episodes=len(episodes))
                     chain.append((src, episodes))
@@ -1849,6 +1859,57 @@ class DownloadWorker:
                 await self._c.progress.delete(job_id)
             except Exception:  # noqa: BLE001
                 log.debug("download.progress_cleanup.failed", job_id=job_id)
+
+    def _ddl_progress(self, job_id: int, req):
+        """Progress callback for DDL's in-get_episodes download+extract.
+
+        Publishes a per-archive DOWNLOAD bar (with the ZIP filename surfaced via
+        ``label`` + archive i/n, so the card shows a transfer panel) and an
+        EXTRACTING stage — the visible steps the admin should see BEFORE the
+        naming prompt. Cosmetic: a Redis blip never affects the download.
+        """
+        st = {"last": 0.0, "win_t": time.monotonic(), "win_done": 0, "key": None}
+
+        async def on_progress(info: dict) -> None:
+            if not self._c.progress:
+                return
+            stage = info.get("stage")
+            name = info.get("archive_name") or "archive"
+            idx = int(info.get("index") or 1)
+            cnt = int(info.get("count") or 1)
+            try:
+                if stage == "download":
+                    done = int(info.get("done") or 0)
+                    total = int(info.get("total") or 0)
+                    now = time.monotonic()
+                    if info.get("key") != st["key"]:
+                        st.update(win_t=now, win_done=0, key=info.get("key"), last=0.0)
+                    # Throttle + rolling speed (mirrors _make_progress).
+                    if done < total and now - st["last"] < 0.7:
+                        return
+                    dt = max(now - st["win_t"], 1e-6)
+                    speed = max(done - st["win_done"], 0) / dt
+                    st["win_t"], st["win_done"], st["last"] = now, done, now
+                    pct = (done / total * 100) if total else 0.0
+                    eta = int((total - done) / speed) if speed > 0 else None
+                    await self._c.progress.set(ProgressSnapshot(
+                        job_id=job_id, status=JobStatus.RUNNING.value, progress=pct,
+                        stage="Downloading", speed_bps=speed,
+                        downloaded_bytes=done, total_bytes=total, eta_seconds=eta,
+                        episode_index=idx, total_episodes=cnt, label=name,
+                    ))
+                elif stage in ("extract", "extract_done"):
+                    pct = 100.0 if stage == "extract_done" else 0.0
+                    await self._c.progress.set(ProgressSnapshot(
+                        job_id=job_id, status=JobStatus.RUNNING.value, progress=pct,
+                        stage="Extracting", episode_index=idx, total_episodes=cnt,
+                        label=name,
+                    ))
+                # 'failed' snapshots are handled by the fail-card path; ignore here.
+            except Exception:  # noqa: BLE001 — progress is cosmetic telemetry
+                log.debug("ddl.progress_redis_blip", job_id=job_id)
+
+        return on_progress
 
     async def _push_stage(self, job_id: int, title: str, stage: str, pct: float) -> None:
         """Publish a coarse stage marker so ACTIVE TASKS shows post-download stages

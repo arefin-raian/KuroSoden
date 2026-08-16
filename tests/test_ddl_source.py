@@ -102,7 +102,7 @@ async def test_get_episodes_keeps_every_quality(tmp_path: Path, monkeypatch) -> 
         lambda: SimpleNamespace(storage_path=tmp_path),
     )
 
-    async def fake_fetch(url: str, dest: Path) -> Path:
+    async def fake_fetch(url: str, dest: Path, **kwargs) -> Path:
         shutil.copy(archive, dest)
         return dest
 
@@ -136,3 +136,46 @@ async def test_registry_activates_and_resolves_ddl() -> None:
 
     assert registry.get("ddl").name == "ddl"
     assert isinstance(registry.resolve("ddl"), DdlSource)
+
+
+async def test_get_episodes_emits_download_and_extract_progress(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    # The owner's core complaint: download+extract were invisible, so the naming
+    # prompt LOOKED like it came first. get_episodes must now emit a download bar
+    # (with the ZIP filename) and an extract stage BEFORE returning.
+    archive = _make_zip(tmp_path / "pack.zip", ["Show S01E01 1080p.mkv"])
+    src = DdlSource()
+    monkeypatch.setattr(
+        "nekofetch.sources.ddl.get_env",
+        lambda: SimpleNamespace(storage_path=tmp_path),
+    )
+
+    async def fake_fetch(url, dest, *, on_bytes=None, archive_name="", index=1, count=1):
+        shutil.copy(archive, dest)
+        if on_bytes:  # simulate a couple of byte updates
+            await on_bytes(0, 100, archive_name, index, count)
+            await on_bytes(100, 100, archive_name, index, count)
+        return dest
+
+    monkeypatch.setattr(src, "_fetch_archive", fake_fetch)
+
+    events: list[dict] = []
+
+    async def on_progress(info: dict) -> None:
+        events.append(info)
+
+    ref = json.dumps({
+        "archives": [{
+            "url": "https://worker.dev/abc/Akudama.Drive.S01.480p.zip", "season": None,
+        }],
+        "title": "Akudama Drive",
+    })
+    episodes = await src.get_episodes(ref, on_progress=on_progress)
+
+    assert len(episodes) == 1
+    stages = [e["stage"] for e in events]
+    assert "download" in stages
+    assert "extract" in stages and "extract_done" in stages
+    # The ZIP filename (last path segment, url-decoded) is surfaced for the card.
+    assert any(e.get("archive_name") == "Akudama.Drive.S01.480p.zip" for e in events)

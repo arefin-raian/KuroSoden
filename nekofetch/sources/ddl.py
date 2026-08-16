@@ -20,9 +20,11 @@ cache under ``work/<code>/.ddl`` so it's cleaned up with the request.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import aiofiles
 import httpx
@@ -96,40 +98,106 @@ class DdlSource(AnimeSource):
         root.mkdir(parents=True, exist_ok=True)
         return root
 
-    async def _fetch_archive(self, url: str, dest: Path) -> Path:
-        """Stream a remote archive to ``dest`` (skips the download if already cached)."""
+    async def _fetch_archive(
+        self, url: str, dest: Path,
+        *, on_bytes=None, archive_name: str = "", index: int = 1, count: int = 1,
+    ) -> Path:
+        """Stream a remote archive to ``dest`` (skips the download if already cached).
+
+        Reports byte progress via ``on_bytes(done, total, archive_name, index,
+        count)`` and retries transient failures (the worker.dev links flake) with
+        backoff. Writes to a ``.part`` file and renames on success so a partial
+        never looks complete.
+        """
         if dest.exists() and dest.stat().st_size > 0:
+            if on_bytes:
+                size = dest.stat().st_size
+                await on_bytes(size, size, archive_name, index, count)
             return dest
         tmp = dest.with_suffix(dest.suffix + ".part")
-        async with self.http.stream("GET", url) as resp:
-            resp.raise_for_status()
-            async with aiofiles.open(tmp, "wb") as fh:
-                async for chunk in resp.aiter_bytes(_CHUNK):
-                    await fh.write(chunk)
-        tmp.replace(dest)
-        return dest
+        attempts = 3
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                async with self.http.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    total = int(resp.headers.get("content-length") or 0)
+                    done = 0
+                    async with aiofiles.open(tmp, "wb") as fh:
+                        if on_bytes:
+                            await on_bytes(0, total, archive_name, index, count)
+                        async for chunk in resp.aiter_bytes(_CHUNK):
+                            await fh.write(chunk)
+                            done += len(chunk)
+                            if on_bytes:
+                                await on_bytes(done, total, archive_name, index, count)
+                tmp.replace(dest)
+                return dest
+            except Exception as exc:  # noqa: BLE001 — retry transient host flakiness
+                last_exc = exc
+                log.warning("ddl.fetch.retry", url=url, attempt=attempt,
+                            error=str(exc)[:200])
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if attempt < attempts:
+                    await asyncio.sleep(1.5 * attempt)
+        raise last_exc or RuntimeError(f"failed to download {archive_name or url}")
 
-    async def get_episodes(self, source_ref: str) -> list[Episode]:
-        """Download + extract every provided archive, order EP1..EPN across them."""
+    async def get_episodes(self, source_ref: str, *, on_progress=None) -> list[Episode]:
+        """Download + extract every provided archive, order EP1..EPN across them.
+
+        ``on_progress`` (optional) is an async ``callback(info: dict)`` the worker
+        supplies so the live card can show a download bar (per archive, with the
+        zip filename) and an extraction bar BEFORE the naming prompt. ``info``
+        carries ``{stage, archive_name, index, count, done, total}``; it is
+        best-effort and never affects the result.
+        """
         ref = _parse_ref(source_ref)
         archives = ref.get("archives") or []
         title = ref.get("title", "")
         cache = self._cache_root(ref)
+        count = len([a for a in archives if a.get("url")])
+
+        async def _emit(stage: str, archive_name: str, index: int,
+                        done: int = 0, total: int = 0) -> None:
+            if on_progress is None:
+                return
+            try:
+                await on_progress({
+                    "stage": stage, "archive_name": archive_name,
+                    "index": index, "count": count, "done": done, "total": total,
+                })
+            except Exception:  # noqa: BLE001 — progress is cosmetic
+                pass
+
+        async def _on_bytes(done, total, archive_name, index, cnt) -> None:
+            await _emit("download", archive_name, index, done, total)
 
         pooled: list[dict] = []
-        for idx, arc in enumerate(archives):
+        pos = 0
+        for arc in archives:
             url = arc.get("url")
             if not url:
                 continue
+            pos += 1
             season_hint = arc.get("season")  # positional fallback for Phase 4/5
+            arc_name = _archive_name(url)
             digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
             archive_path = cache / f"{digest}{_ext_of(url)}"
             extract_dir = cache / digest
             try:
-                await self._fetch_archive(url, archive_path)
+                await self._fetch_archive(
+                    url, archive_path, on_bytes=_on_bytes,
+                    archive_name=arc_name, index=pos, count=count,
+                )
+                await _emit("extract", arc_name, pos)
                 videos = await extract_archive(archive_path, extract_dir)
+                await _emit("extract_done", arc_name, pos, 1, 1)
             except Exception as exc:  # noqa: BLE001
                 log.warning("ddl.archive.failed", url=url, error=str(exc))
+                await _emit("failed", f"{arc_name}: {exc}", pos)
                 continue
             for vp in videos:
                 pooled.append({
@@ -283,3 +351,16 @@ def _ext_of(url: str) -> str:
         if low.endswith(ext):
             return ext
     return ".zip"
+
+
+def _archive_name(url: str) -> str:
+    """Human archive filename from a URL for the progress card (the ZIP name).
+
+    Worker links bury the real name in the path (…/<hash>/Akudama.Drive.S01.480p…
+    .zip); take the last path segment, URL-decode it, and fall back to the host."""
+    try:
+        path = urlparse(url).path
+    except Exception:  # noqa: BLE001
+        path = url
+    name = unquote((path or "").rstrip("/").split("/")[-1])
+    return name or "archive.zip"
