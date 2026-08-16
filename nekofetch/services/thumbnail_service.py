@@ -17,6 +17,7 @@ The output is a high-quality ``.webp`` image.
 
 from __future__ import annotations
 
+import asyncio
 import html as html_module
 import math
 from pathlib import Path
@@ -94,6 +95,22 @@ def _genre_pill(label: str) -> str:
         'rounded-full text-md font-medium tracking-wider text-zinc-100 '
         f'backdrop-blur-xs">{html_module.escape(label)}</span>'
     )
+
+
+def _encode_png_to_webp(png_bytes: bytes, output_path: Path) -> None:
+    """Encode PNG bytes → WEBP (CPU-heavy; always run via ``asyncio.to_thread``)."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    with Image.open(BytesIO(png_bytes)) as im:
+        im.save(output_path, format="WEBP", quality=95, method=6)
+
+
+async def webp_to_jpeg_async(path: str | Path, *, quality: int = 92) -> Path | None:
+    """Async wrapper for :func:`webp_to_jpeg` — offloads the PIL decode/encode to a
+    worker thread so a photo-send path never blocks the shared event loop."""
+    return await asyncio.to_thread(webp_to_jpeg, path, quality=quality)
 
 
 def webp_to_jpeg(path: str | Path, *, quality: int = 92) -> Path | None:
@@ -623,12 +640,10 @@ class ThumbnailRenderService:
             # Playwright's screenshot only emits png|jpeg — grab a lossless PNG
             # and transcode to the .webp the rest of the pipeline expects.
             png_bytes = await page.screenshot(type="png", full_page=False)
-            from io import BytesIO
-
-            from PIL import Image
-
-            with Image.open(BytesIO(png_bytes)) as im:
-                im.save(output_path, format="WEBP", quality=95, method=6)
+            # WEBP method=6 on a 4098×1923 image is CPU-heavy (hundreds of ms →
+            # seconds). Do it in a worker thread so it never blocks the shared
+            # event loop and starve Pyrogram's ping → session drop.
+            await asyncio.to_thread(_encode_png_to_webp, png_bytes, output_path)
             log.info("thumbnail.rendered", path=str(output_path), title=title)
             return output_path
         except Exception as exc:

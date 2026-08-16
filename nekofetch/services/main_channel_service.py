@@ -29,7 +29,7 @@ from nekofetch.infrastructure.database.postgres.models import (
     StoragePack,
 )
 from nekofetch.infrastructure.database.postgres.session import session_scope
-from nekofetch.services.thumbnail_service import webp_to_jpeg
+from nekofetch.services.thumbnail_service import webp_to_jpeg_async
 from nekofetch.ui import templates
 
 log = get_logger(__name__)
@@ -625,7 +625,7 @@ class MainChannelService:
                 return False
             # The webp card is the sticker format to Telegram's media endpoint,
             # so the live edit sends a JPEG conversion of the same render.
-            photo = webp_to_jpeg(image_path) or Path(image_path)
+            photo = (await webp_to_jpeg_async(image_path)) or Path(image_path)
             await client.edit_message_media(
                 chat_id,
                 message_id,

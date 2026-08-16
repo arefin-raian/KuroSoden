@@ -41,7 +41,7 @@ from nekofetch.ui.artwork import (
 )
 from nekofetch.ui.components import cb, keyboard
 from nekofetch.ui.screens import Screen, card, send_screen
-from nekofetch.services.thumbnail_service import webp_to_jpeg
+from nekofetch.services.thumbnail_service import webp_to_jpeg, webp_to_jpeg_async
 
 from kurosoden.shared import senku_voice as V
 from kurosoden.shared.channel_essentials import build_channel_essentials
@@ -1165,7 +1165,7 @@ def register(client: Client, container: Container) -> None:
         rendered_selection = await cache.get_selection(code, index)
         has_public_preview = isinstance(rendered_selection.thumbnail_url, str) and \
             rendered_selection.thumbnail_url.startswith(("http://", "https://"))
-        local_preview = None if has_public_preview else (webp_to_jpeg(path) or path)
+        local_preview = None if has_public_preview else ((await webp_to_jpeg_async(path)) or path)
         preview = (rendered_selection.thumbnail_url
                    if has_public_preview else local_preview)
         # ``keyboard`` accepts each row as one positional argument. Passing an
@@ -1195,7 +1195,7 @@ def register(client: Client, container: Container) -> None:
             if has_public_preview:
                 # Build the local fallback only after the public URL has failed;
                 # the normal path should not do the extra conversion.
-                local_fallback = webp_to_jpeg(path) or path
+                local_fallback = (await webp_to_jpeg_async(path)) or path
                 try:
                     await client.send_photo(
                         q.message.chat.id, str(local_fallback), reply_markup=markup,

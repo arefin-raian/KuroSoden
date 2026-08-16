@@ -51,7 +51,7 @@ from nekofetch.providers.metadata.tmdb_assets import (
 from nekofetch.ui import thumbnail_sections as S
 from nekofetch.ui.components import cb
 from nekofetch.ui.screens import MESSAGE_LIMIT, _truncate_html
-from nekofetch.services.thumbnail_service import ThumbnailRenderService, webp_to_jpeg
+from nekofetch.services.thumbnail_service import ThumbnailRenderService, webp_to_jpeg_async
 
 log = get_logger(__name__)
 
@@ -328,7 +328,7 @@ class ThumbnailChannelService:
                 return False
             # The webp card is the sticker format to Telegram's media endpoint,
             # so the live edit sends a JPEG conversion of the same render.
-            photo = webp_to_jpeg(image_path) or Path(image_path)
+            photo = (await webp_to_jpeg_async(image_path)) or Path(image_path)
             await client.edit_message_media(
                 chat_id, message_id,
                 InputMediaPhoto(str(photo), caption=caption,
@@ -1540,7 +1540,7 @@ class ThumbnailChannelService:
         # Telegram's photo endpoint is unreliable with the rendered .webp (the
         # sticker format), so the channel reference card is sent as a JPEG — the
         # stored artifact stays the original WebP.
-        preview = webp_to_jpeg(thumbnail_path) or Path(thumbnail_path)
+        preview = (await webp_to_jpeg_async(thumbnail_path)) or Path(thumbnail_path)
         try:
             photo_msg = await self._client.send_photo(
                 self.cfg.channel_id, str(preview),
