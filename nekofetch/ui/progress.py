@@ -218,7 +218,9 @@ def download_card_html(
     )
 
     if _archive_phase:
-        header_title = f"📺 {_esc(archive_name)}"
+        # No TV emoji for DDL (the long zip name wraps in the blockquote and a
+        # lone 📺 on the first line looks broken) — just the bold zip name.
+        header_title = _esc(archive_name)
     else:
         title_bits = [_esc(title)]
         if current_episode is not None:

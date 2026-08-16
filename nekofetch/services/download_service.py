@@ -529,6 +529,19 @@ class DownloadWorker:
             v.audio == AudioType.DUAL_AUDIO and v.resolution == resolution
             for v in variants
         )
+        # A single muxed MULTI-track file (e.g. a DDL release named
+        # "…Hindi.Japanese.English…") contains every language, so it satisfies
+        # ANY single-language request. Without this, _select_variant's exact
+        # `audio == SUBBED/DUBBED` match finds zero MULTI variants and the loop
+        # silently skips every unit → "produced 0 files (0 units failed)" even
+        # though the extracted episodes are sitting on disk. Collapse all wanted
+        # audios to ONE MULTI acquisition (deduped → single download pass).
+        has_native_multi = any(
+            v.audio == AudioType.MULTI and v.resolution == resolution
+            for v in variants
+        )
+        if has_native_multi:
+            return [AudioType.MULTI]
         if not has_native_dual:
             return list(wanted)
         result: list[AudioType] = []
@@ -1883,7 +1896,10 @@ class DownloadWorker:
                     total = int(info.get("total") or 0)
                     now = time.monotonic()
                     if idx != st["key"]:  # new archive → reset the speed window
-                        st.update(win_t=now, win_done=0, key=idx, last=0.0)
+                        # Seed win_done with the CURRENT bytes (not 0) so a cached
+                        # archive that reports (size,size) once doesn't divide a
+                        # huge delta by ~0 and show "2548 TB/s".
+                        st.update(win_t=now, win_done=done, key=idx, last=0.0)
                     # Throttle + rolling speed (mirrors _make_progress).
                     if done < total and now - st["last"] < 0.7:
                         return
@@ -2211,7 +2227,16 @@ def _select_variant(variants, resolution, audio, require_english_subs: bool):
     if resolution:
         cands = [v for v in cands if v.resolution == resolution]
     if audio is not None:
-        cands = [v for v in cands if v.audio == audio]
+        exact = [v for v in cands if v.audio == audio]
+        if not exact and audio in (
+            AudioType.SUBBED, AudioType.DUBBED, AudioType.DUAL_AUDIO,
+        ):
+            # No exact single-language match — a MULTI-track file (all languages
+            # muxed, e.g. a DDL "Hindi.Japanese.English" release) contains the
+            # requested language, so fall back to it rather than skipping the unit
+            # and producing "0 files".
+            exact = [v for v in cands if v.audio == AudioType.MULTI]
+        cands = exact
     if not cands:
         return None
     if require_english_subs:

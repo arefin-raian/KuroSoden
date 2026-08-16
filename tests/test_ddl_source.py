@@ -138,6 +138,40 @@ async def test_registry_activates_and_resolves_ddl() -> None:
     assert isinstance(registry.resolve("ddl"), DdlSource)
 
 
+def test_multi_audio_pack_matches_subbed_dubbed_requests() -> None:
+    # The real DDL failure: MoviesMod packs are "Hindi.Japanese.English" → tagged
+    # AudioType.MULTI, but the worker only ever asks for DUBBED/SUBBED. The exact
+    # `v.audio == audio` match found nothing → every unit skipped → "0 files".
+    # A MULTI file contains every language, so it must satisfy those requests.
+    from nekofetch.domain.enums import AudioType
+    from nekofetch.services.download_service import DownloadWorker, _select_variant
+    from nekofetch.sources.base import VideoVariant
+
+    def _v(res, audio=AudioType.MULTI):
+        return VideoVariant(source_ref="{}", resolution=res, audio=audio,
+                            container="mkv", size_bytes=1)
+
+    multi = [_v("1080p"), _v("720p"), _v("480p")]
+
+    # A [DUBBED, SUBBED] request against MULTI variants collapses to ONE MULTI
+    # acquisition (single download pass), not two skipped ones.
+    assert DownloadWorker._resolve_audio_targets(
+        [AudioType.DUBBED, AudioType.SUBBED], multi, "1080p",
+    ) == [AudioType.MULTI]
+
+    # _select_variant falls back to the MULTI file for a single-language request.
+    assert _select_variant(multi, "1080p", AudioType.SUBBED, False).audio == AudioType.MULTI
+    assert _select_variant(multi, "1080p", AudioType.DUBBED, False).audio == AudioType.MULTI
+    assert _select_variant(multi, "1080p", AudioType.MULTI, False).audio == AudioType.MULTI
+
+    # A normal SUBBED-only source is unaffected (no MULTI to fall back to).
+    subs = [_v("1080p", AudioType.SUBBED)]
+    assert DownloadWorker._resolve_audio_targets(
+        [AudioType.SUBBED], subs, "1080p",
+    ) == [AudioType.SUBBED]
+    assert _select_variant(subs, "1080p", AudioType.DUBBED, False) is None
+
+
 async def test_get_episodes_emits_download_and_extract_progress(
     tmp_path: Path, monkeypatch,
 ) -> None:
