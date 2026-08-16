@@ -56,9 +56,13 @@ class _FakeTier:
         pass
 
 
-def _client(anilist, mal, kitsu) -> ResilientMetadataClient:
+def _client(anilist, mal, kitsu, dataset=None) -> ResilientMetadataClient:
     c = ResilientMetadataClient()
     c.anilist, c.mal, c.kitsu = anilist, mal, kitsu
+    # Stub the local dataset tier too (default: a miss-everything fake) so unit
+    # tests never touch the network — the real AnimeDatasetClient would download
+    # and index the live CSV snapshot.
+    c.dataset = dataset if dataset is not None else _FakeTier("dataset")
     return c
 
 
@@ -85,6 +89,21 @@ async def test_first_tier_hit_short_circuits():
 
     assert await c.search("Frieren") == "ANILIST_MEDIA"
     assert mal.calls == [] and kitsu.calls == []  # never consulted
+
+
+@_aio
+async def test_dataset_tier_sits_right_after_anilist():
+    # AniList misses → the local dataset is tried BEFORE the REST APIs; a dataset
+    # hit short-circuits Jikan/Kitsu (the fast local path the owner wants).
+    anilist = _FakeTier("anilist", search=None)
+    dataset = _FakeTier("dataset", search="DATASET_MEDIA")
+    mal = _FakeTier("mal", search="MAL_MEDIA")
+    kitsu = _FakeTier("kitsu", search="KITSU_MEDIA")
+    c = _client(anilist, mal, kitsu, dataset=dataset)
+
+    assert await c.search("Solo Leveling") == "DATASET_MEDIA"
+    assert dataset.calls == ["search"]
+    assert mal.calls == [] and kitsu.calls == []  # APIs skipped on a dataset hit
 
 
 @_aio

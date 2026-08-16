@@ -82,6 +82,8 @@ class Container:
         # Arm the @acutebot userbot tier as the last resort when both AniList
         # and Jikan miss. Stays dormant unless a userbot session is present.
         self.anilist.enable_acute_fallback(env)
+        # Point the local dataset tier's CSV cache at the real storage dir.
+        self.anilist.set_storage(env.storage_path)
         self.tmdb = TmdbClient(
             token=env.tmdb_read_access_token,
             api_key=env.tmdb_api_key,
