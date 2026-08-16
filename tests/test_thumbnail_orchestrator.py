@@ -80,3 +80,36 @@ async def test_first_season_uses_workflow_order_not_anilist_id():
     assert await service.get_first_season_thumbnail("anime-2") == (
         "https://img/first.webp"
     )
+
+
+@pytest.mark.asyncio
+async def test_first_season_prefers_main_variant_for_the_main_post():
+    # The base entry's TMDB-synopsis "main" variant is used for the main-channel
+    # post; the distribution card image (thumbnail_url) is the fallback.
+    key = "nf:thumbcc:workflow:anime-3"
+    redis = FakeRedis({
+        key: json.dumps([
+            {
+                "index": 1,
+                "status": "done",
+                "anilist_id": 900,
+                "thumbnail_url": "https://img/dist-s1.webp",
+                "main_thumbnail_url": "https://img/main-s1.webp",
+            },
+            {
+                "index": 2,
+                "status": "done",
+                "anilist_id": 100,
+                "thumbnail_url": "https://img/dist-s2.webp",
+            },
+        ]),
+    })
+    service = ThumbnailOrchestratorService(SimpleNamespace(redis=redis))
+
+    # Main post gets the TMDB variant of the BASE entry...
+    assert await service.get_first_season_thumbnail("anime-3") == (
+        "https://img/main-s1.webp"
+    )
+    # ...while the distribution season-1 card still uses its own image.
+    generated = await service.get_generated_thumbnails("anime-3")
+    assert generated[900] == "https://img/dist-s1.webp"

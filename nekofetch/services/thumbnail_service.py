@@ -171,7 +171,8 @@ def _flag_url(country: str | None) -> str:
 
 
 async def gather_thumbnail_fields(container: Any, title: str,
-                                  anime_doc_id: str | None = None) -> dict:
+                                  anime_doc_id: str | None = None,
+                                  *, prefer_anilist_synopsis: bool = False) -> dict:
     """Enrich a title into the display fields ``render_thumbnail`` consumes.
 
     Pulls facts from TMDB (overview, native title, studio, rating, country,
@@ -180,11 +181,18 @@ async def gather_thumbnail_fields(container: Any, title: str,
     enabled ``StoragePack`` rows — the same lookup ``bot_factory`` uses. Every
     provider call is best-effort: a miss degrades one field, never the whole set.
 
+    ``prefer_anilist_synopsis`` routes the baked synopsis by SURFACE: distribution
+    entry-card renders pass ``True`` (each card describes THAT title via AniList's
+    synopsis), while the main-channel-post render leaves it ``False`` (the
+    franchise-level TMDB overview). Either way the other source is the fallback.
+    Rating stays TMDB on every surface (series-level).
+
     The user-picked logo/poster/backdrop are NOT set here (the caller owns those);
     this fills everything else. Returns a kwargs dict ready to splat into
     ``render_thumbnail`` alongside the chosen art.
     """
     synopsis = ""
+    tmdb_synopsis = anilist_synopsis = ""
     native_title = romaji_title = studio = language = ""
     meta_bits: list[str] = []
     genres: list[str] = []
@@ -218,7 +226,7 @@ async def gather_thumbnail_fields(container: Any, title: str,
         return getattr(tmdb_result, key, default) if tmdb_result else default
 
     if tmdb_cached is not None or tmdb_result:
-        synopsis = _t("overview") or synopsis
+        tmdb_synopsis = _t("overview") or ""
         native_title = _t("native_title") or ""
         studio = _t("studio") or ""
         tmdb_rating = _t("rating")
@@ -265,7 +273,16 @@ async def gather_thumbnail_fields(container: Any, title: str,
         if _score is not None:
             # AnilistMedia.score is 0-10; the ring wants 0-100.
             anilist_score = round(_score * 10)
-        synopsis = synopsis or (_a("synopsis") or "")
+        anilist_synopsis = _a("synopsis") or ""
+
+    # Route the baked synopsis by surface: distribution entry cards prefer the
+    # per-title AniList synopsis; the main-channel post prefers the franchise-
+    # level TMDB overview. The other source is always the fallback, and Jikan
+    # (below) is the last-resort fill when both are empty.
+    if prefer_anilist_synopsis:
+        synopsis = anilist_synopsis or tmdb_synopsis
+    else:
+        synopsis = tmdb_synopsis or anilist_synopsis
 
     # ── Jikan (MyAnimeList) cache: last-resort fill for synopsis / score /
     # genres when neither TMDB nor AniList supplied them. This is the read-side

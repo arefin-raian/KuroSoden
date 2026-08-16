@@ -222,7 +222,13 @@ class ThumbnailOrchestratorService:
                 continue
             candidates.append((index, entry))
         first = min(candidates, key=lambda item: item[0], default=None)
-        return first[1].get("thumbnail_url") if first else None
+        if not first:
+            return None
+        entry = first[1]
+        # Prefer the base entry's MAIN-channel variant (TMDB synopsis, rendered
+        # by handle_generate); fall back to the distribution card image when it
+        # wasn't produced (older workflows / manual path).
+        return entry.get("main_thumbnail_url") or entry.get("thumbnail_url")
 
     # \u2500\u2500 helpers \u2500\u2500 used by :class:`ThumbnailChannelService.handle_callback` \u2500\u2500\u2500\u2500\u2500
 

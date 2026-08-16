@@ -93,6 +93,7 @@ class WorkflowEntry:
     poster_url: str | None = None
     bg_url: str | None = None
     thumbnail_url: str | None = None
+    main_thumbnail_url: str | None = None  # base entry only: TMDB-synopsis variant for the main-channel post
     tmdb_id: int | None = None
     media_type: str | None = None  # "tv" | "movie"
     anilist_id: int | None = None   # ties workflow entry to a franchise installment
@@ -235,6 +236,7 @@ class ThumbnailChannelService:
         data = [{"index": e.index, "label": e.label, "format": e.format,
                  "status": e.status, "logo_url": e.logo_url, "poster_url": e.poster_url,
                  "bg_url": e.bg_url, "thumbnail_url": e.thumbnail_url,
+                 "main_thumbnail_url": e.main_thumbnail_url,
                  "tmdb_id": e.tmdb_id, "media_type": e.media_type,
                  "anilist_id": e.anilist_id}
                 for e in entries]
@@ -1487,7 +1489,10 @@ class ThumbnailChannelService:
         # best-effort — a provider miss degrades one field, never the render.
         # Shared with Senku's distribution wizard via ``gather_thumbnail_fields``. ──
         from nekofetch.services.thumbnail_service import gather_thumbnail_fields
-        fields = await gather_thumbnail_fields(self._c, title, anime_doc_id)
+        # Distribution entry cards use the per-title AniList synopsis (the base
+        # entry also gets a TMDB-synopsis variant below, for the main post).
+        fields = await gather_thumbnail_fields(
+            self._c, title, anime_doc_id, prefer_anilist_synopsis=True)
         source_fields = {
             **fields,
             "title": title,
@@ -1562,6 +1567,34 @@ class ThumbnailChannelService:
             )
         except Exception as exc:  # noqa: BLE001 - DB is authoritative but best effort here
             log.warning("thumbcc.source.message_ref_failed", error=str(exc))
+
+        # ── Base entry: also render a MAIN-CHANNEL variant with the TMDB
+        # synopsis (the main post summarizes the whole franchise; distribution
+        # cards describe each season via AniList). "Base" = the lowest-index TV
+        # entry with a real anilist_id — exactly what get_first_season_thumbnail
+        # picks. Stored as a real http(s) URL (NOT thumb://, which nothing
+        # resolves) so the main post's send_photo can consume it. Best-effort:
+        # any failure just leaves the main post on its existing fallback.
+        try:
+            tv_indexes = [w.index for w in workflow if w.anilist_id not in (None, -1)]
+            if tv_indexes and int(entry_index) == min(tv_indexes):
+                main_fields = await gather_thumbnail_fields(
+                    self._c, title, anime_doc_id, prefer_anilist_synopsis=False)
+                main_path = await renderer.render_thumbnail(
+                    title=title, logo_url=entry.logo_url,
+                    poster_url=entry.poster_url, bg_url=entry.bg_url,
+                    variant_key="main", **main_fields,
+                )
+                if main_path:
+                    from kurosoden.shared.image_backup import backup_bytes
+                    mirrored = await backup_bytes(
+                        self._c, Path(main_path).read_bytes(), mime="image/webp")
+                    entry.main_thumbnail_url = mirrored.primary or f"file://{main_path}"
+                    log.info("thumbcc.main_variant.rendered", anime=anime_doc_id,
+                             url=entry.main_thumbnail_url)
+        except Exception as exc:  # noqa: BLE001 — main post keeps its fallback
+            log.warning("thumbcc.main_variant.failed", anime=anime_doc_id,
+                        error=str(exc))
 
         # Mark as done
         entry.status = "done"
