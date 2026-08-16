@@ -102,12 +102,12 @@ class NotificationService:
         """Tell a requester their request was removed by staff (owner delete)."""
         await self._send(
             user_id,
-            f"<blockquote><b>🗑 request removed</b></blockquote>\n\n"
+            f"<blockquote><b>🗑 Request Removed</b></blockquote>\n\n"
             f"<blockquote expandable>"
-            f"<b>anime:</b> {anime_title}\n"
-            f"<b>request:</b> <code>#{request_code}</code>\n\n"
-            f"your request was removed by staff. if you think this was a mistake, "
-            f"feel free to request it again."
+            f"<b>Anime :</b> {anime_title}\n"
+            f"<b>Request :</b> <code>#{request_code}</code>\n\n"
+            f"Your request was removed by staff. If you think this was a mistake, "
+            f"just request it again — no hard feelings."
             f"</blockquote>"
         )
 

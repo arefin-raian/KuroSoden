@@ -661,6 +661,34 @@ class RequestService:
         except Exception:  # noqa: BLE001
             pass
 
+    async def _signal_and_finalize_cards(
+        self, job_ids: list[int], title: str, code: str,
+    ) -> None:
+        """For each job of a deleted/reassigned request: signal a running worker
+        to stop, then edit its live Levi download card to a 'cancelled' card and
+        auto-advance the downloader to their next task.
+
+        Must run BEFORE :meth:`_clear_job_flags` (which wipes the card's stored
+        ``progressmsg`` ref). Best-effort throughout — a card/redis hiccup never
+        blocks the delete."""
+        for jid in job_ids:
+            # Signal-to-stop: the row is already gone, but a worker mid-stage
+            # polls this and bails cleanly instead of erroring on the missing row.
+            if self._c.redis:
+                try:
+                    await self._c.redis.set(f"nf:job:{jid}:cancel", "1", ex=600)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                from kurosoden.bots.levi.handlers.progress_monitor import (
+                    finalize_cancelled_card,
+                )
+                await finalize_cancelled_card(self._c, jid, title=title, code=code)
+            except Exception as exc:  # noqa: BLE001 — card update never blocks delete
+                from nekofetch.core.logging import get_logger
+                get_logger(__name__).debug(
+                    "request.cancel_card.failed", job=jid, error=str(exc))
+
     async def delete_request(self, code: str) -> dict:
         """Delete a request ENTIRELY — rows, files, packs, assignments — and tell
         the requester it was removed.
@@ -688,6 +716,12 @@ class RequestService:
             await self._clear_assignments(session, code)
             await session.delete(req)
             await session.flush()
+
+        # Signal any running worker to stop (its row is now gone, but the flag
+        # makes it bail at its next checkpoint instead of erroring on the missing
+        # row), and edit the live Levi download card to a "cancelled" card +
+        # auto-advance — BEFORE _clear_job_flags wipes the card's stored msg-ref.
+        await self._signal_and_finalize_cards(job_ids, title, code)
 
         await self._prune_work_dir(work_folder)
         await self._clear_job_flags(code, job_ids)
@@ -764,6 +798,10 @@ class RequestService:
             )
             await requests.add(new_req)
             await session.flush()
+
+        # Stop any running worker on the OLD ticket and finalize its live Levi
+        # card (→ 'cancelled' + auto-advance) before the flags/refs are wiped.
+        await self._signal_and_finalize_cards(job_ids, title, code)
 
         await self._prune_work_dir(work_folder)
         await self._clear_job_flags(code, job_ids)

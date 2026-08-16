@@ -262,6 +262,22 @@ def task_aborted(title: str) -> str:
     )
 
 
+def task_cancelled(title: str) -> str:
+    """Cancel/delete while downloading: the request is gone — stop working it.
+
+    Painted onto the live Levi download card in place (replacing the frozen
+    progress frame) so the downloader knows the job was pulled and they don't
+    need to finish it. The next task card follows automatically when one exists.
+    """
+    return (
+        f"{ICON} <b>Cancelled.</b>\n\n"
+        f"<b>{esc(title)}</b> was cancelled — you don't need to download it anymore. "
+        "I've stopped the job and cleared what it had.\n\n"
+        "<i>Your next task lands below if one's queued; otherwise sit tight — "
+        "the card comes the moment a request drops.</i>"
+    )
+
+
 # ── Button labels ─────────────────────────────────────────────────────────────
 
 BTN_REPORT = "📊 Generate Report"

@@ -75,6 +75,48 @@ async def _load_msg_ref(container: Container, job_id: int) -> tuple[int, int] | 
     return d["chat"], d["msg"]
 
 
+async def finalize_cancelled_card(
+    container: Container, job_id: int, *, title: str, code: str,
+    admin_id: int | None = None,
+) -> None:
+    """Edit the live Levi download card IN PLACE to a 'cancelled' card, then
+    auto-advance the downloader to their next task.
+
+    Called by BOTH cancel paths so a cancelled/deleted request never leaves a
+    frozen progress frame: the queue/jcancel path (job row kept — driven from
+    ``_paint_terminal``) and ``delete_request``/``reassign_fresh`` (job row
+    deleted — the service calls this BEFORE it wipes the card's stored msg-ref).
+    Best-effort: a Telegram/Redis hiccup never breaks the cancel itself. The
+    downloader's DM chat is the ``admin_id`` auto-advance needs, so it's derived
+    from the card ref when not passed.
+    """
+    from kurosoden.shared import levi_voice as V
+
+    ref = await _load_msg_ref(container, job_id)
+    mgr = getattr(container, "pipeline_manager", None)
+    levi = getattr(mgr, "levi", None) if mgr is not None else None
+    if ref is not None:
+        chat_id, msg_id = ref
+        if admin_id is None:
+            admin_id = chat_id  # the card is DM'd to the downloader
+        if levi is not None:
+            try:
+                await levi.edit_message_text(
+                    chat_id, msg_id, V.task_cancelled(title or code),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as exc:  # noqa: BLE001 — cosmetic; never block the cancel
+                log.debug("levi.progress.cancel_paint_blip", job_id=job_id,
+                          error=str(exc))
+    # Push the downloader's next task card (all jobs), like the completion flow.
+    try:
+        from kurosoden.shared.handoff import _advance_to_next_task
+
+        await _advance_to_next_task(container, admin_id, code)
+    except Exception as exc:  # noqa: BLE001 — advancing is best-effort
+        log.debug("levi.progress.cancel_advance_blip", job_id=job_id, error=str(exc))
+
+
 async def _job_view(container: Container, job_id: int) -> dict | None:
     """One read of everything the card needs, merging the live Redis snapshot over
     the persisted job/request row. Returns None if the job vanished."""
@@ -338,7 +380,13 @@ async def _paint_terminal(client: Client, container: Container, job_id: int,
                           chat_id: int, msg_id: int, view: dict) -> None:
     title, code, status = view["title"], view.get("code", ""), view["status"]
     if status == JobStatus.CANCELLED.value:
-        return  # cancel path already told the admin; leave the last frame
+        # Don't leave the card frozen on its last live frame — edit it to a
+        # "request cancelled" card and auto-advance to the next task (chat_id is
+        # the downloader's DM = the admin_id auto-advance needs).
+        await finalize_cancelled_card(
+            container, job_id, title=title, code=code, admin_id=chat_id,
+        )
+        return
     if view.get("partial"):
         text = t(M.DL_CARD_FAILED, title=title, job=job_id)
         kb = await _recovery_keyboard(container, code)
