@@ -283,7 +283,7 @@ POSTEDIT_ASK_LINK = (
     "distribution channel (<code>t.me/c/…/123</code> for a private channel, or "
     "<code>t.me/yourchannel/123</code> for a public one).\n\n"
     "I'll make sure it's a channel I can edit, then let you rewrite the "
-    "caption or swap the buttons."
+    "caption, swap the buttons, or replace the image."
 )
 
 
@@ -325,8 +325,17 @@ POSTEDIT_ASK_BUTTONS = (
     "to remove every button. Reply /cancel to leave them as they are."
 )
 
+POSTEDIT_ASK_IMAGE = (
+    f"{ICON} <b>Send the new image.</b>\n\n"
+    "Upload a photo (or an image file) and I'll swap it into the post, keeping "
+    "the caption and buttons as they are. Best for the info card, footer, or any "
+    "picture post. Reply /cancel to keep the current image."
+)
+
+
 BTN_POSTEDIT_CAPTION = "📝 Edit caption"
 BTN_POSTEDIT_BUTTONS = "🔘 Replace buttons"
+BTN_POSTEDIT_IMAGE = "🖼 Replace image"
 
 
 # ── Edit Thumbnail (Senku-native thumbnail editor) ───────────────────────────

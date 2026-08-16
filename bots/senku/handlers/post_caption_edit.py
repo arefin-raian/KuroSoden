@@ -19,10 +19,11 @@ rendered properly (never raw) via ``parse_user_markup``.
 from __future__ import annotations
 
 import html
+import io
 
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType, ParseMode
-from pyrogram.types import CallbackQuery, Message
+from pyrogram.types import CallbackQuery, InputMediaPhoto, Message
 from sqlalchemy import select
 
 from nekofetch.bots.channel_reply import arm as arm_reply
@@ -330,6 +331,109 @@ async def _edit_buttons(
     return True, "Buttons updated in the channel and the database."
 
 
+async def _edit_media(
+    client: Client, container: Container,
+    *, chat_id: int, tg_message_id: int, image_bytes: bytes,
+    bot_id: int | None = None,
+) -> tuple[bool, str]:
+    """Replace one post's image without claiming success on live-edit failure.
+
+    Live-edits the message in ``chat_id`` first (Telegram is the source of
+    truth), preserving the existing caption and inline keyboard — Telegram's
+    ``editMessageMedia`` drops the markup unless it is re-supplied. When
+    ``bot_id`` is given, the matching ``BotContentPost`` image URLs are
+    re-pointed to a durably-mirrored copy of the new image (the model stores
+    URLs, not file_ids) and the channel backup is refreshed. An untracked
+    link-edit (``bot_id`` None) is live-only.
+    """
+    anime_doc_id: str | None = None
+    if bot_id is not None:
+        async with session_scope(container.pg_sessionmaker) as session:
+            bot = await session.get(DistributionBot, bot_id)
+            if bot is not None:
+                anime_doc_id = bot.anime_doc_id
+
+    # Preserve caption + buttons from the live message; editMessageMedia clears
+    # the keyboard unless we hand it back.
+    try:
+        live = await client.get_messages(chat_id, tg_message_id)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("senku.image.fetch_failed", chat=chat_id,
+                    mid=tg_message_id, error=str(exc))
+        return False, "I couldn't read that post to replace its image."
+    if not any(getattr(live, kind, None)
+               for kind in ("photo", "video", "animation", "document")):
+        return False, ("That post has no image to replace — edit its caption or "
+                       "buttons instead.")
+    caption = getattr(live, "caption", None)
+    markup = getattr(live, "reply_markup", None)
+
+    try:
+        stream = io.BytesIO(image_bytes)
+        stream.name = "image.jpg"  # pyrogram needs a filename hint on a stream
+        media = InputMediaPhoto(stream, caption=caption, parse_mode=ParseMode.HTML)
+        await client.edit_message_media(
+            chat_id, tg_message_id, media, reply_markup=markup,
+        )
+    except Exception as exc:  # noqa: BLE001 — keep durable data unchanged
+        log.warning("senku.image.live_edit_failed", chat=chat_id,
+                    mid=tg_message_id, error=str(exc))
+        return False, "Telegram rejected the live image edit; the database was left unchanged."
+
+    if bot_id is None:
+        log.info("senku.image.edited", chat=chat_id, mid=tg_message_id, durable=False)
+        return True, "Image replaced in the channel."
+
+    # The row stores URLs (no file_id column): mirror the new bytes to a durable
+    # host so ban-restore / re-render ship the new picture too.
+    durable_url: str | None = None
+    try:
+        from kurosoden.shared.image_backup import backup_bytes
+
+        mirrored = await backup_bytes(container, image_bytes, mime="image/jpeg")
+        durable_url = mirrored.primary
+    except Exception as exc:  # noqa: BLE001 — live edit already stands
+        log.warning("senku.image.mirror_failed", bot=bot_id, error=str(exc))
+
+    try:
+        async with session_scope(container.pg_sessionmaker) as session:
+            rows = (await session.execute(
+                select(BotContentPost).where(
+                    BotContentPost.bot_id == bot_id,
+                    BotContentPost.tg_message_id == tg_message_id,
+                )
+            )).scalars().all()
+            for row in rows:
+                if durable_url:
+                    row.image_url = durable_url
+                    row.image_cached_url = durable_url
+            if rows:
+                bot = await session.get(DistributionBot, bot_id)
+                if bot is not None:
+                    bot.content_revision = (bot.content_revision or 0) + 1
+    except Exception as exc:  # noqa: BLE001 — live edit succeeded, DB retry is needed
+        log.error("senku.image.database_update_failed", bot=bot_id,
+                  mid=tg_message_id, error=str(exc))
+        return False, "Telegram was updated, but the database update failed; retry the save."
+
+    try:
+        from nekofetch.services.backup_service import BackupService
+
+        if anime_doc_id:
+            await BackupService(container).record_distribution_channel(anime_doc_id)
+    except Exception as exc:  # noqa: BLE001 — live + DB edits remain authoritative
+        log.warning("senku.image.backup_failed", bot=bot_id, error=str(exc))
+
+    if not durable_url:
+        # Live edit stands, but we couldn't persist a durable URL — be honest so
+        # the operator knows a ban-restore might ship the old image.
+        return True, ("Image replaced in the channel, but I couldn't mirror it to "
+                      "durable storage — a ban-restore may show the old image.")
+    log.info("senku.image.edited", bot=bot_id, chat=chat_id, mid=tg_message_id,
+             durable=True)
+    return True, "Image replaced in the channel and the database."
+
+
 # ── Screens ──────────────────────────────────────────────────────────────────
 
 def _cancel_row() -> list[list[tuple[str, str]]]:
@@ -384,7 +488,7 @@ def register(client: Client, container: Container) -> None:
                 pass
             return
 
-        if action in {"caption", "buttons"}:
+        if action in {"caption", "buttons", "image"}:
             if q.message.chat.type != ChatType.PRIVATE:
                 await q.answer("Open Senku in a private chat to edit posts.",
                                show_alert=True)
@@ -403,11 +507,12 @@ def register(client: Client, container: Container) -> None:
                 return
             await arm_reply(
                 redis, q.message.chat.id, _STATE_EDIT,
-                chat_id=data.get("chat_id"), bot_id=data.get("bot_id"),
+                target_chat_id=data.get("target_chat_id"), bot_id=data.get("bot_id"),
                 tg_message_id=data.get("tg_message_id"), mode=action,
             )
             await q.answer()
             prompt = (V.POSTEDIT_ASK_BUTTONS if action == "buttons"
+                      else V.POSTEDIT_ASK_IMAGE if action == "image"
                       else V.POSTEDIT_ASK_CAPTION)
             await send_screen(
                 client, q.message.chat.id,
@@ -431,8 +536,68 @@ def register(client: Client, container: Container) -> None:
             await _consume_link(message, redis, data)
             return
         if state == _STATE_EDIT and data.get("mode"):
+            if data.get("mode") == "image":
+                # Image mode waits for a photo upload, not text — nudge, stay armed.
+                await message.reply_text(
+                    "🖼 Please upload the new image as a photo or image file."
+                )
+                return
             await _consume_edit(message, redis, data)
             return
+
+    @client.on_message(
+        (filters.photo | filters.document) & filters.private, group=16,
+    )
+    async def _consume_image(_: Client, message: Message) -> None:
+        redis = container.redis
+        if redis is None or not message.from_user or not is_staff(message):
+            return
+        state, data = await peek_reply(redis, message.chat.id)
+        if state != _STATE_EDIT or data.get("mode") != "image":
+            return
+        # An image *document* must actually be an image; ignore stray files.
+        if message.document is not None and not (
+            (message.document.mime_type or "").startswith("image/")
+        ):
+            await message.reply_text(
+                "🖼 That file isn't an image. Send a photo or an image file."
+            )
+            return
+        await _consume_image_upload(message, redis, data)
+
+    async def _consume_image_upload(message: Message, redis, data: dict) -> None:
+        lock_key = f"{_LOCK_PREFIX}{message.chat.id}"
+        try:
+            chat_id = int(data.get("target_chat_id"))
+            tg_message_id = int(data.get("tg_message_id"))
+            bot_id = int(data["bot_id"]) if data.get("bot_id") is not None else None
+        except (TypeError, ValueError):
+            await disarm_reply(redis, message.chat.id)
+            await redis.delete(lock_key)
+            return
+        # Read the uploaded bytes BEFORE clearing state, so a download failure
+        # leaves the flow armed for a retry.
+        try:
+            raw = await message.download(in_memory=True)
+            image_bytes = bytes(raw.getbuffer()) if hasattr(raw, "getbuffer") else bytes(raw)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("senku.postedit.image_download_failed", error=str(exc))
+            await message.reply_text("⚠️ I couldn't read that image. Try sending it again.")
+            return
+        await disarm_reply(redis, message.chat.id)
+        await redis.delete(lock_key)
+        ok, result = await _edit_media(
+            client, container, chat_id=chat_id, bot_id=bot_id,
+            tg_message_id=tg_message_id, image_bytes=image_bytes,
+        )
+        try:
+            await message.reply_text(
+                ("✅ " if ok else "⚠️ ") + result, parse_mode=ParseMode.HTML,
+            )
+        except Exception:  # noqa: BLE001 — cosmetic
+            pass
+        log.info("senku.postedit.image_consumed", chat=chat_id, mid=tg_message_id,
+                 admin=message.from_user.id, ok=ok)
 
     async def _consume_link(message: Message, redis, data: dict) -> None:
         text = (message.text or "").strip()
@@ -469,7 +634,7 @@ def register(client: Client, container: Container) -> None:
         )
         await arm_reply(
             redis, message.chat.id, _STATE_EDIT,
-            chat_id=chat_id, bot_id=bot_id, tg_message_id=tg_message_id,
+            target_chat_id=chat_id, bot_id=bot_id, tg_message_id=tg_message_id,
         )
         screen = card(
             V.postedit_choose(preview),
@@ -477,6 +642,7 @@ def register(client: Client, container: Container) -> None:
             buttons=[
                 [(V.BTN_POSTEDIT_CAPTION, cb(_BOT, "postedit", "caption")),
                  (V.BTN_POSTEDIT_BUTTONS, cb(_BOT, "postedit", "buttons"))],
+                [(V.BTN_POSTEDIT_IMAGE, cb(_BOT, "postedit", "image"))],
                 [(V.BTN_CANCEL, cb(_BOT, "postedit", "cancel"))],
             ],
         )
@@ -494,7 +660,7 @@ def register(client: Client, container: Container) -> None:
             return
         lock_key = f"{_LOCK_PREFIX}{message.chat.id}"
         try:
-            chat_id = int(data.get("chat_id"))
+            chat_id = int(data.get("target_chat_id"))
             tg_message_id = int(data.get("tg_message_id"))
             bot_id = int(data["bot_id"]) if data.get("bot_id") is not None else None
             mode = str(data.get("mode") or "caption")

@@ -23,6 +23,7 @@ import pytest
 from bots.senku.handlers.post_caption_edit import (
     _edit_buttons,
     _edit_caption,
+    _edit_media,
     _parse_button_lines,
     _parse_post_link,
     _resolve_editable_channel,
@@ -351,3 +352,174 @@ async def test_failed_live_caption_edit_does_not_overwrite_database(sessionmaker
             )
         )).scalar_one()
         assert row.caption == "Old caption"
+
+
+# ── image replace ─────────────────────────────────────────────────────────────
+
+class _MediaClient:
+    """Fake client that records the media/markup passed to edit_message_media.
+
+    ``live`` is the SimpleNamespace returned by get_messages (its ``photo`` /
+    ``caption`` / ``reply_markup`` drive the preserve-caption-and-buttons path).
+    """
+
+    def __init__(self, live):
+        self._live = live
+        self.calls: list[dict] = []
+
+    async def get_messages(self, chat_id, mid):
+        return self._live
+
+    async def edit_message_media(self, chat_id, mid, media, reply_markup=None):
+        self.calls.append({
+            "chat_id": chat_id, "mid": mid, "media": media,
+            "reply_markup": reply_markup,
+        })
+
+
+@_aio
+async def test_edit_media_persists_mirrors_and_preserves_markup(
+    sessionmaker, monkeypatch,
+):
+    """A tracked image replace live-edits, mirrors bytes to a durable URL,
+    re-points both image URLs, bumps the revision, and keeps caption+buttons."""
+    from sqlalchemy import select
+    from types import SimpleNamespace
+
+    from nekofetch.infrastructure.database.postgres.models import (
+        BotContentPost,
+        DistributionBot,
+    )
+
+    bot_id, chat_id = await _seed_channel(sessionmaker)
+
+    # The live post carries a photo, a caption and an inline keyboard we must keep.
+    existing_markup = SimpleNamespace(inline_keyboard=[["btn"]])
+    live = SimpleNamespace(photo=True, caption="Keep me", reply_markup=existing_markup)
+    client = _MediaClient(live)
+
+    # Durable mirror → a stable URL.
+    import kurosoden.shared.image_backup as _ib
+    monkeypatch.setattr(
+        _ib, "backup_bytes",
+        lambda *a, **k: _async(SimpleNamespace(primary="https://cdn.test/new.jpg")),
+    )
+    backups: list[str] = []
+
+    class _FakeBackup:
+        def __init__(self, _c):
+            pass
+
+        async def record_distribution_channel(self, anime_doc_id):
+            backups.append(anime_doc_id)
+
+    monkeypatch.setattr("nekofetch.services.backup_service.BackupService", _FakeBackup)
+
+    ok, result = await _edit_media(
+        client, _container(sessionmaker),
+        chat_id=chat_id, bot_id=bot_id, tg_message_id=101,
+        image_bytes=b"\xff\xd8\xff new-jpeg-bytes",
+    )
+    assert ok and "Image replaced" in result
+    # Live edit fired once, keyboard preserved, caption re-passed on the media.
+    assert len(client.calls) == 1
+    assert client.calls[0]["reply_markup"] is existing_markup
+    assert client.calls[0]["media"].caption == "Keep me"
+    # DB: both URL columns re-pointed to the mirrored copy + revision bumped.
+    async with sessionmaker() as s:
+        row = (await s.execute(
+            select(BotContentPost).where(
+                BotContentPost.bot_id == bot_id,
+                BotContentPost.tg_message_id == 101,
+            )
+        )).scalar_one()
+        assert row.image_url == "https://cdn.test/new.jpg"
+        assert row.image_cached_url == "https://cdn.test/new.jpg"
+        bot = await s.get(DistributionBot, bot_id)
+        assert (bot.content_revision or 0) == 1
+    assert backups == ["doc-vanitas"]
+
+
+@_aio
+async def test_edit_media_untracked_is_live_only(sessionmaker, monkeypatch):
+    """An untracked image replace (bot_id None) live-edits without DB/mirror."""
+    from types import SimpleNamespace
+
+    live = SimpleNamespace(photo=True, caption=None, reply_markup=None)
+    client = _MediaClient(live)
+
+    def _boom(*a, **k):  # mirror must NOT be called on the untracked path
+        raise AssertionError("backup_bytes should not run for bot_id=None")
+
+    import kurosoden.shared.image_backup as _ib
+    monkeypatch.setattr(_ib, "backup_bytes", _boom)
+
+    ok, result = await _edit_media(
+        client, _container(sessionmaker),
+        chat_id=-100999, bot_id=None, tg_message_id=7, image_bytes=b"jpegbytes",
+    )
+    assert ok and "Image replaced in the channel." == result
+    assert len(client.calls) == 1
+
+
+@_aio
+async def test_edit_media_rejects_text_only_post(sessionmaker):
+    """Replacing the image of a text-only post is refused before any live edit."""
+    from types import SimpleNamespace
+
+    # No photo/video/animation/document on the live message.
+    live = SimpleNamespace(photo=None, video=None, animation=None, document=None,
+                           caption="text", reply_markup=None)
+    client = _MediaClient(live)
+
+    ok, result = await _edit_media(
+        client, _container(sessionmaker),
+        chat_id=-100999, bot_id=None, tg_message_id=7, image_bytes=b"jpegbytes",
+    )
+    assert not ok and "no image to replace" in result
+    assert client.calls == []  # never attempted the live edit
+
+
+@_aio
+async def test_failed_live_image_edit_does_not_overwrite_database(
+    sessionmaker, monkeypatch,
+):
+    from sqlalchemy import select
+    from types import SimpleNamespace
+
+    from nekofetch.infrastructure.database.postgres.models import BotContentPost
+
+    bot_id, chat_id = await _seed_channel(sessionmaker)
+    live = SimpleNamespace(photo=True, caption="Old caption", reply_markup=None)
+
+    class _FailingClient(_MediaClient):
+        async def edit_message_media(self, *a, **k):
+            raise RuntimeError("MEDIA_INVALID")
+
+    def _boom(*a, **k):
+        raise AssertionError("mirror must not run when the live edit fails")
+
+    import kurosoden.shared.image_backup as _ib
+    monkeypatch.setattr(_ib, "backup_bytes", _boom)
+
+    ok, result = await _edit_media(
+        _FailingClient(live), _container(sessionmaker),
+        chat_id=chat_id, bot_id=bot_id, tg_message_id=101, image_bytes=b"jpeg",
+    )
+    assert not ok and "database was left unchanged" in result
+    async with sessionmaker() as s:
+        row = (await s.execute(
+            select(BotContentPost).where(
+                BotContentPost.bot_id == bot_id,
+                BotContentPost.tg_message_id == 101,
+            )
+        )).scalar_one()
+        # image_url untouched (still whatever it was seeded as — None here).
+        assert row.image_url is None
+
+
+def _async(value):
+    """Wrap a plain value in an awaitable (for monkeypatching async fns)."""
+    async def _coro(*a, **k):
+        return value
+    return _coro()
