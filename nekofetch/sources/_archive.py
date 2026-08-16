@@ -75,6 +75,37 @@ def _collect_videos(root: Path) -> list[Path]:
     )
 
 
+def _nested_archives(root: Path) -> list[Path]:
+    """Archive files (zip/rar/7z, or split .001/.partN) sitting under ``root``.
+
+    Release hosts (MoviesMod et al.) routinely wrap the video in an archive
+    INSIDE the downloaded archive, so a first-pass extract yields only more
+    archives. We classify by magic bytes (extension is unreliable) plus the
+    common split-part names so we can recurse into them.
+    """
+    out: list[Path] = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        name = p.name.lower()
+        if _sniff_kind(p) in ("zip", "rar", "7z"):
+            out.append(p)
+        elif name.endswith((".001",)) or ".part1." in name or name.endswith(".part1.rar"):
+            out.append(p)  # first part of a split set — 7z follows the rest
+    return sorted(out)
+
+
+def _looks_like_text(path: Path) -> bool:
+    """True when the 'archive' is really an HTML/JSON error page, not a binary
+    archive — the worker link expired or returned an interstitial."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(512).lstrip()
+    except OSError:
+        return False
+    return head[:1] in (b"<", b"{") or head[:5].lower() == b"<!doc"
+
+
 async def _run_7z(binary: str, archive: Path, dest: Path) -> None:
     """Extract ``archive`` into ``dest`` with the 7-Zip CLI (flat-tree via ``x``)."""
     dest.mkdir(parents=True, exist_ok=True)
@@ -88,30 +119,23 @@ async def _run_7z(binary: str, archive: Path, dest: Path) -> None:
         raise RuntimeError(f"7-Zip failed to extract {archive.name}: {tail}")
 
 
-async def extract_archive(archive: Path, dest_dir: Path) -> list[Path]:
-    """Unpack ``archive`` into ``dest_dir`` and return the video files found.
+async def _extract_once(archive: Path, dest_dir: Path) -> None:
+    """Unpack a SINGLE archive into ``dest_dir`` (stdlib zip → 7-Zip fallback).
 
-    ``.zip`` uses stdlib ``zipfile`` (no external dependency). ``.rar``/``.7z`` (and
-    any zip whose stdlib extraction fails) go through the 7-Zip binary. Raises
-    ``RuntimeError`` with an actionable message when a rar/7z arrives but no 7-Zip
-    binary is installed — the launcher scripts pull it in on next start.
+    No video assertion here — the caller decides whether the result is usable or
+    needs a nested pass. Raises ``RuntimeError`` when a rar/7z arrives with no
+    7-Zip binary installed.
     """
-    archive = Path(archive)
-    dest_dir = Path(dest_dir)
     kind = _sniff_kind(archive)
-
     if kind == "zip":
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(archive) as zf:
                 zf.extractall(dest_dir)
-            vids = _collect_videos(dest_dir)
-            if vids:
-                return vids
-            # A "zip" that stdlib opened but held no video — fall through to 7z in
-            # case it's a nested/oddly-compressed archive the CLI handles better.
+            return
         except zipfile.BadZipFile:
             log.warning("archive.zip.bad", archive=archive.name)
+            # fall through to 7-Zip (handles some zips stdlib rejects)
 
     binary = find_7z()
     if binary is None:
@@ -121,10 +145,54 @@ async def extract_archive(archive: Path, dest_dir: Path) -> list[Path]:
             "and retry, or send a .zip which needs no extra tooling."
         )
     await _run_7z(binary, archive, dest_dir)
-    vids = _collect_videos(dest_dir)
-    if not vids:
+
+
+async def extract_archive(
+    archive: Path, dest_dir: Path, *, _depth: int = 0,
+) -> list[Path]:
+    """Unpack ``archive`` into ``dest_dir`` and return the video files found.
+
+    Recurses up to two levels into nested archives (the video is often wrapped
+    in an inner zip/rar by release hosts). Raises ``RuntimeError`` with an
+    actionable message when the download isn't an archive at all (an expired
+    link / HTML interstitial) or when it extracts but yields no video anywhere.
+    """
+    archive = Path(archive)
+    dest_dir = Path(dest_dir)
+
+    # A download that isn't a real archive (worker returned HTML/JSON) would
+    # otherwise fail deep inside 7-Zip with a confusing message — surface it.
+    # No real archive starts with '<' or '{' (zip=PK, rar=Rar!, 7z=7z magic), so
+    # the text sniff is reliable even when the file is *named* .zip (an expired
+    # link served an HTML page).
+    if _depth == 0 and _looks_like_text(archive):
         raise RuntimeError(
-            f"no video files found inside {archive.name} after extraction "
-            f"(looked for {', '.join(VIDEO_EXT)})."
+            f"{archive.name} is not an archive — the link returned a web page, not "
+            "a file (it likely expired or needs a fresh direct link)."
         )
-    return vids
+
+    await _extract_once(archive, dest_dir)
+    vids = _collect_videos(dest_dir)
+    if vids:
+        return vids
+
+    # No video yet — the payload may be wrapped in nested archives. Extract each
+    # into its own subdir and re-collect (bounded depth so a zip-bomb can't loop).
+    if _depth < 2:
+        nested = _nested_archives(dest_dir)
+        for inner in nested:
+            sub = inner.parent / f"{inner.stem}__x"
+            try:
+                await extract_archive(inner, sub, _depth=_depth + 1)
+            except Exception as exc:  # noqa: BLE001 — try the rest
+                log.warning("archive.nested.failed", inner=inner.name, error=str(exc))
+        vids = _collect_videos(dest_dir)
+        if vids:
+            return vids
+
+    raise RuntimeError(
+        f"no video files found inside {archive.name} after extraction "
+        f"(looked for {', '.join(VIDEO_EXT)}; also recursed into nested archives). "
+        "The archive may hold only samples/subs, use an unsupported container, or "
+        "be password-protected."
+    )

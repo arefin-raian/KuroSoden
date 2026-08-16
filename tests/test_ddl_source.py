@@ -48,6 +48,39 @@ async def test_extract_archive_zip_returns_only_videos(tmp_path: Path) -> None:
     assert all(v.exists() for v in videos)
 
 
+async def test_extract_archive_recurses_into_nested_zip(tmp_path: Path) -> None:
+    # Release hosts (MoviesMod et al.) wrap the video in an INNER archive, so a
+    # first-pass extract yields only another zip — the Akudama Drive failure.
+    inner = _make_zip(tmp_path / "inner.zip", ["Akudama Drive S01E01 480p.mkv"])
+    outer = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer, "w") as zf:
+        zf.write(inner, arcname="Akudama.Drive.S01.480p/inner.zip")
+
+    videos = await extract_archive(outer, tmp_path / "out")
+    assert [v.name for v in videos] == ["Akudama Drive S01E01 480p.mkv"]
+    assert videos[0].exists()
+
+
+async def test_extract_archive_rejects_html_interstitial(tmp_path: Path) -> None:
+    # An expired worker link returns an HTML page, not a file. The old code failed
+    # deep in 7-Zip with a misleading "no video files"; now it says so plainly.
+    import pytest
+
+    fake = tmp_path / "2b8ddef4.zip"
+    fake.write_bytes(b"<!DOCTYPE html><html><body>Link expired</body></html>")
+    with pytest.raises(RuntimeError, match="not an archive"):
+        await extract_archive(fake, tmp_path / "out")
+
+
+async def test_extract_archive_no_video_message_mentions_nested(tmp_path: Path) -> None:
+    # A real archive with no video anywhere → actionable error (not a crash).
+    import pytest
+
+    archive = _make_zip(tmp_path / "subsonly.zip", ["episode.ass", "readme.nfo"])
+    with pytest.raises(RuntimeError, match="no video files found"):
+        await extract_archive(archive, tmp_path / "out")
+
+
 async def test_get_episodes_keeps_every_quality(tmp_path: Path, monkeypatch) -> None:
     # Episode 1 ships in both 1080p and 720p; episode 2 only in 1080p. The reversed
     # encode logic wants ALL qualities available for download — but as ONE episode
