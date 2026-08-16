@@ -281,6 +281,23 @@ class FranchiseFlowService:
             )
         return self._build_from_aggregated(franchise_data, anime_doc_id, root_title)
 
+    async def build_mapping_resolved(
+        self, franchise_data: dict, anime_doc_id: str,
+    ) -> FranchiseMapping:
+        """Resolve the franchise walk (cache → live, now Kitsu-backed when AniList
+        is down) and build the mapping from it — so per-season episode counts are
+        correct (S1 13 / S2 12) instead of the aggregated-total fallback (25/25).
+
+        Use this from any async caller that has only ``franchise_data`` in hand;
+        it collapses ``resolve_franchise_entries`` + :meth:`build_mapping` and
+        degrades gracefully to the (now safe) aggregated fallback when no walk
+        entries are available anywhere.
+        """
+        entries = await self.resolve_franchise_entries(franchise_data, anime_doc_id)
+        return self.build_mapping(
+            franchise_data, anime_doc_id, franchise_entries=entries,
+        )
+
     async def resolve_franchise_entries(
         self, franchise_data: dict, anime_doc_id: str,
     ) -> dict | None:
@@ -529,13 +546,22 @@ class FranchiseFlowService:
         entries: list[MappingEntry] = []
 
         seasons = franchise_data.get("franchise_seasons", 1) or 1
+        # Per-season episode counts are NOT knowable from the aggregated totals:
+        # ``franchise_episodes`` is the SUM across seasons. Stamping that sum on
+        # every season is the "2 seasons, 25 episodes → 25/25" bug (should be
+        # 13/12). Only when there is a single season does the total equal that
+        # season's count; for multi-season, leave episodes unknown (None) — a
+        # blank is honest, a false 25-per-season is not. The correct per-season
+        # split comes from the franchise walk (`_build_from_franchise_entries`),
+        # which callers now reach via `build_mapping_resolved`.
+        single_season = seasons == 1
         for n in range(1, seasons + 1):
             entries.append(MappingEntry(
                 kind=ContentKind.SEASON,
                 season_number=n,
                 season_part=None,
                 title=f"Season {n:02d}",
-                episodes=franchise_data.get("franchise_episodes"),
+                episodes=franchise_data.get("franchise_episodes") if single_season else None,
                 included=True,
             ))
 

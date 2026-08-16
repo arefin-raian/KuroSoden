@@ -146,3 +146,45 @@ def test_spin_off_multi_episode_ona_is_an_extra():
     assert _seasons(m) == [(1, None, 24)]
     spin = next(e for e in m.entries if e.anilist_id == 401)
     assert spin.kind != ContentKind.SEASON
+
+
+# ── per-season episode counts (the "25/25" bug) ───────────────────────────────
+
+def _build_aggregated(franchise_data):
+    svc = FranchiseFlowService.__new__(FranchiseFlowService)
+    return svc._build_from_aggregated(franchise_data, "doc", "Shadows House")
+
+
+def test_two_season_walk_yields_per_season_counts_not_the_total():
+    # The reported case: ROOT (13 eps) + SEQUEL (12 eps). The per-entry builder
+    # must produce S1=13 and S2=12 — never the aggregated 25 on each.
+    m = _build([
+        _entry(1, "Shadows House", 13, 2021),
+        _entry(2, "Shadows House 2nd Season", 12, 2022, relation="SEQUEL"),
+    ])
+    assert _seasons(m) == [(1, None, 13), (2, None, 12)]
+
+
+def test_aggregated_fallback_never_stamps_the_total_on_every_season():
+    # Multi-season aggregated data (2 seasons, 25 total eps) with NO walk entries:
+    # each season's episodes must be None (unknown), NOT 25 — a false 25/25 split
+    # is the exact bug the owner reported.
+    m = _build_aggregated({
+        "franchise_seasons": 2,
+        "franchise_episodes": 25,
+        "title": "Shadows House",
+    })
+    seasons = _seasons(m)
+    assert seasons == [(1, None, None), (2, None, None)]
+    assert all(eps != 25 for _n, _p, eps in seasons)
+
+
+def test_aggregated_fallback_single_season_keeps_its_episode_count():
+    # A single season: the aggregate total IS that season's count, so keep it.
+    m = _build_aggregated({
+        "franchise_seasons": 1,
+        "franchise_episodes": 13,
+        "title": "Solo",
+    })
+    assert _seasons(m) == [(1, None, 13)]
+

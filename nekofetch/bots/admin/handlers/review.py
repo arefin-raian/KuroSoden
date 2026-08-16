@@ -2884,7 +2884,7 @@ def register(client: Client, container: Container) -> None:
                 req = await RequestService(container).get(code)
                 fr = req.franchise_data or {}
                 ff = FranchiseFlowService(container)
-                mapping = ff.build_mapping(fr, req.anime_doc_id or "")
+                mapping = await ff.build_mapping_resolved(fr, req.anime_doc_id or "")
                 stored_mapping = {
                     "entries": [{
                         "anilist_id": e.anilist_id,
@@ -2926,7 +2926,7 @@ def register(client: Client, container: Container) -> None:
                 req = await RequestService(container).get(code)
                 fr = req.franchise_data or {}
                 ff = FranchiseFlowService(container)
-                mapping = ff.build_mapping(fr, req.anime_doc_id or "")
+                mapping = await ff.build_mapping_resolved(fr, req.anime_doc_id or "")
                 backdrop_url = await _anime_backdrop(container, req)
                 screen = franchise_map_selection(mapping, backdrop_url=backdrop_url)
                 from nekofetch.ui.screens import send_screen

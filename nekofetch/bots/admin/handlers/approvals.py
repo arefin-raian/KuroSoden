@@ -35,7 +35,7 @@ async def _show_post_processing_confirmation(
 
     fr = req.franchise_data or {}
     ff = FranchiseFlowService(container)
-    mapping = ff.build_mapping(fr, req.anime_doc_id or "")
+    mapping = await ff.build_mapping_resolved(fr, req.anime_doc_id or "")
 
     # Only show the post-processing confirmation if there are multiple entries
     if mapping.entry_count > 1:
