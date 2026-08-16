@@ -71,7 +71,11 @@ class DdlSource(AnimeSource):
     def http(self) -> httpx.AsyncClient:
         if self._http is None:
             self._http = httpx.AsyncClient(
-                timeout=httpx.Timeout(60.0, read=None),
+                # A real READ timeout is essential: worker.dev links stall
+                # mid-stream, and read=None (the old value) hangs the whole job
+                # forever. 90s between chunks is generous; a stall raises
+                # ReadTimeout → _fetch_archive retries, then fails cleanly.
+                timeout=httpx.Timeout(connect=30.0, read=90.0, write=30.0, pool=30.0),
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
                 follow_redirects=True,
             )
@@ -98,22 +102,36 @@ class DdlSource(AnimeSource):
         root.mkdir(parents=True, exist_ok=True)
         return root
 
-    async def _fetch_archive(
-        self, url: str, dest: Path,
-        *, on_bytes=None, archive_name: str = "", index: int = 1, count: int = 1,
-    ) -> Path:
-        """Stream a remote archive to ``dest`` (skips the download if already cached).
+    async def _fetch_archive(self, url: str, dest: Path, *, on_bytes=None) -> Path:
+        """Download a remote archive to ``dest`` (skips if already cached).
 
-        Reports byte progress via ``on_bytes(done, total, archive_name, index,
-        count)`` and retries transient failures (the worker.dev links flake) with
-        backoff. Writes to a ``.part`` file and renames on success so a partial
-        never looks complete.
+        ``on_bytes(done, total)`` reports byte progress. PRIMARY path is aria2c
+        (16 Range connections + per-piece timeout + retry + resume) — the
+        technique the Leech bot uses to pull these MoviesMod ``workers.dev`` links
+        reliably; a naive single-socket stream gets throttled/cut by the
+        Cloudflare worker and stalls. Falls back to a resumable httpx stream only
+        when aria2c isn't installed.
         """
         if dest.exists() and dest.stat().st_size > 0:
             if on_bytes:
                 size = dest.stat().st_size
-                await on_bytes(size, size, archive_name, index, count)
+                await on_bytes(size, size)
             return dest
+
+        # ── Primary: aria2c multi-connection (robust on worker.dev) ──
+        from nekofetch.sources._torrentdl import download_http_file, find_aria2
+
+        if find_aria2() is not None:
+            total = await self._content_length(url)
+            try:
+                await download_http_file(
+                    url, dest, total_bytes=total, on_progress=on_bytes,
+                )
+                return dest
+            except Exception as exc:  # noqa: BLE001 — fall back to httpx below
+                log.warning("ddl.aria2.failed", url=url, error=str(exc)[:200])
+
+        # ── Fallback: resumable httpx stream (with a real read timeout) ──
         tmp = dest.with_suffix(dest.suffix + ".part")
         attempts = 3
         last_exc: Exception | None = None
@@ -125,12 +143,12 @@ class DdlSource(AnimeSource):
                     done = 0
                     async with aiofiles.open(tmp, "wb") as fh:
                         if on_bytes:
-                            await on_bytes(0, total, archive_name, index, count)
+                            await on_bytes(0, total)
                         async for chunk in resp.aiter_bytes(_CHUNK):
                             await fh.write(chunk)
                             done += len(chunk)
                             if on_bytes:
-                                await on_bytes(done, total, archive_name, index, count)
+                                await on_bytes(done, total)
                 tmp.replace(dest)
                 return dest
             except Exception as exc:  # noqa: BLE001 — retry transient host flakiness
@@ -143,22 +161,41 @@ class DdlSource(AnimeSource):
                     pass
                 if attempt < attempts:
                     await asyncio.sleep(1.5 * attempt)
-        raise last_exc or RuntimeError(f"failed to download {archive_name or url}")
+        raise last_exc or RuntimeError(f"failed to download {url}")
+
+    async def _content_length(self, url: str) -> int:
+        """Best-effort total size for the progress bar (HEAD, then a ranged GET)."""
+        try:
+            r = await self.http.head(url)
+            cl = r.headers.get("content-length")
+            if cl and cl.isdigit():
+                return int(cl)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            async with self.http.stream("GET", url) as resp:
+                cl = resp.headers.get("content-length")
+                return int(cl) if cl and cl.isdigit() else 0
+        except Exception:  # noqa: BLE001
+            return 0
 
     async def get_episodes(self, source_ref: str, *, on_progress=None) -> list[Episode]:
         """Download + extract every provided archive, order EP1..EPN across them.
 
-        ``on_progress`` (optional) is an async ``callback(info: dict)`` the worker
-        supplies so the live card can show a download bar (per archive, with the
-        zip filename) and an extraction bar BEFORE the naming prompt. ``info``
-        carries ``{stage, archive_name, index, count, done, total}``; it is
-        best-effort and never affects the result.
+        Two visible phases (owner-requested), reported via the optional async
+        ``on_progress(info)`` callback so the live card shows them BEFORE the
+        naming prompt:
+          1. DOWNLOAD every archive — one transfer bar per archive (per quality).
+          2. EXTRACT every downloaded archive — per-FILE progress.
+        ``info`` = ``{stage, archive_name, index, count, done, total}`` where
+        ``stage`` is ``download`` | ``extract`` | ``extract_done`` | ``failed``.
+        Best-effort: a progress hiccup never affects the result.
         """
         ref = _parse_ref(source_ref)
-        archives = ref.get("archives") or []
+        archives = [a for a in (ref.get("archives") or []) if a.get("url")]
         title = ref.get("title", "")
         cache = self._cache_root(ref)
-        count = len([a for a in archives if a.get("url")])
+        count = len(archives)
 
         async def _emit(stage: str, archive_name: str, index: int,
                         done: int = 0, total: int = 0) -> None:
@@ -172,31 +209,44 @@ class DdlSource(AnimeSource):
             except Exception:  # noqa: BLE001 — progress is cosmetic
                 pass
 
-        async def _on_bytes(done, total, archive_name, index, cnt) -> None:
-            await _emit("download", archive_name, index, done, total)
-
-        pooled: list[dict] = []
-        pos = 0
-        for arc in archives:
-            url = arc.get("url")
-            if not url:
-                continue
-            pos += 1
-            season_hint = arc.get("season")  # positional fallback for Phase 4/5
+        # ── Phase 1: download every archive (one transfer bar per archive) ──
+        downloaded: list[dict] = []  # {arc_name, path, dir, season_hint}
+        for pos, arc in enumerate(archives, start=1):
+            url = arc["url"]
             arc_name = _archive_name(url)
             digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
             archive_path = cache / f"{digest}{_ext_of(url)}"
-            extract_dir = cache / digest
+
+            async def _on_bytes(done, total, an=arc_name, i=pos):
+                await _emit("download", an, i, done, total)
+
             try:
-                await self._fetch_archive(
-                    url, archive_path, on_bytes=_on_bytes,
-                    archive_name=arc_name, index=pos, count=count,
+                await self._fetch_archive(url, archive_path, on_bytes=_on_bytes)
+            except Exception as exc:  # noqa: BLE001 — a dead link shouldn't kill the rest
+                log.warning("ddl.download.failed", url=url, error=str(exc))
+                await _emit("failed", f"{arc_name}: {exc}", pos)
+                continue
+            downloaded.append({
+                "arc_name": arc_name, "path": archive_path,
+                "dir": cache / digest, "season_hint": arc.get("season"),
+            })
+
+        # ── Phase 2: extract every downloaded archive (per-file progress) ──
+        pooled: list[dict] = []
+        for pos, item in enumerate(downloaded, start=1):
+            arc_name = item["arc_name"]
+
+            async def _on_file(done, total, name="", an=arc_name, i=pos):
+                await _emit("extract", an, i, done, total)
+
+            try:
+                await _emit("extract", arc_name, pos, 0, 0)
+                videos = await extract_archive(
+                    item["path"], item["dir"], on_file=_on_file,
                 )
-                await _emit("extract", arc_name, pos)
-                videos = await extract_archive(archive_path, extract_dir)
                 await _emit("extract_done", arc_name, pos, 1, 1)
             except Exception as exc:  # noqa: BLE001
-                log.warning("ddl.archive.failed", url=url, error=str(exc))
+                log.warning("ddl.archive.failed", archive=arc_name, error=str(exc))
                 await _emit("failed", f"{arc_name}: {exc}", pos)
                 continue
             for vp in videos:
@@ -205,7 +255,7 @@ class DdlSource(AnimeSource):
                     "name": vp.name,
                     "length": vp.stat().st_size,
                     "index": len(pooled) + 1,
-                    "_season_hint": season_hint,
+                    "_season_hint": item["season_hint"],
                 })
 
         if not pooled:

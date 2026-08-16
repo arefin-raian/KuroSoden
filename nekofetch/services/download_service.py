@@ -1882,8 +1882,8 @@ class DownloadWorker:
                     done = int(info.get("done") or 0)
                     total = int(info.get("total") or 0)
                     now = time.monotonic()
-                    if info.get("key") != st["key"]:
-                        st.update(win_t=now, win_done=0, key=info.get("key"), last=0.0)
+                    if idx != st["key"]:  # new archive → reset the speed window
+                        st.update(win_t=now, win_done=0, key=idx, last=0.0)
                     # Throttle + rolling speed (mirrors _make_progress).
                     if done < total and now - st["last"] < 0.7:
                         return
@@ -1896,14 +1896,21 @@ class DownloadWorker:
                         job_id=job_id, status=JobStatus.RUNNING.value, progress=pct,
                         stage="Downloading", speed_bps=speed,
                         downloaded_bytes=done, total_bytes=total, eta_seconds=eta,
-                        episode_index=idx, total_episodes=cnt, label=name,
+                        label=name,
                     ))
                 elif stage in ("extract", "extract_done"):
-                    pct = 100.0 if stage == "extract_done" else 0.0
+                    # done/total are FILE counts from the extractor → real bar +
+                    # "File i/n" via episode_index/total_episodes.
+                    done = int(info.get("done") or 0)
+                    total = int(info.get("total") or 0)
+                    if stage == "extract_done":
+                        pct = 100.0
+                    else:
+                        pct = (done / total * 100) if total else 0.0
                     await self._c.progress.set(ProgressSnapshot(
                         job_id=job_id, status=JobStatus.RUNNING.value, progress=pct,
-                        stage="Extracting", episode_index=idx, total_episodes=cnt,
-                        label=name,
+                        stage="Extracting", label=name,
+                        episode_index=(done or None), total_episodes=(total or None),
                     ))
                 # 'failed' snapshots are handled by the fail-card path; ignore here.
             except Exception:  # noqa: BLE001 — progress is cosmetic telemetry

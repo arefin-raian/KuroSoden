@@ -151,11 +151,11 @@ async def test_get_episodes_emits_download_and_extract_progress(
         lambda: SimpleNamespace(storage_path=tmp_path),
     )
 
-    async def fake_fetch(url, dest, *, on_bytes=None, archive_name="", index=1, count=1):
+    async def fake_fetch(url, dest, *, on_bytes=None):
         shutil.copy(archive, dest)
-        if on_bytes:  # simulate a couple of byte updates
-            await on_bytes(0, 100, archive_name, index, count)
-            await on_bytes(100, 100, archive_name, index, count)
+        if on_bytes:  # simulate a couple of byte updates (2-arg contract)
+            await on_bytes(0, 100)
+            await on_bytes(100, 100)
         return dest
 
     monkeypatch.setattr(src, "_fetch_archive", fake_fetch)

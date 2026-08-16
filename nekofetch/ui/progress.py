@@ -206,29 +206,32 @@ def download_card_html(
     - **Processing stages** (branding, watermarking, metadata, etc.): compact
       Progress panel (just progress bar + elapsed)
     """
-    title_bits = [_esc(title)]
-    if current_episode is not None:
-        part = f"P{int(season_part):02d}" if season_part is not None else ""
-        title_bits.append(
-            f"[S{(season or 1):02d}{part}E{int(current_episode):02d}]"
-        )
-    if resolution:
-        title_bits.append(f"[{_esc(resolution)}]")
-    if audio:
-        # Normalize underscores → spaces for display (e.g. DUAL_AUDIO → DUAL AUDIO)
-        title_bits.append(f"[{_esc(audio.upper().replace('_', ' '))}]")
     # DDL archive phase (download/extract of the ZIP, before per-episode naming):
-    # show the archive filename + which archive of how many, so the admin SEES
-    # the download+extract happen before being asked for a name. Only when there's
-    # no per-episode context (torrent/normal downloads are unaffected).
+    # the owner wants JUST the TV icon + the bold zip filename — no title, no
+    # "(i/n)" count, no "@AniXWeebs" handle — while keeping the same panel/bar/
+    # ETA/speed as a normal download. Detected by an archive_name with no
+    # per-episode context, so torrent/normal downloads are untouched.
     _stage_l = (stage or "").strip().lower()
-    if archive_name and current_episode is None and _stage_l in (
-        "downloading", "download", "extracting", "extract"
-    ):
-        arc = _esc(archive_name)
-        if episode_index and total_episodes and total_episodes > 1:
-            arc = f"{arc} ({episode_index}/{total_episodes})"
-        title_bits.append(f"\n<i>{arc}</i>")
+    _archive_phase = bool(
+        archive_name and current_episode is None
+        and _stage_l in ("downloading", "download", "extracting", "extract")
+    )
+
+    if _archive_phase:
+        header_title = f"📺 {_esc(archive_name)}"
+    else:
+        title_bits = [_esc(title)]
+        if current_episode is not None:
+            part = f"P{int(season_part):02d}" if season_part is not None else ""
+            title_bits.append(
+                f"[S{(season or 1):02d}{part}E{int(current_episode):02d}]"
+            )
+        if resolution:
+            title_bits.append(f"[{_esc(resolution)}]")
+        if audio:
+            # Normalize underscores → spaces (e.g. DUAL_AUDIO → DUAL AUDIO)
+            title_bits.append(f"[{_esc(audio.upper().replace('_', ' '))}]")
+        header_title = f"📺 {' '.join(title_bits)} @AniXWeebs"
 
     if retry_attempt and retry_max:
         reason = f" · {_esc(retry_reason)}" if retry_reason else ""
@@ -245,7 +248,7 @@ def download_card_html(
     warning = f"\n\n<blockquote>{t(M.DL_CARD_LOW_DISK)}</blockquote>" if low_disk else ""
 
     header = (
-        f"<blockquote><b>📺 {' '.join(title_bits)} @AniXWeebs</b></blockquote>\n"
+        f"<blockquote><b>{header_title}</b></blockquote>\n"
         f"<blockquote><b><u>‣ Status : </u></b><i><u>{stage_label}</u></i>\n"
         f"<b>[{cells}] {percent}%</b></blockquote>\n"
     )

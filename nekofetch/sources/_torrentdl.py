@@ -45,6 +45,86 @@ def find_aria2() -> str | None:
     return None
 
 
+async def download_http_file(
+    url: str,
+    dest: Path,
+    *,
+    total_bytes: int = 0,
+    on_progress: ProgressCallback | None = None,
+    max_seconds: int = 3 * 3600,
+) -> Path:
+    """Download a direct HTTP(S) link into ``dest`` via aria2c (multi-connection).
+
+    This is the technique the Leech bot uses to pull MoviesMod ``workers.dev``
+    archives reliably: a single long single-socket stream (naive httpx) gets
+    throttled/cut by the Cloudflare worker, whereas aria2c splits the file into
+    16 short ``Range`` requests, each with a 60s idle timeout + 20 retries +
+    resume — so a stalled piece is re-fetched instead of hanging the whole job.
+
+    ``total_bytes`` (from a prior HEAD/Content-Length) lets us report byte
+    progress; without it we fall back to percent. Raises ``RuntimeError`` when
+    aria2c is missing or exits non-zero (the caller can fall back to httpx).
+    """
+    aria2 = find_aria2()
+    if aria2 is None:
+        raise RuntimeError("aria2c not found (expected on PATH or in tools/)")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # aria2c writes <dir>/<out>; force the exact name so there's no
+    # Content-Disposition rename surprise, and overwrite any stale partial.
+    cmd = [
+        aria2,
+        "--dir", str(dest.parent),
+        "--out", dest.name,
+        "--max-connection-per-server=16",
+        "--split=16",
+        "--min-split-size=10M",
+        "--max-tries=20",
+        "--retry-wait=3",
+        "--continue=true",
+        "--check-certificate=false",
+        "--user-agent=Wget/1.12",           # innocuous UA the workers serve happily
+        "--auto-file-renaming=false",
+        "--allow-overwrite=true",
+        "--summary-interval=1",
+        "--console-log-level=warn",
+        "--timeout=60",                       # per-piece idle timeout → re-fetch, don't hang
+        "--connect-timeout=60",
+        "--file-allocation=none",
+        url,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        stdin=asyncio.subprocess.DEVNULL,   # never block waiting on stdin
+    )
+    last_pct = -1
+
+    async def pump() -> None:
+        nonlocal last_pct
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            m = _PROGRESS_RE.search(raw.decode(errors="replace"))
+            if m and on_progress:
+                pct = int(m.group(1))
+                if pct != last_pct:
+                    last_pct = pct
+                    if total_bytes:
+                        await on_progress(pct * total_bytes // 100, total_bytes)
+                    else:
+                        await on_progress(pct, 100)
+
+    try:
+        await asyncio.wait_for(asyncio.gather(pump(), proc.wait()), timeout=max_seconds)
+    except TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"aria2c http download timed out after {max_seconds}s") from None
+    if proc.returncode != 0:
+        raise RuntimeError(f"aria2c exited {proc.returncode} downloading {dest.name}")
+    if on_progress:
+        size = dest.stat().st_size if dest.exists() else (total_bytes or 0)
+        await on_progress(size, total_bytes or size)
+    return dest
+
+
 async def download_torrent_file(
     info: dict,
     dest: Path,

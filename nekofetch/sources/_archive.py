@@ -106,32 +106,61 @@ def _looks_like_text(path: Path) -> bool:
     return head[:1] in (b"<", b"{") or head[:5].lower() == b"<!doc"
 
 
-async def _run_7z(binary: str, archive: Path, dest: Path) -> None:
-    """Extract ``archive`` into ``dest`` with the 7-Zip CLI (flat-tree via ``x``)."""
+async def _run_7z(binary: str, archive: Path, dest: Path, *, timeout: float = 1800.0) -> None:
+    """Extract ``archive`` into ``dest`` with the 7-Zip CLI (flat-tree via ``x``).
+
+    Hardened against hangs: ``stdin`` is closed (a password-protected archive
+    would otherwise block forever waiting for a password on the pipe), and the
+    whole run is bounded by ``timeout`` (killed + raised on expiry) so a stuck
+    subprocess can never freeze the job.
+    """
     dest.mkdir(parents=True, exist_ok=True)
     cmd = [binary, "x", "-y", f"-o{dest}", str(archive)]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        stdin=asyncio.subprocess.DEVNULL,
     )
-    out, _ = await proc.communicate()
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (TimeoutError, asyncio.TimeoutError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        raise RuntimeError(
+            f"7-Zip timed out after {int(timeout)}s extracting {archive.name} "
+            "(archive may be password-protected or corrupt)."
+        ) from None
     if proc.returncode != 0:
         tail = (out or b"").decode(errors="replace").strip()[-400:] or "(no output)"
         raise RuntimeError(f"7-Zip failed to extract {archive.name}: {tail}")
 
 
-async def _extract_once(archive: Path, dest_dir: Path) -> None:
+async def _extract_once(archive: Path, dest_dir: Path, *, on_file=None) -> None:
     """Unpack a SINGLE archive into ``dest_dir`` (stdlib zip → 7-Zip fallback).
 
     No video assertion here — the caller decides whether the result is usable or
-    needs a nested pass. Raises ``RuntimeError`` when a rar/7z arrives with no
-    7-Zip binary installed.
+    needs a nested pass. When ``on_file(done, total, name)`` is given and the
+    archive is a zip, members are extracted one-by-one so the caller can show
+    REAL per-file extraction progress. Raises ``RuntimeError`` when a rar/7z
+    arrives with no 7-Zip binary installed.
     """
     kind = _sniff_kind(archive)
     if kind == "zip":
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(archive) as zf:
-                zf.extractall(dest_dir)
+                members = [m for m in zf.infolist() if not m.is_dir()]
+                total = len(members)
+                if on_file is None or total == 0:
+                    await asyncio.to_thread(zf.extractall, dest_dir)
+                else:
+                    for i, m in enumerate(members, start=1):
+                        await asyncio.to_thread(zf.extract, m, dest_dir)
+                        try:
+                            await on_file(i, total, m.filename)
+                        except Exception:  # noqa: BLE001 — progress is cosmetic
+                            pass
             return
         except zipfile.BadZipFile:
             log.warning("archive.zip.bad", archive=archive.name)
@@ -144,18 +173,31 @@ async def _extract_once(archive: Path, dest_dir: Path) -> None:
             "automatically on the next launch (run.sh / run.bat) — restart the bots "
             "and retry, or send a .zip which needs no extra tooling."
         )
+    # 7-Zip is a single subprocess — no per-member hook; signal start/finish.
+    if on_file is not None:
+        try:
+            await on_file(0, 1, archive.name)
+        except Exception:  # noqa: BLE001
+            pass
     await _run_7z(binary, archive, dest_dir)
+    if on_file is not None:
+        try:
+            await on_file(1, 1, archive.name)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def extract_archive(
-    archive: Path, dest_dir: Path, *, _depth: int = 0,
+    archive: Path, dest_dir: Path, *, on_file=None, _depth: int = 0,
 ) -> list[Path]:
     """Unpack ``archive`` into ``dest_dir`` and return the video files found.
 
     Recurses up to two levels into nested archives (the video is often wrapped
-    in an inner zip/rar by release hosts). Raises ``RuntimeError`` with an
-    actionable message when the download isn't an archive at all (an expired
-    link / HTML interstitial) or when it extracts but yields no video anywhere.
+    in an inner zip/rar by release hosts). ``on_file(done, total, name)`` (async)
+    reports per-file extraction progress for the top-level zip. Raises
+    ``RuntimeError`` with an actionable message when the download isn't an
+    archive at all (an expired link / HTML interstitial) or when it extracts but
+    yields no video anywhere.
     """
     archive = Path(archive)
     dest_dir = Path(dest_dir)
@@ -171,7 +213,8 @@ async def extract_archive(
             "a file (it likely expired or needs a fresh direct link)."
         )
 
-    await _extract_once(archive, dest_dir)
+    # Per-file progress only for the top-level pass; nested archives are quiet.
+    await _extract_once(archive, dest_dir, on_file=(on_file if _depth == 0 else None))
     vids = _collect_videos(dest_dir)
     if vids:
         return vids
