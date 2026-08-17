@@ -82,6 +82,46 @@ def test_multi_episode_entry_renders_season_card():
     assert "12" in caption
 
 
+# ── entry_language_tag: audio-type label (the multi-audio mislabel fix) ────────
+
+def test_entry_language_multi_audio_uses_compact_codes():
+    # A MULTI pack (English/Japanese/Hindi in one file) must read "Multi Audio"
+    # with COMPACT codes — NOT "Dual Audio [English & Japanese]" (the reported
+    # bug where a 3-language multi-audio release was mislabelled dual).
+    tag = BotContentService.entry_language_tag({AudioType.MULTI})
+    assert tag == "Multi Audio [Eng, Jpn & Hin]"
+    assert "Dual" not in tag
+
+
+def test_entry_language_multi_wins_over_sub_dub_packs():
+    # Even when SUBBED/DUBBED packs sit alongside the MULTI file, the entry is
+    # multi-audio — MULTI is checked before dual/sub/dub.
+    tag = BotContentService.entry_language_tag(
+        {AudioType.MULTI, AudioType.SUBBED, AudioType.DUBBED})
+    assert tag == "Multi Audio [Eng, Jpn & Hin]"
+
+
+def test_entry_language_dual_and_others_unchanged():
+    f = BotContentService.entry_language_tag
+    # Dual audio keeps full names (short enough to fit).
+    assert f({AudioType.DUAL_AUDIO}) == "Dual Audio [English & Japanese]"
+    assert f({AudioType.SUBBED, AudioType.DUBBED}) == "Sub & Dub [English & Japanese]"
+    assert f({AudioType.DUBBED}) == "Dub [English]"
+    assert f({AudioType.DUBBED}, has_english_subs=True) == "Dub [English + Subs]"
+    assert f({AudioType.SUBBED}) == "Sub [Japanese + ESubs]"
+
+
+def test_multi_audio_label_reaches_the_season_card_caption():
+    # End-to-end: a MULTI pack renders the season card with the multi-audio line.
+    svc = _svc()
+    packs = [_Pack(season=1, episode_from=1, episode_to=12, file_count=12,
+                   audio=AudioType.MULTI)]
+    meta = {"title": "Akudama Drive", "entry_episodes": 12, "duration_min": 24}
+    caption, _ = svc._build_season_card(meta, season=1, packs=packs)
+    assert "Multi Audio [Eng, Jpn & Hin]" in caption
+    assert "Dual Audio" not in caption
+
+
 def test_split_season_uses_local_count_not_global_episode_to():
     svc = _svc()
     # Part 2 is globally located at episodes 13–24 but contains 12 files.

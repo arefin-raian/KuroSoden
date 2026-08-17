@@ -1373,23 +1373,34 @@ class BotContentService:
 
     @staticmethod
     def entry_language_tag(audios: set[AudioType], *, has_english_subs: bool = False) -> str:
-        """Entry-card LANGUAGE label — the operator's 5 canonical variants.
+        """Entry-card LANGUAGE label — the operator's canonical variants.
 
         Distinct from the channel-title ``bot_naming.audio_tag`` (which reads
         "Dual Audio, Sub & Dub"): the ENTRY post uses a tighter label the
         operator specified exactly:
 
-          * dual-audio file        → ``Dual Audio [English & Japanese]``
-          * separate sub + dub     → ``Sub & Dub [English & Japanese]``
-          * sub only               → ``Sub [Japanese + ESubs]``
-          * dub only + eng subs    → ``Dub [English + Subs]``
-          * dub only               → ``Dub [English]``
+          * multi-audio file (3 langs) → ``Multi Audio [Eng, Jpn & Hin]``
+          * dual-audio file            → ``Dual Audio [English & Japanese]``
+          * separate sub + dub         → ``Sub & Dub [English & Japanese]``
+          * sub only                   → ``Sub [Japanese + ESubs]``
+          * dub only + eng subs        → ``Dub [English + Subs]``
+          * dub only                   → ``Dub [English]``
+
+        Multi-audio uses COMPACT 3-letter language codes so the line doesn't run
+        long — the full names ("English, Japanese & Hindi") would overflow the
+        card, so only this branch abbreviates. MULTI is checked BEFORE DUAL so a
+        multi-audio pack is never mislabelled "Dual Audio" (the reported bug).
         """
         vals = set(audios)
-        has_dual = AudioType.DUAL_AUDIO in vals or AudioType.MULTI in vals
+        has_multi = AudioType.MULTI in vals
+        has_dual = AudioType.DUAL_AUDIO in vals
         has_sub = AudioType.SUBBED in vals
         has_dub = AudioType.DUBBED in vals
 
+        if has_multi:
+            # Compact codes, main-channel language order (English, Japanese, then
+            # the rest). Mirrors main_channel_service._AUDIO_LANG's MULTI set.
+            return "Multi Audio [Eng, Jpn & Hin]"
         if has_dual:
             return "Dual Audio [English & Japanese]"
         if has_sub and has_dub:
