@@ -76,11 +76,17 @@ def format_torrent_summary(torrent_name: str, ordered_files: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def format_torrent_mapping(mapping) -> str:
+def format_torrent_mapping(mapping, *, encode_heights=None, fallbacks_cfg=None) -> str:
     """Compact mapping summary for a Telegram caption.
 
-    Shows each franchise entry with its assigned torrent file range and
-    confidence indicator.  ``mapping`` is a ``TorrentMapping`` instance.
+    Shows each franchise entry with its assigned file range and confidence. For a
+    DDL release (files already extracted, so their tiers are known) each entry
+    also gets a quality line — which tiers are PRESENT and which will be ENCODED
+    to fill the gaps (``encode_heights`` + ``fallbacks_cfg`` come from
+    ``config.processing.encode_heights`` / ``config.acquisition.resolution_fallbacks``,
+    the same inputs the encoder uses). Torrent callers omit those and their files
+    carry no resolutions, so no quality line is shown (quality is a download-time
+    discovery there). ``mapping`` is a ``TorrentMapping`` instance.
     """
     pct = int(mapping.overall_confidence * 100)
     lines = [f"Franchise Mapping ({pct}%)", ""]
@@ -123,6 +129,16 @@ def format_torrent_mapping(mapping) -> str:
             parts.append(f"  {title}")
         parts.append(conf_icon)
         lines.append("  ".join(parts))
+
+        # Per-entry quality line (DDL only — torrent files carry no resolutions).
+        present = me.present_resolutions
+        if present:
+            quality = "  ⌬ " + ", ".join(present) + " ✓"
+            if encode_heights:
+                to_enc = me.tiers_to_encode(encode_heights, fallbacks_cfg or {})
+                if to_enc:
+                    quality += "  · encode " + ", ".join(f"{h}p" for h in to_enc)
+            lines.append(quality)
 
     # Show missing episodes warning.
     if mapping.has_gaps:

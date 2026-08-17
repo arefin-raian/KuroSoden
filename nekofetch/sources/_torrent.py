@@ -446,7 +446,13 @@ def group_variants(ordered: list[dict]) -> list[dict]:
         g = groups.get(key)
         if g is None:
             g = {"season": e["season"], "episode": e.get("episode"),
-                 "number": number, "kind": e["kind"], "files": []}
+                 "number": number, "kind": e["kind"],
+                 # Preserve whether the NAME actually stated a season, so a later
+                 # franchise-mapping pass (DDL builds its mapping post-extract from
+                 # these groups) can trust an explicit S02 instead of re-deriving
+                 # and collapsing it onto S01.
+                 "season_explicit": bool(e.get("season_explicit")),
+                 "files": []}
             groups[key] = g
         g["files"].append({
             "index": e.get("index"),

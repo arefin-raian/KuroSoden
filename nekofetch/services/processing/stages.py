@@ -1494,22 +1494,16 @@ class EncodeStage(Stage):
         # disk OR an acceptable substitute for that slot shipped instead — the
         # operator's rule: a 540p/360p file fills the 480p slot, so we must NOT
         # also derive a 480p (that would duplicate the SD tier). Mirrors the
-        # download-side ``resolution_fallbacks`` ladder.
+        # download-side ``resolution_fallbacks`` ladder. Shared with the DDL/torrent
+        # mapping card via ``tier_gapfill`` so the preview can't drift from here.
+        from nekofetch.services.tier_gapfill import parse_fallbacks, tier_satisfied
+
         _acq = getattr(self.c.config, "acquisition", None)
         _fallbacks_cfg = getattr(_acq, "resolution_fallbacks", None) or {}
-        _subs: dict[int, set[int]] = {}
-        for _tgt, _alts in _fallbacks_cfg.items():
-            _th = str(_tgt).rstrip("p")
-            if not _th.isdigit():
-                continue
-            _subs[int(_th)] = {
-                int(str(a).rstrip("p")) for a in _alts
-                if str(a).rstrip("p").isdigit()
-            }
+        _subs = parse_fallbacks(_fallbacks_cfg)
 
         def _tier_satisfied(unit_key: tuple, target_h: int) -> bool:
-            have = present.get(unit_key, set())
-            return target_h in have or any(s in have for s in _subs.get(target_h, set()))
+            return tier_satisfied(present.get(unit_key, set()), target_h, _subs)
 
         session = None
         try:

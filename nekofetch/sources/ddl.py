@@ -284,6 +284,9 @@ class DdlSource(AnimeSource):
                         "season": g["season"],
                         "episode": g["episode"],
                         "kind": g["kind"],
+                        # Whether the filename stated a season — the post-extract
+                        # franchise mapping trusts an explicit S02 over re-deriving.
+                        "season_explicit": bool(g.get("season_explicit")),
                     }),
                     season=g["season"],
                     number=g["number"],

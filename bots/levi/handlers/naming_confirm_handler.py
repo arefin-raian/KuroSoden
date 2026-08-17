@@ -44,13 +44,17 @@ from nekofetch.core.redis_safe import (
 from nekofetch.services.naming_confirm import (
     _USE_DEFAULT,
     await_key,
+    ddlmap_data_key,
     value_key,
 )
 from nekofetch.ui.components import cb
 
 log = get_logger(__name__)
 
-_KINDS = {"name", "caption"}
+# Text-reply kinds this handler consumes. ``name``/``caption`` capture a free-text
+# edit; ``ddlmap`` captures ``<file#> S<season>`` override lines for the DDL
+# franchise-mapping confirm (a different grammar — handled in its own branch).
+_KINDS = {"name", "caption", "ddlmap"}
 
 
 def _choice_kb(job_id: int, kind: str) -> InlineKeyboardMarkup:
@@ -86,6 +90,47 @@ async def _release(redis, job_id: int, kind: str, value: str) -> None:
                          label="naming_confirm.set_value", ex=15 * 60)
     await safe_redis_delete(redis, await_key(job_id, kind),
                             label="naming_confirm.release")
+
+
+# ── DDL mapping-confirm helpers (kind "ddlmap") ───────────────────────────────
+
+def _rebuild_ddl_mapping(data: dict, overrides: dict[int, int]):
+    """Re-run ``build_torrent_mapping`` from the stashed working set + season
+    overrides. Returns a ``TorrentMapping`` (or None). The franchise structure is
+    reconstructed from the stored mapping entries (they carry season/part/episode
+    counts) — no AniList re-walk, mirroring the torrent flow's rebuild."""
+    from nekofetch.services.franchise_flow import FranchiseMapping
+    from nekofetch.services.torrent_mapping import TorrentMapping, build_torrent_mapping
+
+    md = data.get("mapping")
+    ordered = data.get("ordered_files")
+    if not md or not ordered:
+        return None
+    prev = TorrentMapping.from_dict(md)
+    franchise = FranchiseMapping(
+        anime_doc_id="", root_title="",
+        entries=[e.franchise_entry for e in prev.entries],
+    )
+    return build_torrent_mapping(ordered, franchise, season_overrides=overrides or None)
+
+
+def _render_ddl_card(data: dict, mapping) -> str:
+    """The mapping card body (per-entry present/to-encode qualities), using the
+    encode config carried in the stashed working set so it matches the worker."""
+    from nekofetch.ui.torrent_screens import format_torrent_mapping
+
+    head = (
+        "🧩 <b>Franchise mapping</b>\n"
+        "Each entry shows the qualities present and what will be encoded to fill "
+        "the gaps. To fix a mis-detected season, tap <b>Fix seasons</b> and send "
+        "lines like <code>3 S2</code> (file #3 → Season 2).\n\n"
+    )
+    body = format_torrent_mapping(
+        mapping,
+        encode_heights=data.get("encode_heights") or [],
+        fallbacks_cfg=data.get("fallbacks_cfg") or {},
+    )
+    return head + f"<pre>{body}</pre>"
 
 
 def register(client: Client, container: Container) -> None:
@@ -152,9 +197,24 @@ def register(client: Client, container: Container) -> None:
         except Exception:  # noqa: BLE001
             pass
 
+    @client.on_callback_query(filters.regex(r"^levi\|ddlfix\|"))
+    async def _ddl_fix_prompt(client: Client, q: CallbackQuery) -> None:
+        """DDL mapping: 'Fix seasons' tapped — keep the worker blocked and nudge
+        the admin to send ``<file#> S<season>`` override lines (consumed below).
+        The marker stays armed; Proceed (nmuse) still ends the wait."""
+        parts = q.data.split("|")
+        if len(parts) < 3:
+            return
+        try:
+            await q.answer(
+                "Send lines like `3 S2` (file #3 → Season 2), one per fix. "
+                "Then tap Proceed.", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
+
     @client.on_message(filters.text & ~filters.command(["start"]), group=16)
     async def _consume_edit(client: Client, message: Message) -> None:
-        """Capture a text reply while a naming/caption marker is armed here."""
+        """Capture a text reply while a naming/caption/ddlmap marker is armed here."""
         redis = container.redis
         if redis is None:
             return
@@ -168,6 +228,10 @@ def register(client: Client, container: Container) -> None:
         if job_id is None:
             return
         job_id = int(job_id)
+
+        if kind == "ddlmap":
+            await _consume_ddlmap_fix(client, message, redis, job_id)
+            return
 
         text = (message.text or "").strip()
         if not text:
@@ -196,3 +260,67 @@ def register(client: Client, container: Container) -> None:
             except Exception:  # noqa: BLE001 — cosmetic
                 pass
         log.info("levi.naming_confirm.edit_consumed", job_id=job_id, kind=kind)
+
+    async def _consume_ddlmap_fix(client: Client, message: Message, redis, job_id: int) -> None:
+        """Apply ``<file#> S<season>`` override lines to the DDL mapping, re-run
+        it, and re-show the card in place. The worker stays blocked (marker armed,
+        Proceed still ends it) — this only refines the mapping the worker will read
+        back on Proceed."""
+        import json
+        import re
+
+        text = (message.text or "").strip()
+        raw = await safe_redis_get(redis, ddlmap_data_key(job_id),
+                                   label="ddlmap.fix_read")
+        try:
+            data = json.loads(raw) if raw else None
+        except Exception:  # noqa: BLE001
+            data = None
+        if not data:
+            return
+
+        ordered = data.get("ordered_files") or []
+        max_idx = len(ordered)
+        overrides: dict[int, int] = {}
+        applied: list[tuple[int, int]] = []
+        for m in re.finditer(r"\b(\d+)\s+[sS]\s*(\d+)\b", text):
+            file_no, season = int(m.group(1)), int(m.group(2))
+            if 1 <= file_no <= max_idx:
+                real_index = ordered[file_no - 1].get("index")
+                if real_index is not None:
+                    overrides[int(real_index)] = season
+                    applied.append((file_no, season))
+
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001 — best-effort tidy
+            pass
+        if not applied:
+            return
+
+        mapping = _rebuild_ddl_mapping(data, overrides)
+        if mapping is None:
+            return
+        # Persist the corrected mapping so Proceed (the worker) reads THIS one.
+        data["mapping"] = mapping.to_dict()
+        await safe_redis_set(redis, ddlmap_data_key(job_id), json.dumps(data),
+                             label="ddlmap.fix_write", ex=15 * 60)
+
+        ref = await safe_redis_get(redis, _card_key(job_id, "ddlmap"),
+                                   label="ddlmap.fix_cardref")
+        if ref and ":" in ref:
+            from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+            applied_str = ", ".join(f"#{n}→S{s}" for n, s in applied)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Proceed", callback_data=cb("levi", "nmuse", job_id, "ddlmap")),
+                InlineKeyboardButton("🔧 Fix seasons", callback_data=cb("levi", "ddlfix", job_id)),
+            ]])
+            try:
+                chat_s, msg_s = ref.split(":", 1)
+                await client.edit_message_text(
+                    int(chat_s), int(msg_s),
+                    f"<i>Applied {applied_str}.</i>\n\n" + _render_ddl_card(data, mapping),
+                    parse_mode=ParseMode.HTML, reply_markup=kb)
+            except Exception:  # noqa: BLE001 — cosmetic
+                pass
+        log.info("levi.ddlmap.fix_applied", job_id=job_id, fixes=len(applied))

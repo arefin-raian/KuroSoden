@@ -16,16 +16,25 @@ from dataclasses import dataclass, field
 
 from nekofetch.domain.enums import ContentKind
 from nekofetch.services.franchise_flow import FranchiseMapping, MappingEntry
+from nekofetch.services.tier_gapfill import res_height, tiers_to_encode
 
 
 @dataclass
 class FileAssignment:
-    """One torrent file assigned to a franchise entry."""
+    """One torrent file assigned to a franchise entry.
+
+    ``resolutions`` holds the quality tiers this LOGICAL episode ships (a DDL
+    release provides the same episode in several tiers as sibling files, so one
+    assignment carries e.g. ``["1080p", "720p", "480p"]``). Empty for torrent
+    (quality isn't known until download), so the mapping card shows no quality
+    line for torrents — only DDL, whose files are already extracted.
+    """
     file_index: int
     filename: str
     episode_number: int | None
     kind: str = "episode"
     season: int = 1
+    resolutions: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -64,6 +73,28 @@ class TorrentMappingEntry:
                 s += f" — {title[:40]}"
             return s
         return f"{e.kind.value.title()}: {e.title[:50]}"
+
+    @property
+    def present_resolutions(self) -> list[str]:
+        """Union of the quality tiers shipped across this entry's files, ordered
+        high→low (e.g. ``["1080p", "720p", "480p"]``). Empty when the files carry
+        no resolution info (torrent — quality unknown until download)."""
+        seen: set[str] = set()
+        for f in self.files:
+            for r in (f.resolutions or []):
+                if r:
+                    seen.add(r)
+        return sorted(seen, key=lambda r: res_height(r), reverse=True)
+
+    def tiers_to_encode(self, encode_heights, fallbacks_cfg) -> list[int]:
+        """Lower tiers that WILL be derived for this entry, per the shared
+        gap-fill rule — empty when it already ships every requested tier, or when
+        quality is unknown (torrent). Same result the encoder produces."""
+        present = {res_height(r) for r in self.present_resolutions}
+        present.discard(0)
+        if not present:
+            return []
+        return tiers_to_encode(present, encode_heights, fallbacks_cfg)
 
 
 @dataclass
@@ -110,6 +141,7 @@ class TorrentMapping:
                             "episode_number": f.episode_number,
                             "kind": f.kind,
                             "season": f.season,
+                            "resolutions": f.resolutions,
                         }
                         for f in e.files
                     ],
@@ -131,6 +163,7 @@ class TorrentMapping:
                     "episode_number": f.episode_number,
                     "kind": f.kind,
                     "season": f.season,
+                    "resolutions": f.resolutions,
                 }
                 for f in self.unmatched
             ],
@@ -156,6 +189,7 @@ class TorrentMapping:
                     episode_number=f.get("episode_number"),
                     kind=f.get("kind", "episode"),
                     season=f.get("season", 1),
+                    resolutions=list(f.get("resolutions") or []),
                 )
                 for f in ed.get("files", [])
             ]
@@ -179,6 +213,7 @@ class TorrentMapping:
                 episode_number=f.get("episode_number"),
                 kind=f.get("kind", "episode"),
                 season=f.get("season", 1),
+                resolutions=list(f.get("resolutions") or []),
             )
             for f in d.get("unmatched", [])
         ]
@@ -331,6 +366,7 @@ def build_torrent_mapping(
                 episode_number=f.get("episode"),
                 kind=f.get("kind", "episode"),
                 season=f.get("season", 0),
+                resolutions=list(f.get("resolutions") or []),
             )
             for f in matched
         ]
@@ -350,6 +386,7 @@ def build_torrent_mapping(
             episode_number=f.get("episode"),
             kind=f.get("kind", "episode"),
             season=f.get("season", 0),
+            resolutions=list(f.get("resolutions") or []),
         )
         for f in ordered_files
         if f["index"] not in used_file_indices
@@ -428,6 +465,7 @@ def _assign_files(files: list[dict], season: int) -> list[FileAssignment]:
             episode_number=f.get("episode"),
             kind=f.get("kind", "episode"),
             season=f.get("season", season),
+            resolutions=list(f.get("resolutions") or []),
         )
         for f in files
     ]

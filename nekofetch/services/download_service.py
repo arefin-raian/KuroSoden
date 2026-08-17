@@ -221,6 +221,34 @@ class DownloadWorker:
         if req.episodes:
             episodes = [e for e in episodes if e.number in set(req.episodes)]
 
+        # DDL franchise mapping (post-extract, interactive). DDL only knows its
+        # files after download+extract (which already happened in get_episodes),
+        # so — unlike torrent, mapped at enqueue — we build + confirm the mapping
+        # HERE, then persist it to franchise_data['_torrent_mapping'] so the shared
+        # remap block below applies the corrected entry identity (S02 no longer
+        # collapses onto S01; a movie files as a movie, not S1E<seq>). The confirm
+        # card lists each entry's present tiers + what will be encoded.
+        if getattr(source, "name", "") in _READY_RELEASE_SOURCES and episodes:
+            # Stamp a stable file_index onto each episode's ref (= its position),
+            # so the remap block — which keys on ``file_index`` — can match DDL
+            # episodes (they carry no file_index natively). Uses the SAME order the
+            # mapping's ordered_files are built from, so indices line up.
+            for _i, _ep in enumerate(episodes):
+                try:
+                    _r = json.loads(_ep.source_ref)
+                    _r["file_index"] = _i
+                    _ep.source_ref = json.dumps(_r)
+                except Exception:  # noqa: BLE001 — leave the ref as-is on bad JSON
+                    pass
+            try:
+                confirmed_map = await self._ddl_franchise_map(job_id, req, episodes)
+                if confirmed_map:
+                    fr = dict(req.franchise_data or {})
+                    fr["_torrent_mapping"] = confirmed_map
+                    req.franchise_data = fr
+            except Exception as exc:  # noqa: BLE001 — mapping is best-effort
+                log.info("ddl.franchise_map.skipped", job_id=job_id, error=str(exc))
+
         # Strip extras (NCOP, NCED, etc.) when the franchise data tells us how
         # many main episodes to expect and no explicit episode list was given.
         # Extras are only downloaded when the user specifically selected them.
@@ -245,6 +273,11 @@ class DownloadWorker:
         if torrent_mapping_dict:
             from nekofetch.services.torrent_mapping import TorrentMapping
             from nekofetch.sources.base import Episode
+            # DDL preserves every acquired file (the admin pasted exactly the
+            # archives they want, incl. a movie); torrent keeps its historic
+            # "included files only" filter. So for DDL we also remap the EXTRAS
+            # (movie/OVA/special → season 0) and never drop an unmatched episode.
+            is_ready_release = getattr(source, "name", "") in _READY_RELEASE_SOURCES
             tm = TorrentMapping.from_dict(torrent_mapping_dict)
             ep_override: dict[int, tuple[int, int, int | None]] = {}
             for tme in tm.included_entries:
@@ -253,6 +286,14 @@ class DownloadWorker:
                     if fa.episode_number is not None:
                         ep_override[fa.file_index] = (
                             fe.season_number, fa.episode_number, fe.season_part,
+                        )
+                    elif is_ready_release:
+                        # Unnumbered entry (movie / OVA batch). Give it the entry's
+                        # season (0 for extras) and a stable per-file number so it
+                        # is its OWN encode unit + storage entry — the movie-only-
+                        # 1080p case then gap-fills 720/480 independently.
+                        ep_override[fa.file_index] = (
+                            fe.season_number, fa.file_index + 1, fe.season_part,
                         )
             if ep_override:
                 remapped = []
@@ -271,6 +312,10 @@ class DownloadWorker:
                             source_ref=ep.source_ref, season=s, number=n,
                             title=ep.title, season_part=part,
                         ))
+                    elif is_ready_release:
+                        # DDL: keep an unmapped file as-is rather than dropping it
+                        # (torrent intentionally drops files outside included_entries).
+                        remapped.append(ep)
                 if remapped:
                     episodes = remapped
 
@@ -978,6 +1023,95 @@ class DownloadWorker:
     @staticmethod
     def _skip_key(job_id: int) -> str:
         return f"nf:job:{job_id}:skip"
+
+    async def _ddl_franchise_map(self, job_id: int, req, episodes: list) -> dict | None:
+        """Build a franchise mapping for a DDL release AFTER extract, show the
+        interactive confirm card (per-entry present/to-encode qualities + Fix
+        seasons), and return the confirmed ``TorrentMapping`` dict — or ``None``
+        when there's nothing to map (single un-parted entry) / the admin cancels.
+
+        DDL, unlike torrent, only knows its files AFTER download+extract, so the
+        mapping is built here (worker-side) rather than at enqueue. The returned
+        dict is stored on ``franchise_data['_torrent_mapping']`` by the caller so
+        the existing remap block applies the corrected entry identity to every
+        episode before the ready-release acquire.
+        """
+        from kurosoden.bots.levi.handlers.progress_monitor import _load_msg_ref
+        from nekofetch.services import naming_confirm as nc
+        from nekofetch.services.franchise_flow import FranchiseFlowService
+        from nekofetch.services.torrent_mapping import build_torrent_mapping
+        from nekofetch.ui.torrent_screens import format_torrent_mapping
+
+        franchise = req.franchise_data or {}
+
+        # Build ``ordered_files`` from the resolved episodes: one row per LOGICAL
+        # episode carrying that episode's quality tiers (the sibling files a DDL
+        # release ships). This is exactly the shape build_torrent_mapping wants.
+        ordered_files: list[dict] = []
+        for idx, ep in enumerate(episodes):
+            try:
+                ref = json.loads(ep.source_ref)
+            except Exception:  # noqa: BLE001
+                ref = {}
+            files = ref.get("files") or []
+            resolutions = [f.get("resolution") for f in files if f.get("resolution")]
+            ordered_files.append({
+                "index": idx,
+                "name": ep.title or ref.get("name") or "",
+                "season": ep.season if ep.season is not None else ref.get("season", 1),
+                "episode": ep.number if getattr(ep, "number", None) else ref.get("episode"),
+                "kind": ref.get("kind", "episode"),
+                "seq": idx + 1,
+                "season_explicit": bool(ref.get("season_explicit")),
+                "resolutions": resolutions,
+            })
+
+        # AniList franchise structure (cache-first walk, like the torrent path).
+        ff = FranchiseFlowService(self._c)
+        try:
+            entries = await ff.resolve_franchise_entries(franchise, req.anime_doc_id or "")
+            mapping = ff.build_mapping(
+                franchise, req.anime_doc_id or "", franchise_entries=entries)
+        except Exception as exc:  # noqa: BLE001 — mapping is best-effort
+            log.info("ddl.franchise_map.build_failed", job_id=job_id, error=str(exc))
+            return None
+
+        # A single un-parted entry needs no mapping — the flat episode list is
+        # already correct (mirrors _show_torrent_mapping's early return).
+        if len(mapping.entries) <= 1 and not any(e.season_part for e in mapping.entries):
+            return None
+
+        tmapping = build_torrent_mapping(ordered_files, mapping)
+
+        enc_heights = [h for h in self._c.config.processing.encode_heights if h > 0]
+        _acq = getattr(self._c.config, "acquisition", None)
+        fallbacks = getattr(_acq, "resolution_fallbacks", None) or {}
+        card_body = format_torrent_mapping(
+            tmapping, encode_heights=enc_heights, fallbacks_cfg=fallbacks)
+        card_text = (
+            "🧩 <b>Franchise mapping</b>\n"
+            "Each entry shows the qualities present and what will be encoded to "
+            "fill the gaps. To fix a mis-detected season, tap <b>Fix seasons</b> "
+            "and send lines like <code>3 S2</code> (file #3 → Season 2).\n\n"
+            f"<pre>{card_body}</pre>"
+        )
+
+        ref = await _load_msg_ref(self._c, job_id)
+        chat_id = ref[0] if ref else None
+        msg_id = ref[1] if ref else None
+
+        confirm = nc.NamingConfirm(self._c)
+        await self._set_confirm_hold(job_id, True)
+        try:
+            confirmed = await confirm.confirm_mapping(
+                job_id, mapping_dict=tmapping.to_dict(), ordered_files=ordered_files,
+                franchise=franchise, encode_heights=enc_heights,
+                fallbacks_cfg=fallbacks, card_text=card_text,
+                chat_id=chat_id, msg_id=msg_id,
+            )
+        finally:
+            await self._set_confirm_hold(job_id, False)
+        return confirmed
 
     async def _run_naming_confirms(self, job_id: int, req, resolutions: list[str],
                                    audios, variants=None, *,

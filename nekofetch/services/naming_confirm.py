@@ -74,6 +74,15 @@ def done_key(job_id: int, kind: str) -> str:
     return _DONE_KEY.format(job_id=job_id, kind=kind)
 
 
+def ddlmap_data_key(job_id: int) -> str:
+    """Holds the DDL mapping-confirm working set as JSON — the current mapping
+    dict plus the raw ``ordered_files`` + franchise blob + encode config the
+    "Fix seasons" handler needs to RE-RUN ``build_torrent_mapping`` with
+    accumulated overrides. The worker reads the (possibly-corrected) ``mapping``
+    from here after the admin taps Proceed."""
+    return f"nf:job:{job_id}:ddlmap_data"
+
+
 # ── filename parsing (inverse of templates.render_filename) ───────────────────
 
 # Resolution / audio tokens appear as bracketed tags in the rendered name, e.g.
@@ -389,7 +398,124 @@ class NamingConfirm:
             return
         from nekofetch.bots.channel_reply import disarm as _disarm
         for k in (await_key(job_id, kind), value_key(job_id, kind),
-                  f"nf:job:{job_id}:{kind}_card"):
+                  f"nf:job:{job_id}:{kind}_card", ddlmap_data_key(job_id)):
             await safe_redis_delete(redis, k, label="naming_confirm.cleanup")
         if chat_id is not None:
             await _disarm(redis, chat_id)
+
+    async def confirm_mapping(
+        self, job_id: int, *, mapping_dict: dict, ordered_files: list[dict],
+        franchise: dict, encode_heights: list[int], fallbacks_cfg: dict,
+        card_text: str, chat_id: int | None, msg_id: int | None = None,
+    ) -> dict | None:
+        """DDL franchise-mapping confirm (kind ``"ddlmap"``): show the mapping card
+        with per-entry present/to-encode qualities, block until the admin taps
+        **Proceed** / **Fix seasons** / **Cancel** (or the timeout), and return the
+        confirmed mapping dict (possibly season-corrected) — or ``None`` on
+        Cancel/abandon so the caller can fall back to the auto mapping.
+
+        Mirrors :meth:`confirm`: arm the awaiting flag + reply marker, evolve the
+        live progress card in place, block-poll. The working set (mapping +
+        ordered_files + franchise + encode cfg) is stashed under
+        :func:`ddlmap_data_key` so the Levi "Fix seasons" handler can re-run
+        ``build_torrent_mapping`` with overrides and re-show the card without the
+        worker's involvement; on Proceed the worker reads the current mapping back
+        from that key.
+        """
+        import json
+
+        kind = "ddlmap"
+        if await self.already_confirmed(job_id, kind):
+            return mapping_dict
+        redis = self._c.redis
+        levi = self._levi()
+        if redis is None or levi is None or chat_id is None:
+            await self._mark_confirmed(job_id, kind)
+            return mapping_dict
+        if await self._abandoned(job_id):
+            log.info("naming_confirm.ddlmap.aborted_preshow", job=job_id)
+            return None
+
+        from nekofetch.bots.channel_reply import arm as _arm
+        from nekofetch.ui.components import cb
+
+        state = f"levi_confirm_{kind}"
+        await safe_redis_delete(redis, value_key(job_id, kind),
+                                label="ddlmap.clear_val")
+        await safe_redis_set(redis, await_key(job_id, kind), "1",
+                             label="ddlmap.arm", ex=_CONFIRM_TIMEOUT_S + 60)
+        # Stash the full working set for the Fix-seasons handler + the worker.
+        await safe_redis_set(
+            redis, ddlmap_data_key(job_id),
+            json.dumps({
+                "mapping": mapping_dict, "ordered_files": ordered_files,
+                "franchise": franchise, "encode_heights": encode_heights,
+                "fallbacks_cfg": fallbacks_cfg,
+            }),
+            label="ddlmap.data", ex=_CONFIRM_TIMEOUT_S + 60)
+        await _arm(redis, chat_id, state, job_id=job_id, kind=kind)
+
+        from pyrogram.enums import ParseMode
+        from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Proceed", callback_data=cb("levi", "nmuse", job_id, kind)),
+            InlineKeyboardButton("🔧 Fix seasons", callback_data=cb("levi", "ddlfix", job_id)),
+        ]])
+        card_id = None
+        if msg_id is not None:
+            try:
+                await levi.edit_message_text(
+                    chat_id, msg_id, card_text, parse_mode=ParseMode.HTML,
+                    reply_markup=kb)
+                card_id = msg_id
+            except Exception as exc:  # noqa: BLE001 — fall through to send-new
+                log.debug("ddlmap.edit_inplace_failed", job=job_id, error=str(exc))
+        if card_id is None:
+            try:
+                sent = await levi.send_message(
+                    chat_id, card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+                card_id = sent.id
+            except Exception as exc:  # noqa: BLE001 — can't show card → use default
+                log.warning("ddlmap.card_failed", job=job_id, error=str(exc))
+                await self._cleanup(job_id, kind, chat_id)
+                await self._mark_confirmed(job_id, kind)
+                return mapping_dict
+        await safe_redis_set(
+            redis, f"nf:job:{job_id}:{kind}_card", f"{chat_id}:{card_id}",
+            label="ddlmap.cardref", ex=_CONFIRM_TIMEOUT_S + 60)
+
+        loops = int(_CONFIRM_TIMEOUT_S / _POLL_INTERVAL_S)
+        cancelled = False
+        for _ in range(loops):
+            await asyncio.sleep(_POLL_INTERVAL_S)
+            if await self._abandoned(job_id):
+                log.info("naming_confirm.ddlmap.aborted", job=job_id)
+                cancelled = True
+                break
+            still = await safe_redis_get(redis, await_key(job_id, kind),
+                                         label="ddlmap.poll")
+            if not still:
+                # Released. "__use__" = Proceed; anything else (a Cancel sentinel)
+                # means bail to the auto mapping.
+                val = await safe_redis_get(redis, value_key(job_id, kind),
+                                           label="ddlmap.readval")
+                if val and val != _USE_DEFAULT:
+                    cancelled = True
+                break
+        else:
+            log.info("naming_confirm.ddlmap.timeout", job=job_id)
+
+        # Read the (possibly Fix-corrected) mapping back before cleanup wipes it.
+        confirmed = mapping_dict
+        try:
+            raw = await safe_redis_get(redis, ddlmap_data_key(job_id),
+                                       label="ddlmap.final_read")
+            if raw:
+                confirmed = json.loads(raw).get("mapping") or mapping_dict
+        except Exception:  # noqa: BLE001 — fall back to the auto mapping
+            pass
+
+        await self._cleanup(job_id, kind, chat_id)
+        await self._mark_confirmed(job_id, kind)
+        return None if cancelled else confirmed
