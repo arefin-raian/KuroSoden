@@ -1,10 +1,12 @@
-"""Lelouch batch flow — marshal many titles into the *work* line at once.
+"""Lelouch batch flow — submit many titles into the request line at once.
 
 This is Lelouch's own batch handler, distinct from the inherited NekoFetch admin
-batch (which submits *requests* via ``RequestService``). Here every confirmed
-title becomes a :class:`WorkItem` — an admin-marshalled pipeline job that flows
-into the same download queue Levi drains but never counts against a user's
-request limit.
+batch. Every confirmed title becomes a real :class:`Request` (QUEUED) — exactly
+what the single-request flow produces — and is assigned to the downloader (Levi).
+A batch entry is a request and nothing more: it does **not** also spawn a
+``WorkItem``. Levi's task board reads ``AdminAssignment`` rows keyed on
+``Request.code``, so the request alone surfaces the work; a parallel WRK row would
+just be a redundant duplicate on the manage board.
 
 Flow:
   1. ``/batch`` (staff+) or the ``batch|new`` button → styled prompt.
@@ -16,9 +18,11 @@ Flow:
   4. A review *carousel* parades each resolved title one card at a time. The
      admin approves or skips each, pages with ◀ ▶, and commits with "Commit the
      line".
-  5. On commit, approved entries are staged as :class:`WorkItem` rows via
-     :meth:`WorkService.add_batch`, then every configured admin is DMed a
-     summary through the downloader (Levi) so a human actually sees the orders.
+  5. On commit, each approved entry becomes a QUEUED :class:`Request`, is assigned
+     to Levi, and the selected downloader is DMed the same "New Download Task"
+     card the single-request path sends (via
+     :func:`kurosoden.shared.handoff.notify_stage_assignment`) — so a human sees
+     each order as an actionable task, not a silent summary line.
 
 State lives in Redis (:class:`FSM`) so the carousel survives restarts and works
 across workers. The resolved franchise dicts are stored whole in the FSM bag so
@@ -36,7 +40,7 @@ from nekofetch.bots.fsm import FSM
 from nekofetch.core.container import Container
 from nekofetch.domain.enums import Role
 from nekofetch.ui.artwork import pick_artwork
-from nekofetch.ui.components import cb, keyboard, lock_buttons
+from nekofetch.ui.components import cb, lock_buttons
 from nekofetch.ui.progress import SPINNER
 from nekofetch.ui.screens import Screen, card, message_ref, send_screen
 
@@ -50,7 +54,6 @@ from kurosoden.shared.franchise_resolver import (
     resolve_franchise,
     resolve_franchise_candidates,
 )
-from kurosoden.shared.work_service import WorkService
 
 import structlog
 
@@ -110,8 +113,106 @@ def _slim(fr: dict) -> dict:
     return {k: fr.get(k) for k in keep if fr.get(k) is not None}
 
 
+async def _commit_batch_requests(
+    container: Container, submitter_telegram_id: int, keep: list[dict],
+) -> list[tuple[str, str, dict]]:
+    """Turn accepted batch entries into real requests + Levi assignments.
+
+    Mirrors the single-request path exactly — one QUEUED :class:`Request` per
+    entry (NO ``WorkItem``), each assigned to the downloader (Levi), and the
+    selected admin DMed the same "New Download Task" card
+    (:func:`notify_stage_assignment`) rather than a silent summary line.
+
+    Returns ``(code, title, franchise_data)`` for every created request, kept
+    aligned so the confirmation count, prefetch, and assignment cards agree.
+    Raises only if the DB write itself fails (the caller shows the failure card);
+    per-request assignment/notification is best-effort and never aborts the rest.
+    """
+    from types import SimpleNamespace
+
+    from nekofetch.core.constants import REQUEST_PREFIX
+    from nekofetch.domain.enums import DownloadScope, RequestStatus
+    from nekofetch.infrastructure.database.postgres.models import Request
+    from nekofetch.infrastructure.database.postgres.session import session_scope
+    from nekofetch.infrastructure.repositories.request_repo import RequestRepository
+    from nekofetch.infrastructure.repositories.user_repo import UserRepository
+    from kurosoden.shared.admin_assignment import AdminAssignmentEngine
+    from kurosoden.shared.handoff import notify_stage_assignment
+    from kurosoden.shared.management_service import ManagementService
+    from kurosoden.shared.owner_seed import _owner_id
+
+    bridged: list[tuple[str, str, dict]] = []
+    async with session_scope(container.pg_sessionmaker) as session:
+        repo = RequestRepository(session)
+        # ``submitter_telegram_id`` is a TELEGRAM id, but ``Request.user_id`` FKs
+        # ``users.id`` (the internal PK). Resolve/create the submitter's User row
+        # once and use its ``.id`` — passing the telegram id straight through
+        # violates the FK, so every batched Request INSERT fails and nothing
+        # surfaces on Levi's board.
+        submitter = await UserRepository(session).get_or_create(
+            submitter_telegram_id, username=None, first_name=None)
+        await session.flush()
+        for keep_data in keep:
+            title = (keep_data.get("anime_title")
+                     or keep_data.get("title") or "").strip()
+            if not title:
+                continue
+            seq = await repo.next_sequence()
+            code = f"{REQUEST_PREFIX}-{seq}"
+            fr = keep_data.get("franchise_data") or {}
+            aid = fr.get("anilist_id")
+            req = Request(
+                code=code,
+                user_id=submitter.id,
+                anime_doc_id=f"{aid}" if aid else None,
+                anime_title=title,
+                source="",  # batch has no source yet (admin picks later)
+                source_ref="",
+                scope=DownloadScope.ENTIRE_SERIES.value,
+                season=None,
+                episodes=None,
+                franchise_data=fr,
+                status=RequestStatus.QUEUED,
+            )
+            await repo.add(req)
+            bridged.append((code, title, fr))
+        await session.flush()
+
+    # Assign each request to Levi + DM the selected downloader the task card.
+    # Done outside the creation session so each assign gets its own transaction
+    # (matching the single-request path) and one failure never rolls back the
+    # others.
+    assignment = AdminAssignmentEngine(container.pg_sessionmaker)
+    for code, title, fr in bridged:
+        try:
+            result = await assignment.assign(code, "levi")
+            if result is None:
+                # No qualifying admin (off-hours/on-break); fall back to the
+                # owner so the task is always visible, never silently dropped.
+                owner = _owner_id(container)
+                if owner is not None:
+                    await ManagementService(container.pg_sessionmaker).reassign(
+                        code, "levi", owner
+                    )
+                    result = SimpleNamespace(
+                        admin_telegram_id=owner,
+                        status="assigned",
+                        assignment_mode="fallback",
+                    )
+            if result is not None:
+                await notify_stage_assignment(
+                    container, "levi", result, code, title,
+                    franchise_json=fr,
+                )
+        except Exception as exc:  # noqa: BLE001 — recovery sweep still catches it
+            log.warning("lelouch.batch.assign_failed",
+                        code=code, error=str(exc)[:200])
+
+    return bridged
+
+
 def register(client: Client, container: Container) -> None:
-    """Wire Lelouch's work-item batch flow onto the Pyrogram client."""
+    """Wire Lelouch's batch request flow onto the Pyrogram client."""
     fsm = FSM(container.redis, bot="lelouch_batch")
 
     # ── Role gate (staff or admin only — work items are an admin surface) ─────
@@ -484,10 +585,16 @@ def register(client: Client, container: Container) -> None:
             await q.answer()
             return
 
+        # ── Commit: one real Request per accepted title (NO WorkItem) ──
+        # A batch entry IS a request, nothing more. Batch used to create a
+        # WorkItem (WRK-N) *and* bridge it to a Request — but Levi's task board
+        # reads AdminAssignment rows keyed on Request.code, so the request alone
+        # already surfaces the work; the parallel WRK row was redundant (owner:
+        # "just keep it as REQ, no need to make it work"). ``_commit_batch_requests``
+        # mirrors the single-request path exactly: create QUEUED Request → assign
+        # to Levi → DM the downloader the "New Download Task" card.
         try:
-            created = await WorkService(container.pg_sessionmaker).add_batch(
-                user_id, keep,
-            )
+            bridged = await _commit_batch_requests(container, user_id, keep)
         except Exception as exc:  # noqa: BLE001
             log.error("lelouch.batch.commit_failed", error=str(exc)[:300])
             await send_screen(
@@ -502,111 +609,29 @@ def register(client: Client, container: Container) -> None:
             await q.answer()
             return
 
-        # ── Bridge work_items → real Request rows + Levi assignments ──
-        # Batch creates work_items (WRK-N codes), but Levi's task list reads
-        # AdminAssignment rows (which key on Request.code). The single-request path
-        # creates a Request (QUEUED) + calls assign(code, "levi") so the work is
-        # visible. Batch must do the same: create a Request row per work item and
-        # assign each to levi, so tasks actually appear on the download board.
-        try:
-            from nekofetch.core.constants import REQUEST_PREFIX
-            from nekofetch.domain.enums import DownloadScope, RequestStatus
-            from nekofetch.infrastructure.database.postgres.models import Request
-            from nekofetch.infrastructure.database.postgres.session import session_scope
-            from nekofetch.infrastructure.repositories.request_repo import RequestRepository
-            from kurosoden.shared.admin_assignment import AdminAssignmentEngine
-
-            from kurosoden.shared.management_service import ManagementService
-            from kurosoden.shared.owner_seed import _owner_id
-
-            assignment = AdminAssignmentEngine(container.pg_sessionmaker)
-            codes: list[str] = []
-            async with session_scope(container.pg_sessionmaker) as session:
-                repo = RequestRepository(session)
-                # ``user_id`` here is a TELEGRAM id, but ``Request.user_id`` FKs
-                # ``users.id`` (the internal PK). Resolve/create the submitter's
-                # User row once and use its ``.id`` — passing the telegram id
-                # straight through violates the FK, so every batched Request INSERT
-                # fails and the work items never surface on Levi's board.
-                from nekofetch.infrastructure.repositories.user_repo import (
-                    UserRepository,
-                )
-                submitter = await UserRepository(session).get_or_create(
-                    user_id, username=None, first_name=None)
-                await session.flush()
-                for keep_data in keep:
-                    title = (keep_data.get("anime_title")
-                             or keep_data.get("title") or "").strip()
-                    if not title:
-                        continue  # mirror add_batch's skip so codes stay aligned
-                    seq = await repo.next_sequence()
-                    code = f"{REQUEST_PREFIX}-{seq}"
-                    fr = keep_data.get("franchise_data") or {}
-                    aid = fr.get("anilist_id")
-                    req = Request(
-                        code=code,
-                        user_id=submitter.id,
-                        anime_doc_id=f"{aid}" if aid else None,
-                        anime_title=title,
-                        source="",  # batch has no source yet (admin picks later)
-                        source_ref="",
-                        scope=DownloadScope.ENTIRE_SERIES.value,
-                        season=None,
-                        episodes=None,
-                        franchise_data=fr,
-                        status=RequestStatus.QUEUED,
-                    )
-                    await repo.add(req)
-                    codes.append(code)
-                await session.flush()
-
-            # Assign each real request to levi so it appears in the download task
-            # list. Done outside the creation session so each assign gets its own
-            # transaction (matching the single-request path) and one failure never
-            # rolls back the others.
-            for code in codes:
-                try:
-                    result = await assignment.assign(code, "levi")
-                    if result is None:
-                        # No qualifying admin (off-hours/on-break); fall back to the
-                        # owner so the task is always visible, never silently dropped.
-                        owner = _owner_id(container)
-                        if owner is not None:
-                            await ManagementService(container.pg_sessionmaker).reassign(
-                                code, "levi", owner
-                            )
-                except Exception as exc:  # noqa: BLE001 — recovery sweep still catches it
-                    log.warning("lelouch.batch.assign_failed",
-                                code=code, error=str(exc)[:200])
-
-            # Link each work item to its bridged request so the pipeline keeps
-            # the work's stage/status in step as the request advances (see
-            # AdminAssignmentEngine.complete_task). ``created`` and ``codes`` stay
-            # aligned because both skip blank titles the same way. Best-effort —
-            # Levi's board and the lazy bridge (shared/work_bridge.py) cover any
-            # leftover unlinked work.
-            try:
-                wsvc = WorkService(container.pg_sessionmaker)
-                for w_code, r_code in zip(
-                    [w.code for w in created], codes,
-                ):
-                    await wsvc.link(w_code, r_code)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("lelouch.batch.link_failed", error=str(exc)[:200])
-        except Exception as exc:  # noqa: BLE001 — batch still shows success; the recovery sweep picks up unassigned items
-            log.error("lelouch.batch.bridge_failed", error=str(exc)[:300])
+        if not bridged:
+            await send_screen(
+                client, q.message.chat.id,
+                card(V.BATCH_EMPTY, image=_art(), bot_name=BOT,
+                     buttons=[[(V.BTN_HOME, cb(BOT, "home"))]]),
+                old_msg=q.message,
+            )
+            await q.answer()
+            return
 
         from kurosoden.shared.access_gate import levi_link
         open_tasks = await levi_link(container)
         await send_screen(
             client, q.message.chat.id,
-            card(V.batch_done(len(created), skipped), image=_art(), bot_name=BOT,
+            card(V.batch_done(len(bridged), skipped), image=_art(), bot_name=BOT,
                  url_buttons=[[(V.BTN_OPEN_TASKS, open_tasks)]] if open_tasks else None,
                  buttons=[[(V.BTN_QUEUE, cb(BOT, "queue", 0)),
                            (V.BTN_HOME, cb(BOT, "home"))]]),
             old_msg=q.message,
         )
         await q.answer()
+        log.info("lelouch.batch.committed", count=len(bridged),
+                 by=getattr(q.from_user, "first_name", "") or "command")
 
         # Prefetch metadata for every accepted batch entry (same policy as the
         # single-request flow): cache AniList/Jikan/TMDB + mirrored artwork to
@@ -616,41 +641,12 @@ def register(client: Client, container: Container) -> None:
             from nekofetch.services.metadata_prefetch import MetadataPrefetchService
 
             svc = MetadataPrefetchService(container)
-            for i, w in enumerate(created):
-                fr = keep[i]["franchise_data"] if i < len(keep) else {}
+            for code, _title, fr in bridged:
                 aid = (fr or {}).get("anilist_id")
                 _doc = f"{aid}" if aid else None
-                asyncio.create_task(svc.prefetch(w.code, _doc, fr or {}))
+                asyncio.create_task(svc.prefetch(code, _doc, fr or {}))
         except Exception as exc:  # noqa: BLE001 — prefetch never blocks the batch
             log.warning("lelouch.batch.prefetch_spawn_failed", error=str(exc)[:200])
-
-        # DM every admin the new orders through the downloader (Levi), falling
-        # back to this client — same delivery path as single-request pings.
-        await _notify_admins(
-            [(w.code, w.anime_title) for w in created],
-            getattr(q.from_user, "first_name", "") or "command",
-        )
-
-    async def _notify_admins(entries: list[tuple[str, str]], added_by: str) -> None:
-        """DM configured admins a batch summary. Each send is independent."""
-        admin_ids = list(getattr(container.env, "admin_ids", []) or [])
-        if not admin_ids or not entries:
-            return
-        notifier = client
-        mgr = getattr(container, "pipeline_manager", None)
-        if mgr is not None and getattr(mgr, "levi", None) is not None:
-            notifier = mgr.levi
-        caption = V.batch_admin_summary(entries)
-        for admin_id in admin_ids:
-            try:
-                await notifier.send_message(
-                    admin_id, caption, parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard([(V.BTN_QUEUE, cb(BOT, "queue", 0))]),
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("lelouch.batch.dm_failed", admin=admin_id,
-                            error=str(exc)[:200])
-        log.info("lelouch.batch.committed", count=len(entries), by=added_by)
 
     # ── Cancel ────────────────────────────────────────────────────────────────
     @client.on_callback_query(filters.regex(r"^batch\|cancel$"))
