@@ -17,7 +17,12 @@ from pathlib import Path
 from pyrogram import Client
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
+from pyrogram.errors import BadRequest as _BadRequest
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from nekofetch.core.logging import get_logger
+
+log = get_logger(__name__)
 
 from nekofetch.core.constants import BULLET, DOT_ACTIVE, DOT_DONE, DOT_PENDING
 from nekofetch.localization.messages import PARSE_MODE, M, t
@@ -553,11 +558,22 @@ async def send_screen(
 
     if photo_arg:
         send_arg = _cached_photo_arg(photo_arg)
-        msg = await _send_photo(
-            photo=send_arg, caption=fitted,
-            parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
-        )
-        _remember_file_id(photo_arg, msg)
+        try:
+            msg = await _send_photo(
+                photo=send_arg, caption=fitted,
+                parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
+            )
+            _remember_file_id(photo_arg, msg)
+        except _BadRequest as exc:
+            # Telegram rejected the artwork (MEDIA_EMPTY / unfetchable URL / stale
+            # file_id). A bad image must NEVER crash the card — drop it and send
+            # the caption as a text card so the flow still works.
+            log.warning("screens.photo_rejected_text_fallback",
+                        photo=str(photo_arg)[:120], error=str(exc))
+            msg = await _send_text(
+                _truncate_html(caption, MESSAGE_LIMIT),
+                parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
+            )
     else:
         msg = await _send_text(
             fitted, parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
