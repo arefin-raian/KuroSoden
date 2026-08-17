@@ -74,6 +74,43 @@ def _remember_file_id(photo_arg: str | None, msg) -> None:
             _FILE_ID_CACHE[photo_arg] = file_id
 
 
+def _is_remote_url(photo_arg: str | None) -> bool:
+    """True for an HTTP(S) URL (vs a local path or an already-uploaded file_id)."""
+    return bool(photo_arg) and photo_arg.startswith(("http://", "https://"))
+
+
+async def _download_photo_upload(url: str):
+    """Fetch a remote image OURSELVES so we can UPLOAD the bytes to Telegram
+    instead of handing it a URL to fetch.
+
+    Telegram's server-side URL fetch intermittently fails with ``MEDIA_EMPTY`` on
+    the TMDB / AniList CDNs even when the URL is perfectly reachable from us (a
+    200 with valid JPEG bytes) — this was the "recurring artwork doesn't appear
+    on the early Senku cards" bug: those cards carry backdrop URLs, and once
+    Telegram couldn't fetch them the card degraded to a text-only fallback. When
+    WE fetch the bytes and upload them, Telegram never touches the origin, so the
+    fetch can't fail. Returns a named ``BytesIO`` (Pyrogram reads ``.name`` for
+    the extension) or ``None`` on any failure (caller then degrades to text).
+    """
+    import io
+
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as cli:
+            r = await cli.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or not r.content:
+            return None
+        ctype = (r.headers.get("content-type") or "").lower()
+        ext = "png" if "png" in ctype else ("webp" if "webp" in ctype else "jpg")
+        bio = io.BytesIO(r.content)
+        bio.name = f"artwork.{ext}"  # Pyrogram uses .name to type the upload
+        return bio
+    except Exception:  # noqa: BLE001 — artwork is decorative; never fail a flow
+        return None
+
+
+
 @dataclass(slots=True)
 class Screen:
     caption: str
@@ -535,9 +572,17 @@ async def send_screen(
     async def _send_photo(**kw):
         for _ in range(3):
             try:
+                # Rewind a seekable upload (BytesIO) so a FloodWait retry re-reads
+                # from the start instead of sending an already-consumed stream.
+                _p = kw.get("photo")
+                if hasattr(_p, "seek"):
+                    _p.seek(0)
                 return await client.send_photo(chat_id, **kw)
             except FloodWait as fw:
                 await asyncio.sleep(fw.value + 1)
+        _p = kw.get("photo")
+        if hasattr(_p, "seek"):
+            _p.seek(0)
         return await client.send_photo(chat_id, **kw)
 
     async def _send_text(text, **kw):
@@ -565,15 +610,31 @@ async def send_screen(
             )
             _remember_file_id(photo_arg, msg)
         except _BadRequest as exc:
-            # Telegram rejected the artwork (MEDIA_EMPTY / unfetchable URL / stale
-            # file_id). A bad image must NEVER crash the card — drop it and send
-            # the caption as a text card so the flow still works.
-            log.warning("screens.photo_rejected_text_fallback",
-                        photo=str(photo_arg)[:120], error=str(exc))
-            msg = await _send_text(
-                _truncate_html(caption, MESSAGE_LIMIT),
-                parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
-            )
+            # Telegram rejected the artwork. If it was a URL it couldn't fetch
+            # (MEDIA_EMPTY on the TMDB/AniList CDNs is common even for URLs that
+            # are 200 from our side), fetch the bytes OURSELVES and upload them —
+            # Telegram never touches the origin, so it can't fail the fetch. Also
+            # covers a stale cached file_id: we re-fetch from the original URL.
+            # Only if that also fails do we drop to a text card so the flow lives.
+            msg = None
+            if _is_remote_url(photo_arg):
+                bio = await _download_photo_upload(photo_arg)
+                if bio is not None:
+                    try:
+                        msg = await _send_photo(
+                            photo=bio, caption=fitted,
+                            parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
+                        )
+                        _remember_file_id(photo_arg, msg)
+                    except _BadRequest:
+                        msg = None
+            if msg is None:
+                log.warning("screens.photo_rejected_text_fallback",
+                            photo=str(photo_arg)[:120], error=str(exc))
+                msg = await _send_text(
+                    _truncate_html(caption, MESSAGE_LIMIT),
+                    parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
+                )
     else:
         msg = await _send_text(
             fitted, parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
@@ -616,14 +677,28 @@ async def _try_edit_in_place(client, old_msg, screen, photo_arg, fitted):
     if old_has_photo != want_photo:
         return None
 
+    async def _edit_photo(src):
+        return await client.edit_message_media(
+            chat_id, message_id,
+            InputMediaPhoto(src, caption=fitted, parse_mode=screen.parse_mode),
+            reply_markup=screen.keyboard,
+        )
+
     async def _do_edit():
         if want_photo:
-            edited = await client.edit_message_media(
-                chat_id, message_id,
-                InputMediaPhoto(_cached_photo_arg(photo_arg), caption=fitted,
-                                parse_mode=screen.parse_mode),
-                reply_markup=screen.keyboard,
-            )
+            try:
+                edited = await _edit_photo(_cached_photo_arg(photo_arg))
+            except MessageNotModified:
+                raise  # already correct — handled by the outer catch
+            except _BadRequest:
+                # Telegram couldn't fetch the URL (MEDIA_EMPTY) — upload the bytes
+                # ourselves and edit again IN PLACE (no flicker, keeps position).
+                if not _is_remote_url(photo_arg):
+                    raise
+                bio = await _download_photo_upload(photo_arg)
+                if bio is None:
+                    raise
+                edited = await _edit_photo(bio)
             _remember_file_id(photo_arg, edited)
             return edited
         return await client.edit_message_text(
