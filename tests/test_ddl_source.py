@@ -213,3 +213,49 @@ async def test_get_episodes_emits_download_and_extract_progress(
     assert "extract" in stages and "extract_done" in stages
     # The ZIP filename (last path segment, url-decoded) is surfaced for the card.
     assert any(e.get("archive_name") == "Akudama.Drive.S01.480p.zip" for e in events)
+
+
+async def test_extract_progress_reports_true_file_total(tmp_path: Path) -> None:
+    """The extraction bar must count the REAL number of video files (e.g. 12), not
+    a frozen 1/1. Regression for the owner's report that the 720p/480p zips showed
+    "1 out of 1" instead of "1 out of 12"."""
+    names = [f"Show S01E{n:02d} 480p.mkv" for n in range(1, 13)]  # 12 episodes
+    archive = _make_zip(tmp_path / "pack480.zip", [*names, "readme.nfo"])
+
+    ticks: list[tuple[int, int]] = []
+
+    async def on_file(done, total, name=""):
+        ticks.append((done, total))
+
+    videos = await extract_archive(archive, tmp_path / "out", on_file=on_file)
+
+    assert len(videos) == 12
+    assert ticks, "no extraction progress was reported"
+    # The denominator is the true video count (12), never a bogus 1.
+    final_done, final_total = ticks[-1]
+    assert final_total == 12
+    assert final_done == 12
+    # Never reports the frozen 1/1 that the 7z/nested path used to emit.
+    assert (1, 1) not in ticks
+
+
+async def test_extract_progress_true_total_for_nested_archive(tmp_path: Path) -> None:
+    """A release that wraps its 12 videos inside an INNER archive (the outer zip
+    has ONE member) must still report /12, not /1 — the nested case that produced
+    the '1 out of 1' bug."""
+    names = [f"Show S01E{n:02d} 720p.mkv" for n in range(1, 13)]
+    inner = _make_zip(tmp_path / "inner.zip", names)
+    outer = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer, "w") as zf:
+        zf.write(inner, arcname="Show.S01.720p/inner.zip")
+
+    ticks: list[tuple[int, int]] = []
+
+    async def on_file(done, total, name=""):
+        ticks.append((done, total))
+
+    videos = await extract_archive(outer, tmp_path / "out", on_file=on_file)
+
+    assert len(videos) == 12
+    # Final tick lands on the real video count, not the outer archive's 1 member.
+    assert ticks[-1] == (12, 12)

@@ -187,17 +187,77 @@ async def _extract_once(archive: Path, dest_dir: Path, *, on_file=None) -> None:
             pass
 
 
+async def _count_7z_videos(binary: str, archive: Path) -> int:
+    """Best-effort count of video entries inside an archive via ``7z l`` (0 on any
+    failure). Gives the extraction bar a correct denominator for rar/7z (and zips
+    stdlib rejected) so it shows ``i/12`` instead of ``1/1``."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            binary, "l", "-ba", "-slt", str(archive),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=120.0)
+    except Exception:  # noqa: BLE001 — listing is best-effort
+        return 0
+    n = 0
+    for line in (out or b"").decode(errors="replace").splitlines():
+        s = line.strip()
+        if s.lower().startswith("path =") and s.split("=", 1)[1].strip().lower().endswith(VIDEO_EXT):
+            n += 1
+    return n
+
+
+async def _expected_video_count(archive: Path) -> int:
+    """How many video files this archive should yield (best-effort, 0 if unknown).
+
+    Used only as the progress-bar denominator — a wrong/zero value never affects
+    the actual extraction, just the ``i/n`` display."""
+    if _sniff_kind(archive) == "zip":
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                return sum(
+                    1 for m in zf.infolist()
+                    if not m.is_dir() and m.filename.lower().endswith(VIDEO_EXT)
+                )
+        except Exception:  # noqa: BLE001 — fall through to 7-Zip listing
+            pass
+    binary = find_7z()
+    return await _count_7z_videos(binary, archive) if binary else 0
+
+
+async def _extract_tree(archive: Path, dest_dir: Path, *, _depth: int = 0) -> list[Path]:
+    """Extract ``archive`` (recursing up to two levels into nested archives) and
+    return the videos found. Progress is handled by the poller in
+    :func:`extract_archive`, so this stays quiet."""
+    await _extract_once(archive, dest_dir)
+    vids = _collect_videos(dest_dir)
+    if vids:
+        return vids
+    if _depth < 2:
+        for inner in _nested_archives(dest_dir):
+            sub = inner.parent / f"{inner.stem}__x"
+            try:
+                await _extract_tree(inner, sub, _depth=_depth + 1)
+            except Exception as exc:  # noqa: BLE001 — try the rest
+                log.warning("archive.nested.failed", inner=inner.name, error=str(exc))
+        vids = _collect_videos(dest_dir)
+    return vids
+
+
 async def extract_archive(
     archive: Path, dest_dir: Path, *, on_file=None, _depth: int = 0,
 ) -> list[Path]:
     """Unpack ``archive`` into ``dest_dir`` and return the video files found.
 
     Recurses up to two levels into nested archives (the video is often wrapped
-    in an inner zip/rar by release hosts). ``on_file(done, total, name)`` (async)
-    reports per-file extraction progress for the top-level zip. Raises
-    ``RuntimeError`` with an actionable message when the download isn't an
-    archive at all (an expired link / HTML interstitial) or when it extracts but
-    yields no video anywhere.
+    in an inner zip/rar by release hosts). When ``on_file(done, total, name)``
+    (async) is given, a REAL per-file extraction bar is driven off the video
+    files landing in ``dest_dir`` — uniform across zip / rar / 7z / nested, so a
+    rar or a nested-inside-a-zip release shows ``i/12`` instead of a frozen
+    ``1/1``. Raises ``RuntimeError`` with an actionable message when the download
+    isn't an archive at all (an expired link / HTML interstitial) or when it
+    extracts but yields no video anywhere.
     """
     archive = Path(archive)
     dest_dir = Path(dest_dir)
@@ -213,26 +273,56 @@ async def extract_archive(
             "a file (it likely expired or needs a fresh direct link)."
         )
 
-    # Per-file progress only for the top-level pass; nested archives are quiet.
-    await _extract_once(archive, dest_dir, on_file=(on_file if _depth == 0 else None))
-    vids = _collect_videos(dest_dir)
-    if vids:
-        return vids
-
-    # No video yet — the payload may be wrapped in nested archives. Extract each
-    # into its own subdir and re-collect (bounded depth so a zip-bomb can't loop).
-    if _depth < 2:
-        nested = _nested_archives(dest_dir)
-        for inner in nested:
-            sub = inner.parent / f"{inner.stem}__x"
-            try:
-                await extract_archive(inner, sub, _depth=_depth + 1)
-            except Exception as exc:  # noqa: BLE001 — try the rest
-                log.warning("archive.nested.failed", inner=inner.name, error=str(exc))
-        vids = _collect_videos(dest_dir)
+    # No progress hook → extract quietly and return.
+    if on_file is None:
+        vids = await _extract_tree(archive, dest_dir, _depth=_depth)
         if vids:
             return vids
+        raise RuntimeError(
+            f"no video files found inside {archive.name} after extraction "
+            f"(looked for {', '.join(VIDEO_EXT)}; also recursed into nested archives). "
+            "The archive may hold only samples/subs, use an unsupported container, or "
+            "be password-protected."
+        )
 
+    # Progress path: poll the destination for video files as they appear and
+    # report a real i/n bar, with a best-effort pre-count for the denominator.
+    expected = await _expected_video_count(archive)
+    stop = asyncio.Event()
+
+    async def _poll() -> None:
+        last = -1
+        while not stop.is_set():
+            have = len(_collect_videos(dest_dir))
+            if have != last:
+                last = have
+                try:
+                    await on_file(have, expected or max(have, 1), "")
+                except Exception:  # noqa: BLE001 — progress is cosmetic
+                    pass
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=0.4)
+            except (TimeoutError, asyncio.TimeoutError):
+                pass
+
+    poller = asyncio.ensure_future(_poll())
+    try:
+        vids = await _extract_tree(archive, dest_dir, _depth=_depth)
+    finally:
+        stop.set()
+        try:
+            await poller
+        except BaseException:  # noqa: BLE001 — poller teardown never fails extraction
+            pass
+
+    # Final authoritative tick so the bar lands on n/n.
+    try:
+        await on_file(len(vids), expected or len(vids) or 1, "")
+    except Exception:  # noqa: BLE001
+        pass
+
+    if vids:
+        return vids
     raise RuntimeError(
         f"no video files found inside {archive.name} after extraction "
         f"(looked for {', '.join(VIDEO_EXT)}; also recursed into nested archives). "
