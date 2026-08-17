@@ -54,6 +54,18 @@ _ESTIMATED_BYTES_PER_RES: dict[str, int] = {
 _DISK_BUFFER_BYTES = 1_000_000_000  # 1 GB safety margin
 
 
+# ── Ready-release sources ────────────────────────────────────────────────────
+# A "ready release" already ships every quality it has as real files on disk
+# (DDL extracts a per-tier archive; there is nothing left to fetch tier-by-tier).
+# These are processed in a SINGLE pass — download every tier, then process +
+# upload ONCE — so EncodeStage sees all tiers together and fills only genuinely
+# missing ones (net: 480/720/1080 provided → encode nothing), and the per-file
+# stage cards count every file (36 = 12 eps × 3 tiers), not one tier's worth.
+# Streaming/torrent sources keep the per-tier loop (they fetch + free disk one
+# quality at a time).
+_READY_RELEASE_SOURCES = frozenset({"ddl"})
+
+
 def _is_torrent_ref(ref: str) -> bool:
     """True when a ``source_ref`` is a nyaa/torrent descriptor (magnet, torrent
     URL/path, or info-hash) rather than a website native id. Such refs are only
@@ -306,6 +318,59 @@ class DownloadWorker:
             )
         except Exception as exc:  # noqa: BLE001 — confirm is a nicety, never fatal
             log.debug("download.naming_confirm.skipped", job_id=job_id, error=str(exc))
+
+        ready_release = getattr(source, "name", "") in _READY_RELEASE_SOURCES
+        if ready_release:
+            # ── Ready release (DDL): ONE pass, then process+upload ONCE ──
+            # The archives are already downloaded + extracted, so every quality
+            # this release ships is on disk as a sibling file per episode. Fetch
+            # ALL tiers for ALL episodes (``resolution=None`` → _download_episode
+            # copies each sibling into the work store), then run the pipeline a
+            # SINGLE time with every tier present. That is what makes EncodeStage
+            # fill only genuinely-missing tiers (480/720/1080 provided → encode
+            # NOTHING) and the per-file stage cards count every file (12 eps × 3
+            # tiers = 36), instead of the streaming per-tier loop that processed
+            # one quality at a time and up-encoded from the lone tier on disk.
+            await self._push_stage(job_id, title, "Preparing files", 0.0)
+            try:
+                failed: list[dict] = []
+                total_eps = len(episodes) or 1
+                for idx, ep in enumerate(episodes, start=1):
+                    if await self._source_abort_requested(job_id):
+                        raise _AbortSourceAttempt()
+                    if await self._cancel_requested(job_id):
+                        raise _CancelJob()
+                    await self._download_episode(
+                        job_id, req, source, chain, ep, audios, folder, cfg, failed,
+                    )  # resolution=None → every quality this episode ships
+                    await self._push_stage(
+                        job_id, title, "Preparing files", idx / total_eps * 100.0,
+                    )
+                for spec in failed:
+                    if await self._source_abort_requested(job_id):
+                        raise _AbortSourceAttempt()
+                    if await self._cancel_requested(job_id):
+                        raise _CancelJob()
+                    if not await self._retry_unit(
+                        job_id, req, source, chain, spec, folder, cfg,
+                    ):
+                        all_failed.append(spec)
+                if await self._source_abort_requested(job_id):
+                    await self._finalize_source_aborted(job_id)
+                    return
+                if await self._cancel_requested(job_id):
+                    await self._finalize_cancelled(job_id)
+                    return
+                # Single pass — every tier present, so encode gap-fills nothing.
+                await self._process_and_upload_quality(job_id, code, title)
+            except _CancelJob:
+                await self._finalize_cancelled(job_id)
+                return
+            except _AbortSourceAttempt:
+                await self._finalize_source_aborted(job_id)
+                return
+            # The per-tier loop below is a no-op for ready releases (handled above).
+            resolutions = []
 
         try:
             for resolution in resolutions:
@@ -563,7 +628,12 @@ class DownloadWorker:
             / f"S{ep.season:02d}E{ep.number:03d}_{variant.resolution}_{variant.audio.value}"
               f".{variant.container or 'mkv'}"
         )
-        on_progress = self._make_progress(job_id, req, ep, variant, cfg)
+        # Ready releases (DDL) already have the file on disk — the "download" is a
+        # fast LOCAL copy into the work store. Suppress the per-file download card
+        # so the user never sees a phantom "Downloading" pass AFTER extraction; the
+        # caller's single "Preparing files" stage covers this phase instead.
+        ready = getattr(source, "name", "") in _READY_RELEASE_SOURCES
+        on_progress = None if ready else self._make_progress(job_id, req, ep, variant, cfg)
         on_retry = self._make_retry(job_id, req, ep, variant, cfg)
         try:
             result = await self._download_watched(job_id, source, variant, dest,

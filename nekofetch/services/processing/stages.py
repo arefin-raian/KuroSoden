@@ -1471,6 +1471,27 @@ class EncodeStage(Stage):
         if not sources:
             return
 
+        # A target tier counts as "already provided" when the exact height is on
+        # disk OR an acceptable substitute for that slot shipped instead — the
+        # operator's rule: a 540p/360p file fills the 480p slot, so we must NOT
+        # also derive a 480p (that would duplicate the SD tier). Mirrors the
+        # download-side ``resolution_fallbacks`` ladder.
+        _acq = getattr(self.c.config, "acquisition", None)
+        _fallbacks_cfg = getattr(_acq, "resolution_fallbacks", None) or {}
+        _subs: dict[int, set[int]] = {}
+        for _tgt, _alts in _fallbacks_cfg.items():
+            _th = str(_tgt).rstrip("p")
+            if not _th.isdigit():
+                continue
+            _subs[int(_th)] = {
+                int(str(a).rstrip("p")) for a in _alts
+                if str(a).rstrip("p").isdigit()
+            }
+
+        def _tier_satisfied(unit_key: tuple, target_h: int) -> bool:
+            have = present.get(unit_key, set())
+            return target_h in have or any(s in have for s in _subs.get(target_h, set()))
+
         session = None
         try:
             session = _sa_inspect(sources[0]).session
@@ -1500,8 +1521,9 @@ class EncodeStage(Stage):
         total_units = sum(
             1 for f in sources for h in heights
             if f"{h}p" != (f.resolution or "1080p")
-            and h not in present.get(
-                (f.season, f.season_part, f.episode, f.audio), set()
+            and h < max_h  # NEVER up-encode: only derive tiers below the source
+            and not _tier_satisfied(
+                (f.season, f.season_part, f.episode, f.audio), h
             )
         )
         # All requested tiers already shipped (e.g. a DDL pack that provided
@@ -1536,13 +1558,16 @@ class EncodeStage(Stage):
                 label = f"{height}p"
                 if label == src_res:
                     continue  # never "downscale" to the same tier
-                # Reversal: this tier was already downloaded for this unit —
-                # skip encoding it (that's the whole point of downloading every
-                # provided quality instead of transcoding down from 1080p).
-                if height in present.get(
-                    (f.season, f.season_part, f.episode, f.audio), set()
+                if height >= max_h:
+                    continue  # NEVER up-encode a tier at/above the source height
+                # Reversal: this tier (or an acceptable substitute — 540p/360p for
+                # the 480p slot) was already provided for this unit — skip encoding
+                # it (that's the whole point of downloading every provided quality
+                # instead of transcoding down from 1080p).
+                if _tier_satisfied(
+                    (f.season, f.season_part, f.episode, f.audio), height
                 ):
-                    ctx.notes.append(f"encode {label}: already downloaded — skipped")
+                    ctx.notes.append(f"encode {label}: already provided — skipped")
                     continue
                 await _push_stage_progress(
                     self.c, ctx, f"Encoding {label}", 0.0,

@@ -172,7 +172,7 @@ async def test_encode_stage_skip_tiers_already_on_disk(tmp_path: Path):
 
     # 720p was already on disk → skipped (note in ctx.notes).
     # 480p was missing → derived (new MediaFile row added to ctx.files).
-    assert any("already downloaded" in note and "720p" in note for note in ctx.notes)
+    assert any("already provided" in note and "720p" in note for note in ctx.notes)
     new_480 = [f for f in ctx.files if f.resolution == "480p"]
     assert len(new_480) == 1
     assert new_480[0].season == 1 and new_480[0].episode == 1
@@ -294,3 +294,89 @@ async def test_source_abort_requested_reads_the_flag():
     assert await source_abort_requested(SimpleNamespace(redis=_Redis(b"1")), 5) is True
     assert await source_abort_requested(SimpleNamespace(redis=_Redis(None)), 5) is False
     assert await source_abort_requested(SimpleNamespace(redis=None), 5) is False
+
+
+def _encode_container(*, fallbacks=None):
+    """Container stub with encode config + an optional resolution-fallback ladder."""
+    cfg = SimpleNamespace(
+        processing=SimpleNamespace(
+            encode=True, encode_heights=[720, 480], encode_preset="faster",
+        ),
+        downloads=SimpleNamespace(concurrent_downloads=5),
+        acquisition=SimpleNamespace(resolution_fallbacks=fallbacks or {}),
+    )
+    return SimpleNamespace(config=cfg, redis=None, progress=None)
+
+
+def _mf(tmp_path, res, *, ep=1, season=1, size=500):
+    from nekofetch.infrastructure.database.postgres.models import MediaFile
+    p = tmp_path / f"ep{ep}_{res}.mkv"
+    p.write_bytes(b"x" * size)
+    return MediaFile(
+        job_id=1, anime_doc_id="anilist:1", season=season, episode=ep,
+        resolution=res, audio=AudioType.DUAL_AUDIO,
+        local_path=str(p), final_name=p.name, size_bytes=size,
+    )
+
+
+def _stub_encode_helpers(monkeypatch):
+    """Neutralize progress + ffmpeg so EncodeStage runs without transcoding."""
+    import nekofetch.services.processing.stages as stages_mod
+    import nekofetch.sources._hls as hls_mod
+    import nekofetch.sources._transcode as transcode_mod
+
+    async def _noop(*a, **k):
+        pass
+
+    async def _fake_encode(src, out, height, crf, **kw):
+        Path(out).write_bytes(b"x" * 50)
+
+    async def _ok_probe(probe, path):
+        return True, None
+
+    monkeypatch.setattr(stages_mod, "_push_stage_progress", AsyncMock(side_effect=_noop))
+    monkeypatch.setattr(stages_mod, "_ffprobe_ok", AsyncMock(side_effect=_ok_probe))
+    monkeypatch.setattr(transcode_mod, "_encode", AsyncMock(side_effect=_fake_encode))
+    monkeypatch.setattr(hls_mod, "find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(hls_mod, "find_ffprobe", lambda: "ffprobe")
+
+
+@pytest.mark.asyncio
+async def test_encode_never_upscales_from_a_low_source(tmp_path: Path, monkeypatch):
+    """Only 480p on disk (a DDL 480-only tier processed alone) must NOT produce a
+    720p by up-encoding — the old bug that ran an encode on the ascending 480p
+    pass. Nothing higher than the source is ever derived."""
+    from nekofetch.services.processing.base import StageContext
+    from nekofetch.services.processing.stages import EncodeStage
+
+    _stub_encode_helpers(monkeypatch)
+    stage = EncodeStage(_encode_container())
+    req = SimpleNamespace(source="ddl", code="REQ-U", anime_title="T")
+    ctx = StageContext(job_id=1, request=req, files=[_mf(tmp_path, "480p")])
+
+    await stage.process(ctx)
+
+    # No 720p (or any higher tier) was fabricated from the 480p source.
+    assert [f.resolution for f in ctx.files] == ["480p"]
+    assert any("already present" in n for n in ctx.notes)  # total_units == 0 → skipped
+
+
+@pytest.mark.asyncio
+async def test_encode_treats_540_as_the_480_slot(tmp_path: Path, monkeypatch):
+    """A release that shipped 1080 + 720 + 540 (540 filling the SD slot) must NOT
+    also derive a 480p — the operator's rule that 540/360 count as the low tier."""
+    from nekofetch.services.processing.base import StageContext
+    from nekofetch.services.processing.stages import EncodeStage
+
+    _stub_encode_helpers(monkeypatch)
+    stage = EncodeStage(_encode_container(fallbacks={"480p": ["540p", "360p"]}))
+    req = SimpleNamespace(source="ddl", code="REQ-S", anime_title="T")
+    files = [_mf(tmp_path, "1080p"), _mf(tmp_path, "720p"), _mf(tmp_path, "540p")]
+    ctx = StageContext(job_id=1, request=req, files=files)
+
+    await stage.process(ctx)
+
+    # 540p satisfied the 480 slot → no 480p rendition fabricated.
+    assert not any(f.resolution == "480p" for f in ctx.files)
+    assert {f.resolution for f in ctx.files} == {"1080p", "720p", "540p"}
+
