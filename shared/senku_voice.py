@@ -319,6 +319,34 @@ POSTEDIT_ASK_CAPTION = (
     "and save it. Reply /cancel to keep the current one."
 )
 
+
+def postedit_ask_caption(current_html: str | None) -> str:
+    """Ask-for-caption prompt that shows the CURRENT caption in RAW HTML.
+
+    Staff copy the source out of the code block, tweak it, and paste it back —
+    so the exact markup is visible, not a rendered/truncated preview. Falls back
+    to the plain prompt when the current caption couldn't be read.
+    """
+    if not current_html:
+        return POSTEDIT_ASK_CAPTION
+    shown = esc(current_html[:3500])
+    return (
+        f"{ICON} <b>Send the new caption.</b>\n\n"
+        "Here is the current caption in raw HTML — copy, edit and paste it back:\n"
+        f"<pre>{shown}</pre>\n"
+        "HTML, Markdown or Telegram-formatted text all work. Reply /cancel to keep it."
+    )
+
+
+def postedit_caption_working() -> str:
+    return f"{ICON} <b>Updating the caption…</b>"
+
+
+def postedit_caption_done(ok: bool, detail: str) -> str:
+    head = "✅ <b>Caption updated.</b>" if ok else "⚠️ <b>Couldn't update the caption.</b>"
+    return f"{head}\n\n{esc(detail)}"
+
+
 POSTEDIT_ASK_BUTTONS = (
     f"{ICON} <b>Send the buttons.</b>\n\n"
     "One per line as <code>Label | https://link</code>. Send <code>none</code> "

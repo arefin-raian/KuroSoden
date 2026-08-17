@@ -523,3 +523,80 @@ def _async(value):
     async def _coro(*a, **k):
         return value
     return _coro()
+
+
+# ── button preservation on caption edit (the grave regression) ────────────────
+
+@_aio
+async def test_caption_edit_preserves_inline_keyboard(sessionmaker, monkeypatch):
+    """A caption edit MUST hand the live keyboard back to Telegram — omitting
+    reply_markup makes editMessageCaption/Text WIPE the buttons (the reported
+    Akudama Drive bug where a caption edit deleted the quality buttons)."""
+    from types import SimpleNamespace
+
+    bot_id, chat_id = await _seed_channel(sessionmaker)
+    existing_markup = SimpleNamespace(inline_keyboard=[["1080p"], ["720p"]])
+    calls: list[dict] = []
+
+    class _Client:
+        async def get_messages(self, chat_id, mid):
+            # A photo post that already has an inline keyboard.
+            return SimpleNamespace(photo=True, reply_markup=existing_markup)
+
+        async def edit_message_caption(self, chat_id, mid, caption, **kw):
+            calls.append({"kind": "caption", "reply_markup": kw.get("reply_markup")})
+
+        async def edit_message_text(self, chat_id, mid, caption, **kw):
+            calls.append({"kind": "text", "reply_markup": kw.get("reply_markup")})
+
+    class _FakeBackup:
+        def __init__(self, _c):
+            pass
+
+        async def record_distribution_channel(self, anime_doc_id):
+            pass
+
+    monkeypatch.setattr("nekofetch.services.backup_service.BackupService", _FakeBackup)
+
+    ok, _ = await _edit_caption(
+        _Client(), _container(sessionmaker), None,
+        chat_id=chat_id, bot_id=bot_id, tg_message_id=101,
+        new_caption="<b>New</b>",
+    )
+    assert ok
+    # The photo branch fired and passed the SAME keyboard object straight back.
+    assert len(calls) == 1 and calls[0]["kind"] == "caption"
+    assert calls[0]["reply_markup"] is existing_markup
+
+
+@_aio
+async def test_caption_edit_text_post_preserves_keyboard(sessionmaker, monkeypatch):
+    """The text-post branch (no media) must also re-supply the live keyboard."""
+    from types import SimpleNamespace
+
+    bot_id, chat_id = await _seed_channel(sessionmaker)
+    kb = SimpleNamespace(inline_keyboard=[["watch"]])
+    seen: list = []
+
+    class _Client:
+        async def get_messages(self, chat_id, mid):
+            return SimpleNamespace(photo=False, reply_markup=kb)
+
+        async def edit_message_text(self, chat_id, mid, caption, **kw):
+            seen.append(kw.get("reply_markup"))
+
+    class _FakeBackup:
+        def __init__(self, _c):
+            pass
+
+        async def record_distribution_channel(self, anime_doc_id):
+            pass
+
+    monkeypatch.setattr("nekofetch.services.backup_service.BackupService", _FakeBackup)
+
+    ok, _ = await _edit_caption(
+        _Client(), _container(sessionmaker), None,
+        chat_id=chat_id, bot_id=bot_id, tg_message_id=103,
+        new_caption="new text",
+    )
+    assert ok and seen == [kb]
