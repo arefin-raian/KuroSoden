@@ -67,6 +67,18 @@ def is_meaningful_track_name(name: str | None) -> bool:
     return t.lower() not in _GENERIC_AUDIO_NAMES
 
 
+def is_moviesmod_title(name: str | None) -> bool:
+    """True when a track TITLE is a MoviesMod release-site watermark.
+
+    DDL packs from MoviesMod stamp the release site into audio/subtitle track
+    titles (e.g. ``"MoviesMod.org"`` or ``"Hindi - MoviesMod"``). That carries no
+    legitimate stream meaning, so a DDL caller treats such a title as unusable and
+    falls back to the (detected/tagged) language instead. Compared case-
+    insensitively. Torrent callers don't apply this (see ``strip_domain``).
+    """
+    return "moviesmod" in (name or "").lower()
+
+
 def brand_audio_title(name: str | None, ordinal: int,
                       *, fallback_lang: str | None = None) -> str:
     """Audio track label: ``"Name『 @AniXWeebs 』"``.

@@ -811,6 +811,12 @@ def _lang_display(lang: str) -> str:
 _TORRENT_SOURCES = frozenset({"nyaa", "ddl"})
 
 
+# Sources that need release-site (MoviesMod) cruft stripped from subtitle content
+# and track titles. DDL packs carry it; torrents (fansub releases) never do, so
+# this is DDL-only — a torrent's fansub cues and titles are preserved verbatim.
+_DOMAIN_STRIP_SOURCES = frozenset({"ddl"})
+
+
 # Corner position expressions, parameterised by per-edge margin (px). ``m`` is
 # the configured ``watermark.margin``.
 def _corner_overlay(corner: str, m: int) -> str:
@@ -880,12 +886,14 @@ class BrandingStage(Stage):
             brand_container_title,
             brand_subtitle_title,
             is_meaningful_track_name,
+            is_moviesmod_title,
         )
         from nekofetch.sources._hls import find_ffprobe
 
         if not self.c.config.branding.enabled:
             return
         is_torrent = (ctx.request.source or "").lower() in _TORRENT_SOURCES
+        strip_domain = (ctx.request.source or "").lower() in _DOMAIN_STRIP_SOURCES
         ffprobe = find_ffprobe()
         anime_title = (ctx.request.anime_title or "").strip()
         branded_title = brand_container_title(anime_title) if anime_title else ""
@@ -904,7 +912,7 @@ class BrandingStage(Stage):
             #    keep original-title track names via a single remux. ──
             if is_torrent and ffprobe:
                 did = await self._brand_torrent_file(
-                    ctx, path, branded_title, brand_subtitle_title,
+                    ctx, path, branded_title, brand_subtitle_title, strip_domain,
                 )
                 if did:
                     pct = ((i + 1) / n) * 100
@@ -923,23 +931,29 @@ class BrandingStage(Stage):
             if branded_title:
                 tags += ["--edit", "info", "--set", f"title={branded_title}"]
             # Audio: keep a MEANINGFUL source title (torrent rule), else the
-            # language, else "Audio Track 〢N". Fall back to one track when the
-            # probe found none (so a container ffprobe can't read still gets a name).
+            # language, else "Audio Track 〢N". On DDL a MoviesMod site title is
+            # dropped so it falls back to the language. Fall back to one track when
+            # the probe found none (so a container ffprobe can't read still gets a name).
             audio_count = len(audio) or 1
             for t in range(1, audio_count + 1):
                 tr = audio[t - 1] if t - 1 < len(audio) else {}
+                a_title = tr.get("title", "")
+                if strip_domain and is_moviesmod_title(a_title):
+                    a_title = ""
                 name = brand_audio_title(
-                    tr.get("title", ""), t,
+                    a_title, t,
                     fallback_lang=_lang_display(tr.get("lang", "")))
                 tags += ["--edit", f"track:a{t}", "--set", f"name={name}"]
             # Subtitles: only name tracks we actually detected — never invent a
             # phantom subtitle track. Keep the original title (fansub "Full Subs"),
-            # else the language, else the bare "〘 By @AniXWeebs 〙".
+            # else the language, else the bare "〘 By @AniXWeebs 〙". On DDL a
+            # MoviesMod site title is dropped so it falls back to the language.
             for t in range(1, len(subs) + 1):
                 tr = subs[t - 1]
-                sub_name = tr.get("title", "") \
-                    if is_meaningful_track_name(tr.get("title", "")) \
-                    else _lang_display(tr.get("lang", ""))
+                s_title = tr.get("title", "")
+                usable = is_meaningful_track_name(s_title) and not (
+                    strip_domain and is_moviesmod_title(s_title))
+                sub_name = s_title if usable else _lang_display(tr.get("lang", ""))
                 name = brand_subtitle_title(sub_name, t)
                 tags += ["--edit", f"track:s{t}", "--set", f"name={name}"]
 
@@ -956,6 +970,7 @@ class BrandingStage(Stage):
 
     async def _brand_torrent_file(
         self, ctx: StageContext, path: Path, branded_title: str, brand_subtitle_title,
+        strip_domain: bool = False,
     ) -> bool:
         """Torrent subtitle branding for one file: inject the Telegram cue into
         subtitle content + keep original-title track names, via one remux.
@@ -964,6 +979,9 @@ class BrandingStage(Stage):
         to do or the remux couldn't run (caller falls back to metadata-only).
         Audio-track names + container title are applied afterwards via mkvpropedit
         (fast, no second remux) so this method owns ONLY the subtitle work.
+
+        ``strip_domain`` (DDL only) removes MoviesMod release-site cruft from the
+        subtitle content + track titles inside the remux.
         """
         from nekofetch.sources._branding import brand_audio_title
         from nekofetch.sources._hls import find_ffprobe
@@ -989,6 +1007,7 @@ class BrandingStage(Stage):
                 lang_display=_lang_display,
                 normalize_dialogue=getattr(
                     self.c.config.processing, "subtitle_dialogue_normalize", True),
+                strip_domain=strip_domain,
             )
         except Exception as exc:  # noqa: BLE001 — remux failure is recoverable
             ctx.notes.append(f"branding(torrent): remux error {exc}")
