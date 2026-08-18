@@ -96,6 +96,12 @@ async def handoff_download_to_distribution(
             await _notify_auto_distribution_done(
                 container, code, title, levi_admin, fd,
             )
+        else:
+            # Redo published in place → retire the ORIGINAL request row(s) this
+            # redo replaced (``franchise_data["redo_of"]``) so a doc no longer
+            # accumulates parallel "published" Requests (the ORB/Bisco double
+            # entry) that linger in /tasks or confuse restore/redo bookkeeping.
+            await _supersede_redo_originals(container, code, fd)
         await _advance_to_next_task(container, levi_admin, code)
         return
 
@@ -122,6 +128,52 @@ async def handoff_download_to_distribution(
 
     # Auto-advance the downloader to their next task (all jobs, not just redo).
     await _advance_to_next_task(container, levi_admin, code)
+
+
+async def _supersede_redo_originals(
+    container: Container, new_code: str, fd: dict,
+) -> None:
+    """Retire the original published Request row(s) a redo replaced.
+
+    A redo mints a FRESH request code (so it shows on Levi's board like any
+    work); ``franchise_data["redo_of"]`` records the original published code(s)
+    for the same doc. Once the redo republishes in place, mark those originals
+    terminal (``REJECTED`` — no schema change; already treated as closed by
+    work_service) with a ``superseded_by`` marker, so a doc stops accumulating
+    parallel "published" Requests. Never touches the NEW code, and only rows
+    still marked ``published`` (an in-flight request for the same doc is left
+    alone). Best-effort: a bookkeeping failure never affects the live channel.
+
+    NOTE: redo's "already published?" detection reads the DistributionBot channel
+    + ChannelLayout cards (anime_doc_id-keyed), NOT Request.status — so retiring
+    the old Request row does not affect future redo detection."""
+    originals = [c for c in (fd.get("redo_of") or []) if c and c != new_code]
+    if not originals:
+        return
+    try:
+        from sqlalchemy import select
+
+        from nekofetch.domain.enums import RequestStatus
+        from nekofetch.infrastructure.database.postgres.models import Request
+        from nekofetch.infrastructure.database.postgres.session import session_scope
+
+        async with session_scope(container.pg_sessionmaker) as session:
+            rows = (await session.execute(
+                select(Request).where(
+                    Request.code.in_(originals),
+                    Request.status == RequestStatus.PUBLISHED,
+                )
+            )).scalars().all()
+            for row in rows:
+                row.status = RequestStatus.REJECTED
+                row.franchise_data = {**(row.franchise_data or {}),
+                                      "superseded_by": new_code}
+        if rows:
+            log.info("handoff.redo.superseded_originals", new_code=new_code,
+                     originals=[r.code for r in rows])
+    except Exception as exc:  # noqa: BLE001 — bookkeeping only
+        log.warning("handoff.redo.supersede_failed", new_code=new_code,
+                    error=str(exc))
 
 
 async def _advance_to_next_task(

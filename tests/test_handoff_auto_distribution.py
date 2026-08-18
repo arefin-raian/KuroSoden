@@ -170,6 +170,89 @@ async def test_redo_relink_skips_senku_and_auto_publishes(
     assert all("Redo complete" not in (m[1] or "") for m in levi.sent)
 
 
+async def test_redo_supersedes_the_original_published_request(
+    session, sessionmaker, monkeypatch,
+):
+    """A redo mints a fresh code but records the original in
+    franchise_data['redo_of']; once it republishes, the ORIGINAL published
+    Request is retired (REJECTED + superseded_by) so a doc stops accumulating
+    parallel 'published' rows (the ORB/Bisco double-entry)."""
+    from nekofetch.domain.enums import RequestStatus
+    from nekofetch.infrastructure.database.postgres.models import Request
+    from nekofetch.services.publishing_service import PublishingService
+    from kurosoden.shared.handoff import handoff_download_to_distribution
+    from tests.helpers import _create_request
+
+    doc = "anilist:55501"
+    # The ORIGINAL published request for this doc.
+    old = await _create_request(session, code="REQ-OLD", anime_doc_id=doc,
+                                status="published")
+    await session.commit()
+    # The redo work: fresh code, tagged redo_of the original.
+    code = "REQ-NEW"
+    await _seed_handoff(session, sessionmaker, code=code, doc=doc,
+                        fd={"redo": True, "redo_relink": True,
+                            "redo_of": ["REQ-OLD"]})
+    _calls, fake = await _publish_completes_gojo(sessionmaker)
+    monkeypatch.setattr(PublishingService, "publish", fake)
+
+    await handoff_download_to_distribution(
+        _container(sessionmaker, pipeline_manager=SimpleNamespace(levi=_FakeLevi())),
+        code, "Handoff Anime",
+    )
+
+    async with sessionmaker() as s:
+        old_row = (await s.execute(select(Request).where(
+            Request.code == "REQ-OLD"))).scalar_one()
+        # Original retired + breadcrumbed to the redo.
+        assert old_row.status == RequestStatus.REJECTED
+        assert (old_row.franchise_data or {}).get("superseded_by") == code
+        # The redo row itself was NOT retired (it's the survivor; the real
+        # PublishingService flips it to published — the fake here doesn't).
+        new_row = (await s.execute(select(Request).where(
+            Request.code == code))).scalar_one()
+        assert new_row.status != RequestStatus.REJECTED
+        # No OTHER published row lingers for the doc besides (eventually) the redo.
+        pub = (await s.execute(select(Request).where(
+            Request.anime_doc_id == doc,
+            Request.status == RequestStatus.PUBLISHED))).scalars().all()
+        assert pub == []  # old retired; redo not yet flipped by the fake publish
+
+
+async def test_redo_supersede_ignores_unrelated_or_unlisted_requests(
+    session, sessionmaker, monkeypatch,
+):
+    """Supersede only retires the codes listed in redo_of — a different published
+    request for the same doc (not the one this redo replaced) is left alone."""
+    from nekofetch.domain.enums import RequestStatus
+    from nekofetch.infrastructure.database.postgres.models import Request
+    from nekofetch.services.publishing_service import PublishingService
+    from kurosoden.shared.handoff import handoff_download_to_distribution
+    from tests.helpers import _create_request
+
+    doc = "anilist:55502"
+    other = await _create_request(session, code="REQ-OTHER", anime_doc_id=doc,
+                                  status="published")
+    await session.commit()
+    code = "REQ-NEW2"
+    # redo_of points at a DIFFERENT original (not REQ-OTHER).
+    await _seed_handoff(session, sessionmaker, code=code, doc=doc,
+                        fd={"redo": True, "redo_relink": True,
+                            "redo_of": ["REQ-GONE"]})
+    _calls, fake = await _publish_completes_gojo(sessionmaker)
+    monkeypatch.setattr(PublishingService, "publish", fake)
+
+    await handoff_download_to_distribution(
+        _container(sessionmaker, pipeline_manager=SimpleNamespace(levi=_FakeLevi())),
+        code, "Handoff Anime",
+    )
+
+    async with sessionmaker() as s:
+        row = (await s.execute(select(Request).where(
+            Request.code == "REQ-OTHER"))).scalar_one()
+        assert row.status == RequestStatus.PUBLISHED  # untouched
+
+
 async def test_redo_relink_already_relinked_skips_republish(
     session, sessionmaker, monkeypatch,
 ):

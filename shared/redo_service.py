@@ -292,6 +292,7 @@ class RedoService:
             from nekofetch.domain.enums import DownloadScope, RequestStatus
             from nekofetch.infrastructure.database.postgres.models import Request
             from nekofetch.infrastructure.database.postgres.session import session_scope
+            from sqlalchemy import select
             from nekofetch.infrastructure.repositories.request_repo import (
                 RequestRepository,
             )
@@ -317,6 +318,19 @@ class RedoService:
                 owner_user = await UserRepository(session).get_or_create(
                     owner_id, username=None, first_name=None)
                 await session.flush()
+                # Link this redo to the ORIGINAL published request(s) for the same
+                # doc, so the pair is traceable and the old row can be superseded
+                # on completion (a redo mints a fresh code for the board; without
+                # this the two Requests look unrelated — the ORB/Bisco double-entry).
+                if franchise_data.get("redo_relink"):
+                    prior = (await session.execute(
+                        select(Request.code).where(
+                            Request.anime_doc_id == anime_doc_id,
+                            Request.status == RequestStatus.PUBLISHED,
+                        )
+                    )).scalars().all()
+                    if prior:
+                        franchise_data = {**franchise_data, "redo_of": list(prior)}
                 seq = await repo.next_sequence()
                 code = f"{REQUEST_PREFIX}-{seq}"
                 req = Request(
