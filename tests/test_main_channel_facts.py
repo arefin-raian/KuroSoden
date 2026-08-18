@@ -29,6 +29,31 @@ def test_collapse_flattens_hard_line_breaks():
     assert _collapse(raw) == "First line. Second line. Third paragraph."
 
 
+# ── _language_summary: Oxford-style separator ──
+
+def test_language_summary_oxford_join():
+    from types import SimpleNamespace
+
+    from nekofetch.domain.enums import AudioType
+    from nekofetch.services.main_channel_service import _language_summary
+
+    def _p(a):
+        return SimpleNamespace(audio=a)
+
+    # Multi (3 langs) → comma-separated with '&' before the last, in reading order.
+    assert _language_summary([_p(AudioType.MULTI)]) == "English, Japanese & Hindi"
+    # Two languages → just '&'.
+    assert _language_summary([_p(AudioType.DUAL_AUDIO)]) == "English & Japanese"
+    assert _language_summary([_p(AudioType.SUBBED), _p(AudioType.DUBBED)]) == "English & Japanese"
+    # One language → bare.
+    assert _language_summary([_p(AudioType.SUBBED)]) == "Japanese"
+    # None → em dash.
+    assert _language_summary([]) == "—"
+    # The old 3-way '&' join must NOT be produced.
+    assert "English & Japanese & Hindi" != _language_summary([_p(AudioType.MULTI)])
+
+
+
 def test_collapse_strips_anilist_br_tags():
     raw = "One.<br>Two.<br/>Three.<br />Four."
     assert _collapse(raw) == "One. Two. Three. Four."

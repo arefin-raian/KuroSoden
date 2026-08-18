@@ -132,7 +132,13 @@ _AUDIO_LANG = {
 
 
 def _language_summary(packs) -> str:
-    """Union audio languages across every stored entry/pack."""
+    """Union audio languages across every stored entry/pack.
+
+    Joined in reading order (English, Japanese, Hindi, then the rest) with an
+    Oxford-style separator: two languages read "English & Japanese"; three or
+    more read "English, Japanese & Hindi" (comma-separated, ``&`` before the
+    last) — NOT "English & Japanese & Hindi". Mirrors ``bot_naming.language_label``.
+    """
     found: set[str] = set()
     for pack in packs or []:
         found.update(_AUDIO_LANG.get(pack.audio, []))
@@ -141,7 +147,9 @@ def _language_summary(packs) -> str:
     preferred = ["English", "Japanese", "Hindi"]
     ordered = [name for name in preferred if name in found]
     ordered.extend(sorted(found.difference(preferred)))
-    return " & ".join(ordered)
+    if len(ordered) == 1:
+        return ordered[0]
+    return " & ".join([", ".join(ordered[:-1]), ordered[-1]])
 
 
 @dataclass(slots=True)
