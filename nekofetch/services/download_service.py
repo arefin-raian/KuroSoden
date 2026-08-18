@@ -2070,6 +2070,24 @@ class DownloadWorker:
                 job.status = JobStatus.COMPLETED
                 job.progress = 100.0
                 job.finished_at = _now()
+                # Assert the request is READY (packs are uploaded → awaiting
+                # distribution). Processing sets READY too, but a later per-tier
+                # _record_file resets it to PROCESSING, and if the download→senku
+                # handoff then defers, the request strands at PROCESSING where the
+                # assignment-recovery job (READY-only) can never rescue it — the
+                # SK8 / God-of-High-School "no senku task ever arrived" bug. Only
+                # for a NORMAL work: a redo/update SKIPS senku + auto-publishes, so
+                # flipping it READY could let recovery inject a bogus senku task in
+                # the gap before publish. Never downgrade a terminal status.
+                if job.request_id is not None:
+                    req = await RequestRepository(session).get(job.request_id)
+                    fd = (req.franchise_data or {}) if req is not None else {}
+                    is_redo_or_update = bool(
+                        fd.get("redo_relink") or fd.get("update_entry"))
+                    if (req is not None
+                            and not is_redo_or_update
+                            and req.status == RequestStatus.PROCESSING):
+                        req.status = RequestStatus.READY
         if self._c.progress:
             try:
                 await self._c.progress.delete(job_id)

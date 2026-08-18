@@ -34,6 +34,13 @@ import sys
 import types
 from pathlib import Path
 
+# Anime titles / decision reasons can be non-ASCII (Japanese, etc.); force a
+# UTF-8 stdout with replacement so printing them never dies on a cp1252 console.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # noqa: BLE001 — older Python / non-reconfigurable stream
+    pass
+
 # ── ``kurosoden`` namespace bootstrap (mirrors requeue_senku.py) ─────────────
 _HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_HERE))
@@ -65,7 +72,7 @@ async def _dump(container) -> None:
     async with session_scope(container.pg_sessionmaker) as session:
         # 1. Every admin's availability + whether senku is enabled for them.
         avails = (await session.execute(select(AdminAvailability))).scalars().all()
-        print("── Admins (availability) ──")
+        print("== Admins (availability) ==")
         for a in avails:
             bots = a.assigned_bots or []
             print(f"  id={a.admin_telegram_id} name={a.admin_name!r} "
@@ -82,12 +89,12 @@ async def _dump(container) -> None:
                 AdminAssignment.created_at >= since,
             ).order_by(AdminAssignment.created_at.desc())
         )).scalars().all()
-        print(f"\n── Recent senku assignments (last 2 days: {len(rows)}) ──")
+        print(f"\n== Recent senku assignments (last 2 days: {len(rows)}) ==")
         blockers = []
         for r in rows:
             flag = ""
             if r.status in ("skipped", "rejected"):
-                flag = "  ⚠ BLOCKS new senku assigns (until local-day rollover)"
+                flag = "  <-- BLOCKS new senku assigns (until local-day rollover)"
                 blockers.append(r)
             print(f"  {r.request_code:14} admin={r.admin_telegram_id} "
                   f"status={r.status} mode={r.assignment_mode} "
@@ -98,7 +105,7 @@ async def _dump(container) -> None:
         ready = (await session.execute(
             select(Request).where(Request.status == RequestStatus.READY)
         )).scalars().all()
-        print(f"\n── READY requests missing a senku assignment ──")
+        print(f"\n== READY requests missing a senku assignment ==")
         stuck = []
         for req in ready:
             has = (await session.execute(
@@ -112,7 +119,7 @@ async def _dump(container) -> None:
             if has is None:
                 stuck.append(req)
                 print(f"  {req.code:14} {req.anime_title!r} status={req.status.value}"
-                      f"  ← STUCK (no senku task)")
+                      f"  <-- STUCK (no senku task)")
         if not stuck:
             print("  (none — every READY request has a senku task)")
 
