@@ -653,14 +653,29 @@ class MainChannelService:
             message_id = post.main_message_id
 
         caption = backup_caption
+        markup = None
         try:
             if hasattr(client, "get_messages"):
                 live = await client.get_messages(chat_id, message_id)
-                caption = getattr(live, "caption", None) or getattr(live, "text", None) or caption
+                # Use the HTML rendering (entities → tags) so re-applying the
+                # caption doesn't strip the styling; keep the live keyboard so the
+                # media swap doesn't drop the Index/Download buttons.
+                src = getattr(live, "caption", None)
+                if src is None:
+                    src = getattr(live, "text", None)
+                caption = getattr(src, "html", None) or (str(src) if src else None) or caption
+                markup = getattr(live, "reply_markup", None)
             if not caption:
                 log.warning("mainchannel.thumbnail_refresh.no_caption",
                             anime=anime_doc_id)
                 return False
+            # If the live message had no keyboard to read (id-only client), rebuild
+            # from facts so we never post the main card button-less.
+            if markup is None:
+                try:
+                    markup = await self._buttons(await self.gather_facts(anime_doc_id))
+                except Exception:  # noqa: BLE001 — buttons are best-effort
+                    markup = None
             # The webp card is the sticker format to Telegram's media endpoint,
             # so the live edit sends a JPEG conversion of the same render.
             photo = (await webp_to_jpeg_async(image_path)) or Path(image_path)
@@ -669,6 +684,7 @@ class MainChannelService:
                 message_id,
                 InputMediaPhoto(str(photo), caption=caption,
                                 parse_mode=ParseMode.HTML),
+                reply_markup=markup,
             )
         except Exception as exc:  # noqa: BLE001 - editor reports a safe failure
             log.warning("mainchannel.thumbnail_refresh.failed",
@@ -708,8 +724,14 @@ class MainChannelService:
         try:
             facts = await self.gather_facts(anime_doc_id)
             caption = self._caption(facts)
+            # CRITICAL: editMessageCaption DROPS the inline keyboard unless it is
+            # re-supplied. The main post carries Index + Download buttons — rebuild
+            # them from the same facts publish() uses and hand them back, or a
+            # caption refresh silently strips them.
+            markup = await self._buttons(facts)
             await client.edit_message_caption(
                 chat_id, message_id, caption=caption, parse_mode=ParseMode.HTML,
+                reply_markup=markup,
             )
         except Exception as exc:  # noqa: BLE001 - redo must survive a caption hiccup
             log.warning("mainchannel.caption_refresh.failed",

@@ -227,15 +227,22 @@ def register(client: Client, container: Container) -> None:
                     live = None
                     if hasattr(client_obj, "get_messages"):
                         live = await client_obj.get_messages(int(channel_id), int(message_id))
+                    # HTML rendering so styling survives the media swap; keep the
+                    # live keyboard so buttons aren't stripped.
+                    _src = getattr(live, "caption", None)
+                    if _src is None:
+                        _src = getattr(live, "text", None)
                     existing_caption = (
-                        getattr(live, "caption", None)
-                        or getattr(live, "text", None)
+                        getattr(_src, "html", None)
+                        or (str(_src) if _src else None)
                         or staging_caption
                     )
+                    _markup = getattr(live, "reply_markup", None)
                     await client_obj.edit_message_media(
                         int(channel_id), int(message_id),
                         InputMediaPhoto(str(image_path), caption=existing_caption,
                                         parse_mode=ParseMode.HTML),
+                        reply_markup=_markup,
                     )
                     staging_edited = True
                 except Exception as exc:  # noqa: BLE001 - live surfaces remain authoritative

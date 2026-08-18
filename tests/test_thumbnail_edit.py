@@ -28,8 +28,8 @@ class FakeClient:
     async def get_messages(self, chat_id, message_id):
         return self.messages.get((chat_id, message_id))
 
-    async def edit_message_media(self, chat_id, message_id, media):
-        self.media_edits.append((chat_id, message_id, media))
+    async def edit_message_media(self, chat_id, message_id, media, reply_markup=None):
+        self.media_edits.append((chat_id, message_id, media, reply_markup))
 
 
 def _container(sessionmaker, client):
@@ -91,6 +91,36 @@ async def test_main_thumbnail_refresh_preserves_caption_and_updates_backup(
         )).scalars().one()
         assert backup.image_catbox_url == "https://catbox.example/new.webp"
         assert backup.image_source_url == "https://old.example/image.webp"
+
+
+@pytest.mark.asyncio
+async def test_main_thumbnail_refresh_preserves_buttons(
+    sessionmaker, monkeypatch, tmp_path: Path,
+):
+    """Replacing the main-post image must KEEP its Index/Download buttons —
+    editMessageMedia drops the keyboard unless re-supplied (the bug that stripped
+    buttons off 4 live posts). The live markup must be handed back to the edit."""
+    kb = SimpleNamespace(inline_keyboard=[["Index", "Download"]])
+    client = FakeClient()
+    client.messages[(-1001, 88)] = SimpleNamespace(
+        caption="<b>Cap</b>", reply_markup=kb)
+    image = tmp_path / "n.webp"
+    image.write_bytes(b"img")
+    async with sessionmaker() as session:
+        session.add(ChannelPost(
+            anime_doc_id="anime-kb", main_channel_id=-1001, main_message_id=88))
+        await session.commit()
+
+    async def mirror_bytes(*a, **k):
+        return SimpleNamespace(catbox_url="https://c/x.webp",
+                               telegraph_url=None, imgbb_url=None)
+    monkeypatch.setattr(image_backup, "backup_bytes", mirror_bytes)
+
+    svc = MainChannelService(_container(sessionmaker, client))
+    assert await svc.refresh_thumbnail("anime-kb", str(image)) is True
+    # The media edit carried the SAME live keyboard (index 3 = reply_markup).
+    assert client.media_edits[0][3] is kb
+
 
 
 @pytest.mark.asyncio

@@ -127,12 +127,27 @@ async def _affected_docs(container) -> list[tuple[str, str]]:
         cap = getattr(backups.get(p.anime_doc_id), "caption", None) or ""
         m = _BAD_JOIN.search(cap)
         if m:
-            out.append((p.anime_doc_id, m.group(0)))
+            out.append((p.anime_doc_id, f"old: {m.group(0)!r}"))
     return out
 
 
+async def _all_main_docs(container) -> list[tuple[str, str]]:
+    """Every live main-channel post — for a full re-render (fixes the caption AND
+    rebuilds the Index/Download buttons, e.g. after an edit stripped them)."""
+    from sqlalchemy import select
+
+    from nekofetch.infrastructure.database.postgres.models import ChannelPost
+    from nekofetch.infrastructure.database.postgres.session import session_scope
+
+    async with session_scope(container.pg_sessionmaker) as session:
+        posts = (await session.execute(
+            select(ChannelPost).where(ChannelPost.main_message_id.is_not(None))
+        )).scalars().all()
+    return [(p.anime_doc_id, "(re-render: caption + buttons)") for p in posts]
+
+
 async def main(code: str | None, doc: str | None, assume_yes: bool,
-               dry_run: bool) -> None:
+               dry_run: bool, all_published: bool = False) -> None:
     from nekofetch.core.config import get_env
 
     env = get_env()
@@ -154,14 +169,18 @@ async def main(code: str | None, doc: str | None, assume_yes: bool,
                       f"{code or doc!r} — aborting.")
                 return
             targets = [(one, "(explicit)")]
+        elif all_published:
+            # Every live main post — used to REBUILD buttons after a caption edit
+            # already stripped them (so the 3-way-'&' detector no longer matches).
+            targets = await _all_main_docs(container)
         else:
             targets = await _affected_docs(container)
 
         print(f"main posts to fix: {len(targets)}")
         for d, sample in targets:
-            print(f"  doc={d}   old: {sample!r}")
+            print(f"  doc={d}   {sample}")
         if not targets:
-            print("nothing to fix — no main caption has the 3-way ' & ' join.")
+            print("nothing to fix.")
             return
         if dry_run:
             print("\ndry run — no edits. Re-run with --yes to repair.")
@@ -207,11 +226,16 @@ async def main(code: str | None, doc: str | None, assume_yes: bool,
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Re-edit main-channel captions with the wrong language separator.")
+        description="Re-render main-channel posts (fix language separator + "
+                    "rebuild Index/Download buttons).")
     ap.add_argument("--code", help="target one request code (e.g. REQ-1088)")
     ap.add_argument("--doc", help="target one anime_doc_id (e.g. 116006)")
+    ap.add_argument("--all-published", action="store_true",
+                    help="re-render EVERY live main post (restores buttons an "
+                         "earlier caption edit stripped)")
     ap.add_argument("--yes", action="store_true", help="skip the confirm prompt")
     ap.add_argument("--dry-run", action="store_true",
-                    help="list affected main posts, edit nothing")
+                    help="list the posts that would be re-rendered, edit nothing")
     args = ap.parse_args()
-    asyncio.run(main(args.code, args.doc, args.yes, args.dry_run))
+    asyncio.run(main(args.code, args.doc, args.yes, args.dry_run,
+                     args.all_published))

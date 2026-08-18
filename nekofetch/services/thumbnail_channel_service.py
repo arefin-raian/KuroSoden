@@ -318,10 +318,17 @@ class ThumbnailChannelService:
         if client is None:
             return False
         caption = fallback_caption
+        markup = None
         try:
             if hasattr(client, "get_messages"):
                 live = await client.get_messages(chat_id, message_id)
-                caption = getattr(live, "caption", None) or getattr(live, "text", None) or caption
+                # HTML rendering so styling survives; keep the live keyboard so the
+                # image swap doesn't strip the season card's quality buttons.
+                src = getattr(live, "caption", None)
+                if src is None:
+                    src = getattr(live, "text", None)
+                caption = getattr(src, "html", None) or (str(src) if src else None) or caption
+                markup = getattr(live, "reply_markup", None)
             if not caption:
                 log.warning("thumbcc.published_refresh.no_caption",
                             anime=anime_doc_id, anilist_id=anilist_id)
@@ -333,6 +340,7 @@ class ThumbnailChannelService:
                 chat_id, message_id,
                 InputMediaPhoto(str(photo), caption=caption,
                                 parse_mode=ParseMode.HTML),
+                reply_markup=markup,
             )
         except Exception as exc:  # noqa: BLE001 - one live surface must not abort the edit
             log.warning("thumbcc.published_refresh.failed", anime=anime_doc_id,
@@ -510,8 +518,19 @@ class ThumbnailChannelService:
         if client is None:
             return False
         try:
+            # editMessageCaption drops the inline keyboard unless re-supplied;
+            # read the live season/movie card's markup and hand it back so the
+            # quality buttons survive a caption refresh.
+            markup = None
+            if hasattr(client, "get_messages"):
+                try:
+                    live = await client.get_messages(chat_id, message_id)
+                    markup = getattr(live, "reply_markup", None)
+                except Exception:  # noqa: BLE001 — best-effort; None keeps old behaviour
+                    markup = None
             await client.edit_message_caption(
                 chat_id, message_id, caption=caption, parse_mode=ParseMode.HTML,
+                reply_markup=markup,
             )
         except Exception as exc:  # noqa: BLE001 - redo survives a failed caption edit
             log.warning("thumbcc.caption_refresh.failed",
