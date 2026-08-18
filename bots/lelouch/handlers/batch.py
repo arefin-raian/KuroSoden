@@ -336,6 +336,38 @@ def register(client: Client, container: Container) -> None:
         fr["_query"] = query
         return fr
 
+    async def _franchise_candidates(title: str) -> list[dict]:
+        """The franchises a title could mean — using the SAME logic as Lelouch's
+        single-request flow (``container.series_resolver.resolve``), so batch and
+        request agree on what's one franchise vs. genuinely-distinct adaptations.
+
+        SeriesResolver starts from the single best AniList hit and only splits into
+        multiple entries for real alternate adaptations (a full TV remake, a
+        substantial ≥2-ep OVA) — a special/recap/OVA of the SAME show collapses
+        into ONE franchise (its extras are folded into the counts by
+        ``apply_franchise_totals`` at hydrate). This is what stops "Vivy" from
+        listing its special episode as a second franchise (the old
+        ``resolve_franchise_candidates`` grouped the raw search page by title
+        words, so siblings showed up separately). Returns the light
+        ``{title, anilist_id, format}`` dicts the picker + ``_hydrate`` consume.
+
+        Falls back to ``resolve_franchise_candidates`` only when the resolver finds
+        nothing (a title AniList can't page but @acutebot/TMDB can)."""
+        try:
+            resolution = await container.series_resolver.resolve(title)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("lelouch.batch.series_resolve_failed",
+                        title=title, error=str(exc)[:200])
+            resolution = None
+        if resolution is not None and resolution.entries:
+            return [
+                {"title": e.title, "anilist_id": str(e.anilist_id) if e.anilist_id else None,
+                 "format": e.format}
+                for e in resolution.entries
+            ]
+        # AniList couldn't resolve it → the acutebot/TMDB-aware candidate path.
+        return await resolve_franchise_candidates(container, title)
+
     async def _resolve(src: Message, titles: list[str], *, prompt=None) -> None:
         """Resolve each title to its franchise(s):
 
@@ -356,7 +388,7 @@ def register(client: Client, container: Container) -> None:
             skipped: list[str] = []
             for title in titles:
                 try:
-                    cands = await resolve_franchise_candidates(container, title)
+                    cands = await _franchise_candidates(title)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("lelouch.batch.candidates_failed",
                                 title=title, error=str(exc)[:200])

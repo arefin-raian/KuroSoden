@@ -84,7 +84,79 @@ async def test_candidates_empty_page_falls_back_to_single(monkeypatch):
     assert out == [{"title": "Fallback Show", "anilist_id": "77", "format": "TV"}]
 
 
-# ── aggregated-fallback relation-type guard ───────────────────────────────────
+# ── batch now shares the request flow's SeriesResolver (Vivy special bug) ─────
+#
+# Batch's franchise picker used to call resolve_franchise_candidates, which groups
+# the raw AniList search PAGE by title words — so "Vivy" listed BOTH the TV series
+# and its "PILOT MOVIE" special as two franchises. It now uses the same
+# SeriesResolver.resolve as the single-request flow, which starts from the single
+# best hit and only splits genuinely-distinct adaptations (a special/OVA of the
+# SAME show collapses into ONE franchise). These pin that resolver behaviour.
+
+class _Rel:
+    def __init__(self, anilist_id, fmt, relation, titles, episodes=None):
+        self.anilist_id = anilist_id
+        self.format = fmt
+        self.relation = relation
+        self.titles = titles
+        self.episodes = episodes
+
+
+class _Media:
+    def __init__(self, id_, titles, fmt, relations):
+        self.id = id_
+        self.titles = titles
+        self.format = fmt
+        self.relations = relations
+
+    def all_titles(self):
+        return list(self.titles)
+
+
+class _ResolverAnilist:
+    def __init__(self, media):
+        self._media = media
+
+    async def search(self, query):
+        return self._media
+
+
+@pytest.mark.asyncio
+async def test_series_resolver_collapses_special_into_one_franchise():
+    """The Vivy case: a TV series + its single-episode SPECIAL/pilot resolve to
+    ONE franchise (the special is folded in, not a second entry)."""
+    from nekofetch.providers.metadata.series import SeriesResolver
+
+    media = _Media(
+        1, ["Vivy -Fluorite Eye's Song-"], "TV",
+        relations=[
+            _Rel(2, "SPECIAL", "SIDE_STORY",
+                 ["Vivy: Fluorite Eye's Song - PILOT MOVIE"], episodes=1),
+        ],
+    )
+    res = await SeriesResolver(_ResolverAnilist(media)).resolve("Vivy")
+    assert res.multiple is False
+    assert len(res.entries) == 1
+    assert res.entries[0].anilist_id == 1
+
+
+@pytest.mark.asyncio
+async def test_series_resolver_keeps_distinct_adaptation():
+    """A genuinely distinct full TV adaptation still splits into two entries — so
+    batch's picker still fires for real ambiguity (parity with request)."""
+    from nekofetch.providers.metadata.series import SeriesResolver
+
+    media = _Media(
+        10, ["Fullmetal Alchemist"], "TV",
+        relations=[
+            _Rel(11, "TV", "ALTERNATIVE",
+                 ["Fullmetal Alchemist: Brotherhood"], episodes=64),
+        ],
+    )
+    res = await SeriesResolver(_ResolverAnilist(media)).resolve("Fullmetal Alchemist")
+    assert res.multiple is True
+    assert {e.anilist_id for e in res.entries} == {10, 11}
+
 
 def test_aggregated_fallback_excludes_spinoffs_and_recaps():
     """The aggregated mapping (used when no walk entries are available) must drop
