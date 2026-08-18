@@ -347,6 +347,26 @@ def postedit_caption_done(ok: bool, detail: str) -> str:
     return f"{head}\n\n{esc(detail)}"
 
 
+# Generic working/done cards for the image + buttons replace flows, so all three
+# post-edit modes share the same consume → working → done → back-to-menu feel.
+_POSTEDIT_NOUNS = {
+    "image": ("Replacing the image…", "Image replaced.", "Couldn't replace the image."),
+    "buttons": ("Updating the buttons…", "Buttons updated.", "Couldn't update the buttons."),
+    "caption": ("Updating the caption…", "Caption updated.", "Couldn't update the caption."),
+}
+
+
+def postedit_working(mode: str) -> str:
+    working, _, _ = _POSTEDIT_NOUNS.get(mode, _POSTEDIT_NOUNS["caption"])
+    return f"{ICON} <b>{working}</b>"
+
+
+def postedit_done(mode: str, ok: bool, detail: str) -> str:
+    _, ok_head, fail_head = _POSTEDIT_NOUNS.get(mode, _POSTEDIT_NOUNS["caption"])
+    head = f"✅ <b>{ok_head}</b>" if ok else f"⚠️ <b>{fail_head}</b>"
+    return f"{head}\n\n{esc(detail)}"
+
+
 POSTEDIT_ASK_BUTTONS = (
     f"{ICON} <b>Send the buttons.</b>\n\n"
     "One per line as <code>Label | https://link</code>. Send <code>none</code> "

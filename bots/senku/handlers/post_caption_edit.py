@@ -372,7 +372,13 @@ async def _edit_media(
                for kind in ("photo", "video", "animation", "document")):
         return False, ("That post has no image to replace — edit its caption or "
                        "buttons instead.")
-    caption = getattr(live, "caption", None)
+    # CRITICAL: ``live.caption`` is the PLAIN text; the styling lives in
+    # caption_entities. Re-supplying the plain text with parse_mode=HTML strips
+    # all formatting (the reported "caption became regular text" bug). Use the
+    # ``.html`` accessor, which reconstructs the HTML from the entities so the
+    # bold/links/spoilers survive the media swap.
+    cap_src = getattr(live, "caption", None)
+    caption = getattr(cap_src, "html", None) or (str(cap_src) if cap_src else None)
     markup = getattr(live, "reply_markup", None)
 
     try:
@@ -604,6 +610,80 @@ def register(client: Client, container: Container) -> None:
             return
         await _consume_image_upload(message, redis, data)
 
+    async def _finish_edit_ui(
+        message: Message, redis, *, mode: str, prompt_msg_id, do_edit,
+        chat_id: int, bot_id: int | None, tg_message_id: int,
+    ) -> tuple[bool, str]:
+        """Shared post-save UX for caption / image / buttons.
+
+        Consume the operator's message (delete it), flip the prompt card in place
+        to "working", run ``do_edit()`` (an async callable → ``(ok, result)``),
+        show "done" on the SAME card, then after ~2s revert it to the choose menu
+        — never spawning a new standalone message. Re-arms the edit marker so the
+        reverted menu's buttons work again. The revert menu's preview is refreshed
+        from the LIVE post caption so it's accurate whatever was edited. Falls back
+        to a fresh card only when the prompt id was lost (older flow). Returns
+        ``do_edit``'s ``(ok, result)``.
+        """
+        prompt_ref = message_ref(client, message.chat.id, prompt_msg_id) \
+            if prompt_msg_id else None
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001 — cosmetic
+            pass
+        # Working state in place (the "rendering…" cue the owner asked for).
+        if prompt_ref is not None:
+            try:
+                await send_screen(
+                    client, message.chat.id,
+                    card(V.postedit_working(mode), bot_name=_BOT),
+                    old_msg=prompt_ref)
+            except Exception:  # noqa: BLE001
+                pass
+
+        ok, result = await do_edit()
+
+        if prompt_ref is not None:
+            try:
+                await send_screen(
+                    client, message.chat.id,
+                    card(V.postedit_done(mode, ok, result), bot_name=_BOT,
+                         buttons=_cancel_row()),
+                    old_msg=prompt_ref)
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(2)
+            await arm_reply(
+                redis, message.chat.id, _STATE_EDIT,
+                target_chat_id=chat_id, bot_id=bot_id, tg_message_id=tg_message_id)
+            # Refresh the menu preview from the live post (accurate for any mode).
+            preview = ""
+            try:
+                live = await client.get_messages(chat_id, tg_message_id)
+                src = (getattr(live, "caption", None)
+                       if getattr(live, "caption", None) is not None
+                       else getattr(live, "text", None))
+                preview = str(src) if src else ""
+            except Exception:  # noqa: BLE001 — preview is optional
+                pass
+            try:
+                await send_screen(
+                    client, message.chat.id,
+                    card(V.postedit_choose(preview), bot_name=_BOT,
+                         buttons=_choose_buttons()),
+                    old_msg=prompt_ref)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            try:
+                await send_screen(
+                    client, message.chat.id,
+                    card(V.postedit_done(mode, ok, result), bot_name=_BOT,
+                         buttons=_cancel_row()))
+            except Exception:  # noqa: BLE001
+                pass
+        return ok, result
+
     async def _consume_image_upload(message: Message, redis, data: dict) -> None:
         lock_key = f"{_LOCK_PREFIX}{message.chat.id}"
         try:
@@ -614,6 +694,7 @@ def register(client: Client, container: Container) -> None:
             await disarm_reply(redis, message.chat.id)
             await redis.delete(lock_key)
             return
+        prompt_msg_id = data.get("prompt_msg_id")
         # Read the uploaded bytes BEFORE clearing state, so a download failure
         # leaves the flow armed for a retry.
         try:
@@ -625,16 +706,16 @@ def register(client: Client, container: Container) -> None:
             return
         await disarm_reply(redis, message.chat.id)
         await redis.delete(lock_key)
-        ok, result = await _edit_media(
-            client, container, chat_id=chat_id, bot_id=bot_id,
-            tg_message_id=tg_message_id, image_bytes=image_bytes,
-        )
-        try:
-            await message.reply_text(
-                ("✅ " if ok else "⚠️ ") + result, parse_mode=ParseMode.HTML,
-            )
-        except Exception:  # noqa: BLE001 — cosmetic
-            pass
+
+        # Same consume → working → done → back-to-menu UX as caption/buttons.
+        async def _do():
+            return await _edit_media(
+                client, container, chat_id=chat_id, bot_id=bot_id,
+                tg_message_id=tg_message_id, image_bytes=image_bytes)
+
+        ok, _ = await _finish_edit_ui(
+            message, redis, mode="image", prompt_msg_id=prompt_msg_id, do_edit=_do,
+            chat_id=chat_id, bot_id=bot_id, tg_message_id=tg_message_id)
         log.info("senku.postedit.image_consumed", chat=chat_id, mid=tg_message_id,
                  admin=message.from_user.id, ok=ok)
 
@@ -703,97 +784,46 @@ def register(client: Client, container: Container) -> None:
             await redis.delete(lock_key)
             return
         prompt_msg_id = data.get("prompt_msg_id")
-        await disarm_reply(redis, message.chat.id)
-        await redis.delete(lock_key)
 
         if mode == "buttons":
+            # Validate BEFORE consuming the flow, so a malformed line just nudges
+            # and leaves the marker armed for another try (no working card).
             try:
                 button_data = _parse_button_lines(text)
             except ValueError as exc:
                 await message.reply_text(f"⚠️ {html.escape(str(exc))}")
                 return
-            ok, result = await _edit_buttons(
-                client, container, chat_id=chat_id, bot_id=bot_id,
-                tg_message_id=tg_message_id, button_data=button_data,
-            )
-            try:
-                await message.reply_text(
-                    ("✅ " if ok else "⚠️ ") + result, parse_mode=ParseMode.HTML,
-                )
-                await message.delete()
-            except Exception:  # noqa: BLE001 — cosmetic cleanup
-                pass
+            await disarm_reply(redis, message.chat.id)
+            await redis.delete(lock_key)
+
+            async def _do_buttons():
+                return await _edit_buttons(
+                    client, container, chat_id=chat_id, bot_id=bot_id,
+                    tg_message_id=tg_message_id, button_data=button_data)
+
+            ok, _ = await _finish_edit_ui(
+                message, redis, mode="buttons", prompt_msg_id=prompt_msg_id,
+                do_edit=_do_buttons, chat_id=chat_id, bot_id=bot_id,
+                tg_message_id=tg_message_id)
             log.info("senku.postedit.consumed", chat=chat_id, mid=tg_message_id,
                      mode=mode, admin=message.from_user.id, ok=ok)
             return
 
-        # ── Caption mode: toast → in-place "working" → "done" → back to menu ──
+        # ── Caption mode ──
         from kurosoden.shared.settings_ui import parse_user_markup
 
-        prompt_ref = message_ref(client, message.chat.id, prompt_msg_id) \
-            if prompt_msg_id else None
-        # 1) Consume the operator's message immediately (delete it, show a toast
-        #    like the thumbnail 'Rendering…' feedback) so the chat stays clean.
-        try:
-            await message.delete()
-        except Exception:  # noqa: BLE001 — cosmetic
-            pass
-        # 2) Flip the prompt card to a "working" state in place.
-        if prompt_ref is not None:
-            try:
-                await send_screen(
-                    client, message.chat.id,
-                    card(V.postedit_caption_working(), bot_name=_BOT),
-                    old_msg=prompt_ref,
-                )
-            except Exception:  # noqa: BLE001 — the edit itself is what matters
-                pass
-
+        await disarm_reply(redis, message.chat.id)
+        await redis.delete(lock_key)
         new_caption = parse_user_markup(message)
-        ok, result = await _edit_caption(
-            client, container, message, chat_id=chat_id, bot_id=bot_id,
-            tg_message_id=tg_message_id, new_caption=new_caption,
-        )
 
-        # 3) Show the result ON THE SAME card, then after ~2s revert it to the
-        #    caption-edit menu (never spawn a new standalone message).
-        if prompt_ref is not None:
-            try:
-                await send_screen(
-                    client, message.chat.id,
-                    card(V.postedit_caption_done(ok, result), bot_name=_BOT,
-                         buttons=_cancel_row()),
-                    old_msg=prompt_ref,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            await asyncio.sleep(2)
-            # Re-arm the edit marker so the reverted menu's buttons work again.
-            await arm_reply(
-                redis, message.chat.id, _STATE_EDIT,
-                target_chat_id=chat_id, bot_id=bot_id, tg_message_id=tg_message_id,
-            )
-            # Rebuild the choose-menu with the fresh (edited) caption preview.
-            preview = new_caption
-            try:
-                await send_screen(
-                    client, message.chat.id,
-                    card(V.postedit_choose(preview), bot_name=_BOT,
-                         buttons=_choose_buttons()),
-                    old_msg=prompt_ref,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-        else:
-            # No prompt card to update (older flow / lost id) — send a fresh card
-            # (the operator's message was already deleted, so don't reply on it).
-            try:
-                await send_screen(
-                    client, message.chat.id,
-                    card(V.postedit_caption_done(ok, result), bot_name=_BOT,
-                         buttons=_cancel_row()),
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        async def _do_caption():
+            return await _edit_caption(
+                client, container, message, chat_id=chat_id, bot_id=bot_id,
+                tg_message_id=tg_message_id, new_caption=new_caption)
+
+        ok, _ = await _finish_edit_ui(
+            message, redis, mode="caption", prompt_msg_id=prompt_msg_id,
+            do_edit=_do_caption, chat_id=chat_id, bot_id=bot_id,
+            tg_message_id=tg_message_id)
         log.info("senku.postedit.consumed", chat=chat_id, mid=tg_message_id,
                  mode=mode, admin=message.from_user.id, ok=ok)

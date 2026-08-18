@@ -463,6 +463,36 @@ async def test_edit_media_untracked_is_live_only(sessionmaker, monkeypatch):
 
 
 @_aio
+async def test_edit_media_preserves_html_caption_styling(sessionmaker, monkeypatch):
+    """Image replace must keep the caption's FORMATTING. Telegram gives the plain
+    text in ``live.caption`` and the styling in caption_entities; Pyrogram exposes
+    the reconstructed HTML on ``live.caption.html``. Re-supplying the plain text
+    would strip all formatting (the reported "caption became regular text" bug),
+    so the media edit must carry the HTML."""
+    from types import SimpleNamespace
+
+    class _Caption(str):
+        """A caption Str whose ``.html`` reconstructs the styled markup."""
+        html = "<b>Bold</b> and <i>italic</i>"
+
+    live = SimpleNamespace(
+        photo=True, caption=_Caption("Bold and italic"),
+        reply_markup=SimpleNamespace(inline_keyboard=[["1080p"]]),
+    )
+    client = _MediaClient(live)
+
+    ok, _ = await _edit_media(
+        client, _container(sessionmaker),
+        chat_id=-100999, bot_id=None, tg_message_id=7, image_bytes=b"jpegbytes",
+    )
+    assert ok
+    # The new media carries the HTML caption (tags preserved), NOT the plain text.
+    assert client.calls[0]["media"].caption == "<b>Bold</b> and <i>italic</i>"
+    # Buttons preserved too (editMessageMedia drops them unless re-supplied).
+    assert client.calls[0]["reply_markup"] is live.reply_markup
+
+
+@_aio
 async def test_edit_media_rejects_text_only_post(sessionmaker):
     """Replacing the image of a text-only post is refused before any live edit."""
     from types import SimpleNamespace
