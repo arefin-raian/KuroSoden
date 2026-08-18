@@ -101,6 +101,17 @@ if [ ! -f ".env" ]; then
     echo ""
 fi
 
+# --- prefetch metadata datasets (Kaggle + LeoRigasaki) ------
+# The metadata chain (AniList → Kaggle → LeoRigasaki → Jikan → Kitsu) reads two
+# on-disk CSV datasets that otherwise lazy-download in the BACKGROUND on first
+# use (missing until ready). Warm them into <storage>/cache up front so the chain
+# is armed the moment the bots start. Idempotent (skips when current) and
+# non-fatal — the bots start regardless; the tiers just fill in once ready.
+# The Kaggle set is ~257 MB, so the FIRST run can take a few minutes.
+echo "[Kuro Sōden] Prefetching metadata datasets (first run may take a few minutes) ..."
+"$VENV_PY" scripts/prefetch_datasets.py \
+    || echo "[Kuro Sōden] NOTE: dataset prefetch skipped — the tiers self-fill at runtime."
+
 # --- run ----------------------------------------------------
 echo "[Kuro Sōden] Starting 4-bot pipeline..."
 echo "[Kuro Sōden]   🎭 Lelouch    🡆 Request intake"

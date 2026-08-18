@@ -114,6 +114,21 @@ class AnimeDatasetClient:
         except OSError:
             return True
 
+    async def prefetch(self) -> bool:
+        """Download the CSV to disk NOW (foreground), if absent or stale.
+
+        Launcher/warm-up counterpart to :meth:`_ensure_loaded` — awaits the
+        download synchronously so the CSV is on disk before the bots start,
+        instead of the runtime path's download-and-refresh. Idempotent: a present,
+        non-stale CSV is a no-op (True). No in-memory index is built here. Returns
+        True when the CSV exists on disk afterwards."""
+        if not self._needs_refresh():
+            return True
+        blob = await self._download_latest()
+        if blob:
+            await asyncio.to_thread(self._write_cache, blob)
+        return self._csv_path.exists()
+
     async def _download_latest(self) -> bytes | None:
         """Fetch the newest dated snapshot via raw URLs (no GitHub API)."""
         if self._http is None:

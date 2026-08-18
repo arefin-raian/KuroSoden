@@ -150,6 +150,25 @@ class KaggleDatasetClient:
 
     # ── download + index ───────────────────────────────────────────────────────
 
+    async def prefetch(self) -> bool:
+        """Download the dataset to disk NOW (foreground), if absent or stale.
+
+        For the launcher/warm-up: unlike :meth:`_ensure_loaded` (which backgrounds
+        the download and returns a MISS so no user request blocks), this awaits the
+        zip download + extract synchronously so the CSV is on disk before the bots
+        start. Idempotent — a present, non-stale CSV is a no-op (returns True). The
+        in-memory index is NOT built here; the running client builds it on first
+        use. Returns True when the CSV exists on disk afterwards."""
+        if self._csv_path.exists() and not self._refresh_due():
+            return True
+        zip_bytes = await self._download_zip()
+        if not zip_bytes:
+            return self._csv_path.exists()  # keep an existing (stale) copy usable
+        if not await asyncio.to_thread(self._extract_to_cache, zip_bytes):
+            return self._csv_path.exists()
+        self._write_meta(len(zip_bytes))
+        return self._csv_path.exists()
+
     async def _remote_zip_size(self) -> int | None:
         """Read the remote zip's Content-Length WITHOUT downloading the body."""
         try:

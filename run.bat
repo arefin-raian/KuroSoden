@@ -118,6 +118,25 @@ if /I "%~1"=="--check" (
     exit /b 0
 )
 
+REM --- prefetch metadata datasets (Kaggle + LeoRigasaki) ------------------
+REM The metadata chain (AniList -^> Kaggle -^> LeoRigasaki -^> Jikan -^> Kitsu)
+REM reads two on-disk CSV datasets that otherwise lazy-download in the BACKGROUND
+REM on first use (missing until ready). Warm them into ^<storage^>\cache up front
+REM so the chain is armed at boot. Marker-gated so we don't re-probe every launch
+REM (the script itself is idempotent; the running bot self-refreshes thereafter).
+REM Non-fatal - the bots start regardless. The Kaggle set is ~257 MB, so the FIRST
+REM run can take a few minutes.
+set "DATASETS_MARKER=%VENV_DIR%\.datasets-ready"
+if not exist "%DATASETS_MARKER%" (
+    echo [Kuro Soden] Prefetching metadata datasets ^(first run may take a few minutes^) ...
+    "%VENV_PY%" scripts\prefetch_datasets.py
+    if not errorlevel 1 (
+        echo ready>"%DATASETS_MARKER%"
+    ) else (
+        echo [Kuro Soden] NOTE: dataset prefetch skipped - the tiers self-fill at runtime.
+    )
+)
+
 REM --- run ----------------------------------------------------
 echo [Kuro Soden] Starting 4-bot pipeline...
 echo [Kuro Soden]   Lelouch    - Request intake
