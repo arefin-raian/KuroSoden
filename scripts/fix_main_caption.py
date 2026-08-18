@@ -1,26 +1,36 @@
-"""Re-edit main-channel post captions that used the wrong language separator.
+"""Repair main-channel posts that were damaged by an earlier caption edit.
 
-The multi-audio language line joined every language with " & "
-("English & Japanese & Hindi") instead of the Oxford form
-("English, Japanese & Hindi"). The code is fixed (main_channel_service.
-_language_summary), so any FUTURE publish/redo is correct — this repairs the
-ALREADY-POSTED captions by making Gojo (the main-channel author) re-render + edit
-them in place from the current facts.
+Two things can be wrong with a live main post:
+  * its Index/Download buttons were STRIPPED (an ``edit_message_caption`` without
+    ``reply_markup`` — the bug that hit 4 posts during the language-fix run), and/or
+  * its language line still uses the old 3-way " & " join
+    ("English & Japanese & Hindi" instead of "English, Japanese & Hindi").
 
-    # DRY-RUN: list main posts whose stored caption has the 3-way "A & B & C" join
+The code is fixed (``main_channel_service`` re-passes the keyboard and uses the
+Oxford join), so any FUTURE publish/redo is correct. This repairs ALREADY-POSTED
+ones by making Gojo (the main-channel author) re-render + edit them in place from
+current facts — which restores the buttons AND applies the Oxford join in one go.
+
+    # DEFAULT: scan every live main post, list only the ACTUALLY-broken ones
+    #   (missing buttons or bad " & " join). Edits nothing.
     python scripts/fix_main_caption.py --dry-run
 
-    # REPAIR every affected main post (re-edit in place via MainChannelService)
+    # REPAIR only the broken posts (re-render in place via MainChannelService)
     python scripts/fix_main_caption.py --yes
 
     # REPAIR one title only (anime_doc_id or REQ code)
     python scripts/fix_main_caption.py --doc 116006 --yes
     python scripts/fix_main_caption.py --code REQ-1088 --yes
 
-Uses the ADMIN bot client (the identity that authors/edits the main-channel post)
-— editing with the wrong client silently no-ops. refresh_caption re-derives facts
-from current packs (so the Oxford join applies), edits the live caption, and
-updates the wipe-proof backup. Media + buttons are untouched.
+    # BLUNT: force re-render EVERY live main post (no inspection — rarely needed;
+    #   this also touches posts you may have hand-edited)
+    python scripts/fix_main_caption.py --all-published --yes
+
+The default no longer trusts a stored-caption heuristic: it reads each LIVE
+message and only targets the ones missing a keyboard or still showing the bad
+join, so healthy/hand-edited posts are left untouched. Uses the ADMIN bot client
+(the identity that authors the main-channel post) — editing with the wrong
+client silently no-ops.
 """
 
 from __future__ import annotations
@@ -97,43 +107,9 @@ async def _resolve_doc(container, code: str | None, doc: str | None) -> str | No
         return req.anime_doc_id if req is not None else None
 
 
-async def _affected_docs(container) -> list[tuple[str, str]]:
-    """Every main post whose BACKUP caption still has the 3-way ' & ' join.
-
-    Returns ``(anime_doc_id, sample_line)``. The durable backup caption
-    (PublishedPostBackup) is the reliable stored copy of what's live."""
-    from sqlalchemy import select
-
-    from nekofetch.infrastructure.database.postgres.models import (
-        ChannelPost,
-        PublishedPostBackup,
-    )
-    from nekofetch.infrastructure.database.postgres.session import session_scope
-
-    out: list[tuple[str, str]] = []
-    async with session_scope(container.pg_sessionmaker) as session:
-        posts = (await session.execute(
-            select(ChannelPost).where(ChannelPost.main_message_id.is_not(None))
-        )).scalars().all()
-        doc_ids = [p.anime_doc_id for p in posts]
-        backups = {
-            b.anime_doc_id: b for b in (await session.execute(
-                select(PublishedPostBackup).where(
-                    PublishedPostBackup.anime_doc_id.in_(doc_ids or [""]),
-                )
-            )).scalars().all()
-        }
-    for p in posts:
-        cap = getattr(backups.get(p.anime_doc_id), "caption", None) or ""
-        m = _BAD_JOIN.search(cap)
-        if m:
-            out.append((p.anime_doc_id, f"old: {m.group(0)!r}"))
-    return out
-
-
 async def _all_main_docs(container) -> list[tuple[str, str]]:
-    """Every live main-channel post — for a full re-render (fixes the caption AND
-    rebuilds the Index/Download buttons, e.g. after an edit stripped them)."""
+    """Every live main-channel post — for a full forced re-render (rarely needed;
+    prefer the default live-damage scan). Kept behind --all-published."""
     from sqlalchemy import select
 
     from nekofetch.infrastructure.database.postgres.models import ChannelPost
@@ -143,7 +119,50 @@ async def _all_main_docs(container) -> list[tuple[str, str]]:
         posts = (await session.execute(
             select(ChannelPost).where(ChannelPost.main_message_id.is_not(None))
         )).scalars().all()
-    return [(p.anime_doc_id, "(re-render: caption + buttons)") for p in posts]
+    return [(p.anime_doc_id, "(forced re-render)") for p in posts]
+
+
+async def _damaged_docs(container, client) -> list[tuple[str, str]]:
+    """Only the main posts that are ACTUALLY broken — inspected LIVE.
+
+    A post needs repair when its live message either (a) has NO inline keyboard
+    (buttons were stripped by an earlier caption edit) or (b) still shows the
+    3-way ' & ' language join. Everything else — including posts you hand-edited —
+    is left untouched. Requires a connected client (reads the live message)."""
+    from sqlalchemy import select
+
+    from nekofetch.infrastructure.database.postgres.models import ChannelPost
+    from nekofetch.infrastructure.database.postgres.session import session_scope
+
+    async with session_scope(container.pg_sessionmaker) as session:
+        posts = (await session.execute(
+            select(ChannelPost).where(ChannelPost.main_message_id.is_not(None))
+        )).scalars().all()
+        rows = [(p.anime_doc_id, p.main_channel_id, p.main_message_id) for p in posts]
+
+    out: list[tuple[str, str]] = []
+    main_cfg_id = container.config.main_channel.channel_id
+    for doc, chan, mid in rows:
+        chat_id = chan or main_cfg_id
+        if not chat_id or not mid:
+            continue
+        try:
+            live = await client.get_messages(int(chat_id), int(mid))
+        except Exception as exc:  # noqa: BLE001 — can't read → skip, don't touch
+            print(f"  doc={doc}: (skipped — couldn't read live msg: {exc})")
+            continue
+        has_buttons = bool(getattr(live, "reply_markup", None))
+        cap = getattr(getattr(live, "caption", None), "html", None) \
+            or (getattr(live, "caption", None) or getattr(live, "text", None) or "")
+        cap = str(cap)
+        bad_join = bool(_BAD_JOIN.search(cap))
+        if not has_buttons and bad_join:
+            out.append((doc, "no buttons + bad ' & ' join"))
+        elif not has_buttons:
+            out.append((doc, "missing buttons"))
+        elif bad_join:
+            out.append((doc, "bad ' & ' join"))
+    return out
 
 
 async def main(code: str | None, doc: str | None, assume_yes: bool,
@@ -161,43 +180,55 @@ async def main(code: str | None, doc: str | None, assume_yes: bool,
 
     client = None
     try:
-        # Which docs to repair.
+        # Explicit single-target modes don't need a live scan — resolve up front.
+        explicit: list[tuple[str, str]] | None = None
         if code or doc:
             one = await _resolve_doc(container, code, doc)
             if not one:
                 print(f"could not resolve an anime_doc_id from "
                       f"{code or doc!r} — aborting.")
                 return
-            targets = [(one, "(explicit)")]
+            explicit = [(one, "(explicit)")]
+
+        # Attach as the main-post author FIRST. The default scan reads each live
+        # message to decide what's actually broken, and every mode edits as this
+        # identity — editing with the wrong client silently no-ops.
+        client, label = await _start_admin_client(env)
+        me = await client.get_me()
+        print(f"editing as @{me.username} ({label}, id {me.id})\n")
+        container.admin_client = client  # type: ignore[attr-defined]
+
+        # Which docs to repair.
+        if explicit is not None:
+            targets = explicit
         elif all_published:
-            # Every live main post — used to REBUILD buttons after a caption edit
-            # already stripped them (so the 3-way-'&' detector no longer matches).
+            # Blunt: EVERY live main post, no inspection. Rarely what you want —
+            # it also re-renders posts you may have hand-edited. Prefer the
+            # default live-damage scan.
             targets = await _all_main_docs(container)
         else:
-            targets = await _affected_docs(container)
+            # DEFAULT: inspect each live post and target only the broken ones
+            # (missing Index/Download buttons, or still-bad ' & ' join).
+            print("scanning live main posts for damage "
+                  "(missing buttons / bad ' & ' join)…")
+            targets = await _damaged_docs(container, client)
 
-        print(f"main posts to fix: {len(targets)}")
+        print(f"\nmain posts to fix: {len(targets)}")
         for d, sample in targets:
             print(f"  doc={d}   {sample}")
         if not targets:
-            print("nothing to fix.")
+            print("nothing to fix — every live main post has its buttons and a "
+                  "correct language line.")
             return
         if dry_run:
             print("\ndry run — no edits. Re-run with --yes to repair.")
             return
         if not assume_yes:
-            ans = input(f"\nRe-edit {len(targets)} main-channel caption(s)? "
+            ans = input(f"\nRe-edit {len(targets)} main-channel post(s)? "
                         "Type 'yes': ")
             if ans.strip().lower() != "yes":
                 print("aborted")
                 return
-
-        # Attach as the main-post author + hand the client to the container so
-        # MainChannelService.refresh_caption edits with the right identity.
-        client, label = await _start_admin_client(env)
-        me = await client.get_me()
-        print(f"\nediting as @{me.username} ({label}, id {me.id})\n")
-        container.admin_client = client  # type: ignore[attr-defined]
 
         from nekofetch.services.main_channel_service import MainChannelService
         svc = MainChannelService(container)
@@ -210,7 +241,7 @@ async def main(code: str | None, doc: str | None, assume_yes: bool,
                 print(f"  doc={d}: ERROR {exc}")
             if ok:
                 fixed += 1
-                print(f"  doc={d}: caption re-edited ✓")
+                print(f"  doc={d}: caption + buttons re-rendered ✓")
             else:
                 failed += 1
                 print(f"  doc={d}: FAILED (no live post, or edit rejected)")
@@ -231,11 +262,12 @@ if __name__ == "__main__":
     ap.add_argument("--code", help="target one request code (e.g. REQ-1088)")
     ap.add_argument("--doc", help="target one anime_doc_id (e.g. 116006)")
     ap.add_argument("--all-published", action="store_true",
-                    help="re-render EVERY live main post (restores buttons an "
-                         "earlier caption edit stripped)")
+                    help="BLUNT: force re-render EVERY live main post without "
+                         "inspection (also touches hand-edited posts; prefer the "
+                         "default live-damage scan)")
     ap.add_argument("--yes", action="store_true", help="skip the confirm prompt")
     ap.add_argument("--dry-run", action="store_true",
-                    help="list the posts that would be re-rendered, edit nothing")
+                    help="scan + list only the broken posts, edit nothing")
     args = ap.parse_args()
     asyncio.run(main(args.code, args.doc, args.yes, args.dry_run,
                      args.all_published))
