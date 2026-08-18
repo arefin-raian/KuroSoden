@@ -348,3 +348,101 @@ async def test_render_entry_host_failure_is_nonfatal(adapter, monkeypatch, tmp_p
     assert out == webp
     sel = await adapter.cache.get_selection("REQ-1", 1)
     assert sel.thumbnail_url == f"file://{webp}"
+
+
+# ── surface split: distribution entry = AniList synopsis; main = TMDB + avg ring ──
+
+@pytest.mark.asyncio
+async def test_render_entry_prefers_anilist_synopsis(adapter, monkeypatch, tmp_path):
+    """A distribution entry card must describe THAT season → AniList synopsis
+    (prefer_anilist_synopsis=True), not the franchise-level TMDB overview."""
+    await _seed_assets(adapter)
+    _stub_renderer(adapter, tmp_path)
+    captured: dict = {}
+
+    import nekofetch.services.thumbnail_service as ts
+
+    async def spy_gather(container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False):
+        captured["prefer"] = prefer_anilist_synopsis
+        return {}
+    monkeypatch.setattr(ts, "gather_thumbnail_fields", spy_gather)
+
+    import kurosoden.shared.image_backup as image_backup
+
+    async def _bk(container, blob, *, mime="image/jpeg", source_url=""):
+        from kurosoden.shared.image_backup import BackupImage
+        return BackupImage(source_url=source_url)
+    monkeypatch.setattr(image_backup, "backup_bytes", _bk)
+
+    entry = await adapter.cache.get_entry("REQ-1", 1)
+    await adapter.render_entry("REQ-1", entry)
+    assert captured["prefer"] is True
+
+
+@pytest.mark.asyncio
+async def test_render_main_uses_tmdb_synopsis_avg_ring_and_persists_minus1(
+    adapter, monkeypatch, tmp_path,
+):
+    """The main-channel render: TMDB franchise synopsis (prefer_anilist_synopsis=
+    False), the franchise-AVERAGE AniList ring, variant_key='main', and a
+    ThumbnailSource row persisted under the -1 sentinel with a hosted_url."""
+    await _seed_assets(adapter)
+    # base entry (index 1) already has all three assets from _seed_assets.
+    await adapter.cache.set_franchise("REQ-1", {"anime_doc_id": "doc-x", "english": "Root"})
+    webp = _stub_renderer(adapter, tmp_path)
+
+    captured: dict = {}
+    import nekofetch.services.thumbnail_service as ts
+
+    async def spy_gather(container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False):
+        captured["prefer"] = prefer_anilist_synopsis
+        return {"anilist_score": 70}  # per-entry value that must be OVERRIDDEN
+
+    async def spy_persist(container, anime_doc_id, anilist_id, fields, *, image_path=None):
+        captured["persist_anilist_id"] = anilist_id
+        captured["persist_fields"] = fields
+    monkeypatch.setattr(ts, "gather_thumbnail_fields", spy_gather)
+    monkeypatch.setattr(ts, "persist_thumbnail_source", spy_persist)
+
+    # Wrap the fake renderer to capture the kwargs it's called with.
+    class _CapRenderer:
+        async def render_thumbnail(self, **kw):
+            captured["render_kw"] = kw
+            return webp
+    adapter._render = _CapRenderer()
+
+    # Franchise-average score source: the cached AniList walk (scores 0-10).
+    import nekofetch.services.metadata_prefetch as mp
+
+    async def fake_load_cached(container, doc, kind, *, anime_doc_id=None):
+        if kind == "anilist":
+            return {"franchise": [{"score": 8.0}, {"score": 9.0}]}  # avg 8.5 → 85
+        return None
+    monkeypatch.setattr(mp, "load_cached", fake_load_cached)
+
+    import kurosoden.shared.image_backup as image_backup
+
+    async def fake_backup(container, blob, *, mime="image/jpeg", source_url=""):
+        from kurosoden.shared.image_backup import BackupImage
+        return BackupImage(source_url=source_url,
+                           catbox_url="https://files.catbox.moe/main.webp")
+    monkeypatch.setattr(image_backup, "backup_bytes", fake_backup)
+
+    out = await adapter.render_main("REQ-1")
+
+    assert out == webp
+    assert captured["prefer"] is False                       # TMDB franchise synopsis
+    assert captured["render_kw"]["variant_key"] == "main"
+    assert captured["render_kw"]["anilist_score"] == 85       # avg 8.5 ×10, overrides 70
+    assert captured["persist_anilist_id"] is None             # → stored as -1
+    assert captured["persist_fields"]["hosted_url"] == "https://files.catbox.moe/main.webp"
+
+
+@pytest.mark.asyncio
+async def test_render_main_needs_base_assets(adapter, monkeypatch):
+    """No base-entry assets → render_main bails (None), never crashes publish."""
+    await adapter.cache.set_entries("REQ-1", _entries())  # no selections
+    await adapter.cache.set_franchise("REQ-1", {"anime_doc_id": "doc-x"})
+    _stub = type("_R", (), {"render_thumbnail": staticmethod(lambda **k: None)})()
+    adapter._render = _stub
+    assert await adapter.render_main("REQ-1") is None

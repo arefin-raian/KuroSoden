@@ -1401,6 +1401,16 @@ def register(client: Client, container: Container) -> None:
                 old_msg=work_msg,
             )
             return
+        # Distribution channel is live. NOW render the MAIN-CHANNEL post card
+        # (last step, no preview): TMDB franchise synopsis + franchise-average
+        # AniList ring, persisted for MainChannelService to consume. Must run
+        # BEFORE the handoff, because Gojo's downstream publish reads it. Fully
+        # best-effort — a main-render miss leaves the main post on its fallback
+        # and must never block the successful distribution publish or the handoff.
+        try:
+            await thumbs.render_main(code)
+        except Exception as exc:  # noqa: BLE001 — main card is best-effort
+            log.warning("senku.wiz.main_render_failed", code=code, error=str(exc))
         # Hand the request to Gojo (publish stage) and clear the working cache.
         try:
             from kurosoden.shared.handoff import handoff_distribution_to_publish

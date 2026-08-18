@@ -389,7 +389,11 @@ class SenkuThumbnailAdapter:
                 gather_thumbnail_fields,
                 persist_thumbnail_source,
             )
-            fields = await gather_thumbnail_fields(self._c, title, anime_doc_id)
+            # Distribution entry cards describe THAT season → AniList per-entry
+            # synopsis (TMDB fallback). Without this flag the render baked the
+            # franchise-level TMDB overview onto every season card.
+            fields = await gather_thumbnail_fields(
+                self._c, title, anime_doc_id, prefer_anilist_synopsis=True)
             source_fields = {
                 **fields,
                 "title": title,
@@ -458,6 +462,135 @@ class SenkuThumbnailAdapter:
         await self.cache.set_selection(code, entry.index, asset="thumbnail",
                                        value=stored)
         log.info("senku.thumb.rendered", code=code, entry=entry.index, path=str(path))
+        return path
+
+    async def _franchise_avg_score(self, anime_doc_id: str | None) -> int | None:
+        """Franchise-average AniList score on the 0-100 ring scale, or None.
+
+        Same source + averaging as the main-channel post CAPTION rating
+        (``main_channel_service._apply_franchise_facts`` / ``_avg_score_pct``):
+        the cached AniList walk's per-entry ``score`` (0-10), averaged and scaled
+        to 0-100. Cache-only (no live call) — best-effort, so a miss just leaves
+        the ring on whatever ``gather_thumbnail_fields`` produced."""
+        if not anime_doc_id:
+            return None
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            blob = await load_cached(self._c, anime_doc_id, "anilist",
+                                     anime_doc_id=anime_doc_id)
+            walk = (blob or {}).get("franchise")
+            if not walk:
+                return None
+            vals = list(walk.values()) if isinstance(walk, dict) else list(walk)
+            scores = [float(e["score"]) for e in vals
+                      if isinstance(e, dict) and e.get("score") is not None]
+            if not scores:
+                return None
+            avg = sum(scores) / len(scores)
+            pct = avg if avg > 10 else avg * 10  # 0-10 → 0-100; leave 0-100 alone
+            return int(round(pct))
+        except Exception as exc:  # noqa: BLE001 — averaging is best-effort
+            log.debug("senku.thumb.avg_score_failed", anime=anime_doc_id,
+                      error=str(exc))
+            return None
+
+    async def render_main(self, code: str) -> "object | None":
+        """Render the MAIN-CHANNEL post thumbnail for the franchise (no preview).
+
+        Distinct from the per-entry distribution cards: the franchise-level TMDB
+        overview (AniList fallback) for the synopsis, and the franchise-AVERAGE
+        AniList score on the ring (the TMDB badge stays series-level). Reuses the
+        BASE (first watch-order) entry's picked logo/poster/backdrop — the main
+        card mirrors S1's art, only the info differs. Persists a ``ThumbnailSource``
+        row keyed ``anilist_id=-1`` (the established main sentinel) with the
+        mirrored public URL in ``fields['hosted_url']`` so ``main_channel_service``
+        can consume it. Returns the rendered ``Path`` or None (best-effort — the
+        distribution publish has already succeeded when this runs)."""
+        renderer = self._renderer()
+        if renderer is None:
+            self.last_render_error = "browser"
+            return None
+        franchise = await self.cache.get_franchise(code) or {}
+        anime_doc_id = franchise.get("anime_doc_id")
+        # Base entry = the first in watch order; it supplies the art + title.
+        entries = sorted(await self.cache.get_entries(code),
+                         key=lambda e: getattr(e, "index", 0))
+        base = entries[0] if entries else None
+        if base is None:
+            return None
+        sel = await self.cache.get_selection(code, base.index)
+        if not (sel and sel.logo_url and sel.poster_url and sel.backdrop_url):
+            log.info("senku.thumb.main_no_assets", code=code)
+            return None
+        title = (franchise.get("english") or franchise.get("title")
+                 or base.title or base.label)
+        try:
+            from nekofetch.services.thumbnail_service import (
+                gather_thumbnail_fields,
+                persist_thumbnail_source,
+            )
+            # Main post summarizes the whole franchise → TMDB overview (AniList
+            # fallback); prefer_anilist_synopsis=False is the surface switch.
+            fields = await gather_thumbnail_fields(
+                self._c, title, anime_doc_id, prefer_anilist_synopsis=False)
+            # Ring = franchise-average AniList score (matches the caption rating);
+            # the TMDB badge stays whatever gather resolved (series-level).
+            avg = await self._franchise_avg_score(anime_doc_id)
+            if avg is not None:
+                fields["anilist_score"] = avg
+            source_fields = {
+                **fields,
+                "title": title,
+                "logo_url": sel.logo_url,
+                "poster_url": sel.poster_url,
+                "bg_url": sel.backdrop_url,
+                "entry_label": title,
+                "anilist_id": -1,          # main-channel sentinel
+            }
+            path = await renderer.render_thumbnail(
+                title=title,
+                logo_url=sel.logo_url,
+                poster_url=sel.poster_url,
+                bg_url=sel.backdrop_url,
+                variant_key="main",
+                **fields,
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            self.last_render_error = (
+                "browser"
+                if ("playwright" in msg or "executable doesn't exist" in msg
+                    or "browsertype.launch" in msg or "install" in msg)
+                else "render"
+            )
+            log.warning("senku.thumb.main_render_failed", code=code, error=str(exc))
+            return None
+        if not path:
+            return None
+        # Mirror to a public host so the main-channel post (published downstream by
+        # Gojo) can consume a durable URL; stash it in the persisted fields.
+        stored: str = f"file://{path}"
+        try:
+            from kurosoden.shared.image_backup import backup_bytes
+
+            suffix = str(path).lower()
+            mime = ("image/webp" if suffix.endswith(".webp")
+                    else "image/png" if suffix.endswith(".png")
+                    else "image/jpeg")
+            backup = await backup_bytes(self._c, path.read_bytes(), mime=mime)
+            if backup.primary:
+                stored = backup.primary
+        except Exception as exc:  # noqa: BLE001 — file:// fallback still works
+            log.warning("senku.thumb.main_host_failed", code=code, error=str(exc))
+        source_fields["hosted_url"] = stored
+        try:
+            # anilist_id=None → persisted under the -1 main sentinel.
+            await persist_thumbnail_source(
+                self._c, anime_doc_id, None, source_fields, image_path=path)
+        except Exception as exc:  # noqa: BLE001 — the URL is still returned
+            log.warning("senku.thumb.main_persist_failed", code=code, error=str(exc))
+        log.info("senku.thumb.main_rendered", code=code, url=stored)
         return path
 
     # ── loop-state query helpers ─────────────────────────────────────────────

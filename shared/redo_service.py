@@ -779,6 +779,33 @@ class RedoService:
                 return False
             return bool(bot.name) and bot.name != new_title
 
+    async def _franchise_avg_ring(self, anime_doc_id: str) -> int | None:
+        """Franchise-average AniList score on the 0-100 ring scale, or None.
+
+        Same source + math as the main-post caption rating
+        (``main_channel_service._avg_score_pct``): the cached AniList walk's
+        per-entry ``score`` (0-10), averaged and scaled to 0-100. Cache-only,
+        best-effort — used to keep a redo's main-card ring consistent with a
+        fresh publish."""
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+
+            blob = await load_cached(self._c, anime_doc_id, "anilist",
+                                     anime_doc_id=anime_doc_id)
+            walk = (blob or {}).get("franchise")
+            if not walk:
+                return None
+            vals = list(walk.values()) if isinstance(walk, dict) else list(walk)
+            scores = [float(e["score"]) for e in vals
+                      if isinstance(e, dict) and e.get("score") is not None]
+            if not scores:
+                return None
+            avg = sum(scores) / len(scores)
+            pct = avg if avg > 10 else avg * 10
+            return int(round(pct))
+        except Exception:  # noqa: BLE001 — averaging is best-effort
+            return None
+
     async def _rerender_and_push(
         self, row, anime_doc_id: str, languages: str,
     ) -> bool:
@@ -793,7 +820,12 @@ class RedoService:
 
         stored = dict(row.fields or {})
         title = stored.get("title") or anime_doc_id
-        fresh = await gather_thumbnail_fields(self._c, title, anime_doc_id)
+        # Surface-aware, matching a fresh publish: the main-channel card (-1) uses
+        # the franchise-level TMDB synopsis + franchise-average AniList ring, while
+        # a distribution entry card uses its own AniList per-entry synopsis.
+        is_main = int(row.anilist_id) == -1
+        fresh = await gather_thumbnail_fields(
+            self._c, title, anime_doc_id, prefer_anilist_synopsis=not is_main)
         merged = {
             **stored,
             **fresh,
@@ -803,6 +835,10 @@ class RedoService:
             "poster_url": stored.get("poster_url"),
             "bg_url": stored.get("bg_url"),
         }
+        if is_main:
+            avg = await self._franchise_avg_ring(anime_doc_id)
+            if avg is not None:
+                merged["anilist_score"] = avg
         renderer = ThumbnailRenderService()
         try:
             image_path = await renderer.render_thumbnail(**render_fields(merged))

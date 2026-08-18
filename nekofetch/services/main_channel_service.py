@@ -27,6 +27,7 @@ from nekofetch.infrastructure.database.postgres.models import (
     ChannelPost,
     DistributionBot,
     StoragePack,
+    ThumbnailSource,
 )
 from nekofetch.infrastructure.database.postgres.session import session_scope
 from nekofetch.services.thumbnail_service import webp_to_jpeg_async
@@ -282,6 +283,35 @@ class MainChannelService:
         except Exception as exc:  # noqa: BLE001
             log.debug("mainchannel.thumbnail_lookup.failed",
                       anime=anime_doc_id, error=str(exc))
+
+        # 1a. Senku wizard renders a DEDICATED main-channel card at publish time
+        #     (TMDB franchise synopsis + franchise-average AniList ring) and
+        #     persists it as the ThumbnailSource main row (anilist_id=-1) with the
+        #     mirrored public URL in fields['hosted_url']. Prefer THAT over the
+        #     first-season distribution card — the whole point is the two surfaces
+        #     differ. The orchestrator (step 1) is empty on a Senku job, so this is
+        #     the effective primary there; the auto pipeline keeps step 1.
+        if not facts.backdrop_url:
+            try:
+                async with session_scope(self._c.pg_sessionmaker) as session:
+                    row = (await session.execute(
+                        select(ThumbnailSource).where(
+                            ThumbnailSource.anime_doc_id == anime_doc_id,
+                            ThumbnailSource.anilist_id == -1,
+                        )
+                    )).scalars().first()
+                if row is not None:
+                    hosted = (row.fields or {}).get("hosted_url") if row.fields else None
+                    url = hosted or row.image_path
+                    # A file:// path can't be sent by the downstream post; only use
+                    # a real http(s) URL here (the mirror), else fall through.
+                    if url and str(url).startswith(("http://", "https://")):
+                        facts.backdrop_url = url
+                        log.info("mainchannel.thumbnail.from_main_render",
+                                 anime=anime_doc_id, url=url)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("mainchannel.main_render_lookup.failed",
+                          anime=anime_doc_id, error=str(exc))
 
         # 1b. Manual (Senku wizard) publish path never populates the thumbnail-
         #     channel workflow map the orchestrator reads — it stores the admin's
