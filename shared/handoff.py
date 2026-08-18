@@ -104,6 +104,17 @@ async def handoff_download_to_distribution(
     except Exception as exc:  # noqa: BLE001
         log.warning("handoff.assign.failed", code=code, error=str(exc))
         assignment = None
+    # A first-pass defer (None) usually means the only eligible admin carries a
+    # stale ``skipped`` senku row (an expired offer) that blocks them for the rest
+    # of the local day — so EVERY new senku task would silently vanish. Retry with
+    # second_pass=True, which bypasses the skipped-block, before giving up. Without
+    # this a solo operator stops receiving distribution tasks entirely.
+    if assignment is None:
+        try:
+            assignment = await engine.assign(code, "senku", second_pass=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("handoff.assign.retry_failed", code=code, error=str(exc))
+            assignment = None
     if assignment is None:
         log.info("handoff.deferred_or_unassigned", code=code, stage="senku")
     else:
@@ -191,6 +202,10 @@ async def handoff_distribution_to_publish(
         engine = AdminAssignmentEngine(container.pg_sessionmaker)
         await engine.complete_task(code, "senku")
         assignment = await engine.assign(code, "gojo")
+        # Same solo-operator guard as the senku handoff: a stale skipped gojo row
+        # would otherwise defer every publish task silently. second_pass bypasses it.
+        if assignment is None:
+            assignment = await engine.assign(code, "gojo", second_pass=True)
     except Exception as exc:  # noqa: BLE001
         log.warning("handoff.publish.assign.failed", code=code, error=str(exc))
         assignment = None

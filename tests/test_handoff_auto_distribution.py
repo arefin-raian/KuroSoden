@@ -272,6 +272,49 @@ async def test_normal_work_still_hands_to_senku(session, sessionmaker, monkeypat
         assert rows[0].status in ("assigned", "in_progress", "offered")
 
 
+# ── solo-operator recovery: a stale skipped senku row must not blackhole work ──
+
+
+async def test_stale_skipped_senku_row_does_not_block_new_assignment(
+    session, sessionmaker, monkeypatch,
+):
+    """The reported bug: the sole admin has a ``skipped`` senku row from an
+    earlier title (e.g. ORB, an expired offer) that blocks EVERY new senku
+    assignment for the local day — so a freshly-downloaded title's distribution
+    task silently vanishes. The handoff's second_pass retry must bypass the
+    skipped-block and still hand the new work to that admin."""
+    from nekofetch.services.publishing_service import PublishingService
+    from kurosoden.shared.handoff import handoff_download_to_distribution
+
+    code = "REQ-BLOCK"
+    await _seed_handoff(session, sessionmaker, code=code, fd={"anilist_id": 4242})
+    # The sole admin (levi_admin=500) carries a stale SKIPPED senku offer for a
+    # different, already-handled title — the first-pass block.
+    await _create_admin_assignment(
+        session, admin_telegram_id=500, request_code="REQ-ORB", stage="senku",
+        status="skipped",
+    )
+
+    async def _publish(self, code, **kw):  # must NOT auto-publish a fresh work
+        raise AssertionError("normal work should not auto-publish")
+    monkeypatch.setattr(PublishingService, "publish", _publish)
+
+    await handoff_download_to_distribution(
+        _container(sessionmaker, pipeline_manager=SimpleNamespace(levi=_FakeLevi())),
+        code, "Blocked Anime",
+    )
+
+    # Despite the stale skipped row, the NEW code got a live senku assignment.
+    async with sessionmaker() as s:
+        rows = (await s.execute(select(AdminAssignment).where(
+            AdminAssignment.request_code == code,
+            AdminAssignment.stage == "senku",
+        ))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].admin_telegram_id == 500
+    assert rows[0].status in ("assigned", "in_progress", "offered")
+
+
 # ── auto-publish failure: recoverable via a Gojo task ────────────────────────
 
 

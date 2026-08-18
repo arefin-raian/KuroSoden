@@ -92,6 +92,15 @@ async def recover_assignment_queue(
             if stage is None:
                 continue
             result = await engine.assign(request.code, stage, now=clock, _session=session)
+            # First-pass defer usually means the only eligible admin carries a
+            # stale ``skipped`` row for this stage (an expired offer) that blocks
+            # them for the local day. Escalate to second_pass, which bypasses the
+            # skipped-block, so the durable backstop actually re-delivers the task
+            # instead of counting it deferred on every 60s tick forever.
+            if result is None:
+                result = await engine.assign(
+                    request.code, stage, now=clock, second_pass=True, _session=session,
+                )
             if result is None:
                 report.deferred_assignments += 1
                 continue
