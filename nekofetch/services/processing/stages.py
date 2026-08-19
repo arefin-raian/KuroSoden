@@ -585,6 +585,21 @@ class VerifyStage(Stage):
                      tracks=n_tracks, langs=sorted(distinct),
                      audio=new_audio.value, was=str(old))
 
+        # Persist the REAL per-stream languages (ISO codes) so every label reads
+        # ground truth instead of the enum's Eng/Jpn/Hin assumption — but only
+        # when EVERY track carries a real language tag. Partial or "und"
+        # (undetermined) tagging is untrustworthy: a dual file tagged on one
+        # track would look mono, so we leave audio_langs null and let callers
+        # fall back to the enum map (owner: assume Eng/Jpn/Hin when unknown).
+        meaningful = {l for l in distinct if l != "und"}
+        all_tagged = all(l and l.lower() != "und" for l in langs)
+        if meaningful and all_tagged:
+            new_langs = sorted(meaningful)
+            if f.audio_langs != new_langs:
+                f.audio_langs = new_langs
+                log.info("verify.audio_langs_recorded", file=path.name,
+                         langs=new_langs)
+
 
 # Canonical short audio tags used in file names — the AudioType enum values
 # ("subbed" / "dubbed" / "dual_audio" / "multi") are too verbose for filenames.
@@ -1617,7 +1632,8 @@ class EncodeStage(Stage):
                                 job_id=f.job_id, anime_doc_id=f.anime_doc_id,
                                 season=f.season, season_part=f.season_part,
                                 episode=f.episode, resolution=label,
-                                audio=f.audio, original_name=f.original_name,
+                                audio=f.audio, audio_langs=f.audio_langs,
+                                original_name=f.original_name,
                                 final_name=out_path.name,
                                 local_path=str(out_path),
                                 size_bytes=out_path.stat().st_size,
@@ -1715,7 +1731,7 @@ class EncodeStage(Stage):
                 row = MediaFile(
                     job_id=f.job_id, anime_doc_id=f.anime_doc_id,
                     season=f.season, season_part=f.season_part, episode=f.episode,
-                    resolution=label, audio=f.audio,
+                    resolution=label, audio=f.audio, audio_langs=f.audio_langs,
                     original_name=f.original_name,
                     final_name=out_path.name, local_path=str(out_path),
                     size_bytes=out_path.stat().st_size, container=f.container,

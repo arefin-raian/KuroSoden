@@ -186,6 +186,7 @@ class StorageChannelService:
         alt_titles: list[str] | None = None,
         on_progress=None,
         file_meta: list[dict] | None = None,
+        audio_langs: list[str] | None = None,
     ) -> StoragePack:
         """Post header, upload files in order, post the end sticker; record the range.
 
@@ -246,7 +247,7 @@ class StorageChannelService:
             file_message_ids=file_ids,
             ingest_method="uploaded",
             episode_from=episode_from, episode_to=episode_to, caption=header_caption,
-
+            audio_langs=audio_langs,
         )
 
     async def _persist(self, key: PackKey, **fields) -> StoragePack:
@@ -277,6 +278,7 @@ class StorageChannelService:
                 episode_from=fields.get("episode_from"), episode_to=fields.get("episode_to"),
                 entry_id=key.entry_id,
                 ingest_method=fields.get("ingest_method"),
+                audio_langs=fields.get("audio_langs"),
             )
             if existing is None:
                 pack = StoragePack(**data)
@@ -317,6 +319,11 @@ class StorageChannelService:
                     existing.caption = value
                 # Keep the original header/start from the first upload.
                 existing.ingest_method = fields.get("ingest_method")
+                # Refresh real languages when this upload carries them; never
+                # clobber a previously-probed value with a null (an untagged
+                # reprocess must not erase good languages).
+                if fields.get("audio_langs"):
+                    existing.audio_langs = fields.get("audio_langs")
                 pack = existing
             await session.flush()
             session.expunge(pack)

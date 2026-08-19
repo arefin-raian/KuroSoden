@@ -179,6 +179,7 @@ class PublishingService:
                  "episode": f.episode, "resolution": f.resolution,
                  "audio": f.audio, "path": f.local_path,
                  "original_name": f.original_name,
+                 "audio_langs": f.audio_langs,
                  "entry_id": req_entry_id}
                 for f in files
             ]
@@ -819,6 +820,16 @@ class PublishingService:
                     }
                     for i in items
                 ]
+                # Union the real probed languages across this pack's files (ISO
+                # codes). Only files that carried fully-tagged audio have langs;
+                # if none in the group do, stays None → StoragePack.audio_langs
+                # is null → labels fall back to the AudioType enum map.
+                _langs: set[str] = set()
+                for i in items:
+                    for lang in (i.get("audio_langs") or []):
+                        if lang:
+                            _langs.add(lang)
+                pack_audio_langs = sorted(_langs) or None
                 await storage.upload_pack(
                     pack_key,
                     title=title,
@@ -830,6 +841,7 @@ class PublishingService:
                     alt_titles=alt_titles,
                     on_progress=on_progress,
                     file_meta=file_meta,
+                    audio_langs=pack_audio_langs,
                 )
                 # Pack persisted → these files are safely in the channel. Include
                 # source and generated movie paths so the caller can remove every
