@@ -130,6 +130,10 @@ class MediaFile(Base, PKMixin, TimestampMixin):
     episode: Mapped[int | None] = mapped_column(Integer)
     resolution: Mapped[str | None] = mapped_column(String(16))
     audio: Mapped[AudioType | None] = mapped_column(EnumStr(AudioType))
+    # Real per-stream audio languages probed from the media (ISO codes, e.g.
+    # ["en", "ja", "ko"]). Authoritative when present; null for files probed
+    # before this column existed — callers fall back to the AudioType enum map.
+    audio_langs: Mapped[list | None] = mapped_column(JSONB)
 
     original_name: Mapped[str | None] = mapped_column(String(512))
     final_name: Mapped[str | None] = mapped_column(String(512))
@@ -231,6 +235,10 @@ class StoragePack(Base, PKMixin, TimestampMixin):
     season_part: Mapped[int | None] = mapped_column(Integer, default=None)
     resolution: Mapped[str] = mapped_column(String(16), nullable=False)
     audio: Mapped[AudioType] = mapped_column(EnumStr(AudioType), nullable=False)
+    # Union of the real per-stream audio languages across the pack's files (ISO
+    # codes, e.g. ["en", "ja", "ko"]). Authoritative when present; null for packs
+    # persisted before this column existed — callers fall back to the enum map.
+    audio_langs: Mapped[list | None] = mapped_column(JSONB)
 
     channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     header_message_id: Mapped[int | None] = mapped_column(BigInteger)
