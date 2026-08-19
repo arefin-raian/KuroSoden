@@ -328,18 +328,12 @@ async def gather_thumbnail_fields(container: Any, title: str,
     #   multi→Japanese, English & Hindi. Union per-pack audio into one label.
     if anime_doc_id:
         try:
+            from nekofetch.services.audio_langs import pack_languages
             from nekofetch.services.bot_naming import language_label
-            from nekofetch.domain.enums import AudioType
             from nekofetch.infrastructure.database.postgres.models import StoragePack
             from nekofetch.infrastructure.database.postgres.session import session_scope
             from sqlalchemy import select
 
-            _AUDIO_LANGS = {
-                AudioType.SUBBED.value: {"japanese"},
-                AudioType.DUBBED.value: {"english"},
-                AudioType.DUAL_AUDIO.value: {"japanese", "english"},
-                AudioType.MULTI.value: {"japanese", "english", "hindi"},
-            }
             async with session_scope(container.pg_sessionmaker) as session:
                 packs = (await session.execute(
                     select(StoragePack).where(
@@ -347,10 +341,8 @@ async def gather_thumbnail_fields(container: Any, title: str,
                         StoragePack.enabled.is_(True),
                     )
                 )).scalars().all()
-                audios = {p.audio.value for p in packs if p.audio is not None}
-            langs: set = set()
-            for a in audios:
-                langs |= _AUDIO_LANGS.get(a, set())
+                # Real probed languages per pack, else the enum fallback.
+                langs = pack_languages(packs)
             if langs:
                 language = language_label(langs)
         except Exception as exc:  # noqa: BLE001

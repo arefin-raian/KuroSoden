@@ -116,3 +116,18 @@ def compact_label(langs) -> str:
     if len(codes) == 1:
         return codes[0]
     return " & ".join([", ".join(codes[:-1]), codes[-1]])
+
+
+def caption_langs(langs) -> str:
+    """Uppercase ``+``-joined codes for the storage-pack caption line.
+
+    ``{"english","japanese","hindi"}`` → ``"ENG + JPN + HIN"`` — the exact form
+    ``bot_naming._AUDIO_CAPTION`` hardcoded for DUAL/MULTI, but derived from the
+    REAL languages. Same reading order as the other labels. Accepts ISO codes or
+    full names; returns ``""`` when there's nothing to show.
+    """
+    canon = {_canon(l) for l in (langs or set()) if l and str(l).strip()}
+    if not canon:
+        return ""
+    ordered = sorted(canon, key=lambda l: (_PRIORITY.get(l, 2), l))
+    return " + ".join(_COMPACT.get(l, l[:3].title()).upper() for l in ordered)

@@ -21,7 +21,6 @@ from sqlalchemy import select
 from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
 from nekofetch.core.parsing import clean_anilist_id
-from nekofetch.domain.enums import AudioType
 from nekofetch.infrastructure.database.postgres.models import (
     BotContentPost,
     ChannelPost,
@@ -122,34 +121,20 @@ def _collapse(text: str | None) -> str:
     # AniList synopses embed literal HTML breaks; treat them as spaces too.
     text = text.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
     return " ".join(text.split())
-# Audio track language as the user thinks of it: Dub = English, Sub = Japanese (Eng subs).
-_AUDIO_LANG = {
-    AudioType.DUBBED: ["English"],
-    AudioType.SUBBED: ["Japanese"],
-    AudioType.DUAL_AUDIO: ["English", "Japanese"],
-    AudioType.MULTI: ["English", "Japanese", "Hindi"],
-}
 
 
 def _language_summary(packs) -> str:
     """Union audio languages across every stored entry/pack.
 
-    Joined in reading order (English, Japanese, Hindi, then the rest) with an
-    Oxford-style separator: two languages read "English & Japanese"; three or
-    more read "English, Japanese & Hindi" (comma-separated, ``&`` before the
-    last) — NOT "English & Japanese & Hindi". Mirrors ``bot_naming.language_label``.
+    Delegates to the shared resolver (:mod:`nekofetch.services.audio_langs`),
+    which prefers each pack's REAL probed ``audio_langs`` and falls back to the
+    ``AudioType`` enum map only when a pack has none stored. Joined in reading
+    order (English, Japanese, then the rest) with an Oxford separator: two read
+    "English & Japanese"; three or more read "English, Japanese & Hindi" — never
+    "English & Japanese & Hindi". Returns ``"—"`` when there's nothing to show.
     """
-    found: set[str] = set()
-    for pack in packs or []:
-        found.update(_AUDIO_LANG.get(pack.audio, []))
-    if not found:
-        return "—"
-    preferred = ["English", "Japanese", "Hindi"]
-    ordered = [name for name in preferred if name in found]
-    ordered.extend(sorted(found.difference(preferred)))
-    if len(ordered) == 1:
-        return ordered[0]
-    return " & ".join([", ".join(ordered[:-1]), ordered[-1]])
+    from nekofetch.services.audio_langs import language_summary
+    return language_summary(packs)
 
 
 @dataclass(slots=True)

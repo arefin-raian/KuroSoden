@@ -35,19 +35,12 @@ from sqlalchemy import func, select
 from nekofetch.core.container import Container
 from nekofetch.core.exceptions import NekoFetchError
 from nekofetch.core.logging import get_logger
-from nekofetch.domain.enums import AudioType
 from nekofetch.services.bot_naming import format_bot_name, format_bot_username
 
 log = get_logger(__name__)
 
 _BOTFATHER = "BotFather"
 _TOKEN_RE = re.compile(r"(\d{6,}:[A-Za-z0-9_-]{30,})")
-# subbed → Japanese audio, dubbed → English audio (dual = both).
-_AUDIO_LANGS = {
-    AudioType.SUBBED.value: "japanese",
-    AudioType.DUBBED.value: "english",
-    AudioType.DUAL_AUDIO.value: "english",
-}
 
 
 class BotFactory:
@@ -421,12 +414,11 @@ class BotFactory:
             )).scalars().all()
             audios = {p.audio.value for p in packs if p.audio is not None}
             quals = {p.resolution for p in packs if p.resolution}
-        languages = {_AUDIO_LANGS.get(a) for a in audios}
-        if AudioType.DUAL_AUDIO.value in audios:
-            languages.update({"english", "japanese"})
-        if AudioType.MULTI.value in audios:
-            languages.update({"english", "japanese", "hindi"})
-        languages.discard(None)
+        # Real per-pack languages when probed, else the AudioType enum fallback —
+        # via the shared resolver, so a genuine Eng/Jpn/Kor release names itself
+        # "Korean" instead of the enum's hardcoded Hindi assumption.
+        from nekofetch.services.audio_langs import pack_languages
+        languages = pack_languages(packs)
         # Sort qualities by resolution.
         _QORDER = {"360p": 0, "480p": 1, "540p": 2, "720p": 3, "1080p": 4, "2160p": 5}
         quality_list = sorted(quals, key=lambda q: _QORDER.get(q, 99)) if quals else []

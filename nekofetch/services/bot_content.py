@@ -1375,7 +1375,8 @@ class BotContentService:
         return "—"
 
     @staticmethod
-    def entry_language_tag(audios: set[AudioType], *, has_english_subs: bool = False) -> str:
+    def entry_language_tag(audios: set[AudioType], *, has_english_subs: bool = False,
+                           langs: set[str] | None = None) -> str:
         """Entry-card LANGUAGE label — the operator's canonical variants.
 
         Distinct from the channel-title ``bot_naming.audio_tag`` (which reads
@@ -1393,6 +1394,15 @@ class BotContentService:
         long — the full names ("English, Japanese & Hindi") would overflow the
         card, so only this branch abbreviates. MULTI is checked BEFORE DUAL so a
         multi-audio pack is never mislabelled "Dual Audio" (the reported bug).
+
+        The audio TYPE word (Multi/Dual/Sub & Dub/…) is enum-driven — it names
+        the delivery format. The LANGUAGE list inside the brackets reflects the
+        REAL probed languages when ``langs`` is supplied (so a genuine
+        English/Japanese/Korean multi-audio release reads "Eng, Jpn & Kor", not
+        the hardcoded Hindi assumption). When ``langs`` is absent — old content,
+        or a direct caller — the operator's canonical Eng/Jpn/Hin strings stand
+        in. The enum fallback that ``pack_languages`` supplies produces the SAME
+        strings for Eng/Jpn/Hin content, so already-published cards are unchanged.
         """
         vals = set(audios)
         has_multi = AudioType.MULTI in vals
@@ -1400,14 +1410,21 @@ class BotContentService:
         has_sub = AudioType.SUBBED in vals
         has_dub = AudioType.DUBBED in vals
 
+        from nekofetch.services.audio_langs import compact_label
+        from nekofetch.services.bot_naming import language_label
+        real = {str(l).strip().lower() for l in (langs or set()) if l and str(l).strip()}
+
         if has_multi:
             # Compact codes, main-channel language order (English, Japanese, then
-            # the rest). Mirrors main_channel_service._AUDIO_LANG's MULTI set.
-            return "Multi Audio [Eng, Jpn & Hin]"
+            # the rest). Real probed languages when present, else Eng/Jpn/Hin.
+            codes = compact_label(real) if real else "Eng, Jpn & Hin"
+            return f"Multi Audio [{codes}]"
         if has_dual:
-            return "Dual Audio [English & Japanese]"
+            names = language_label(real) if real else "English & Japanese"
+            return f"Dual Audio [{names}]"
         if has_sub and has_dub:
-            return "Sub & Dub [English & Japanese]"
+            names = language_label(real) if real else "English & Japanese"
+            return f"Sub & Dub [{names}]"
         if has_dub:
             return "Dub [English + Subs]" if has_english_subs else "Dub [English]"
         if has_sub:
@@ -1449,9 +1466,15 @@ class BotContentService:
         ep_max = self._packs_episode_count(packs) if packs else 0
         audios = {p.audio for p in packs}
         # Entry-card LANGUAGE label (tighter than the channel-title audio_tag):
-        # "Dual Audio [English & Japanese]" / "Sub & Dub [...]" / etc. Empty packs
-        # fall back to the sub-only shape.
-        lang_str = self.entry_language_tag(audios) if audios else "Sub [Japanese + ESubs]"
+        # "Dual Audio [English & Japanese]" / "Sub & Dub [...]" / etc. The audio
+        # TYPE is enum-driven; the language list reflects the REAL probed langs
+        # (pack_languages folds in the enum fallback for un-probed packs, so old
+        # cards are byte-identical). Empty packs fall back to the sub-only shape.
+        from nekofetch.services.audio_langs import pack_languages
+        lang_str = (
+            self.entry_language_tag(audios, langs=pack_languages(packs))
+            if audios else "Sub [Japanese + ESubs]"
+        )
         # Collect qualities.
         quals = sorted(
             {p.resolution for p in packs},

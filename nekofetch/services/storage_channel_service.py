@@ -75,7 +75,8 @@ class StorageChannelService:
                     episode_to: int | None = None,
                     content_type: str = "Season",
                     season_part: int | None = None,
-                    alt_titles: list[str] | None = None) -> str:
+                    alt_titles: list[str] | None = None,
+                    audio_langs: list[str] | None = None) -> str:
         """Build the caption posted before a storage pack's files.
 
         Two bold lines (operator spec)::
@@ -111,7 +112,7 @@ class StorageChannelService:
             return build_pack_caption(
                 title, season=season, season_part=season_part,
                 resolution=resolution, audio=audio, content_type=content_type,
-                alt_titles=alt_titles,
+                alt_titles=alt_titles, audio_langs=audio_langs,
             )
 
         branding = BrandingService(self._c)
@@ -209,7 +210,7 @@ class StorageChannelService:
             title=title, season=key.season, resolution=key.resolution,
             audio=key.audio, episode_from=episode_from, episode_to=episode_to,
             content_type=content_type, season_part=key.season_part,
-            alt_titles=alt_titles,
+            alt_titles=alt_titles, audio_langs=audio_langs,
         )
         header = await client.send_message(channel_id, header_caption)
         n_files = len(file_paths)

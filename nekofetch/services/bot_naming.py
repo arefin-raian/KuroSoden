@@ -428,6 +428,7 @@ def build_pack_caption(
     title: str, *, season, season_part, resolution: str, audio,
     content_type: str = "Season", alt_titles=None,
     line_limit: int = _CAPTION_LINE_LIMIT, arrow: str = _CAPTION_ARROW,
+    audio_langs=None,
 ) -> str:
     """Two-line bold pack caption fit to ``line_limit`` characters on line 1.
 
@@ -469,6 +470,16 @@ def build_pack_caption(
 
     tag, langs = _AUDIO_CAPTION.get(
         audio if isinstance(audio, AudioType) else None, ("", ""))
+    # For the language-list variants (DUAL/MULTI), prefer the REAL probed
+    # languages when supplied — so a genuine Eng/Jpn/Kor multi-audio pack reads
+    # "MULTI ∽ ENG + JPN + KOR" instead of the hardcoded Hindi. SUB/DUB carry a
+    # fixed descriptor ("JPN + EngSubs" / "English"), not a language union, so
+    # they keep their canonical string. Absent langs → unchanged behaviour.
+    if audio_langs and audio in (AudioType.DUAL_AUDIO, AudioType.MULTI):
+        from nekofetch.services.audio_langs import caption_langs
+        real = caption_langs(audio_langs)
+        if real:
+            langs = real
     if tag:
         line2 = f"{arrow} {resolution} [{tag} {_CAPTION_SWUNG} {langs}]"
     else:
