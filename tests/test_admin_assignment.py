@@ -358,6 +358,57 @@ class TestAdminAssignmentEngineDB:
         assert row.status == "assigned"
         assert row.admin_telegram_id == 100
 
+    @pytest.mark.asyncio
+    async def test_create_assignment_survives_duplicate_open_row(
+        self, engine, session, admin_availability,
+    ):
+        """A lost check-then-insert race must NOT crash — it returns the winner.
+
+        Reproduces the recovery-job UniqueViolationError on
+        uq_admin_assignments_open_request_stage (request_code, stage): the 60s
+        recovery job and a live handler both read "no open row" in separate
+        transactions, both INSERT, and the second flush violates the partial
+        unique index. We exercise the insert boundary directly — commit an OPEN
+        row first (the race winner), then call _create_assignment for the SAME
+        key. Its flush hits the constraint; the savepoint handler must roll back
+        and return the winner's assignment instead of propagating IntegrityError.
+
+        Targets _create_assignment directly (not assign()) so it doesn't depend
+        on the candidacy/slot logic that is order-sensitive across the suite.
+        """
+        from datetime import datetime, timezone
+        from sqlalchemy import select
+        from kurosoden.shared.admin_assignment import AdminAssignment
+        from kurosoden.tests.helpers import _create_admin_assignment
+
+        # The race winner: an already-committed open row for the key.
+        await _create_admin_assignment(
+            session, admin_telegram_id=100, request_code="REQ-RACE",
+            stage="levi", status="assigned",
+        )
+
+        # The loser: _create_assignment always attempts the INSERT (the top-level
+        # guard lives in _assign_impl), so this deterministically hits the index.
+        result = await engine._create_assignment(
+            session, 100, "REQ-RACE", "levi", admin_availability,
+            status="assigned", assignment_mode="duty",
+            now=datetime.now(timezone.utc),
+        )
+
+        # Recovered, not crashed — returns the winner's open assignment.
+        assert result is not None
+        assert result.admin_telegram_id == 100
+        assert result.status == "assigned"
+
+        # Still exactly ONE open row for the key — no duplicate persisted.
+        rows = (await session.execute(
+            select(AdminAssignment).where(
+                AdminAssignment.request_code == "REQ-RACE",
+                AdminAssignment.stage == "levi",
+            )
+        )).scalars().all()
+        assert len(rows) == 1
+
     # ── complete_task() ───────────────────────────────────────────────────────
 
     @pytest.mark.asyncio

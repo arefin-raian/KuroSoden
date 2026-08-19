@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, select
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, mapped_column
 
 from nekofetch.infrastructure.database.postgres.base import Base, PKMixin, TimestampMixin
@@ -388,8 +389,28 @@ class AdminAssignmentEngine:
             ),
             task_count_at_assignment=active_count,
         )
-        session.add(assignment)
-        await session.flush()
+        try:
+            # Insert inside a SAVEPOINT so a lost race doesn't poison the outer
+            # transaction. The application-level guard (_existing_open_result at
+            # the top of _assign_impl) is a bare SELECT and is NOT atomic: the
+            # 60s recovery job and live bot handlers call assign() concurrently
+            # in SEPARATE transactions, so two can both read "no open row" and
+            # both INSERT, the second violating the partial-unique index
+            # uq_admin_assignments_open_request_stage (request_code, stage).
+            # add() goes INSIDE the savepoint so its rollback also detaches the
+            # pending row (no manual expunge — that would double-detach and raise).
+            async with session.begin_nested():
+                session.add(assignment)
+                await session.flush()
+        except IntegrityError:
+            # The other transaction won and committed its open row. The savepoint
+            # rollback (on begin_nested exit) already undid our INSERT and
+            # detached the row, leaving the outer/shared recover_assignment_queue
+            # transaction usable — return the winner's assignment, don't crash.
+            existing = await self._existing_open_result(session, request_code, stage)
+            if existing is not None:
+                return existing
+            raise
 
         result_active = active_count + (1 if status in ACTIVE_STATUSES else 0)
         return AssignmentResult(
