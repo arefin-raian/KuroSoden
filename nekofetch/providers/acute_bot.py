@@ -88,6 +88,7 @@ async def fetch_from_acutebot(
     photo_dir: str | None = None,
     *,
     on_step: Any | None = None,  # callable(str) for tracing (probe script hook)
+    fetch_full: Any | None = None,  # ResilientMetadataClient._fetch_full (chain verify)
 ) -> dict | None:
     """Fetch anime metadata for ``title_query`` from @acutebot.
 
@@ -109,7 +110,7 @@ async def fetch_from_acutebot(
         # pool one bounded second attempt so a single configured account is
         # rebuilt instead of surfacing a closed-handler error to the caller.
         return await pool.execute(
-            lambda c: _do_fetch(c, title_query, photo_dir, on_step),
+            lambda c: _do_fetch(c, title_query, photo_dir, on_step, fetch_full),
             retries=2,
             retry_on=is_transport_error,
             max_attempts=3,  # owner spec: try @acutebot at most 3 times, then give up
@@ -127,6 +128,7 @@ async def _do_fetch(
     title_query: str,
     photo_dir: str | None,
     on_step: Any | None,
+    fetch_full: Any | None = None,
 ) -> dict | None:
     """Acquire menu → pick candidate → read info card → verify AniList ID."""
     _trace(on_step, f"send  /anime {title_query!r}")
@@ -228,7 +230,7 @@ async def _do_fetch(
     # ``selected_title`` was set in the menu branch above (or stays "" for the
     # direct-card path, where we don't know which title acutebot chose).
     verified, mismatch = await _verify_against_anilist(
-        anilist_id, [selected_title] if selected_title else []
+        anilist_id, [selected_title] if selected_title else [], fetch_full,
     )
     meta["verified"] = verified
     meta["_anilist_mismatch"] = mismatch
@@ -756,44 +758,60 @@ query VerifyMedia($id: Int!) {
 async def _verify_against_anilist(
     anilist_id: int | None,
     expected_titles: list[str],
+    fetch_full: Any | None = None,
 ) -> tuple[bool, bool]:
-    """Cross-check `@acutebot`'s Information-button URL against AniList.
+    """Cross-check `@acutebot`'s Information-button URL against the metadata chain.
 
     Returns ``(verified, mismatch)``:
-      * ``verified=True`` when AniList returned a media whose titles cover at
+      * ``verified=True`` when the lookup returned a media whose titles cover at
         least one of our ``expected_titles`` (via ``title_matches`` at the
         strict 1.0 threshold, mirroring the matcher the rest of NekoFetch
         uses for safe title comparisons),
-      * ``verified=False, mismatch=True`` when AniList returned a media that
+      * ``verified=False, mismatch=True`` when the lookup returned a media that
         is *different* from what we picked (rare — would mean acutebot lied
         in the menu reply),
       * ``verified=False, mismatch=False`` when there's nothing to verify
-        (no ID, or AniList itself was unreachable) — caller treats this as a
+        (no ID, or the source itself was unreachable) — caller treats this as a
         soft pass so a flaky upstream never breaks the bot_content pipeline.
 
-    One httpx POST, 10 s timeout, runs after the userbot pool is freed so a
-    AniList hiccup cannot block the rest of the distribution bot startup.
+    ``fetch_full`` is the shared ``ResilientMetadataClient._fetch_full`` (an
+    id-keyed lookup that traverses the FULL chain: AniList → Kaggle → LeoRigasaki
+    → Jikan → Kitsu). Passing it means an AniList 403 — the exact outage the
+    chain exists to survive — is answered by Kaggle/Jikan by id instead of
+    soft-passing. When it's None (probe scripts / tests), fall back to a single
+    direct AniList GraphQL POST (10 s), the legacy behavior.
     """
     if not anilist_id or not expected_titles:
         return (anilist_id is not None), False
     try:
-        import httpx
         from nekofetch.sources.telegram.matching import any_title_matches
 
         norm_titles: list[str] = []
         for t in expected_titles:
             if t:
                 norm_titles.append(t)
-        async with httpx.AsyncClient(timeout=10.0) as cli:
-            r = await cli.post(
-                "https://graphql.anilist.co",
-                json={"query": _ANILIST_VERIFY_QUERY, "variables": {"id": anilist_id}},
-            )
-            r.raise_for_status()
-            data = (r.json().get("data") or {}).get("Media") or {}
-        titles = [str(t).strip() for t in (data.get("title") or {}).values() if t]
-        synonym_set = list(data.get("synonyms") or [])
-        haystack = titles + synonym_set
+
+        haystack: list[str] = []
+        if fetch_full is not None:
+            # Resilient path: id-based lookup across the whole chain, so AniList
+            # being down falls through to Kaggle/Jikan/Kitsu rather than failing.
+            media = await fetch_full(int(anilist_id))
+            if media is not None:
+                haystack = [str(t).strip() for t in media.all_titles() if t]
+        else:
+            # Legacy fallback: one direct AniList GraphQL POST.
+            import httpx
+
+            async with httpx.AsyncClient(timeout=10.0) as cli:
+                r = await cli.post(
+                    "https://graphql.anilist.co",
+                    json={"query": _ANILIST_VERIFY_QUERY, "variables": {"id": anilist_id}},
+                )
+                r.raise_for_status()
+                data = (r.json().get("data") or {}).get("Media") or {}
+            titles = [str(t).strip() for t in (data.get("title") or {}).values() if t]
+            haystack = titles + list(data.get("synonyms") or [])
+
         if not haystack:
             return (True, False)  # can't compare; trust @acutebot's curated URL.
         if any_title_matches(norm_titles, " ".join(haystack), threshold=1.0):
@@ -805,4 +823,4 @@ async def _verify_against_anilist(
         return False, True
     except Exception as exc:  # noqa: BLE001 - never break the caller on verify failure
         log.warning("acutebot.verify.failed", id=anilist_id, error=str(exc))
-        return (True, False)  # soft pass — AniList hiccup is not the bot's fault.
+        return (True, False)  # soft pass — a metadata hiccup is not the bot's fault.

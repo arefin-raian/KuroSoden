@@ -686,7 +686,10 @@ class BotContentService:
                     self._c._userbot_pool = pool  # type: ignore[attr-defined]
                 # Persistent directory where AcuteBot photos are saved.
                 photo_dir = str(self._c.env.storage_path / "acutebot_cards")
-                acute = await fetch_from_acutebot(search_query, pool, photo_dir=photo_dir)
+                acute = await fetch_from_acutebot(
+                    search_query, pool, photo_dir=photo_dir,
+                    fetch_full=getattr(self._c.anilist, "_fetch_full", None),
+                )
                 if acute is not None:
                     meta.update(acute)
                     meta["_source"] = "acutebot"

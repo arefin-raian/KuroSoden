@@ -138,7 +138,10 @@ async def _try_acute(container: Any, query: str) -> dict | None:
             return None
     try:
         photo_dir = str(container.env.storage_path / "acutebot_cards")
-        meta = await fetch_from_acutebot(query, pool, photo_dir=photo_dir)
+        meta = await fetch_from_acutebot(
+            query, pool, photo_dir=photo_dir,
+            fetch_full=getattr(container.anilist, "_fetch_full", None),
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("resolve.acute.failed", query=query, error=str(exc)[:200])
         return None

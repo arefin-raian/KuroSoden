@@ -234,7 +234,13 @@ class ResilientMetadataClient:
 
         try:
             photo_dir = str(env.storage_path / "acutebot_cards")
-            meta = await fetch_from_acutebot(query, pool, photo_dir=photo_dir)
+            # Verify acutebot's id against the FULL id-keyed chain (_fetch_full:
+            # AniList → Kaggle → LeoRigasaki → Jikan → Kitsu). That chain does
+            # NOT include _acute_search, so there's no recursion — and an AniList
+            # 403 falls through to Kaggle instead of soft-passing the verify.
+            meta = await fetch_from_acutebot(
+                query, pool, photo_dir=photo_dir, fetch_full=self._fetch_full,
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("acute.fallback.failed", query=query, error=str(exc)[:200])
             return None
