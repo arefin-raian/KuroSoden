@@ -110,6 +110,41 @@ async def _download_photo_upload(url: str):
         return None
 
 
+async def _read_local_photo_upload(path: str):
+    """Read a LOCAL image file into a named ``BytesIO`` so we can UPLOAD the bytes.
+
+    Local ``images/art_XX.jpg`` cards also hit ``MEDIA_EMPTY`` intermittently
+    (Telegram rejects the file reference even though the JPEG is valid on disk) —
+    the same failure mode as the remote CDN case, but the URL-only recovery path
+    skipped local paths, so those cards silently degraded to text. Re-reading the
+    bytes and uploading them ourselves clears it. Returns a named ``BytesIO`` or
+    ``None`` (missing/empty/unreadable → caller degrades to text)."""
+    import io
+
+    try:
+        p = Path(path)
+        data = await asyncio.to_thread(p.read_bytes)
+        if not data:
+            return None
+        ext = p.suffix.lstrip(".").lower() or "jpg"
+        bio = io.BytesIO(data)
+        bio.name = f"artwork.{ext}"  # Pyrogram uses .name to type the upload
+        return bio
+    except Exception:  # noqa: BLE001 — artwork is decorative; never fail a flow
+        return None
+
+
+async def _bytes_for_reupload(photo_arg: str | None):
+    """Recover image bytes for a MEDIA_EMPTY re-upload, from either a remote URL
+    (fetch it) or a local file path (read it). Returns a named ``BytesIO`` or
+    ``None``. This is the single entry point both send + edit recovery paths use
+    so local and remote artwork get the same second chance."""
+    if not photo_arg:
+        return None
+    if _is_remote_url(photo_arg):
+        return await _download_photo_upload(photo_arg)
+    return await _read_local_photo_upload(photo_arg)
+
 
 @dataclass(slots=True)
 class Screen:
@@ -610,24 +645,24 @@ async def send_screen(
             )
             _remember_file_id(photo_arg, msg)
         except _BadRequest as exc:
-            # Telegram rejected the artwork. If it was a URL it couldn't fetch
-            # (MEDIA_EMPTY on the TMDB/AniList CDNs is common even for URLs that
-            # are 200 from our side), fetch the bytes OURSELVES and upload them —
-            # Telegram never touches the origin, so it can't fail the fetch. Also
-            # covers a stale cached file_id: we re-fetch from the original URL.
-            # Only if that also fails do we drop to a text card so the flow lives.
+            # Telegram rejected the artwork. If it couldn't fetch/read the media
+            # (MEDIA_EMPTY is common on the TMDB/AniList CDNs even for URLs that
+            # are 200 from our side, AND intermittently on valid LOCAL art files),
+            # get the bytes OURSELVES and upload them — Telegram never touches the
+            # origin, so it can't fail the fetch. Also covers a stale cached
+            # file_id: we re-fetch from the original path/URL. Only if that also
+            # fails do we drop to a text card so the flow lives.
             msg = None
-            if _is_remote_url(photo_arg):
-                bio = await _download_photo_upload(photo_arg)
-                if bio is not None:
-                    try:
-                        msg = await _send_photo(
-                            photo=bio, caption=fitted,
-                            parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
-                        )
-                        _remember_file_id(photo_arg, msg)
-                    except _BadRequest:
-                        msg = None
+            bio = await _bytes_for_reupload(photo_arg)
+            if bio is not None:
+                try:
+                    msg = await _send_photo(
+                        photo=bio, caption=fitted,
+                        parse_mode=screen.parse_mode, reply_markup=screen.keyboard,
+                    )
+                    _remember_file_id(photo_arg, msg)
+                except _BadRequest:
+                    msg = None
             if msg is None:
                 log.warning("screens.photo_rejected_text_fallback",
                             photo=str(photo_arg)[:120], error=str(exc))
@@ -691,11 +726,11 @@ async def _try_edit_in_place(client, old_msg, screen, photo_arg, fitted):
             except MessageNotModified:
                 raise  # already correct — handled by the outer catch
             except _BadRequest:
-                # Telegram couldn't fetch the URL (MEDIA_EMPTY) — upload the bytes
-                # ourselves and edit again IN PLACE (no flicker, keeps position).
-                if not _is_remote_url(photo_arg):
-                    raise
-                bio = await _download_photo_upload(photo_arg)
+                # Telegram couldn't fetch the URL / read the local file
+                # (MEDIA_EMPTY) — upload the bytes ourselves and edit again IN
+                # PLACE (no flicker, keeps position). Works for both remote URLs
+                # and local art paths.
+                bio = await _bytes_for_reupload(photo_arg)
                 if bio is None:
                     raise
                 edited = await _edit_photo(bio)

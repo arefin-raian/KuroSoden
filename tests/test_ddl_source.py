@@ -22,8 +22,34 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from nekofetch.sources._archive import extract_archive
-from nekofetch.sources.ddl import DdlSource
+from nekofetch.sources.ddl import DdlSource, _archive_name, _name_from_disposition
 from nekofetch.sources.registry import build_default_registry
+
+
+def test_name_from_disposition_parses_both_forms() -> None:
+    # Plain filename="…"
+    assert _name_from_disposition(
+        'attachment; filename="A.Couple.Of.Cuckoos.S01.1080p.zip"'
+    ) == "A.Couple.Of.Cuckoos.S01.1080p.zip"
+    # RFC 5987 extended filename*=UTF-8''… (percent-encoded) takes precedence
+    assert _name_from_disposition(
+        "attachment; filename*=UTF-8''A.Couple.Of.Cuckoos.S01.zip"
+    ) == "A.Couple.Of.Cuckoos.S01.zip"
+    # A path/traversal in the header is reduced to the basename
+    assert _name_from_disposition('inline; filename="../../etc/pack.zip"') == "pack.zip"
+    # Absent / empty → None (caller falls back to the final-URL basename)
+    assert _name_from_disposition(None) is None
+    assert _name_from_disposition("attachment") is None
+
+
+def test_archive_name_from_shortener_url_is_the_tail() -> None:
+    # Documents the bug the redirect resolution fixes: the shortener URL's own
+    # basename is the useless tail, which is why get_episodes now resolves the
+    # FINAL url / Content-Disposition instead.
+    assert _archive_name("https://flyn.im/9pYDxXE") == "9pYDxXE"
+    assert _archive_name(
+        "https://worker.dev/abc/A.Couple.Of.Cuckoos.S01.1080p.zip"
+    ) == "A.Couple.Of.Cuckoos.S01.1080p.zip"
 
 
 def _make_zip(path: Path, names: list[str]) -> Path:
@@ -185,7 +211,7 @@ async def test_get_episodes_emits_download_and_extract_progress(
         lambda: SimpleNamespace(storage_path=tmp_path),
     )
 
-    async def fake_fetch(url, dest, *, on_bytes=None):
+    async def fake_fetch(url, dest, *, on_bytes=None, total_hint=0):
         shutil.copy(archive, dest)
         if on_bytes:  # simulate a couple of byte updates (2-arg contract)
             await on_bytes(0, 100)
@@ -194,6 +220,14 @@ async def test_get_episodes_emits_download_and_extract_progress(
 
     monkeypatch.setattr(src, "_fetch_archive", fake_fetch)
 
+    # The shortener 302 is resolved by _head_meta; simulate it returning the real
+    # name so the test stays hermetic (no network) and proves the resolved name —
+    # not the shortener tail — reaches the card.
+    async def fake_head_meta(url):
+        return 0, "Akudama.Drive.S01.480p.zip"
+
+    monkeypatch.setattr(src, "_head_meta", fake_head_meta)
+
     events: list[dict] = []
 
     async def on_progress(info: dict) -> None:
@@ -201,7 +235,7 @@ async def test_get_episodes_emits_download_and_extract_progress(
 
     ref = json.dumps({
         "archives": [{
-            "url": "https://worker.dev/abc/Akudama.Drive.S01.480p.zip", "season": None,
+            "url": "https://flyn.im/9pYDxXE", "season": None,
         }],
         "title": "Akudama Drive",
     })
@@ -211,8 +245,10 @@ async def test_get_episodes_emits_download_and_extract_progress(
     stages = [e["stage"] for e in events]
     assert "download" in stages
     assert "extract" in stages and "extract_done" in stages
-    # The ZIP filename (last path segment, url-decoded) is surfaced for the card.
+    # The RESOLVED archive name is surfaced for the card — never the shortener
+    # tail "9pYDxXE" (the owner's exact complaint).
     assert any(e.get("archive_name") == "Akudama.Drive.S01.480p.zip" for e in events)
+    assert not any(e.get("archive_name") == "9pYDxXE" for e in events)
 
 
 async def test_extract_progress_reports_true_file_total(tmp_path: Path) -> None:

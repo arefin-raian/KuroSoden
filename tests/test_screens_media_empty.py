@@ -5,12 +5,13 @@ server-side fetch of that URL intermittently fails with ``[400 MEDIA_EMPTY]``
 (a ``BadRequest`` subclass) even though the URL is a 200 with valid JPEG from our
 side — so early Senku cards lost their artwork and degraded to text.
 
-Fix (screens.py): on a photo BadRequest for a REMOTE URL, we fetch the bytes
-OURSELVES and re-upload them (Telegram never touches the origin, so the fetch
-can't fail); the returned file_id is cached so later sends are instant. Only when
-we can't fetch the bytes either does the card degrade to a text bubble. These
-tests pin: byte-recovery on fresh send + edit paths, the text last-resort, and no
-needless work when the first send is fine.
+Fix (screens.py): on a photo BadRequest for EITHER a remote URL or a local file
+path, we get the bytes OURSELVES and re-upload them (Telegram never touches the
+origin / re-reads the rejected reference, so it can't fail); the returned file_id
+is cached so later sends are instant. Only when we can't get the bytes either does
+the card degrade to a text bubble. These tests pin: byte-recovery on fresh send +
+edit paths for both remote and local art, the text last-resort, and no needless
+work when the first send is fine.
 """
 
 from __future__ import annotations
@@ -120,23 +121,43 @@ async def test_text_fallback_only_when_bytes_also_fail(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_local_path_image_does_not_attempt_download(monkeypatch):
-    # A local path that Telegram rejects is NOT a URL → no byte-fetch, straight
-    # to text (there's nothing to re-fetch; the path upload already failed).
-    called = {"n": 0}
-
-    async def _dl(url):
-        called["n"] += 1
-        return None
-    monkeypatch.setattr(screens, "_download_photo_upload", _dl)
+async def test_local_path_image_recovers_by_uploading_bytes(monkeypatch):
+    # A local art file Telegram rejects with MEDIA_EMPTY is re-READ from disk and
+    # uploaded as bytes (the recurring `images/art_XX.jpg` failure), not silently
+    # dropped to text. Patch the local reader so no real file is needed.
+    async def _read_local(path):
+        bio = io.BytesIO(b"\xff\xd8\xff\xe0JFIFlocal")
+        bio.name = "artwork.jpg"
+        return bio
+    monkeypatch.setattr(screens, "_read_local_photo_upload", _read_local)
 
     client = _FakeClient(url_photo_raises=True)
     screen = Screen(caption="Monster", image="/local/art_01.jpg")
 
     msg = await send_screen(client, 888, screen)
 
-    assert called["n"] == 0  # never tried to download a local path
+    assert len(client.photo_calls) == 2  # path attempt + bytes attempt
+    assert msg.kind == "photo"           # recovered, did NOT degrade to text
+    assert len(client.text_calls) == 0
+    # file_id from the byte upload is cached under the local path for next time.
+    assert screens._FILE_ID_CACHE["/local/art_01.jpg"] == "FILEID_FROM_BYTES"
+
+
+@pytest.mark.asyncio
+async def test_local_path_text_fallback_when_file_unreadable(monkeypatch):
+    # If the local file can't be read (missing/empty) the byte recovery returns
+    # None → LAST resort is a text card, flow still lives.
+    async def _read_none(path):
+        return None
+    monkeypatch.setattr(screens, "_read_local_photo_upload", _read_none)
+
+    client = _FakeClient(url_photo_raises=True)
+    screen = Screen(caption="Berserk", image="/local/missing_art.jpg")
+
+    msg = await send_screen(client, 889, screen)
+
     assert msg.kind == "text"
+    assert len(client.text_calls) == 1 and "Berserk" in client.text_calls[0]["text"]
 
 
 @pytest.mark.asyncio
@@ -173,6 +194,49 @@ async def test_edit_in_place_recovers_by_uploading_bytes(_fake_download):
     assert result is not None            # edit succeeded (no fall-through to send-new)
     assert edits == ["url", "bytes"]     # tried URL, then recovered with bytes
     assert screens._FILE_ID_CACHE[str(screen.image)] == "FILEID_FROM_BYTES"
+
+
+@pytest.mark.asyncio
+async def test_edit_in_place_recovers_local_path_by_uploading_bytes(monkeypatch):
+    """An in-place photo EDIT of a LOCAL art file that hits MEDIA_EMPTY re-reads
+    the file and edits again in place — the edit path must recover local art too,
+    not just remote URLs."""
+    async def _read_local(path):
+        bio = io.BytesIO(b"\xff\xd8\xff\xe0JFIFlocal")
+        bio.name = "artwork.jpg"
+        return bio
+    monkeypatch.setattr(screens, "_read_local_photo_upload", _read_local)
+
+    edits: list[str] = []
+
+    class _EditClient:
+        async def edit_message_media(self, chat_id, message_id, media, **kw):
+            photo = media.media
+            if hasattr(photo, "read"):
+                edits.append("bytes")
+                return _Msg("photo", photo=_Photo("FILEID_FROM_BYTES"))
+            edits.append("path")
+            raise MediaEmpty.__new__(MediaEmpty)
+
+    class _Old(_Msg):
+        def __init__(self):
+            super().__init__("photo", photo=_Photo("old"))
+            from types import SimpleNamespace
+            self.chat = SimpleNamespace(id=1234)
+
+        async def edit_media(self):
+            return None
+
+    screen = Screen(caption="Vagabond", image="/local/art_11.jpg")
+    old = _Old()
+
+    result = await screens._try_edit_in_place(
+        _EditClient(), old, screen, str(screen.image), screen.caption,
+    )
+
+    assert result is not None
+    assert edits == ["path", "bytes"]
+    assert screens._FILE_ID_CACHE["/local/art_11.jpg"] == "FILEID_FROM_BYTES"
 
 
 @pytest.mark.asyncio

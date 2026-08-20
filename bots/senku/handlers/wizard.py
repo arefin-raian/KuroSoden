@@ -30,6 +30,7 @@ from types import SimpleNamespace
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
+from pyrogram.errors import ChannelInvalid, ChatInvalid
 from pyrogram.types import CallbackQuery, Message
 
 from nekofetch.bots.fsm import FSM
@@ -665,10 +666,38 @@ def register(client: Client, container: Container) -> None:
             except Exception:  # noqa: BLE001 — progress is cosmetic
                 pass
 
+        async def _reask_banned_channel() -> None:
+            """CHAT_INVALID on title/description ⇒ the channel is banned/restricted/
+            deleted. Don't fake success: replace the progress card with an
+            explanatory prompt and re-arm the link step so a freshly-created
+            channel's @username is picked up (mirrors the verify-failed re-ask)."""
+            if prompt_msg_id:
+                try:
+                    await client.delete_messages(prompt_chat_id, prompt_msg_id)
+                except Exception:  # noqa: BLE001
+                    pass
+            fail = await send_screen(
+                client, chat_id,
+                card(V.channel_banned(display),
+                     image=pick_artwork(BOT), bot_name=BOT,
+                     buttons=[
+                         [(V.BTN_CHANNEL_DONE, cb(BOT, "wiz", "chandone", code))],
+                         [(V.BTN_CANCEL, cb(BOT, "wiz", "cancel", code))],
+                     ]),
+            )
+            await fsm.set(user_id, STATE_AWAIT_CHANNEL, code=code,
+                          prompt_msg_id=fail.id, prompt_chat_id=fail.chat.id)
+
         # 1) Title
         try:
             await client.set_chat_title(chat.id, final_title[:128])
             steps[0] = ("Set channel title", "done")
+        except (ChatInvalid, ChannelInvalid) as exc:
+            # Telegram rejects edits on a banned/restricted channel with
+            # CHAT_INVALID — ask for a fresh channel instead of a false "ready".
+            log.warning("senku.wiz.channel_banned", code=code, error=str(exc))
+            await _reask_banned_channel()
+            return
         except Exception as exc:  # noqa: BLE001
             log.warning("senku.wiz.set_title_failed", code=code, error=str(exc))
             steps[0] = ("Set channel title (skipped — check my rights)", "done")
@@ -680,6 +709,10 @@ def register(client: Client, container: Container) -> None:
             try:
                 await client.set_chat_description(chat.id, ess.description[:255])
                 steps[1] = ("Set channel description", "done")
+            except (ChatInvalid, ChannelInvalid) as exc:
+                log.warning("senku.wiz.channel_banned", code=code, error=str(exc))
+                await _reask_banned_channel()
+                return
             except Exception as exc:  # noqa: BLE001
                 log.warning("senku.wiz.set_desc_failed", code=code, error=str(exc))
                 steps[1] = ("Set channel description (skipped — check my rights)",
