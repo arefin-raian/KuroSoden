@@ -195,10 +195,25 @@ class BotContentService:
 
         # Gather the data we need.
         packs = await self._load_packs(anime_doc_id)
-        meta = await self._gather_metadata(anime_doc_id)
+        # Resolve a human title up front so metadata + walk never depend on the
+        # fragile numeric-id recovery (a numeric anime_doc_id like "162896" is not
+        # a searchable title). Prefer the bot's own name, then any pack's title.
+        title_hint = await self._resolve_title_hint(bot_id, packs)
+        meta = await self._gather_metadata(anime_doc_id, title_hint=title_hint)
 
         # Walk the full franchise graph (AniList BFS).
         franchise = await self._walk_franchise(anime_doc_id, meta)
+
+        # Belt-and-suspenders: if the walk produced no TV seasons but we DO have
+        # uploaded packs, synthesize season entries from the packs so a transient
+        # walk miss (AniList hiccup / deleted cache) never silently drops every
+        # season card. Uses the resolved title so the card + TMDB lookup are right.
+        if not franchise.get("tv") and packs:
+            synth = self._seasons_from_packs(packs, meta, title_hint)
+            if synth:
+                franchise = {"tv": synth, "extras": [], "all": synth}
+                log.info("bot.content.franchise.pack_fallback",
+                         anime=anime_doc_id, tv=len(synth))
 
         # Pull user-generated thumbnails from the thumbnail channel. Empty dict
         # when the admin skipped / before generation completed — callers fall
@@ -933,6 +948,56 @@ class BotContentService:
                 continue
         return out
 
+    async def _resolve_title_hint(self, bot_id: int, packs: list) -> str | None:
+        """A human title for the entity, so metadata/walk never rely on searching
+        a numeric anime_doc_id (which can't text-match). Prefer the distribution
+        bot's own name, then any storage pack's ``anime_title``."""
+        try:
+            bot_row = await self._load_bot(bot_id)
+            name = getattr(bot_row, "name", None)
+            if name and str(name).strip():
+                return str(name).strip()
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            log.debug("bot.content.title_hint.bot_lookup_failed", error=str(exc))
+        for p in packs or []:
+            t = getattr(p, "anime_title", None)
+            if t and str(t).strip():
+                return str(t).strip()
+        return None
+
+    def _seasons_from_packs(self, packs: list, meta: dict,
+                            title_hint: str | None):
+        """Synthesize TV ``FranchiseEntry`` objects from uploaded storage packs.
+
+        Fallback when the franchise walk returns no TV entries (AniList hiccup or
+        a deleted prefetch cache) yet packs exist — so a season card still renders
+        with correct season/part + title instead of silently vanishing. One entry
+        per distinct ``(season, season_part)`` among the (season-kind) packs."""
+        from nekofetch.sources.telegram.anilist import FranchiseEntry
+
+        title = (title_hint or meta.get("english") or meta.get("title")
+                 or "Anime")
+        seen: dict[tuple[int, int | None], FranchiseEntry] = {}
+        for p in packs:
+            season = getattr(p, "season", None)
+            # Skip extras (movies/OVAs live at season 90+ or carry entry_id); the
+            # walk-miss fallback only needs the numbered TV seasons.
+            if not season or season <= 0 or season >= 90:
+                continue
+            key = (int(season), getattr(p, "season_part", None))
+            if key in seen:
+                continue
+            seen[key] = FranchiseEntry(
+                anilist_id=getattr(p, "entry_id", None) or -int(season),
+                format="TV",
+                english_title=title,
+                titles=[title],
+                episodes=None,
+                season_part=key[1],
+                relation="ROOT" if season == 1 else "SEQUEL",
+            )
+        return [seen[k] for k in sorted(seen)]
+
     async def _walk_franchise(self, anime_doc_id: str, meta: dict) -> dict:
         """Walk the full AniList franchise graph and return sorted entries.
 
@@ -971,12 +1036,21 @@ class BotContentService:
                 search_query = anime_doc_id
                 if search_query.startswith("anilist:"):
                     search_query = search_query[len("anilist:"):]
-                search = await self._c.anilist.search(search_query)
-                if search is None:
+                root_id = None
+                if search_query.isdigit():
+                    # A numeric doc id IS the AniList id — resolve it directly.
+                    # ``anilist.search("162896")`` is a TITLE text-search and can
+                    # never match, so a numeric-id title with no prefetch cache used
+                    # to yield an empty walk → zero season cards. Walk by id instead.
+                    root_id = int(search_query)
+                else:
+                    search = await self._c.anilist.search(search_query)
+                    if search is not None:
+                        root_id = search.id
+                if root_id is None:
                     log.debug("bot.content.franchise.no_match", anime=search_query)
-                    return empty
-                root_id = search.id
-                entries = await self._c.anilist.walk_franchise_full(root_id)
+                else:
+                    entries = await self._c.anilist.walk_franchise_full(root_id)
             if not entries:
                 log.debug("bot.content.franchise.empty", anime=anime_doc_id)
                 return empty
