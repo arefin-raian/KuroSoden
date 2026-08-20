@@ -418,6 +418,13 @@ class DistributionCache:
             json.dumps({"handle": handle, "chat_id": chat_id}),
             ex=_DEFAULT_TTL, label="dist_cache.channel.set",
         )
+        # A (re)confirmed channel means a fresh setup run — clear the warm-up guard
+        # so global-search warm-up fires again. Without this, a re-do left the
+        # 30-day `warmed` flag set and warm-up silently skipped (the operator saw
+        # "no warm-up messages" on the re-run).
+        await safe_redis_delete(
+            self._redis, f"nf:dist:{code}:warmed", label="dist_cache.warmed.clear",
+        )
 
     async def set_last_logo(self, code: str, *, path: str, kind: str,
                             text: str = "", font: str | None = None) -> None:

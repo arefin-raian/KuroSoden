@@ -252,6 +252,14 @@ class MainChannelService:
             log.debug("mainchannel.anilist_cache.failed",
                       anime=anime_doc_id, error=str(exc))
 
+        # ── Enrichment fallback when the prefetch cache didn't supply a field ──
+        # The block above reads genre/studio/title/romaji/synopsis ONLY from the
+        # prefetched anilist.json. When that cache is absent (e.g. wiped by a
+        # re-do) every field kept its default — empty genre, "#anime" studio, no
+        # romaji. Fall back to franchise_data (in-hand, no network) then a live
+        # AniList fetch so an absent cache can never blank the main post again.
+        await self._enrich_facts_fallback(anime_doc_id, facts)
+
         # ── Franchise-level corrections (per Gojo spec) ──
         #   • EPISODES = Σ episodes of the TV-season continuity chain ONLY
         #     (movies / OVAs / specials / spin-offs excluded). ``franchise_totals``
@@ -402,6 +410,94 @@ class MainChannelService:
             facts.title_html = facts.title
 
         return facts
+
+    async def _enrich_facts_fallback(
+        self, anime_doc_id: str, facts: PublicationFacts,
+    ) -> None:
+        """Backfill genre / studio / title / romaji / synopsis when the prefetch
+        cache didn't (an absent anilist.json leaves them at defaults). Sources, in
+        order: the request's ``franchise_data`` (no network), then a live AniList
+        fetch for the fields it lacks (studio/synopsis). Only fills a field still
+        at its default so a good cached value is never overwritten. Best-effort."""
+        default_genres = "—"
+        default_tag = "Anime"
+        need_genres = facts.genres == default_genres
+        need_studio = (not facts.tag) or facts.tag == default_tag
+        need_title = (not facts._english) or facts._english == anime_doc_id
+        need_romaji = not facts._romaji
+        need_overview = (not facts.overview) or facts.overview == "—"
+        if not any((need_genres, need_studio, need_title, need_romaji, need_overview)):
+            return
+
+        # ── (1) franchise_data — already persisted, no network ──
+        fd: dict = {}
+        try:
+            from nekofetch.core.parsing import clean_anilist_id
+            from nekofetch.infrastructure.database.postgres.models import Request
+
+            async with session_scope(self._c.pg_sessionmaker) as session:
+                doc = clean_anilist_id(anime_doc_id)
+                lookup = {anime_doc_id, doc, f"anilist:{doc}"}
+                req = (await session.execute(
+                    select(Request).where(Request.anime_doc_id.in_(lookup))
+                    .order_by(Request.id.desc())
+                )).scalars().first()
+                fd = (req.franchise_data or {}) if req is not None else {}
+        except Exception as exc:  # noqa: BLE001
+            log.debug("mainchannel.fallback.franchise_data_failed",
+                      anime=anime_doc_id, error=str(exc))
+
+        if need_genres:
+            g = fd.get("genres") or []
+            if g:
+                facts.genres = ", ".join(g)
+                need_genres = False
+        if need_studio and fd.get("studio"):
+            facts.tag = str(fd["studio"]).replace(" ", "")
+            need_studio = False
+        eng = (fd.get("english") or fd.get("title") or "").strip()
+        rom = (fd.get("romaji") or "").strip()
+        if need_title and eng:
+            facts.title = eng
+            facts._english = eng
+            need_title = False
+        if need_romaji and rom:
+            facts._romaji = rom
+            need_romaji = False
+        if need_overview and fd.get("synopsis"):
+            facts.overview = fd["synopsis"]
+            need_overview = False
+
+        # ── (2) live AniList for whatever franchise_data lacked (studio/synopsis) ──
+        if not any((need_genres, need_studio, need_title, need_romaji, need_overview)):
+            return
+        try:
+            from nekofetch.core.parsing import clean_anilist_id
+            doc = clean_anilist_id(anime_doc_id)
+            anilist = getattr(self._c, "anilist", None)
+            media = None
+            if anilist is not None and doc.isdigit():
+                media = await anilist._fetch_full(int(doc))
+            elif anilist is not None:
+                media = await anilist.search(doc)
+            if media is not None:
+                if need_genres and getattr(media, "genres", None):
+                    facts.genres = ", ".join(media.genres)
+                if need_studio and getattr(media, "studio", None):
+                    facts.tag = str(media.studio).replace(" ", "")
+                if need_title and getattr(media, "english", None):
+                    facts.title = media.english
+                    facts._english = media.english
+                if need_romaji and getattr(media, "romaji", None):
+                    facts._romaji = media.romaji
+                if need_overview and getattr(media, "synopsis", None):
+                    facts.overview = media.synopsis
+        except Exception as exc:  # noqa: BLE001 — live fallback is best-effort
+            log.debug("mainchannel.fallback.live_failed",
+                      anime=anime_doc_id, error=str(exc))
+        # NOTE: no title_html rebuild here — gather_facts builds the
+        # "<b>English</b>〢Romaji" header later (after this call) from
+        # facts._english / facts._romaji, so a fallback fill is picked up there.
 
     async def _apply_franchise_facts(
         self, anime_doc_id: str, facts: PublicationFacts,

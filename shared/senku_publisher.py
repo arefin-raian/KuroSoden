@@ -1490,6 +1490,69 @@ class SenkuPublisher:
             log.info("senku.warm.no_userbot", error=str(exc))
             return None
 
+    async def _warm_send_via_userbots(self, admin_client, chat_id: int, code: str,
+                                      quotes: list):
+        """Try each configured userbot in turn to fire the warm-up burst.
+
+        Returns ``((deleter_client, sent_ids), promoted_client_or_None)`` on the
+        first account that posts anything, or ``(None, None)`` when every userbot
+        fails (caller then uses the bot). A userbot that can't be added/promoted
+        (e.g. CHANNELS_TOO_MUCH) or posts nothing is demoted (if we promoted it)
+        and the next account is tried. ``promoted_client`` is returned so the
+        caller can demote+remove it after the burst — only when WE promoted it."""
+        try:
+            from nekofetch.sources.telegram.userbot import UserbotPool
+
+            pool = getattr(self._c, "_userbot_pool", None)
+            if pool is None:
+                pool = UserbotPool.from_env(
+                    self._c.env.telegram_api_id,
+                    self._c.env.telegram_api_hash,
+                    str(self._c.env.session_path),
+                )
+                self._c._userbot_pool = pool  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 — no pool → bot path
+            log.info("senku.warm.no_userbot", error=str(exc))
+            return None, None
+
+        accounts = list(getattr(pool, "accounts", []) or [])
+        if not accounts:
+            return None, None
+        # "randomly one if multiple" — shuffle so we don't always hammer account 1.
+        import random
+        random.shuffle(accounts)
+
+        for acc in accounts:
+            ub = None
+            we_promoted = False
+            try:
+                # execute_on starts the account and runs fn(client); fn must be a
+                # coroutine, so return the client from an async identity.
+                async def _identity(c):
+                    return c
+                ub = await pool.execute_on(acc.name, _identity)
+            except Exception as exc:  # noqa: BLE001 — account won't start → next
+                log.info("senku.warm.userbot_start_failed",
+                         code=code, account=acc.name, error=str(exc))
+                continue
+            try:
+                we_promoted = await self._ensure_userbot_can_post(
+                    admin_client, ub, chat_id)
+                sent_ids = await self._warm_send(
+                    ub, chat_id, code, quotes, pace=False)
+            except Exception as exc:  # noqa: BLE001 — this account errored → next
+                log.info("senku.warm.userbot_burst_failed",
+                         code=code, account=acc.name, error=str(exc))
+                sent_ids = []
+            if sent_ids:
+                log.info("senku.warm.userbot_used", code=code, account=acc.name,
+                         sent=len(sent_ids))
+                return (ub, sent_ids), (ub if we_promoted else None)
+            # This account posted nothing — undo our promotion and try the next.
+            if we_promoted:
+                await self._demote_userbot(admin_client, ub, chat_id)
+        return None, None
+
     @staticmethod
     def _member_status(member) -> str:
         return getattr(getattr(member, "status", None), "value",
@@ -1617,8 +1680,8 @@ class SenkuPublisher:
         # service notice Telegram posted when the wizard renamed the channel — the
         # user wants it gone immediately after the rename, not buried under quotes.
         # Sweep with the USERBOT when available: a bot client can't reliably page
-        # channel history, so a bot-only sweep silently finds nothing. Acquire it
-        # once here and reuse it for the warm-up burst below.
+        # channel history, so a bot-only sweep silently finds nothing. (The warm
+        # burst below picks its own account via the fallback chain.)
         ub = await self._acquire_userbot()
         swept = await self._sweep_service_notices(ub or client, chat_id)
         if swept:
@@ -1626,32 +1689,27 @@ class SenkuPublisher:
 
         quotes = await self._fetch_warm_texts(self._WARM_COUNT)
 
-        # Prefer the userbot (no 20/min channel cap). Fall back to the bot client.
-        # If the userbot isn't already an admin of the channel, promote it (via the
-        # bot admin client) so it can fire all 100 — then demote + remove it after,
-        # but ONLY if WE were the ones who promoted it (leave a pre-existing admin
-        # userbot untouched).
+        # Prefer a userbot (no 20/min channel cap). Try EACH configured userbot in
+        # turn — a single account may be un-addable (already in too many channels /
+        # CHANNELS_TOO_MUCH) or hit flood, so we advance to the next rather than
+        # collapsing straight to the bot. Only when every userbot fails do we fall
+        # back to the bot client (paced, FloodWait-honouring). Each userbot we had
+        # to promote is demoted+removed after, leaving pre-existing admins untouched.
         sent_ids: list[int] = []
-        via = "userbot" if ub is not None else "bot"
-        we_promoted = False
-        if ub is not None:
-            we_promoted = await self._ensure_userbot_can_post(client, ub, chat_id)
-            sent_ids = await self._warm_send(ub, chat_id, code, quotes, pace=False)
-            # If the userbot couldn't post at all (not a member / no rights),
-            # fall back to the bot so warm-up still happens.
-            if not sent_ids:
-                via = "bot"
-                if we_promoted:
-                    await self._demote_userbot(client, ub, chat_id)
-                    we_promoted = False
-                ub = None
-        if ub is None:
+        deleter = client
+        via = "bot"
+        ub_sender, ub_promoted = await self._warm_send_via_userbots(
+            client, chat_id, code, quotes,
+        )
+        if ub_sender is not None:
+            sent_ids = ub_sender[1]
+            deleter = ub_sender[0]
+            via = "userbot"
+        else:
             sent_ids = await self._warm_send(
                 client, chat_id, code, quotes, pace=True,
             )
             deleter = client
-        else:
-            deleter = ub
 
         # Delete everything we sent (chunked — delete_messages takes a list).
         for start in range(0, len(sent_ids), self._WARM_BATCH_DELETE):
@@ -1661,10 +1719,10 @@ class SenkuPublisher:
             except Exception as exc:  # noqa: BLE001
                 log.warning("senku.warm.delete_blip", code=code, error=str(exc))
 
-        # Undo the temporary promotion (strip rights + kick) now that the burst is
-        # done — only when we added the userbot ourselves.
-        if we_promoted and ub is not None:
-            await self._demote_userbot(client, ub, chat_id)
+        # Undo any temporary promotion (strip rights + kick) now the burst is done
+        # — only for the userbot WE promoted.
+        if ub_promoted is not None:
+            await self._demote_userbot(client, ub_promoted[0], chat_id)
 
         try:
             if self._c.redis:

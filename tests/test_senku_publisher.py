@@ -518,3 +518,82 @@ async def test_send_posts_survives_a_failed_card(pub):
     assert client.messages == ["Footer"]
     # Only the successfully-sent footer is recorded in the layout.
     assert [it["kind"] for it in layout] == ["footer"]
+
+
+# ── _warm_send_via_userbots: account fallback chain (A → B → bot) ──────────────
+
+class _FakeAccount:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakePool:
+    """Minimal UserbotPool stand-in: execute_on(name, fn) returns a per-name
+    fake client, mirroring the real 'start the account, run fn(client)'."""
+    def __init__(self, names):
+        self.accounts = [_FakeAccount(n) for n in names]
+        self._clients = {n: object() for n in names}  # opaque client handles
+
+    async def execute_on(self, name, fn):
+        return await fn(self._clients[name])
+
+
+class _WarmContainer:
+    redis = None
+    def __init__(self, pool):
+        self._userbot_pool = pool
+        self.env = None  # not reached — pool is pre-seeded on the container
+
+
+@pytest.fixture(autouse=True)
+def _no_shuffle(monkeypatch):
+    # Make account order deterministic for assertions (random.shuffle → no-op).
+    import random
+    monkeypatch.setattr(random, "shuffle", lambda seq: None)
+
+
+async def _stub_warm(pub, monkeypatch, *, posts_ok: set[str]):
+    """Stub the per-account primitives so only accounts in ``posts_ok`` post."""
+    # Map opaque client handle → account name, so the stubs know which is which.
+    pool = pub._c._userbot_pool
+    handle_to_name = {v: k for k, v in pool._clients.items()}
+    promoted: list[str] = []
+    demoted: list[str] = []
+
+    async def _ensure(admin_client, ub, chat_id):
+        return True  # pretend we promoted every account we tried
+    async def _send(sender, chat_id, code, quotes, *, pace):
+        name = handle_to_name.get(sender)
+        return [1, 2, 3] if name in posts_ok else []
+    async def _demote(admin_client, ub, chat_id):
+        demoted.append(handle_to_name.get(ub))
+
+    monkeypatch.setattr(pub, "_ensure_userbot_can_post", _ensure)
+    monkeypatch.setattr(pub, "_warm_send", _send)
+    monkeypatch.setattr(pub, "_demote_userbot", _demote)
+    return handle_to_name, demoted
+
+
+async def test_warm_second_userbot_used_when_first_posts_nothing(monkeypatch):
+    pub = SenkuPublisher(_WarmContainer(_FakePool(["A", "B"])))
+    h2n, demoted = await _stub_warm(pub, monkeypatch, posts_ok={"B"})
+    result, promoted = await pub._warm_send_via_userbots(object(), -100, "REQ-1", ["q"])
+    assert result is not None                       # a userbot succeeded
+    deleter, sent = result
+    assert sent == [1, 2, 3]
+    assert h2n[deleter] == "B"                       # account B is the one that posted
+    assert "A" in demoted                            # A was demoted after posting nothing
+    assert h2n[promoted] == "B"                      # B returned for post-burst demote
+
+
+async def test_warm_all_userbots_fail_returns_none_for_bot_path(monkeypatch):
+    pub = SenkuPublisher(_WarmContainer(_FakePool(["A", "B"])))
+    await _stub_warm(pub, monkeypatch, posts_ok=set())   # nobody can post
+    result, promoted = await pub._warm_send_via_userbots(object(), -100, "REQ-1", ["q"])
+    assert result is None and promoted is None       # → caller uses the bot
+
+
+async def test_warm_no_accounts_returns_none(monkeypatch):
+    pub = SenkuPublisher(_WarmContainer(_FakePool([])))
+    result, promoted = await pub._warm_send_via_userbots(object(), -100, "REQ-1", ["q"])
+    assert result is None and promoted is None

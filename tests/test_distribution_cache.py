@@ -138,6 +138,16 @@ async def test_channel_round_trip(cache):
 
 
 @pytest.mark.asyncio
+async def test_set_channel_clears_warmed_flag(cache):
+    # A (re)confirmed channel must clear the warm-up guard so global-search
+    # warm-up fires again on a re-do (the "no warm-up messages on re-run" bug).
+    redis = cache._redis
+    redis.store["nf:dist:REQ-1:warmed"] = "1"
+    await cache.set_channel("REQ-1", handle="@x", chat_id=-100)
+    assert "nf:dist:REQ-1:warmed" not in redis.store
+
+
+@pytest.mark.asyncio
 async def test_clear_removes_all_keys(cache):
     await cache.set_entries("REQ-1", _entries())
     await cache.set_selection("REQ-1", 1, asset="logo", value="x")

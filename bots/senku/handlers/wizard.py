@@ -515,6 +515,48 @@ def register(client: Client, container: Container) -> None:
             except Exception as exc:  # noqa: BLE001 — not a member ⇒ not admin
                 log.info("senku.wiz.gojo_verify_failed", code=code, error=str(exc))
 
+        # ── Cross-bot admin auto-promotion ──
+        # The operator was told to add BOTH bots as admins, but often adds only
+        # one. When exactly one of Senku/Gojo is admin, use the present bot (which
+        # has full rights incl. can_promote_members if they granted "all rights")
+        # to add + promote the missing one, so the operator doesn't have to do it
+        # twice. Best-effort: if the promoter lacks the right, we log and fall
+        # through to the existing re-ask below (never crash).
+        if chat is not None and gojo is not None and (senku_ok ^ gojo_ok):
+            try:
+                from pyrogram.types import ChatPrivileges
+                _privs = ChatPrivileges(
+                    can_change_info=True, can_post_messages=True,
+                    can_edit_messages=True, can_delete_messages=True,
+                    can_invite_users=True, can_pin_messages=True,
+                    can_promote_members=True, can_manage_chat=True,
+                )
+                if senku_ok and not gojo_ok:
+                    # Senku is admin → Senku promotes Gojo.
+                    target_id = (await gojo.get_me()).id
+                    promoter, who = client, "Gojo"
+                else:
+                    # Gojo is admin → Gojo promotes Senku.
+                    target_id = (await client.get_me()).id
+                    promoter, who = gojo, "Senku"
+                try:
+                    await promoter.add_chat_members(chat.id, target_id)
+                except Exception as exc:  # noqa: BLE001 — may already be a member
+                    log.debug("senku.wiz.cross_promote_add_skipped",
+                              code=code, error=str(exc))
+                await promoter.promote_chat_member(
+                    chat.id, target_id, privileges=_privs)
+                # Re-verify through Senku's peer so the flags reflect reality.
+                gm2 = await client.get_chat_member(chat.id, target_id)
+                if _is_admin_status(gm2):
+                    if who == "Gojo":
+                        gojo_ok = True
+                    else:
+                        senku_ok = True
+                    log.info("senku.wiz.cross_promoted", code=code, promoted=who)
+            except Exception as exc:  # noqa: BLE001 — promoter lacks rights → re-ask
+                log.info("senku.wiz.cross_promote_failed", code=code, error=str(exc))
+
         display = f"@{chat.username}" if chat and chat.username else (
             chat.title if chat else handle
         )
