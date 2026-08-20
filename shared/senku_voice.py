@@ -531,6 +531,20 @@ def channel_verify_failed(handle: str, missing: list[str] | None = None) -> str:
     )
 
 
+def channel_banned(handle: str) -> str:
+    """Telegram rejected edits on the channel with CHAT_INVALID — the channel is
+    banned/restricted/deleted and can't be used. Ask for a fresh one rather than
+    pretending setup succeeded."""
+    return (
+        f"{ICON} <b>{esc(handle)} looks banned or restricted.</b> Telegram won't let me "
+        "edit it (title/description rejected), which almost always means the channel is "
+        "banned, restricted, or deleted — nothing I can fix from here.\n\n"
+        "<b>Create a fresh channel and send me its @username (or invite link)</b> — the "
+        "link field is still open. Make sure <b>Senku</b> (me) and <b>Gojo</b> are admins "
+        "there with full permissions."
+    )
+
+
 # ── Thumbnail loop ──────────────────────────────────────────────────────────────
 
 def thumb_intro(title: str, total: int) -> str:

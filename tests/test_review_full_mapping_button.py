@@ -1,9 +1,10 @@
-"""The torrent-mapping card's Full Mapping control is a URL button, not a link.
+"""The torrent-mapping card keyboard is a single, STABLE button set.
 
-The operator asked for the Telegraph full-mapping page to open from a BUTTON —
-one extra row at the top of the confirm card — instead of a hyperlink buried in
-the caption. ``_torrent_map_kb`` builds that keyboard: Full Mapping (URL) first,
-then Confirm / Details / Toggle (/ Fix), then Back.
+The rebuilt card (owner request) drops the four overlapping buttons and the
+``with_fix`` branching that corrupted the keyboard on a Back round-trip. It now
+renders the SAME rows every paint: Full Mapping, Toggle Entry + Edit Mapping,
+Confirm, Back. Full Mapping is a URL button when a Telegraph page exists, else an
+inline callback — so it is ALWAYS a real button, never a caption hyperlink.
 """
 
 from __future__ import annotations
@@ -26,38 +27,47 @@ def test_full_mapping_is_the_first_row_url_button():
     rows = kb.inline_keyboard
     assert len(rows) == 4
 
-    # Row 1: the external mapping page as a real URL button (the ask).
+    # Row 1: the external mapping page as a real URL button.
     assert len(rows[0]) == 1
     assert rows[0][0].url == "https://telegra.ph/vanitas-map"
     assert rows[0][0].callback_data is None
 
-    # Rows below: the usual action buttons, unchanged.
+    # Row 2: Toggle Entry (render-only 'list' sentinel — never auto-toggles) + Edit.
     assert [b.callback_data for b in rows[1]] == [
-        "staff|rtmapok|REQ-1", "staff|rtmapdet|REQ-1|0",
+        "staff|rtmaptgl|REQ-1|list", "staff|rtmapedit|REQ-1",
     ]
-    assert [b.callback_data for b in rows[2]] == [
-        "staff|rtmaptgl|REQ-1|0", "staff|rtmapfix|REQ-1",
-    ]
+    # Row 3: Confirm. Row 4: Back.
+    assert [b.callback_data for b in rows[2]] == ["staff|rtmapok|REQ-1"]
     assert [b.callback_data for b in rows[3]] == ["staff|rdetail|REQ-1"]
 
 
-def test_no_mapping_url_means_no_full_mapping_row():
+def test_no_mapping_url_still_gives_a_full_mapping_button():
+    # Without a Telegraph page, Full Mapping becomes an INLINE callback button —
+    # it must never disappear / collapse into a caption hyperlink.
     kb = _torrent_map_kb(_L, "REQ-1", "")
     rows = kb.inline_keyboard
-    assert len(rows) == 3  # Confirm/Details, Toggle/Fix, Back — no URL row
-    assert all(b.url is None for row in rows for b in row)
+    assert len(rows) == 4
+    assert rows[0][0].url is None
+    assert rows[0][0].callback_data == "staff|rtmapfull|REQ-1|0"
 
 
-def test_overview_keyboard_drops_the_fix_button():
-    """The overview return (rtmapov) never offers Fix — only the first card does."""
-    kb = _torrent_map_kb(_L, "REQ-1", "https://telegra.ph/map", with_fix=False)
-    rows = kb.inline_keyboard
-    assert [b.callback_data for b in rows[2]] == ["staff|rtmaptgl|REQ-1|0"]
-    # … and the URL button is still there when a map exists.
-    assert rows[0][0].url == "https://telegra.ph/map"
+def test_keyboard_is_stable_regardless_of_with_fix():
+    # The Back round-trip bug: with_fix is now ignored, so the keyboard is
+    # identical whether or not it's passed — a round-trip reproduces the card.
+    a = _torrent_map_kb(_L, "REQ-1", "https://telegra.ph/map", with_fix=True)
+    b = _torrent_map_kb(_L, "REQ-1", "https://telegra.ph/map", with_fix=False)
+    assert _flat(a) == _flat(b)
+
+
+def test_toggle_entry_uses_list_sentinel_not_index_zero():
+    # Opening Toggle Entry must NOT carry idx=0 (which used to flip Season 1 on
+    # open). It carries the render-only 'list' sentinel.
+    kb = _torrent_map_kb(_L, "REQ-1", "")
+    toggle = next(b for b in _flat(kb) if b[1] and "rtmaptgl" in b[1])
+    assert toggle[1].endswith("|list")
 
 
 def test_keyboard_is_never_empty():
     kb = _torrent_map_kb(_L, "REQ-1", "")
-    assert len(kb.inline_keyboard) == 3
+    assert len(kb.inline_keyboard) == 4
     assert _flat(kb)  # every row has buttons

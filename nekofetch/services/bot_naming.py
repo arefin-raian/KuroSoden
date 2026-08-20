@@ -424,6 +424,70 @@ def _shortest_alt(full_upper: str, alt_titles) -> str:
     return best
 
 
+# Default hard limit for a FINAL output filename's stem (extension excluded). The
+# worst case is the 1080p variant (4-digit resolution → longest token), so if the
+# 1080p stem fits, every derived tier (720p/480p) fits too. 60 is the operator's
+# rule: ≤60 acceptable, ≥61 not.
+FILENAME_STEM_LIMIT = 60
+
+
+def title_candidates(primary: str, alt_titles=None) -> list[str]:
+    """Ordered title candidates for length-aware naming, longest-preferred first:
+
+        full title → shortest Latin-script alternative → acronym
+
+    The same ladder the pack caption shortens through, but PRESERVING natural case
+    (the caption upper-cases; a filename should keep 'TenSura', not 'TENSURA').
+    The acronym is naturally uppercase. De-duplicated, blanks dropped."""
+    primary = re.sub(r"\s+", " ", (primary or "").strip())
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(v: str) -> None:
+        v = re.sub(r"\s+", " ", (v or "").strip())
+        if v and v.casefold() not in seen:
+            seen.add(v.casefold())
+            out.append(v)
+
+    _add(primary)
+    # Shortest Latin-script alt strictly shorter than the full title, in its
+    # ORIGINAL case (mirrors _shortest_alt's selection without the .upper()).
+    best_alt = ""
+    for raw in alt_titles or []:
+        if not is_latin_script(raw):
+            continue
+        alt = re.sub(r"\s+", " ", (raw or "").strip())
+        if not alt or alt.casefold() == primary.casefold() or len(alt) >= len(primary):
+            continue
+        if not best_alt or len(alt) < len(best_alt):
+            best_alt = alt
+    _add(best_alt)
+    acr = _acronym(primary)
+    if len(acr) >= 2 and acr.casefold() != primary.casefold():
+        _add(acr)
+    return out
+
+
+def pick_title_within(candidates, render, limit: int):
+    """Pick the first title candidate whose RENDERED string fits ``limit`` chars.
+
+    ``render(title) -> str`` produces the measured string (e.g. a filename stem)
+    for a given title candidate; the first candidate whose rendered length is
+    ``<= limit`` wins. Falls through to the LAST (shortest) candidate when none
+    fit — a pathologically long acronym can't be shortened further, and a name is
+    always better than a crash. Returns ``(title, rendered)``.
+
+    This is the filename counterpart to ``build_pack_caption``'s inline
+    pick-that-fits loop, factored out so both share one fit strategy."""
+    cands = [c for c in (candidates or []) if c] or [""]
+    chosen_title, chosen_rendered = cands[-1], render(cands[-1])
+    for cand in cands:
+        rendered = render(cand)
+        if len(rendered) <= limit:
+            return cand, rendered
+    return chosen_title, chosen_rendered
+
+
 def build_pack_caption(
     title: str, *, season, season_part, resolution: str, audio,
     content_type: str = "Season", alt_titles=None,

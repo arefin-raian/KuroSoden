@@ -40,6 +40,36 @@ def test_integer_episode_is_not_fractional():
     assert m["fractional"] is False
 
 
+# ── junk classification (trailers/teasers/promos are NOT episodes) ──────────────
+
+def test_season_trailer_is_extra_not_episode():
+    # The owner's exact bug: "Season 1 Trailer 1" was matched as S01E01 and
+    # downloaded as the first episode. It must classify as EXTRA (junk) so it's
+    # never assigned an episode slot — it lands in the unmatched "doesn't belong
+    # here" bucket instead.
+    m = parse_release_meta("The Elusive Samurai Season 1 Trailer 1.mkv")
+    assert m["kind"] == "extra"
+
+
+def test_teaser_promo_creditless_are_extra():
+    for name in (
+        "Show S01 Teaser.mkv",
+        "Show - Promo 2.mkv",
+        "Show NCED 01.mkv",
+        "Show Creditless Opening.mkv",
+        "Show - PV 3.mkv",
+    ):
+        assert parse_release_meta(name)["kind"] == "extra", name
+
+
+def test_real_episode_still_parses_next_to_junk_tokens():
+    # A legit episode whose title happens to contain no junk token stays an
+    # episode — the junk filter must not over-match.
+    m = parse_release_meta("[Grp] Show S01E05 [1080p].mkv")
+    assert m["kind"] == "episode"
+    assert m["episode"] == 5
+
+
 def test_zero_parsed_as_episode_zero():
     m = parse_release_meta("[Grp] Show - 00 [1080p].mkv")
     assert m["episode"] == 0

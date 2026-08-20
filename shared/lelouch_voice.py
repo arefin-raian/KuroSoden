@@ -113,6 +113,20 @@ def sources_unreachable(query: str) -> str:
     )
 
 
+def still_airing(title: str) -> str:
+    """Shown when the requested title is still airing / not finished, so there is
+    no complete, canonical franchise to publish yet. We only distribute finished
+    content — refuse gracefully instead of building a phantom-season franchise."""
+    return (
+        f"{ICON} <b>{esc(title)} is still airing.</b>\n\n"
+        "I only move on a <b>finished</b> title — a season still broadcasting has "
+        "no complete run to publish, and I won't parade an unfinished campaign as "
+        "if it were won.\n\n"
+        "<i>Bring it to me once it's concluded, and I'll take the whole franchise "
+        "in one clean stroke.</i>"
+    )
+
+
 # ── Receipt / dedup ─────────────────────────────────────────────────────────
 
 RECEIPT_CLOSER = (

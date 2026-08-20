@@ -12,11 +12,63 @@ the admin can provide a supplemental torrent or individual file.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from nekofetch.domain.enums import ContentKind
 from nekofetch.services.franchise_flow import FranchiseMapping, MappingEntry
 from nekofetch.services.tier_gapfill import res_height, tiers_to_encode
+
+
+def _normalize_title(text: str) -> str:
+    """Lowercase, strip punctuation/underscores/dots → single-spaced words, so a
+    filename fragment and an episode title compare on words alone."""
+    text = re.sub(r"[._\-]+", " ", (text or "").lower())
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _match_episodes_by_title(
+    ordered_files: list[dict], episode_titles: dict[int, list[dict]],
+) -> int:
+    """Supplementary tier: for files with NO parsed episode number, try to pin it
+    from an episode TITLE embedded in the filename.
+
+    The owner's insight: many releases name files like ``Show - 05 - The Duel``
+    or ``Show S01 The Duel`` — when the numeric marker is missing/garbled but the
+    title text is present, the title uniquely identifies the episode. We only fill
+    ``episode`` where it is currently ``None`` (never override a confident numeric
+    match), and only on an UNAMBIGUOUS, sufficiently-long title hit — so a short or
+    repeated title can't mis-map. Best-effort: returns how many it filled.
+
+    Not universal (many files carry no title) — it simply recovers the ones that
+    do. ``episode_titles`` is ``{anilist_id: [{number,title}, …]}`` from Jikan.
+    """
+    # Flatten all known (number, normalized-title) pairs; drop trivially-short or
+    # duplicate titles that would match ambiguously.
+    seen: dict[str, int | None] = {}
+    for rows in (episode_titles or {}).values():
+        for row in rows or []:
+            num, ttl = row.get("number"), _normalize_title(row.get("title") or "")
+            if num is None or len(ttl) < 6:  # too short → ambiguous, skip
+                continue
+            seen[ttl] = None if ttl in seen else num  # duplicate title → ambiguous
+    candidates = {ttl: num for ttl, num in seen.items() if num is not None}
+    if not candidates:
+        return 0
+
+    filled = 0
+    for f in ordered_files:
+        if f.get("episode") is not None or f.get("kind", "episode") != "episode":
+            continue
+        norm_name = _normalize_title(f.get("name") or "")
+        # Longest title first so the most specific match wins.
+        for ttl in sorted(candidates, key=len, reverse=True):
+            if ttl in norm_name:
+                f["episode"] = candidates[ttl]
+                filled += 1
+                break
+    return filled
 
 
 @dataclass
@@ -231,6 +283,7 @@ def build_torrent_mapping(
     *,
     episode_titles: dict[int, list[dict]] | None = None,
     season_overrides: dict[int, int] | None = None,
+    junk_indices: set[int] | None = None,
 ) -> TorrentMapping:
     """Map torrent files to franchise entries.
 
@@ -248,11 +301,17 @@ def build_torrent_mapping(
     ``season_overrides`` maps ``file_index → season`` — an admin's manual season
     decision from the mapping card; it wins over every automatic tier.
 
+    ``junk_indices`` is a set of ``file_index`` the admin marked "not an episode"
+    in Edit Mapping — those files are forced out of the episode stream so they
+    land in ``unmatched`` (the "doesn't belong here" bucket) instead of being
+    assigned an episode slot (the "Season 1 Trailer 1 became E01" fix).
+
     Before grouping, every file's season (and episode, for flat absolute-numbered
     releases) is run through the season-mapping cascade so a franchise with several
     seasons is no longer collapsed onto S1 by ``parse_release_meta``'s default.
     """
     episode_titles = episode_titles or {}
+    junk_indices = junk_indices or set()
 
     # ── season-mapping cascade (auto → MAL titles → absolute → manual) ──────────
     # Rewrite each file's season/episode from the resolver before the historic
@@ -260,6 +319,23 @@ def build_torrent_mapping(
     ordered_files = _apply_season_resolution(
         ordered_files, franchise, episode_titles, season_overrides,
     )
+
+    # Admin-marked junk: force these files out of the episode stream so they are
+    # never assigned an episode slot and instead surface as unmatched.
+    if junk_indices:
+        ordered_files = [
+            {**f, "kind": "extra"} if f.get("index") in junk_indices else f
+            for f in ordered_files
+        ]
+
+    # Supplementary title-match tier: recover an episode number for any file that
+    # still has none by matching an embedded episode TITLE (from Jikan) against
+    # the filename. Never overrides a numeric match; best-effort only.
+    if episode_titles:
+        try:
+            _match_episodes_by_title(ordered_files, episode_titles)
+        except Exception:  # noqa: BLE001 — a title-match hiccup never breaks mapping
+            pass
 
     torrent_name = ""
     for f in ordered_files:

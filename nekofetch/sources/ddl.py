@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -102,15 +103,18 @@ class DdlSource(AnimeSource):
         root.mkdir(parents=True, exist_ok=True)
         return root
 
-    async def _fetch_archive(self, url: str, dest: Path, *, on_bytes=None) -> Path:
+    async def _fetch_archive(self, url: str, dest: Path, *, on_bytes=None,
+                             total_hint: int = 0) -> Path:
         """Download a remote archive to ``dest`` (skips if already cached).
 
-        ``on_bytes(done, total)`` reports byte progress. PRIMARY path is aria2c
-        (16 Range connections + per-piece timeout + retry + resume) — the
-        technique the Leech bot uses to pull these MoviesMod ``workers.dev`` links
-        reliably; a naive single-socket stream gets throttled/cut by the
-        Cloudflare worker and stalls. Falls back to a resumable httpx stream only
-        when aria2c isn't installed.
+        ``on_bytes(done, total)`` reports byte progress. ``total_hint`` is a
+        pre-resolved content length (from the caller's redirect-following HEAD) so
+        we don't issue a second HEAD here. PRIMARY path is aria2c (16 Range
+        connections + per-piece timeout + retry + resume) — the technique the
+        Leech bot uses to pull these MoviesMod ``workers.dev`` links reliably; a
+        naive single-socket stream gets throttled/cut by the Cloudflare worker and
+        stalls. Falls back to a resumable httpx stream only when aria2c isn't
+        installed.
         """
         if dest.exists() and dest.stat().st_size > 0:
             if on_bytes:
@@ -122,7 +126,7 @@ class DdlSource(AnimeSource):
         from nekofetch.sources._torrentdl import download_http_file, find_aria2
 
         if find_aria2() is not None:
-            total = await self._content_length(url)
+            total = total_hint or await self._content_length(url)
             try:
                 await download_http_file(
                     url, dest, total_bytes=total, on_progress=on_bytes,
@@ -165,19 +169,44 @@ class DdlSource(AnimeSource):
 
     async def _content_length(self, url: str) -> int:
         """Best-effort total size for the progress bar (HEAD, then a ranged GET)."""
+        size, _name = await self._head_meta(url)
+        return size
+
+    async def _head_meta(self, url: str) -> tuple[int, str | None]:
+        """Resolve ``(content_length, filename)`` in a single redirect-following
+        HEAD. The client has ``follow_redirects=True``, so ``r.url`` is the FINAL
+        URL after a shortener 302 (``flyn.im/9pYDxXE`` → ``…/A.Couple.Of.Cuckoos
+        .S01…zip``); the real name comes from ``Content-Disposition`` first, else
+        the final URL's basename — never the shortener tail. Size falls back to a
+        ranged GET; name falls back to ``None`` (caller keeps its own default)."""
+        size = 0
+        name: str | None = None
         try:
             r = await self.http.head(url)
             cl = r.headers.get("content-length")
             if cl and cl.isdigit():
-                return int(cl)
+                size = int(cl)
+            name = _name_from_disposition(r.headers.get("content-disposition"))
+            if not name:
+                # Final URL after redirects — its path holds the real archive name.
+                final = _archive_name(str(r.url))
+                name = final if final != "archive.zip" else None
         except Exception:  # noqa: BLE001
             pass
-        try:
-            async with self.http.stream("GET", url) as resp:
-                cl = resp.headers.get("content-length")
-                return int(cl) if cl and cl.isdigit() else 0
-        except Exception:  # noqa: BLE001
-            return 0
+        if size == 0:
+            try:
+                async with self.http.stream("GET", url) as resp:
+                    cl = resp.headers.get("content-length")
+                    size = int(cl) if cl and cl.isdigit() else 0
+                    if not name:
+                        name = _name_from_disposition(
+                            resp.headers.get("content-disposition"))
+                        if not name:
+                            final = _archive_name(str(resp.url))
+                            name = final if final != "archive.zip" else None
+            except Exception:  # noqa: BLE001
+                pass
+        return size, name
 
     async def get_episodes(self, source_ref: str, *, on_progress=None) -> list[Episode]:
         """Download + extract every provided archive, order EP1..EPN across them.
@@ -213,7 +242,11 @@ class DdlSource(AnimeSource):
         downloaded: list[dict] = []  # {arc_name, path, dir, season_hint}
         for pos, arc in enumerate(archives, start=1):
             url = arc["url"]
-            arc_name = _archive_name(url)
+            # Resolve the REAL archive name (and size) up front via one
+            # redirect-following HEAD, so the card shows "A.Couple.Of.Cuckoos
+            # .S01…zip" from the first tick — not the shortener tail "9pYDxXE".
+            size_hint, resolved_name = await self._head_meta(url)
+            arc_name = resolved_name or _archive_name(url)
             digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
             archive_path = cache / f"{digest}{_ext_of(url)}"
 
@@ -221,7 +254,9 @@ class DdlSource(AnimeSource):
                 await _emit("download", an, i, done, total)
 
             try:
-                await self._fetch_archive(url, archive_path, on_bytes=_on_bytes)
+                await self._fetch_archive(
+                    url, archive_path, on_bytes=_on_bytes, total_hint=size_hint,
+                )
             except Exception as exc:  # noqa: BLE001 — a dead link shouldn't kill the rest
                 log.warning("ddl.download.failed", url=url, error=str(exc))
                 await _emit("failed", f"{arc_name}: {exc}", pos)
@@ -235,8 +270,14 @@ class DdlSource(AnimeSource):
         pooled: list[dict] = []
         for pos, item in enumerate(downloaded, start=1):
             arc_name = item["arc_name"]
+            # Track the real per-file counts the extractor reports so the FINAL
+            # "extract_done" frame shows the true episode total (e.g. 24/24) — not
+            # a hardcoded 1/1, which used to render every season as "File 1/1".
+            last_count = {"done": 0, "total": 0}
 
-            async def _on_file(done, total, name="", an=arc_name, i=pos):
+            async def _on_file(done, total, name="", an=arc_name, i=pos,
+                               _c=last_count):
+                _c["done"], _c["total"] = int(done or 0), int(total or 0)
                 await _emit("extract", an, i, done, total)
 
             try:
@@ -244,7 +285,10 @@ class DdlSource(AnimeSource):
                 videos = await extract_archive(
                     item["path"], item["dir"], on_file=_on_file,
                 )
-                await _emit("extract_done", arc_name, pos, 1, 1)
+                # Prefer the extracted video count; fall back to the last poller
+                # frame. Both beat the old hardcoded (1, 1).
+                final_total = len(videos) or last_count["total"] or 1
+                await _emit("extract_done", arc_name, pos, final_total, final_total)
             except Exception as exc:  # noqa: BLE001
                 log.warning("ddl.archive.failed", archive=arc_name, error=str(exc))
                 await _emit("failed", f"{arc_name}: {exc}", pos)
@@ -417,3 +461,23 @@ def _archive_name(url: str) -> str:
         path = url
     name = unquote((path or "").rstrip("/").split("/")[-1])
     return name or "archive.zip"
+
+
+def _name_from_disposition(disposition: str | None) -> str | None:
+    """Extract a filename from a ``Content-Disposition`` header, if present.
+
+    Handles both ``filename="…"`` and RFC 5987 ``filename*=UTF-8''…`` forms.
+    Returns None when the header is absent or carries no usable name — the caller
+    then falls back to the final-URL basename."""
+    if not disposition:
+        return None
+    # RFC 5987 extended form takes precedence (it carries the real UTF-8 name).
+    m = re.search(r"filename\*\s*=\s*(?:[\w-]+'')?([^;\r\n]+)", disposition, re.I)
+    if not m:
+        m = re.search(r'filename\s*=\s*"?([^";\r\n]+)"?', disposition, re.I)
+    if not m:
+        return None
+    name = unquote(m.group(1).strip().strip('"')).strip()
+    # Guard against a path/traversal sneaking in via the header.
+    name = name.replace("\\", "/").rstrip("/").split("/")[-1]
+    return name or None

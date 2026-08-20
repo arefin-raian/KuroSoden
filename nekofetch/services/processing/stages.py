@@ -634,6 +634,9 @@ class RenameStage(Stage):
     async def process(self, ctx: StageContext) -> None:
         branding = BrandingService(self.c)
         cfg = self.c.config.rename
+        from nekofetch.services.bot_naming import (
+            FILENAME_STEM_LIMIT, pick_title_within, title_candidates,
+        )
         n = len(ctx.files)
         await _push_stage_progress(self.c, ctx, "Renaming", 0.0, file_index=0, file_total=n)
 
@@ -696,6 +699,39 @@ class RenameStage(Stage):
                 source=ctx.request.source,
                 group=branding.group,
             )
+            # Enforce the 60-char stem limit (extension excluded). The worst case
+            # is the 1080p token (4 digits), so measure against 1080p even for a
+            # lower-tier file; if that fits, the real name fits too. When it's over,
+            # fall back through the SAME title ladder the pack caption uses
+            # (full → shortest synonym → acronym) until the stem fits.
+            def _render_stem(cand_title: str, *, res: str) -> str:
+                return templates.render_filename(
+                    tmpl,
+                    title=cand_title,
+                    short_title=_short_title(cand_title, franchise_data),
+                    season=f"{f.season or 1:02d}",
+                    season_part=part_str,
+                    episode=ep_str,
+                    content_type=content_type,
+                    resolution=res,
+                    audio=audio_short,
+                    source=ctx.request.source,
+                    group=branding.group,
+                )
+
+            if len(_render_stem(anime_title, res="1080p")) > FILENAME_STEM_LIMIT:
+                cands = title_candidates(
+                    anime_title, franchise_data.get("synonyms"),
+                )
+                best_title, _ = pick_title_within(
+                    cands,
+                    lambda t: _render_stem(t, res="1080p"),
+                    FILENAME_STEM_LIMIT,
+                )
+                # Re-render the ACTUAL name for this file's real resolution using
+                # the chosen title (the width test used 1080p; the file may be a
+                # lower tier).
+                new_name = _render_stem(best_title, res=f.resolution or "")
             ext = Path(f.local_path).suffix if f.local_path else f".{f.container or 'mkv'}"
             f.final_name = f"{new_name}{ext}"
             if f.local_path:

@@ -574,6 +574,12 @@ class FranchiseFlowService:
             # batch mapping, which the request pipeline correctly leaves out.
             if (rel.get("relation") or "").upper() in _EXCLUDED_RELATIONS:
                 continue
+            # Skip in-flight / cancelled installments (RELEASING/NOT_YET_RELEASED/
+            # HIATUS/CANCELLED) — only released canonical extras belong in the
+            # mapping. Unknown status is kept (see anilist._is_released).
+            from nekofetch.sources.telegram.anilist import _is_released
+            if not _is_released((rel.get("status") or None)):
+                continue
             fmt = (rel.get("format") or "").upper()
             if fmt not in ("OVA", "MOVIE", "ONA", "SPECIAL"):
                 continue

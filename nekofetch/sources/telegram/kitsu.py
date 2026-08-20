@@ -43,8 +43,8 @@ from nekofetch.sources.telegram.anilist import (
     _ANIME_FORMATS,
     _CONTENT_WALK_RELS,
     _CONTINUATION_RELATIONS,
+    _is_released,
     _SERIES_FORMATS,
-    _TRAVERSE_RELATIONS,
 )
 
 log = get_logger(__name__)
@@ -441,6 +441,7 @@ class KitsuClient:
             relation=relation,
             synopsis=attrs.get("synopsis") or attrs.get("description"),
             score=_score_from_rating(attrs.get("averageRating")),
+            status=_kitsu_status(attrs.get("status")),
         )
 
     # ── relations (media-relationships endpoint) ──────────────────────────────
@@ -531,10 +532,14 @@ class KitsuClient:
                 nodes[nid] = (None, None)
                 continue
             attrs = data.get("attributes") or {}
+            # Skip in-flight / cancelled installments (never the root) so an
+            # airing/announced season can't inflate the count — matches AniList.
+            if nid != root_id and not _is_released(_kitsu_status(attrs.get("status"))):
+                continue
             nodes[nid] = (_kitsu_format(attrs.get("subtype")), attrs.get("episodeCount"))
 
             for relation, dest in await self._relationship_edges(nid):
-                if relation not in _TRAVERSE_RELATIONS:
+                if relation not in _CONTENT_WALK_RELS:
                     continue
                 try:
                     eid = int(dest.get("id"))
@@ -625,7 +630,9 @@ class KitsuClient:
                     continue
                 visited.add(eid)
                 entry = self._resource_to_entry(dest, relation=relation_map[eid])
-                if entry is not None:
+                # Only released/finished canonical entries belong in the walk —
+                # an airing/announced Kitsu season must not enter the franchise.
+                if entry is not None and _is_released(entry.status):
                     entries[eid] = entry
                 frontier.append(eid)
 
