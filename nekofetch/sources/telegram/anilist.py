@@ -106,9 +106,23 @@ query ($id: Int) {
 _SERIES_FORMATS = {"TV", "TV_SHORT"}
 # Real anime formats (excludes MANGA / NOVEL / ONE_SHOT source material).
 _ANIME_FORMATS = {"TV", "TV_SHORT", "MOVIE", "OVA", "ONA", "SPECIAL"}
-# Installments that don't exist yet (or never will) — never part of the franchise
-# the user can actually get. We are not a manga distributor and don't list vapor.
-_EXCLUDED_STATUS = {"NOT_YET_RELEASED", "CANCELLED"}
+# Installments that don't belong in a *published* franchise. We only distribute
+# FINISHED, canonical content, so anything still in flight (RELEASING /
+# NOT_YET_RELEASED / HIATUS) or dead (CANCELLED) is excluded — a currently-airing
+# or merely-announced sequel must never inflate the season count or the rating
+# average (the "Clevatess / Elusive Samurai shows 2 seasons" bug). An UNKNOWN
+# status (``None``) is kept: some sources omit the field for real finished
+# entries, and dropping those would nuke whole franchises.
+_EXCLUDED_STATUS = {"NOT_YET_RELEASED", "CANCELLED", "RELEASING", "HIATUS"}
+
+
+def _is_released(status: str | None) -> bool:
+    """True when an installment counts as released/finished franchise content.
+
+    Unknown status (``None``) is treated as released — see ``_EXCLUDED_STATUS``.
+    Every metadata source (AniList/MAL/Kitsu/Kaggle) normalizes to this same
+    uppercase vocabulary, so this single predicate gives uniform filtering."""
+    return status not in _EXCLUDED_STATUS
 
 
 def _aired_episodes(media: dict) -> int | None:
@@ -147,6 +161,7 @@ query ($ids: [Int]) {
       format
       status
       episodes
+      averageScore
       nextAiringEpisode { episode }
       relations {
         edges {
@@ -213,6 +228,17 @@ class FranchiseTotals:
     spin_offs: int = 0     # TV/TV_SHORT NOT in the main continuity chain
     episodes: int = 0      # summed across season (TV/TV_SHORT) entries
     nodes: int = 0         # total installments discovered
+    score_sum: float = 0.0  # Σ of per-entry scores (0-10) across counted nodes
+    score_count: int = 0    # how many counted nodes carried a score
+
+    @property
+    def avg_score(self) -> float | None:
+        """Mean per-entry score (0-10) across the released/canonical franchise,
+        or ``None`` when no entry carried a score. This is the franchise RATING —
+        the average the owner wants, not a single entry's number."""
+        if self.score_count <= 0:
+            return None
+        return self.score_sum / self.score_count
 
 
 @dataclass
@@ -248,6 +274,7 @@ class FranchiseEntry:
     relation: str = ""              # how this entry connects to its parent
     synopsis: str | None = None
     score: float | None = None      # averageScore / 10 (per-entry AniList rating)
+    status: str | None = None       # normalized status (FINISHED/RELEASING/…) or None
 
 
 @dataclass
@@ -611,8 +638,8 @@ class AnilistClient:
 
         visited: set[int] = {root_id}
         frontier: list[int] = [root_id]
-        # id -> (format, episodes) for every node we actually resolve
-        nodes: dict[int, tuple[str | None, int | None]] = {}
+        # id -> (format, episodes, score) for every node we actually resolve
+        nodes: dict[int, tuple[str | None, int | None, float | None]] = {}
         # Continuity adjacency from SEQUEL/PREQUEL edges only — this is what
         # defines "seasons". Spin-offs/side-stories are deliberately NOT in here.
         cont_adj: dict[int, set[int]] = {}
@@ -633,7 +660,9 @@ class AnilistClient:
                 # their edges, so we don't expand vapor branches into the totals.
                 if mid != root_id and m.get("status") in _EXCLUDED_STATUS:
                     continue
-                nodes[mid] = (m.get("format"), _aired_episodes(m))
+                score = (m.get("averageScore") / 10
+                         if m.get("averageScore") is not None else None)
+                nodes[mid] = (m.get("format"), _aired_episodes(m), score)
                 for edge in m.get("relations", {}).get("edges", []):
                     rtype = edge.get("relationType")
                     # Canonical continuity ONLY (same set the preview/distribution
@@ -665,7 +694,7 @@ class AnilistClient:
         stack, seen = [root_id], {root_id}
         while stack:
             cur = stack.pop()
-            if nodes.get(cur, (None, None))[0] in _SERIES_FORMATS:
+            if nodes.get(cur, (None, None, None))[0] in _SERIES_FORMATS:
                 season_ids.add(cur)
             for nb in cont_adj.get(cur, ()):
                 if nb not in seen:
@@ -673,27 +702,39 @@ class AnilistClient:
                     stack.append(nb)
 
         totals = FranchiseTotals(nodes=len(nodes))
-        for nid, (fmt, eps) in nodes.items():
+        for nid, (fmt, eps, score) in nodes.items():
+            counted = False
             if fmt in _SERIES_FORMATS:
                 if nid in season_ids:
                     totals.seasons += 1
                     totals.episodes += eps or 0
+                    counted = True
                 else:                       # a TV series off the main line = spin-off
                     totals.spin_offs += 1
             elif fmt == "MOVIE":
                 totals.movies += 1
+                counted = True
             elif fmt == "OVA":
                 totals.ovas += 1
+                counted = True
             elif fmt == "ONA":
                 totals.onas += 1
+                counted = True
             elif fmt == "SPECIAL":
                 totals.specials += 1
+                counted = True
+            # RATING is the average over the canonical franchise entries we count
+            # (seasons + movies/OVAs/ONAs/specials) — spin-offs are excluded, same
+            # as they're excluded from the counts above.
+            if counted and score is not None:
+                totals.score_sum += score
+                totals.score_count += 1
         # When the root isn't a TV season (it's an ONA/OVA/Special with its own
         # episode count), THAT count is the title's episode count — otherwise an
         # ONA-only entry like a 6-episode ONA would report 0 episodes. Spin-off and
         # side-story episode counts are still deliberately excluded.
         if root_id not in season_ids:
-            root_fmt, root_eps = nodes.get(root_id, (None, None))
+            root_fmt, root_eps, _root_score = nodes.get(root_id, (None, None, None))
             if root_fmt and root_fmt != "MOVIE":
                 totals.episodes += root_eps or 0
         self._totals_cache[root_id] = totals
@@ -746,6 +787,7 @@ class AnilistClient:
             synopsis=root_media.get("description"),
             score=(root_media.get("averageScore") / 10
                    if root_media.get("averageScore") is not None else None),
+            status=root_media.get("status"),
         )
 
         # Seed frontier from root's immediate relations.
@@ -808,6 +850,7 @@ class AnilistClient:
                     synopsis=m.get("description"),
                     score=(m.get("averageScore") / 10
                            if m.get("averageScore") is not None else None),
+                    status=status,
                 )
                 visited.add(mid)
 

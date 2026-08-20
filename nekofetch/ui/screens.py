@@ -325,8 +325,11 @@ def confirm_franchise(
         rows.append(kv(M.F_TYPE, media_data["format"]))
     if media_data.get("status"):
         rows.append(kv(M.F_STATUS, media_data["status"]))
-    if media_data.get("score"):
-        rows.append(f"<b>{t(M.F_RATING)} :</b> {media_data['score']}/10")
+    # RATING = the franchise average when the walk computed one (the owner's
+    # spec: average of released/canonical entries), else the single-entry score.
+    rating_val = media_data.get("franchise_score") or media_data.get("score")
+    if rating_val:
+        rows.append(f"<b>{t(M.F_RATING)} :</b> {rating_val}/10")
     if media_data.get("studio"):
         rows.append(kv(M.FIELD_STUDIO, media_data["studio"]))
     if media_data.get("genres"):

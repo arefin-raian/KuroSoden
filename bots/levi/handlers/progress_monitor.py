@@ -293,6 +293,15 @@ async def _refresh_loop(client: Client, container: Container, job_id: int,
             await _paint_terminal(client, container, job_id, chat_id, msg_id, view)
             return
 
+        if status == JobStatus.PAUSED.value:
+            # The coverage gate paused this job (waiting for more links). That's a
+            # settled, actionable state — paint the paused card ONCE and stop the
+            # loop so the elapsed timer freezes instead of ticking to the 6h cap.
+            # (A naming/caption confirm hold is handled above via confirm_hold and
+            # never reaches here, and resuming re-spawns a fresh monitor.)
+            await _paint_terminal(client, container, job_id, chat_id, msg_id, view)
+            return
+
         # Active OR any transient/unknown status (snapshot gap between the
         # download loop and processing, etc.) → keep the live card refreshing.
         # This is what stops a premature "handed to distribution" while encoding
@@ -389,6 +398,13 @@ async def _paint_terminal(client: Client, container: Container, job_id: int,
         return
     if view.get("partial"):
         text = t(M.DL_CARD_FAILED, title=title, job=job_id)
+        kb = await _recovery_keyboard(container, code)
+    elif status == JobStatus.PAUSED.value:
+        # Coverage gate paused the job waiting for more links — paint an
+        # actionable frame (Retry / Switch / Provide / Abandon) and STOP the
+        # timer, instead of leaving "Storing 0%" ticking to the 6h lifetime cap.
+        # Resuming re-spawns a fresh monitor, so ending this loop is safe.
+        text = t(M.DL_CARD_PAUSED, title=title, job=job_id)
         kb = await _recovery_keyboard(container, code)
     elif status == JobStatus.FAILED.value:
         text = t(M.DL_CARD_FAILED, title=title, job=job_id) + _fail_reason(view)

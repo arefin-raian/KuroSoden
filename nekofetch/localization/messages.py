@@ -284,6 +284,7 @@ class M:
     DL_CARD_LOW_DISK = "dl_card_low_disk"
     DL_CARD_DONE = "dl_card_done"
     DL_CARD_FAILED = "dl_card_failed"
+    DL_CARD_PAUSED = "dl_card_paused"
     DL_BTN_RETRY = "dl_btn_retry"
     DL_BTN_SKIP = "dl_btn_skip"
     DL_TOAST_RETRYING = "dl_toast_retrying"

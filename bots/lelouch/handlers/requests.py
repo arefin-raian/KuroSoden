@@ -405,6 +405,24 @@ def register(client: Client, container: Container) -> None:
 
         # --- 3. Single match — franchise totals + TMDB ---
         await apply_franchise_totals(container, franchise_data)
+
+        # Reject an airing / unfinished PRIMARY gracefully: we only publish
+        # finished content, and building a franchise around a still-airing title
+        # is exactly what produced the phantom-season bug. A known non-FINISHED
+        # status stops here; unknown status (None) is allowed through.
+        primary_status = (media.status or "").upper()
+        if primary_status and primary_status != "FINISHED":
+            from kurosoden.shared import lelouch_voice as V
+
+            await send_screen(
+                client, message.chat.id,
+                Screen(caption=V.still_airing(media.english or query),
+                       image=pick_artwork("lelouch")),
+                old_msg=msg,
+            )
+            await fsm.clear(message.from_user.id)
+            return
+
         backdrop_path = await enrich_with_tmdb(
             container, franchise_data, media.english or query
         )

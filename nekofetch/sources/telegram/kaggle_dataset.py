@@ -48,8 +48,8 @@ from nekofetch.sources.telegram.anilist import (
     _ANIME_FORMATS,
     _CONTENT_WALK_RELS,
     _CONTINUATION_RELATIONS,
+    _is_released,
     _SERIES_FORMATS,
-    _TRAVERSE_RELATIONS,
 )
 from nekofetch.sources.telegram.anime_dataset import _int, _norm, _score
 
@@ -404,6 +404,7 @@ class KaggleDatasetClient:
             relation=relation,
             synopsis=row.get("synopsis"),
             score=row.get("score"),
+            status=row.get("status"),
         )
 
     def _parse_relations(self, cell: str) -> list[FranchiseRelation]:
@@ -530,6 +531,10 @@ class KaggleDatasetClient:
                 child = self._by_id.get(eid)
                 if child is None or (child["format"] not in _ANIME_FORMATS):
                     continue
+                # Only released/finished canonical entries — the slim row carries
+                # an uppercase AniList-style status; airing/announced are dropped.
+                if not _is_released((child.get("status") or None)):
+                    continue
                 relation_map.setdefault(eid, relation)
                 visited.add(eid)
                 entries[eid] = self._row_to_entry(child, relation=relation_map[eid])
@@ -559,9 +564,13 @@ class KaggleDatasetClient:
             row = self._by_id.get(nid)
             if row is None:
                 continue
+            # Skip in-flight / cancelled installments (never the root) so an
+            # airing/announced season can't inflate the count — matches AniList.
+            if nid != root_id and not _is_released((row.get("status") or None)):
+                continue
             nodes[nid] = (row["format"], row.get("episodes"))
             for relation, node in self._relation_edges(row.get("relations_raw") or ""):
-                if relation not in _TRAVERSE_RELATIONS:
+                if relation not in _CONTENT_WALK_RELS:
                     continue
                 eid = _int(node.get("id"))
                 if eid is None or eid in visited:

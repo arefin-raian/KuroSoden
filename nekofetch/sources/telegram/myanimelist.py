@@ -39,9 +39,8 @@ from nekofetch.sources.telegram.anilist import (
     _ANIME_FORMATS,
     _CONTENT_WALK_RELS,
     _CONTINUATION_RELATIONS,
-    _EXCLUDED_STATUS,
+    _is_released,
     _SERIES_FORMATS,
-    _TRAVERSE_RELATIONS,
     _detect_part_from_title,
 )
 
@@ -479,8 +478,10 @@ class MyAnimeListClient:
     async def franchise_totals(self, root_id: int, *, max_nodes: int = 120) -> FranchiseTotals:
         """Walk the entire connected franchise graph and tally by format.
 
-        BFS outward from ``root_id`` following SEQUEL / PREQUEL / SIDE_STORY /
-        PARENT / SPIN_OFF / SUMMARY edges (mirrors AniList's ``_TRAVERSE_RELATIONS``).
+        BFS outward from ``root_id`` following canonical-continuity edges
+        (SEQUEL / PREQUEL / SIDE_STORY / PARENT — the same ``_CONTENT_WALK_RELS``
+        set AniList's totals use). SPIN_OFF and SUMMARY (recap/compilation) are
+        deliberately NOT traversed, so counts match the AniList path exactly.
         """
         visited: set[int] = {root_id}
         # id -> (format, episodes)
@@ -501,13 +502,16 @@ class MyAnimeListClient:
             status = _jikan_status(data.get("status"))
             eps = data.get("episodes")
 
-            if nid != root_id and status in _EXCLUDED_STATUS:
+            # Skip in-flight / cancelled installments (never the root the user
+            # asked about) — RELEASING/NOT_YET_RELEASED/HIATUS/CANCELLED must not
+            # inflate the season count.
+            if nid != root_id and not _is_released(status):
                 continue
             nodes[nid] = (fmt, eps)
 
             for rel in data.get("relations") or []:
                 rtype = _jikan_relation(rel.get("relation", ""))
-                if rtype not in _TRAVERSE_RELATIONS:
+                if rtype not in _CONTENT_WALK_RELS:
                     continue
                 for entry in (rel.get("entry") or []):
                     eid = entry.get("mal_id")
@@ -577,7 +581,6 @@ class MyAnimeListClient:
         root_entry = self._to_franchise_entry(data, relation="ROOT")
         if root_entry is not None:
             entries[root_id] = root_entry
-
         # Seed frontier from root's immediate relations.
         frontier: list[int] = []
         for rel in data.get("relations") or []:
@@ -603,7 +606,7 @@ class MyAnimeListClient:
                 continue
 
             entry = self._to_franchise_entry(data, relation=relation_map.get(nid, ""))
-            if entry is not None:
+            if entry is not None and _is_released(entry.status):
                 entries[nid] = entry
 
             # Discover deeper relations.
@@ -646,6 +649,7 @@ class MyAnimeListClient:
         # Detect season part from title (mirrors AniList's _detect_part_from_title).
         part_num, _ = _detect_part_from_title(english_title)
 
+        score_raw = data.get("score")
         return FranchiseEntry(
             anilist_id=mid,
             format=fmt,
@@ -658,6 +662,8 @@ class MyAnimeListClient:
             start_date=_parse_start_date(data.get("aired")),
             relation=relation,
             synopsis=data.get("synopsis"),
+            score=round(score_raw, 1) if score_raw is not None else None,
+            status=_jikan_status(data.get("status")),
         )
 
     # ── title variants ────────────────────────────────────────────────────────

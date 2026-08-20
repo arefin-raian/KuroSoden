@@ -454,6 +454,7 @@ def _media_to_franchise_dict(media) -> dict:
             {
                 "relation": r.relation,
                 "format": r.format,
+                "status": r.status,
                 "episodes": r.episodes,
                 "titles": r.titles,
                 "anilist_id": r.anilist_id,
@@ -493,6 +494,12 @@ async def apply_franchise_totals(container: Container, franchise_data: dict) -> 
         franchise_specials=totals.specials,
         franchise_spinoffs=totals.spin_offs,
     )
+    # Franchise RATING = average score across the released/canonical franchise
+    # (not a single entry's number). Only overwrite the single-entry score when
+    # the walk actually produced an average, so a walk miss keeps the root score.
+    avg = totals.avg_score
+    if avg is not None:
+        franchise_data["franchise_score"] = round(avg, 1)
 
 
 async def enrich_with_tmdb(container: Container, franchise_data: dict, search_title: str) -> str | None:

@@ -541,6 +541,7 @@
   "dl_card_low_disk": "⚠️  <i>Low disk — downloading one episode at a time.</i>",
   "dl_card_done": "<blockquote><b>✅ {title} @AniXWeebs</b></blockquote>\n\n<blockquote><b><u>‣ Pipeline Complete</u></b>\n<b>›</b> Downloaded, branded &amp; encoded\n<b>›</b> All quality packs uploaded to storage\n<b>›</b> Local working files cleaned up\n<b>›</b> Handed off to <b>distribution</b></blockquote>\n\n<i>⌛ {elapsed}  ·  #{job}</i>",
   "dl_card_failed": "⚠️  <b>{title}</b>  ·  #{job}\nSome episodes couldn't be downloaded. See the recovery card.",
+  "dl_card_paused": "⏸️  <b>{title}</b>  ·  #{job}\nParts of the franchise are still missing — provide more links to finish, or publish what we have.",
   "dl_btn_retry": "🔁 Retry Ep {ep}",
   "dl_btn_skip": "⏭ Skip Ep {ep} for now",
   "dl_toast_retrying": "Re-queued episode {ep}.",

@@ -942,7 +942,14 @@ class DownloadWorker:
         counts) without a live AniList walk — prefer the prefetched franchise
         blob, mirroring ``bot_content._walk_franchise``'s cache-first read. Falls
         back to a live walk only if the cache is empty, and to ``None`` on any
-        failure (caller treats None as "can't assert missing → don't pause")."""
+        failure (caller treats None as "can't assert missing → don't pause").
+
+        Crucially, this REAPPLIES the admin's persisted entry selection: the
+        freshly-built mapping defaults every entry to ``included=True``, but the
+        coverage gate must only expect the seasons the admin actually enabled in
+        Toggle Entry. Without this a de-selected or phantom season (an airing S2
+        the admin turned off) is expected forever → the job hangs at "Storing".
+        """
         from nekofetch.services.franchise_flow import FranchiseFlowService
 
         franchise = req.franchise_data or {}
@@ -951,12 +958,31 @@ class DownloadWorker:
             entries = await ff.resolve_franchise_entries(
                 franchise, req.anime_doc_id or "",
             )
-            return ff.build_mapping(
+            mapping = ff.build_mapping(
                 franchise, req.anime_doc_id or "", franchise_entries=entries,
             )
         except Exception as exc:  # noqa: BLE001
             log.debug("download.coverage.build_failed", error=str(exc))
             return None
+
+        # Reapply the persisted include/exclude selection from the confirmed
+        # torrent/DDL mapping, if present, so coverage honors the toggle.
+        try:
+            persisted = franchise.get("_torrent_mapping") or {}
+            persisted_entries = persisted.get("entries") or franchise.get("entries")
+            if persisted_entries:
+                include_map: dict[str, bool] = {}
+                for e in persisted_entries:
+                    if not isinstance(e, dict):
+                        continue
+                    key = FranchiseFlowService._entry_key_from_dict(e)
+                    include_map[key] = bool(e.get("included", True))
+                if include_map:
+                    ff.apply_inclusions(mapping, include_map)
+        except Exception as exc:  # noqa: BLE001 — never strand a job on selection replay
+            log.debug("download.coverage.inclusion_replay_failed", error=str(exc))
+
+        return mapping
 
     async def ingest_provided_file(self, code: str, episode: int, src_path) -> None:
         """Ingest an admin-provided file for a stuck episode: record it as a verified
