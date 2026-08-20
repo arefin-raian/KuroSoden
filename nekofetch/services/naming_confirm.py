@@ -170,25 +170,41 @@ def build_example_filename(container, request, *, resolution: str,
     ``_AUDIO_TAG``) so the confirm card shows the real name, not an approximation.
     """
     from nekofetch.services.branding_service import BrandingService
+    from nekofetch.services.bot_naming import (
+        FILENAME_STEM_LIMIT, pick_title_within, title_candidates,
+    )
     from nekofetch.services.processing.stages import _AUDIO_TAG, _short_title
     from nekofetch.ui import templates
 
     cfg = container.config.rename
     anime_title = request.anime_title
     franchise_data = request.franchise_data or {}
-    short = _short_title(anime_title, franchise_data)
     raw_audio = (getattr(audio, "value", audio) or "").lower()
     audio_short = _AUDIO_TAG.get(raw_audio, raw_audio)
     group = BrandingService(container).group
-    return templates.render_filename(
-        cfg.template,
-        title=anime_title, short_title=short,
-        season=f"{season or 1:02d}",
-        season_part=f"P{season_part:02d}" if season_part else "",
-        episode=f"{episode:02d}", content_type="Season",
-        resolution=resolution or "1080p", audio=audio_short,
-        source=request.source, group=group,
-    )
+
+    def _render(cand_title: str, *, res: str) -> str:
+        return templates.render_filename(
+            cfg.template,
+            title=cand_title, short_title=_short_title(cand_title, franchise_data),
+            season=f"{season or 1:02d}",
+            season_part=f"P{season_part:02d}" if season_part else "",
+            episode=f"{episode:02d}", content_type="Season",
+            resolution=res, audio=audio_short,
+            source=request.source, group=group,
+        )
+
+    # Mirror RenameStage's 60-char (extension-excluded) guard so the preview shows
+    # the real name: measure the worst-case 1080p stem and, if over, fall back
+    # through the same title ladder before rendering at the requested resolution.
+    if len(_render(anime_title, res="1080p")) > FILENAME_STEM_LIMIT:
+        best_title, _ = pick_title_within(
+            title_candidates(anime_title, franchise_data.get("synonyms")),
+            lambda t: _render(t, res="1080p"),
+            FILENAME_STEM_LIMIT,
+        )
+        return _render(best_title, res=resolution or "1080p")
+    return _render(anime_title, res=resolution or "1080p")
 
 
 def build_example_caption(container, request, *, resolution: str,
