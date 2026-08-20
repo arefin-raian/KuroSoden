@@ -175,10 +175,12 @@ def format_full_mapping(mapping, *, episode_titles=None, torrent_name: str = "")
     HTML (not <pre>) so it wraps cleanly and stays readable; kept compact enough
     for a single message (callers paginate by entry if a franchise is huge).
     """
-    def _title_lookup(season: int) -> dict:
+    def _title_lookup(anilist_id) -> dict:
+        # ``episode_titles`` is keyed by franchise-entry anilist_id (matching
+        # fetch_episode_titles_for_franchise), and each row is {number, title}.
         out: dict[int, str] = {}
-        for row in (episode_titles or {}).get(season, []) or []:
-            n, ttl = row.get("episode"), row.get("title")
+        for row in (episode_titles or {}).get(anilist_id, []) or []:
+            n, ttl = row.get("number"), row.get("title")
             if n is not None and ttl:
                 out[int(n)] = ttl
         return out
@@ -197,7 +199,7 @@ def format_full_mapping(mapping, *, episode_titles=None, torrent_name: str = "")
             continue
         exp = f" / {me.expected} expected" if me.expected is not None else ""
         lines.append(f"\n<b>{_esc(header)}</b>  ({me.actual} file(s){exp})")
-        titles = _title_lookup(fe.season_number) if fe.kind.value == "season" else {}
+        titles = _title_lookup(fe.anilist_id) if fe.kind.value == "season" else {}
         for f in me.files:
             if f.episode_number is not None and fe.kind.value == "season":
                 slug = f"S{fe.season_number:02d}E{f.episode_number:02d}"

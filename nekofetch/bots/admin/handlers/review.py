@@ -1577,9 +1577,18 @@ def register(client: Client, container: Container) -> None:
         ep_titles = {int(k): v for k, v in (data.get("ep_titles") or {}).items()}
         if junk_indices is None:
             junk_indices = set(data.get("junk_indices") or [])
+        # Normalize override + junk keys to ints: FSM state round-trips through
+        # Redis/JSON, which stringifies dict keys. resolve_seasons matches on int
+        # file_index, so a raw str-keyed overrides dict would silently no-op (a
+        # season-fix would vanish the moment the admin also marked junk). Doing it
+        # HERE means no caller can get it wrong.
+        norm_overrides = None
+        if overrides:
+            norm_overrides = {int(k): v for k, v in overrides.items()}
+        junk_indices = {int(i) for i in junk_indices}
         return build_torrent_mapping(
             ordered, franchise, episode_titles=ep_titles,
-            season_overrides=overrides, junk_indices=junk_indices,
+            season_overrides=norm_overrides, junk_indices=junk_indices,
         )
 
     @client.on_callback_query(filters.regex(r"^staff\|rtmapfull"))

@@ -259,7 +259,7 @@
   "torrent_map_toggle_title": "👁 Toggle Entries",
   "torrent_map_toggle_help": "Tap an entry to enable/disable it. Only ✅ entries are downloaded. An included entry with <b>no files yet</b> will be requested before publishing.",
   "torrent_map_edit_title": "✏️ Edit Mapping",
-  "torrent_map_edit_help": "Fix a wrong assignment. Tap a season to reassign its files, mark junk that isn't an episode, or paste a bulk edit.\n\n<b>Bulk grammar</b> (one per line):\n<code>S01E05 = 7</code>  file #7 is S1E5\n<code>junk: 3, 12</code>  files 3 &amp; 12 aren't episodes\n<code>shift S01 +1</code>  bump S1 episode numbers\n<code>exclude S02</code>  drop season 2",
+  "torrent_map_edit_help": "Fix a wrong assignment:\n\n<b>🔧 Fix Seasons</b> — reassign a file to a season. Reply with lines like <code>3 S2</code> (move file #3 to Season 2); send as many as you need.\n<b>🚫 Mark junk</b> — tap any file that isn't an episode (a trailer, preview, extra) so it's dropped from the episode list.",
   "torrent_map_btn_junk": "🚫 Mark junk",
   "torrent_map_fix_prompt": "🔧 <b>Manual season mapping</b>\n\nSome files couldn't be auto-assigned to a season. Reply with one or more lines like:\n<code>3 S2</code>  (move file #3 to Season 2)\n<code>5 S1</code>  (move file #5 to Season 1)\n\nSend as many as you need — the preview updates each time. Tap <b>Apply</b> when done.",
   "torrent_map_fix_ack": "✅ Applied: {applied}",
