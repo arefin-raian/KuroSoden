@@ -46,8 +46,19 @@ from nekofetch.sources.telegram.anilist import (
 
 log = get_logger(__name__)
 
-JIKAN_URL = "https://api.jikan.moe/v4"
+JIKAN_URL = "https://api.jikan.moe/v4"  # default; overridable via JIKAN_BASE_URL
 MAL_SITE = "https://myanimelist.net/anime"
+
+
+def _jikan_base() -> str:
+    """The Jikan base URL — a self-hosted jikan-rest instance when JIKAN_BASE_URL
+    is set (avoids the public gateway's per-resource 504s), else the public API.
+    Read lazily so a missing/!invalid env never breaks import."""
+    try:
+        from nekofetch.core.config import get_env
+        return (get_env().jikan_base_url or JIKAN_URL).rstrip("/")
+    except Exception:  # noqa: BLE001 — config unavailable → public default
+        return JIKAN_URL
 
 # ── format / status / relation mapping ────────────────────────────────────────
 
@@ -168,6 +179,7 @@ class MyAnimeListClient:
         self._http: httpx.AsyncClient | None = None
         self._cf = None  # curl_cffi.AsyncSession — Chrome-impersonating transport
         self._last_request: float = 0.0
+        self._base = _jikan_base()  # public API, or a self-hosted jikan-rest URL
 
     @property
     def http(self) -> httpx.AsyncClient:
@@ -252,7 +264,7 @@ class MyAnimeListClient:
         broadly (``Exception``) because curl_cffi raises its own error types,
         not ``httpx.*``.
         """
-        url = f"{JIKAN_URL}/{endpoint.lstrip('/')}"
+        url = f"{self._base}/{endpoint.lstrip('/')}"
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             await self._throttle()

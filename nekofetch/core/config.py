@@ -131,6 +131,13 @@ class EnvSettings(BaseSettings):
     tmdb_read_access_token: str = Field("", alias="TMDB_API_READ_ACCESS_TOKEN")
     tmdb_api_key: str = Field("", alias="TMDB_API_KEY")
 
+    # Jikan (unofficial MAL API) base URL. Defaults to the public instance, which
+    # gateway-times-out (502/504) per-resource under load. Point this at a
+    # SELF-HOSTED jikan-rest instance (github.com/jikan-me/jikan-rest) — same v4
+    # routes + JSON, no shared public gateway — to eliminate those 504s. Include
+    # the ``/v4`` suffix, no trailing slash, e.g. ``http://localhost:8080/v4``.
+    jikan_base_url: str = Field("https://api.jikan.moe/v4", alias="JIKAN_BASE_URL")
+
     # ImgBB — free public image host used as a durable backup mirror (fallback
     # after catbox). Get a key at https://api.imgbb.com/. Empty = the imgbb mirror
     # is skipped (catbox / telegraph still run).

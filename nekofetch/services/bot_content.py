@@ -58,7 +58,8 @@ async def _jikan_search(title: str) -> dict | None:
     """
     import asyncio
 
-    url = "https://api.jikan.moe/v4/anime"
+    from nekofetch.sources.telegram.myanimelist import _jikan_base
+    url = f"{_jikan_base()}/anime"
     params = {"q": title, "limit": 1}
 
     async def _fetch() -> dict | None:

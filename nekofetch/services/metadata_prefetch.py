@@ -279,7 +279,8 @@ class MetadataPrefetchService:
         curl_cffi with Chrome impersonation (falling back to httpx only if
         curl_cffi is unavailable) so the call actually reaches MAL.
         """
-        url = "https://api.jikan.moe/v4/anime"
+        from nekofetch.sources.telegram.myanimelist import _jikan_base
+        url = f"{_jikan_base()}/anime"
         params = {"q": title, "limit": 1}
         log.info("prefetch.jikan.start", title=title, anilist_id=anilist_id)
 
