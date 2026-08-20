@@ -138,6 +138,12 @@ class EnvSettings(BaseSettings):
     # the ``/v4`` suffix, no trailing slash, e.g. ``http://localhost:8080/v4``.
     jikan_base_url: str = Field("https://api.jikan.moe/v4", alias="JIKAN_BASE_URL")
 
+    # Fallback Jikan base URL, tried when the primary (above) 5xx/times-out. Set
+    # this to a SELF-HOSTED jikan-rest instance (e.g. http://localhost:8080/v4,
+    # auto-deployed by run.sh when JIKAN_SELF_HOST=1) so a public-API 504 fails
+    # over to the local one instead of degrading. Empty = no fallback (primary only).
+    jikan_fallback_url: str = Field("", alias="JIKAN_FALLBACK_URL")
+
     # ImgBB — free public image host used as a durable backup mirror (fallback
     # after catbox). Get a key at https://api.imgbb.com/. Empty = the imgbb mirror
     # is skipped (catbox / telegraph still run).

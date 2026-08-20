@@ -101,6 +101,17 @@ if [ ! -f ".env" ]; then
     echo ""
 fi
 
+# --- optional: self-hosted local Jikan (jikan-rest) ---------
+# The public api.jikan.moe 502/504s per-resource under load. On a Docker-capable
+# VPS, set JIKAN_SELF_HOST=1 in .env to auto-deploy a local jikan-rest stack and
+# JIKAN_FALLBACK_URL=http://localhost:8080/v4 so the metadata client fails over
+# to it. Best-effort + non-fatal (mirrors the Playwright/7-Zip blocks): a failure
+# never blocks the bots — they run on the public API and use the local one once warm.
+if [ -f ".env" ] && grep -qE '^[[:space:]]*JIKAN_SELF_HOST[[:space:]]*=[[:space:]]*1[[:space:]]*$' .env; then
+    echo "[Kuro Sōden] JIKAN_SELF_HOST=1 — bringing up local jikan-rest (best-effort) ..."
+    bash scripts/jikan_local.sh || echo "[Kuro Sōden] NOTE: local Jikan setup skipped; using public API."
+fi
+
 # --- prefetch metadata datasets (Kaggle + LeoRigasaki) ------
 # The metadata chain (AniList → Kaggle → LeoRigasaki → Jikan → Kitsu) reads two
 # on-disk CSV datasets that otherwise lazy-download in the BACKGROUND on first

@@ -60,6 +60,29 @@ def _jikan_base() -> str:
     except Exception:  # noqa: BLE001 — config unavailable → public default
         return JIKAN_URL
 
+
+def _jikan_fallback() -> str:
+    """The fallback Jikan base URL (JIKAN_FALLBACK_URL), tried when the primary
+    5xx/times-out — typically a self-hosted jikan-rest at localhost. Empty when
+    unset (no fallback). Read lazily; any config error → no fallback."""
+    try:
+        from nekofetch.core.config import get_env
+        return (get_env().jikan_fallback_url or "").rstrip("/")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _jikan_bases() -> list[str]:
+    """Ordered Jikan base URLs to try: primary first, then the distinct fallback
+    (when configured). ``_get`` runs its full retry loop against each in turn, so
+    a public-API 504 fails over to the local instance instead of degrading."""
+    primary = _jikan_base()
+    fallback = _jikan_fallback()
+    bases = [primary]
+    if fallback and fallback != primary:
+        bases.append(fallback)
+    return bases
+
 # ── format / status / relation mapping ────────────────────────────────────────
 
 _JIKAN_FORMAT: dict[str, str] = {
@@ -179,7 +202,8 @@ class MyAnimeListClient:
         self._http: httpx.AsyncClient | None = None
         self._cf = None  # curl_cffi.AsyncSession — Chrome-impersonating transport
         self._last_request: float = 0.0
-        self._base = _jikan_base()  # public API, or a self-hosted jikan-rest URL
+        self._bases = _jikan_bases()  # [primary] (+ fallback when configured)
+        self._base = self._bases[0]   # public API, or a self-hosted jikan-rest URL
 
     @property
     def http(self) -> httpx.AsyncClient:
@@ -263,8 +287,33 @@ class MyAnimeListClient:
         below is transport-agnostic. Network/transport exceptions are caught
         broadly (``Exception``) because curl_cffi raises its own error types,
         not ``httpx.*``.
+
+        Runs the retry loop against each configured base in order (primary, then
+        the JIKAN_FALLBACK_URL local instance): a primary that exhausts its
+        retries on 5xx/timeout/transport errors fails over to the fallback, so a
+        public-API 504 transparently uses the self-hosted jikan-rest. A success
+        or a definitive 404 on any base returns immediately (no failover).
         """
-        url = f"{self._base}/{endpoint.lstrip('/')}"
+        _MISS = object()  # sentinel: this base exhausted retries → try the next
+        bases = self._bases or [self._base]
+        for bi, base in enumerate(bases):
+            if bi > 0:
+                log.debug("jikan.failover", to=base, endpoint=endpoint)
+            result = await self._get_one_base(base, endpoint, params, _MISS)
+            if result is not _MISS:
+                return result  # success or definitive 404 (None)
+        # Every base exhausted its retries (all 5xx/timeout) — one warning on the
+        # true dead-end (failover attempts themselves stayed quiet at debug).
+        log.warning("jikan.http_error.final", endpoint=endpoint,
+                    bases=len(bases))
+        return None
+
+    async def _get_one_base(self, base: str, endpoint: str, params, miss):
+        """Run the 3-attempt retry loop against a SINGLE base. Returns the
+        unwrapped payload on success, ``None`` on a definitive 404 / non-retryable
+        4xx, or the ``miss`` sentinel when transient 5xx/timeout/transport errors
+        exhausted all attempts (so the caller can fail over to the next base)."""
+        url = f"{base}/{endpoint.lstrip('/')}"
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             await self._throttle()
@@ -279,35 +328,39 @@ class MyAnimeListClient:
                     log.warning("jikan.ratelimit", retry_after=retry_after)
                     await asyncio.sleep(min(retry_after, 10.0))
                     continue
-                if status in (500, 502, 503, 504) and not last:
-                    backoff = 1.5 * attempt
-                    # Transient gateway hiccup — retry quietly. Jikan 504s are
-                    # frequent and self-resolving; warning on every attempt spammed
-                    # the console at every pipeline stage. Debug keeps it diagnosable
-                    # without the noise; a genuinely exhausted call still warns once.
-                    log.debug("jikan.http_error", url=url,
-                              status=status, retry_in=backoff)
-                    await asyncio.sleep(backoff)
-                    continue
+                if status in (500, 502, 503, 504):
+                    if not last:
+                        backoff = 1.5 * attempt
+                        # Transient gateway hiccup — retry quietly. Jikan 504s are
+                        # frequent and self-resolving; warning on every attempt
+                        # spammed the console at every pipeline stage. Debug keeps
+                        # it diagnosable; a genuinely exhausted call still warns once.
+                        log.debug("jikan.http_error", url=url,
+                                  status=status, retry_in=backoff)
+                        await asyncio.sleep(backoff)
+                        continue
+                    # Exhausted retries on a 5xx → signal failover to the next base.
+                    log.debug("jikan.http_error.exhausted", url=url, status=status)
+                    return miss
                 if status == 404:
                     return None  # entry not found — not an error
                 if status >= 400:
-                    # Exhausted or non-retryable — a single warning, not per-attempt.
+                    # Non-retryable 4xx — a single warning, no failover benefit.
                     log.warning("jikan.http_error.final", url=url, status=status)
                     return None
                 payload = resp.json()
             except Exception as exc:  # noqa: BLE001 - transport-agnostic (curl_cffi/httpx)
-                # Per-attempt transport failures are retried quietly; only the
-                # final give-up is worth a warning.
+                # Per-attempt transport failures are retried quietly; on the final
+                # attempt, signal failover (a dead primary should try the fallback).
                 if not last:
                     log.debug("jikan.request.retry", url=url,
                               error=str(exc), attempt=attempt)
                     await asyncio.sleep(1.5 * attempt)
                     continue
-                log.warning("jikan.request.failed", url=url, error=str(exc))
-                return None
+                log.debug("jikan.request.exhausted", url=url, error=str(exc))
+                return miss
             return payload.get("data") or payload
-        return None
+        return miss
 
     # ── search ────────────────────────────────────────────────────────────────
 

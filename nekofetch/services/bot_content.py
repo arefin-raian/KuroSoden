@@ -58,11 +58,11 @@ async def _jikan_search(title: str) -> dict | None:
     """
     import asyncio
 
-    from nekofetch.sources.telegram.myanimelist import _jikan_base
-    url = f"{_jikan_base()}/anime"
+    from nekofetch.sources.telegram.myanimelist import _jikan_bases
     params = {"q": title, "limit": 1}
 
-    async def _fetch() -> dict | None:
+    async def _fetch(base: str) -> dict | None:
+        url = f"{base}/anime"
         try:
             from curl_cffi import requests as cf_requests
         except ImportError:  # noqa: BLE001
@@ -81,8 +81,9 @@ async def _jikan_search(title: str) -> dict | None:
                                     transport="curl_cffi", status=r.status_code)
                         return None
                     return r.json()
-                log.warning("bot.content.jikan.gave_up",
-                            transport="curl_cffi", status=getattr(r, "status_code", None))
+                log.debug("bot.content.jikan.gave_up",
+                          transport="curl_cffi", base=base,
+                          status=getattr(r, "status_code", None))
                 return None
             finally:
                 try:
@@ -100,12 +101,20 @@ async def _jikan_search(title: str) -> dict | None:
                     continue
                 r.raise_for_status()
                 return r.json()
-
-    try:
-        body = await _fetch()
-    except Exception as exc:  # noqa: BLE001 — best-effort
-        log.warning("bot.content.jikan.failed", title=title, error=str(exc))
         return None
+
+    # Try each configured base (primary → JIKAN_FALLBACK_URL local instance);
+    # a 5xx/exhausted primary fails over to the next.
+    body = None
+    for base in _jikan_bases():
+        try:
+            body = await _fetch(base)
+        except Exception as exc:  # noqa: BLE001 — best-effort; try the next base
+            log.warning("bot.content.jikan.failed", title=title,
+                        base=base, error=str(exc))
+            body = None
+        if body is not None:
+            break
     data = (body or {}).get("data") or []
     if not data:
         log.debug("bot.content.jikan.empty", title=title)

@@ -279,12 +279,12 @@ class MetadataPrefetchService:
         curl_cffi with Chrome impersonation (falling back to httpx only if
         curl_cffi is unavailable) so the call actually reaches MAL.
         """
-        from nekofetch.sources.telegram.myanimelist import _jikan_base
-        url = f"{_jikan_base()}/anime"
+        from nekofetch.sources.telegram.myanimelist import _jikan_bases
         params = {"q": title, "limit": 1}
         log.info("prefetch.jikan.start", title=title, anilist_id=anilist_id)
 
-        async def _fetch() -> dict | None:
+        async def _fetch(base: str) -> dict | None:
+            url = f"{base}/anime"
             try:
                 from curl_cffi import requests as cf_requests
             except ImportError:
@@ -303,8 +303,8 @@ class MetadataPrefetchService:
                                         transport="curl_cffi", status=r.status_code)
                             return None
                         return r.json()
-                    log.warning("prefetch.jikan.gave_up",
-                                transport="curl_cffi", status=r.status_code)
+                    log.debug("prefetch.jikan.gave_up",
+                              transport="curl_cffi", base=base, status=r.status_code)
                     return None
                 finally:
                     try:
@@ -323,14 +323,20 @@ class MetadataPrefetchService:
                         continue
                     r.raise_for_status()
                     return r.json()
-                log.warning("prefetch.jikan.gave_up", transport="httpx")
+                log.debug("prefetch.jikan.gave_up", transport="httpx", base=base)
                 return None
 
-        try:
-            body = await _fetch()
-        except Exception as exc:  # noqa: BLE001 - transport-agnostic
-            log.warning("prefetch.jikan.failed", title=title, error=str(exc))
-            return False
+        # Try each configured base (primary → JIKAN_FALLBACK_URL local instance).
+        body = None
+        for base in _jikan_bases():
+            try:
+                body = await _fetch(base)
+            except Exception as exc:  # noqa: BLE001 - transport-agnostic; try next base
+                log.warning("prefetch.jikan.failed", title=title,
+                            base=base, error=str(exc))
+                body = None
+            if body is not None:
+                break
         data = (body or {}).get("data") or []
         if not data:
             log.info("prefetch.jikan.empty", title=title)
