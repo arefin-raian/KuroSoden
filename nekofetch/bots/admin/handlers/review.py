@@ -1220,8 +1220,11 @@ def register(client: Client, container: Container) -> None:
         )
         if state not in (STATE_DDL_PROVIDE, STATE_MISSING_SOURCE):
             return
-        # http links only top up a ddl request; a torrent top-up wants a magnet.
-        if state == STATE_MISSING_SOURCE and (data.get("source") or "") == "nyaa":
+        # http links only top up a DDL-type request. If the admin explicitly chose
+        # the torrent path (source torrent/nyaa), let the magnet/.torrent handlers
+        # take it instead — accept here only for the ddl choice (or an unset legacy
+        # source, which defaulted to ddl-style http links).
+        if state == STATE_MISSING_SOURCE and (data.get("source") or "ddl") not in ("ddl", ""):
             return
 
         code = data.get("code")
@@ -2236,7 +2239,12 @@ def register(client: Client, container: Container) -> None:
 
     @client.on_callback_query(filters.regex(r"^staff\|amore\|"))
     async def _missing_more(_: Client, q: CallbackQuery) -> None:
-        """Admin chose 'Provide link(s)' — show backdrop + prompt for more DDL/torrent links."""
+        """Admin chose 'Provide link(s)' — offer a DDL / Torrent choice.
+
+        The owner can supply EITHER type regardless of the request's original
+        source (e.g. fill a missing ONA with a torrent even on a DDL request), so
+        we present both buttons and let the chosen handler arm the right prompt.
+        """
         if not await _guard(q, Permission.QUEUE_DOWNLOADS):
             return
         code = q.data.split("|", 2)[2]
@@ -2244,27 +2252,26 @@ def register(client: Client, container: Container) -> None:
         if not missing:
             await q.answer(L(M.ERR_GENERIC), show_alert=True)
             return
-
-        from nekofetch.services.request_service import RequestService
-        req = await RequestService(container).get(code)
-        title = missing.get("title") or req.anime_title
-        source = (missing.get("source") or "").lower()
-
         await q.answer()
-
-        # Render the backdrop card with a Telegraph mapping guide.
-        backdrop = await _anime_backdrop(container, req)
-
-        # Build a Telegraph season-mapping article for the missing content so the
-        # admin sees WHICH seasons are still needed (not just episode numbers).
-        telegraph_url = await _build_mapping_guide(req, missing)
-
-        prompt_text = (
+        title = missing.get("title") or ""
+        summary = _missing_summary(missing)
+        text = (
             f"🧩 <b>{title}</b> — provide more links\n"
             f"<code>{code}</code>\n\n"
+            f"Still missing: <b>{summary}</b>.\n\n"
+            f"How do you want to supply it? You can use <b>either</b> — a torrent "
+            f"even if this was a DDL request, or vice-versa."
         )
+        kb = keyboard(
+            [(L(M.ADMIN_BTN_DDL), cb("staff", "amoresrc", code, "ddl")),
+             (L(M.ADMIN_BTN_TORRENT), cb("staff", "amoresrc", code, "torrent"))],
+            [(L(M.CC_BTN_PUBLISH_ANYWAY), cb("staff", "amoredone", code))],
+        )
+        await show(client, q.message, text, kb)
 
-        # Summarize what's still missing (mirroring the card the worker posted).
+    def _missing_summary(missing: dict) -> str:
+        """Human 'S3 (all 12); S1 eps 10–12' summary from a stored missing-state."""
+        from nekofetch.services.log_channel_service import _summarize_runs
         grouped = {int(s): eps for s, eps in missing.get("missing", {}).items()}
         empty = missing.get("empty_seasons", [])
         parts = []
@@ -2273,40 +2280,67 @@ def register(client: Client, container: Container) -> None:
             if season in empty:
                 parts.append(f"S{season} (all {len(eps)})")
             else:
-                from nekofetch.services.log_channel_service import _summarize_runs
                 parts.append(f"S{season} eps {_summarize_runs(eps)}")
-        summary = "; ".join(parts) or "—"
+        return "; ".join(parts) or "—"
 
-        prompt_text += f"Still missing: <b>{summary}</b>.\n\n"
+    @client.on_callback_query(filters.regex(r"^staff\|amoresrc\|"))
+    async def _missing_more_source(_: Client, q: CallbackQuery) -> None:
+        """Admin picked DDL or Torrent to fill the gap — arm the matching prompt.
 
-        if source == "ddl":
+        Both funnel into STATE_MISSING_SOURCE, which the DDL/magnet/.torrent reply
+        handlers all already accept; the only difference is the instruction text
+        and which input is expected."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        parts = q.data.split("|")
+        code, chosen = parts[2], parts[3]
+        missing = await _load_missing(code)
+        if not missing:
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+
+        from nekofetch.services.request_service import RequestService
+        req = await RequestService(container).get(code)
+        title = missing.get("title") or req.anime_title
+        await q.answer()
+
+        backdrop = await _anime_backdrop(container, req)
+        telegraph_url = await _build_mapping_guide(req, missing)
+        summary = _missing_summary(missing)
+
+        prompt_text = (
+            f"🧩 <b>{title}</b> — provide more links\n"
+            f"<code>{code}</code>\n\n"
+            f"Still missing: <b>{summary}</b>.\n\n"
+        )
+        if chosen == "ddl":
             prompt_text += (
                 "Reply with http(s) direct-download links (one or more, separated by "
                 "whitespace/newlines). Archives will be fetched + extracted and added "
                 "to what we already have."
             )
-        else:  # nyaa / torrent
+        else:
             prompt_text += (
                 "Reply with a magnet: link, http(s) torrent link, or upload a .torrent "
                 "file. The new torrent's episodes will be added to what we already have."
             )
-
         if telegraph_url:
             prompt_text += f'\n\n<a href="{telegraph_url}">📋 Season mapping guide</a>'
 
         kb = keyboard(
+            [(L(M.BTN_BACK), cb("staff", "amore", code))],
             [(L(M.CC_BTN_PUBLISH_ANYWAY), cb("staff", "amoredone", code))],
         )
-
         card = await show(client, q.message, prompt_text, kb, image=backdrop)
 
-        # Arm the reply flow: DDL/magnet/file handlers will detect STATE_MISSING_SOURCE.
-        await _release_torrent_provide(code)  # clear any stale duplicate guard
+        # Arm the reply flow: DDL/magnet/file handlers detect STATE_MISSING_SOURCE.
+        # ``source`` records the CHOSEN type so downstream enqueue uses it.
+        await _release_torrent_provide(code)
         await fsm.set(q.from_user.id, STATE_MISSING_SOURCE,
-                      code=code, title=title, source=source,
+                      code=code, title=title, source=chosen,
                       prompt_chat_id=card.chat.id, prompt_message_id=card.id)
         await _arm_reply(container.redis, card.chat.id,
-                         STATE_MISSING_SOURCE, code=code, title=title, source=source,
+                         STATE_MISSING_SOURCE, code=code, title=title, source=chosen,
                          prompt_chat_id=card.chat.id, prompt_message_id=card.id)
 
     async def _build_mapping_guide(req, missing: dict) -> str | None:

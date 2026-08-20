@@ -505,6 +505,18 @@ class NamingConfirm:
                 break
         else:
             log.info("naming_confirm.ddlmap.timeout", job=job_id)
+            # Annotate the card so the timeout is visible, not a silent revert —
+            # the owner reported "I was never shown any mapping prompt", which the
+            # invisible auto-proceed made worse. Mirrors confirm()'s behaviour.
+            if card_id is not None:
+                try:
+                    await levi.edit_message_text(
+                        chat_id, card_id,
+                        card_text + "\n\n<i>No response — proceeding with the "
+                        "auto mapping.</i>",
+                        parse_mode=ParseMode.HTML)
+                except Exception:  # noqa: BLE001
+                    pass
 
         # Read the (possibly Fix-corrected) mapping back before cleanup wipes it.
         confirmed = mapping_dict

@@ -215,6 +215,21 @@ async def _recovery_keyboard(container: Container, code: str) -> InlineKeyboardM
     return InlineKeyboardMarkup(rows)
 
 
+def _coverage_keyboard(code: str) -> InlineKeyboardMarkup:
+    """Controls for a job PAUSED by the coverage gate (still-missing seasons).
+
+    Routes to the shared coverage handlers: ``amore`` opens the DDL/Torrent choice
+    to supply the missing entry, ``amoredone`` publishes what we have. Shown in the
+    acting admin's DM so the resume path is visible even without a log channel
+    (Kuro Sōden has none)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(M.CC_BTN_PROVIDE_LINKS),
+                              callback_data=cb("staff", "amore", code))],
+        [InlineKeyboardButton(t(M.CC_BTN_PUBLISH_ANYWAY),
+                              callback_data=cb("staff", "amoredone", code))],
+    ])
+
+
 def _render_live(job_id: int, view: dict) -> str:
     now = time.time()
     started = view.get("started_ts")
@@ -401,11 +416,12 @@ async def _paint_terminal(client: Client, container: Container, job_id: int,
         kb = await _recovery_keyboard(container, code)
     elif status == JobStatus.PAUSED.value:
         # Coverage gate paused the job waiting for more links — paint an
-        # actionable frame (Retry / Switch / Provide / Abandon) and STOP the
-        # timer, instead of leaving "Storing 0%" ticking to the 6h lifetime cap.
-        # Resuming re-spawns a fresh monitor, so ending this loop is safe.
+        # actionable frame (Provide links → DDL/Torrent choice · Publish anyway)
+        # and STOP the timer, instead of leaving "Storing 0%" ticking to the 6h
+        # lifetime cap. This is the ONLY visible resume path when there's no log
+        # channel. Resuming re-spawns a fresh monitor, so ending this loop is safe.
         text = t(M.DL_CARD_PAUSED, title=title, job=job_id)
-        kb = await _recovery_keyboard(container, code)
+        kb = _coverage_keyboard(code)
     elif status == JobStatus.FAILED.value:
         text = t(M.DL_CARD_FAILED, title=title, job=job_id) + _fail_reason(view)
         kb = await _recovery_keyboard(container, code)
