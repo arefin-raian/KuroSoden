@@ -162,6 +162,72 @@ def format_torrent_mapping(mapping, *, encode_heights=None, fallbacks_cfg=None) 
     return "\n".join(lines)
 
 
+def format_full_mapping(mapping, *, episode_titles=None, torrent_name: str = "") -> str:
+    """Structured, read-only 'Full Mapping' view for an inline Telegram message.
+
+    The owner's spec: per season, one line per episode reading
+    ``S01E01 → <episode title | filename>``, then a clearly separated section of
+    files that "don't seem to belong here" (unmatched) and a "Missing episodes"
+    section. ``episode_titles`` is the ``{season: [ {episode,title}, … ]}`` map
+    from :func:`fetch_episode_titles_for_franchise` (optional — falls back to the
+    filename when a title isn't known).
+
+    HTML (not <pre>) so it wraps cleanly and stays readable; kept compact enough
+    for a single message (callers paginate by entry if a franchise is huge).
+    """
+    def _title_lookup(season: int) -> dict:
+        out: dict[int, str] = {}
+        for row in (episode_titles or {}).get(season, []) or []:
+            n, ttl = row.get("episode"), row.get("title")
+            if n is not None and ttl:
+                out[int(n)] = ttl
+        return out
+
+    lines: list[str] = []
+    if torrent_name:
+        lines.append(f"<b>{_esc(torrent_name)}</b>")
+    pct = int(mapping.overall_confidence * 100)
+    lines.append(f"<i>Overall confidence: {pct}%</i>")
+
+    for me in mapping.entries:
+        fe = me.franchise_entry
+        header = _entry_header(fe)
+        if not fe.included:
+            lines.append(f"\n<b>{_esc(header)}</b> — <i>excluded</i>")
+            continue
+        exp = f" / {me.expected} expected" if me.expected is not None else ""
+        lines.append(f"\n<b>{_esc(header)}</b>  ({me.actual} file(s){exp})")
+        titles = _title_lookup(fe.season_number) if fe.kind.value == "season" else {}
+        for f in me.files:
+            if f.episode_number is not None and fe.kind.value == "season":
+                slug = f"S{fe.season_number:02d}E{f.episode_number:02d}"
+            elif f.episode_number is not None:
+                slug = f"E{f.episode_number:02d}"
+            else:
+                slug = "•"
+            label = titles.get(f.episode_number) or f.filename
+            lines.append(f"  {slug} → {_esc(label)}")
+
+    missing = getattr(mapping, "all_missing", None) or []
+    if missing:
+        lines.append("\n<b>⚠️ Missing episodes</b>")
+        for m in missing[:20]:
+            ttl = f" — {_esc(m.title)}" if m.title else ""
+            lines.append(f"  S{m.season_number:02d}E{m.episode_number:02d}{ttl}")
+        if len(missing) > 20:
+            lines.append(f"  … and {len(missing) - 20} more")
+
+    if mapping.unmatched:
+        lines.append("\n<b>🗂 Files that don't seem to belong here</b>")
+        for u in mapping.unmatched[:20]:
+            name = getattr(u, "filename", str(u))
+            lines.append(f"  • {_esc(name)}")
+        if len(mapping.unmatched) > 20:
+            lines.append(f"  … and {len(mapping.unmatched) - 20} more")
+
+    return "\n".join(lines)
+
+
 def mapping_telegraph_nodes(mapping, torrent_name: str = "") -> list:
     """Full franchise→torrent mapping as Telegraph DOM nodes.
 

@@ -82,28 +82,40 @@ def _esc(text: str) -> str:
 
 
 def _torrent_map_kb(L, code: str, map_url: str, *, with_fix: bool = True) -> InlineKeyboardMarkup:
-    """Mapping card keyboard: the Telegraph Full Mapping page as a URL button.
+    """Mapping card keyboard — a single, STABLE button set.
 
-    The full mapping is an external page, so it gets a real URL button as the
-    FIRST row (the operator asked for a button instead of a caption hyperlink)
-    with the Confirm / Details / Toggle (/ Fix) action rows below it. ``L`` is
-    the active localizer (``container.localizer.get``).
+    The old card had four overlapping buttons (Full Mapping / Details / Toggle /
+    Fix Seasons) and a ``with_fix`` flag that different Back targets set
+    inconsistently, so a round-trip produced a different keyboard than the
+    original card (the owner's "Fix Seasons → Back drops the buttons" bug). This
+    renders the SAME rows on every paint, keyed only by ``code``:
+
+      • Full Mapping  — the structured read-only view (Telegraph page when we have
+        a URL, else an inline callback so the button NEVER collapses into a bare
+        caption hyperlink).
+      • Toggle Entry  — enable/disable whole franchise entries.
+      • Edit Mapping  — reassign seasons / mark junk (buttons + paste fallback).
+      • Confirm / Back.
+
+    ``with_fix`` is accepted for backward-compat but ignored (the keyboard no
+    longer branches on it).
     """
     rows: list[list[InlineKeyboardButton]] = []
     if map_url:
         rows.append([InlineKeyboardButton(L(M.TORRENT_MAP_BTN_FULL), url=map_url)])
+    else:
+        # No Telegraph page → render the full mapping INLINE via a callback, so
+        # "Full Mapping" is always a real button (never a vanishing URL button).
+        rows.append([InlineKeyboardButton(
+            L(M.TORRENT_MAP_BTN_FULL), callback_data=cb("staff", "rtmapfull", code, 0))])
     rows.append([
-        InlineKeyboardButton(L(M.TORRENT_MAP_BTN_CONFIRM),
-                             callback_data=cb("staff", "rtmapok", code)),
-        InlineKeyboardButton(L(M.TORRENT_MAP_BTN_DETAIL),
-                             callback_data=cb("staff", "rtmapdet", code, 0)),
+        InlineKeyboardButton(L(M.TORRENT_MAP_BTN_TOGGLE),
+                             callback_data=cb("staff", "rtmaptgl", code, "list")),
+        InlineKeyboardButton(L(M.TORRENT_MAP_BTN_EDIT),
+                             callback_data=cb("staff", "rtmapedit", code)),
     ])
-    toggle = [InlineKeyboardButton(L(M.TORRENT_MAP_BTN_TOGGLE),
-                                   callback_data=cb("staff", "rtmaptgl", code, 0))]
-    if with_fix:
-        toggle.append(InlineKeyboardButton(L(M.TORRENT_MAP_BTN_FIX),
-                                           callback_data=cb("staff", "rtmapfix", code)))
-    rows.append(toggle)
+    rows.append([InlineKeyboardButton(L(M.TORRENT_MAP_BTN_CONFIRM),
+                                      callback_data=cb("staff", "rtmapok", code))])
     rows.append([InlineKeyboardButton(L(M.BTN_BACK),
                                       callback_data=cb("staff", "rdetail", code))])
     return InlineKeyboardMarkup(rows)
@@ -1476,19 +1488,28 @@ def register(client: Client, container: Container) -> None:
 
         text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
                  mapping=summary)
-        kb = _torrent_map_kb(L, code, data.get("map_url") or "", with_fix=False)
+        # Stable keyboard, recomputed from the SAME state every time — a Back
+        # round-trip reproduces the original card (no dropped buttons / no
+        # collapsed Full Mapping button).
+        kb = _torrent_map_kb(L, code, data.get("map_url") or "")
         await show(client, q.message, text, kb)
 
     @client.on_callback_query(filters.regex(r"^staff\|rtmaptgl"))
     async def _torrent_map_toggle(_: Client, q: CallbackQuery) -> None:
-        """Toggle inclusion of a franchise entry in the torrent mapping."""
+        """Toggle inclusion of a franchise entry — or just RENDER the list.
+
+        The action carries either the literal ``list`` (open the screen WITHOUT
+        flipping anything — fixes the old bug where opening Toggle Entry via a
+        fixed ``idx=0`` immediately de-selected Season 1) or a numeric entry index
+        to flip. Selection lives on each entry's ``included`` flag in the FSM bag.
+        """
         if not await _guard(q, Permission.QUEUE_DOWNLOADS):
             return
         from nekofetch.services.torrent_mapping import TorrentMapping
-        from nekofetch.ui.torrent_screens import format_torrent_mapping
+        from nekofetch.services.franchise_flow import FranchiseFlowService
 
         parts = q.data.split("|")
-        code, idx = parts[2], int(parts[3])
+        code, target = parts[2], parts[3]
         _, data = await fsm.get(q.from_user.id)
         td = data.get("torrent_mapping")
         if not td:
@@ -1496,40 +1517,45 @@ def register(client: Client, container: Container) -> None:
             return
 
         tmapping = TorrentMapping.from_dict(td)
-        if 0 <= idx < len(tmapping.entries):
-            entry = tmapping.entries[idx]
-            entry.franchise_entry.included = not entry.franchise_entry.included
-            td = tmapping.to_dict()
-            data["torrent_mapping"] = td
-            await fsm.set(q.from_user.id, STATE_TORRENT_MAP, **data)
-
+        # Flip only on an explicit numeric tap; ``list`` renders without mutating.
+        if target != "list":
+            try:
+                idx = int(target)
+            except ValueError:
+                idx = -1
+            if 0 <= idx < len(tmapping.entries):
+                fe = tmapping.entries[idx].franchise_entry
+                fe.included = not fe.included
+                data["torrent_mapping"] = tmapping.to_dict()
+                await fsm.set(q.from_user.id, STATE_TORRENT_MAP, **data)
         await q.answer()
 
-        # Show entry selection list for toggling.
+        # Entry list: real titles (Season 01 — Title / Movie: Name / OVA: Name),
+        # a clear "(no files yet)" marker for an included entry the source shipped
+        # zero files for, and the ✅/❌ selection state.
         rows = []
         for i, me in enumerate(tmapping.entries):
             fe = me.franchise_entry
             icon = "✅" if fe.included else "❌"
-            label = f"{icon} "
-            if fe.kind.value == "season":
-                label += f"S{fe.season_number:02d}"
-                if fe.season_part:
-                    label += f"P{fe.season_part}"
-                label += f" ({me.actual} ep)"
-            else:
-                label += f"{fe.kind.value.title()} ({me.actual} files)"
-            rows.append([(label, cb("staff", "rtmaptgl", code, i))])
+            label = f"{icon} {FranchiseFlowService.entry_label(fe)}"
+            if me.actual:
+                label += f"  ·  {me.actual} file{'s' if me.actual != 1 else ''}"
+            elif fe.included:
+                label += "  ·  ⚠️ no files yet"
+            rows.append([(label[:60], cb("staff", "rtmaptgl", code, i))])
         rows.append([(L(M.BTN_BACK), cb("staff", "rtmapov", code))])
 
-        summary = format_torrent_mapping(tmapping)
-        text = f"<b>Toggle entries</b>\n\n{summary}"
+        text = (f"<b>{L(M.TORRENT_MAP_TOGGLE_TITLE)}</b>\n\n"
+                f"{L(M.TORRENT_MAP_TOGGLE_HELP)}")
         await show(client, q.message, text, keyboard(*rows))
 
     # ── manual season override (Phase 5 cascade fallback) ─────────────────────
 
-    def _rebuild_mapping_from_fsm(data: dict, overrides: dict[int, int] | None):
+    def _rebuild_mapping_from_fsm(data: dict, overrides: dict[int, int] | None,
+                                  junk_indices: set[int] | None = None):
         """Re-run build_torrent_mapping from the FSM-cached raw files, applying
-        any manual season overrides. Returns a TorrentMapping (or None)."""
+        any manual season overrides and admin-marked junk indices. Returns a
+        TorrentMapping (or None)."""
         from nekofetch.services.franchise_flow import FranchiseMapping
         from nekofetch.services.torrent_mapping import build_torrent_mapping
 
@@ -1546,10 +1572,109 @@ def register(client: Client, container: Container) -> None:
             entries=[e.franchise_entry for e in prev.entries],
         )
         ep_titles = {int(k): v for k, v in (data.get("ep_titles") or {}).items()}
+        if junk_indices is None:
+            junk_indices = set(data.get("junk_indices") or [])
         return build_torrent_mapping(
             ordered, franchise, episode_titles=ep_titles,
-            season_overrides=overrides,
+            season_overrides=overrides, junk_indices=junk_indices,
         )
+
+    @client.on_callback_query(filters.regex(r"^staff\|rtmapfull"))
+    async def _torrent_map_full(_: Client, q: CallbackQuery) -> None:
+        """Render the structured, read-only Full Mapping inline (fallback when no
+        Telegraph page exists, and always tappable so the button never collapses
+        into a caption hyperlink)."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        from nekofetch.services.torrent_mapping import TorrentMapping
+        from nekofetch.ui.torrent_screens import format_full_mapping
+
+        code = q.data.split("|")[2]
+        _, data = await fsm.get(q.from_user.id)
+        td = data.get("torrent_mapping")
+        if not td:
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+        await q.answer()
+        tmapping = TorrentMapping.from_dict(td)
+        ep_titles = {int(k): v for k, v in (data.get("ep_titles") or {}).items()}
+        text = format_full_mapping(
+            tmapping, episode_titles=ep_titles, torrent_name=data.get("title", ""),
+        )
+        kb = keyboard([(L(M.BTN_BACK), cb("staff", "rtmapov", code))])
+        await show(client, q.message, text, kb)
+
+    @client.on_callback_query(filters.regex(r"^staff\|rtmapedit"))
+    async def _torrent_map_edit(_: Client, q: CallbackQuery) -> None:
+        """Edit-mapping hub: button-driven fixes (reassign seasons, mark a file as
+        'not an episode') plus a paste-bulk-edit escape hatch."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        code = q.data.split("|")[2]
+        _, data = await fsm.get(q.from_user.id)
+        if not data.get("torrent_mapping"):
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+        await q.answer()
+        rows = [
+            [(L(M.TORRENT_MAP_BTN_FIX), cb("staff", "rtmapfix", code))],
+            [(L(M.TORRENT_MAP_BTN_JUNK), cb("staff", "rtmapjunk", code, 0))],
+            [(L(M.BTN_BACK), cb("staff", "rtmapov", code))],
+        ]
+        text = (f"<b>{L(M.TORRENT_MAP_EDIT_TITLE)}</b>\n\n"
+                f"{L(M.TORRENT_MAP_EDIT_HELP)}")
+        await show(client, q.message, text, keyboard(*rows))
+
+    @client.on_callback_query(filters.regex(r"^staff\|rtmapjunk"))
+    async def _torrent_map_junk(_: Client, q: CallbackQuery) -> None:
+        """Mark a file as 'not an episode' (junk) — it moves to the unmatched
+        'doesn't belong here' bucket and is never assigned an episode slot. This
+        is the direct fix for a stray trailer/preview the auto-classifier missed.
+        A ``list`` target renders the file list; a numeric target toggles that
+        file's junk state and rebuilds the mapping."""
+        if not await _guard(q, Permission.QUEUE_DOWNLOADS):
+            return
+        from nekofetch.services.torrent_mapping import TorrentMapping
+
+        parts = q.data.split("|")
+        code, target = parts[2], parts[3]
+        _, data = await fsm.get(q.from_user.id)
+        td = data.get("torrent_mapping")
+        ordered = data.get("ordered_files")
+        if not td or not ordered:
+            await q.answer(L(M.ERR_GENERIC), show_alert=True)
+            return
+
+        junk = set(data.get("junk_indices") or [])
+        if target != "list":
+            try:
+                fi = int(target)
+            except ValueError:
+                fi = None
+            if fi is not None:
+                junk.symmetric_difference_update({fi})  # toggle
+                data["junk_indices"] = sorted(junk)
+                rebuilt = _rebuild_mapping_from_fsm(
+                    data, data.get("overrides"), junk_indices=junk,
+                )
+                if rebuilt is not None:
+                    data["torrent_mapping"] = rebuilt.to_dict()
+                await fsm.set(q.from_user.id, STATE_TORRENT_MAP, **data)
+        await q.answer()
+
+        # List every file with a ✅/🚫 junk marker so the admin can flip any one.
+        rows = []
+        for f in ordered:
+            fi = f.get("index")
+            name = (f.get("name") or "")[:44]
+            mark = "🚫" if fi in junk else "▫️"
+            rows.append([(f"{mark} #{fi} {name}", cb("staff", "rtmapjunk", code, fi))])
+        rows = rows[:40]  # keep the keyboard within Telegram limits
+        rows.append([(L(M.BTN_BACK), cb("staff", "rtmapedit", code))])
+        await show(client, q.message, f"<b>{L(M.TORRENT_MAP_BTN_JUNK)}</b>\n\n"
+                   "Tap a file to flag it as <b>not an episode</b> (or un-flag). "
+                   "Flagged files won't be downloaded as episodes.",
+                   keyboard(*rows))
 
     @client.on_callback_query(filters.regex(r"^staff\|rtmapfix"))
     async def _torrent_map_fix(_: Client, q: CallbackQuery) -> None:

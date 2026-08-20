@@ -269,22 +269,30 @@ class MyAnimeListClient:
                     continue
                 if status in (500, 502, 503, 504) and not last:
                     backoff = 1.5 * attempt
-                    log.warning("jikan.http_error", url=url,
-                                status=status, retry_in=backoff)
+                    # Transient gateway hiccup — retry quietly. Jikan 504s are
+                    # frequent and self-resolving; warning on every attempt spammed
+                    # the console at every pipeline stage. Debug keeps it diagnosable
+                    # without the noise; a genuinely exhausted call still warns once.
+                    log.debug("jikan.http_error", url=url,
+                              status=status, retry_in=backoff)
                     await asyncio.sleep(backoff)
                     continue
                 if status == 404:
                     return None  # entry not found — not an error
                 if status >= 400:
+                    # Exhausted or non-retryable — a single warning, not per-attempt.
                     log.warning("jikan.http_error.final", url=url, status=status)
                     return None
                 payload = resp.json()
             except Exception as exc:  # noqa: BLE001 - transport-agnostic (curl_cffi/httpx)
-                log.warning("jikan.request.failed", url=url,
-                            error=str(exc), attempt=attempt)
+                # Per-attempt transport failures are retried quietly; only the
+                # final give-up is worth a warning.
                 if not last:
+                    log.debug("jikan.request.retry", url=url,
+                              error=str(exc), attempt=attempt)
                     await asyncio.sleep(1.5 * attempt)
                     continue
+                log.warning("jikan.request.failed", url=url, error=str(exc))
                 return None
             return payload.get("data") or payload
         return None

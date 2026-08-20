@@ -92,7 +92,11 @@ def parse_release_meta(name: str) -> dict:
     kind = "episode"
     _B = r"(?:^|[\s_\-\.\[\(])"
     _E = r"(?:[\s_\-\.\]\)]|$)"
-    if re.search(_B + r"(ncop|nced|opening|ending|preview|menu|pv)" + _E, low):
+    # Non-episode junk: opening/ending creditless, previews, menus, and — the
+    # owner's "Season 1 Trailer 1 matched as S01E01" bug — trailers/teasers/promos
+    # and bare "NC" (no-credit) markers. Classify these as EXTRA so their trailing
+    # numbers ("Trailer 1") are never captured as an episode number.
+    if re.search(_B + r"(ncop|nced|nc|opening|ending|preview|menu|pv|trailer|teaser|promo|creditless|clean)" + _E, low):
         kind = "extra"
     elif re.search(_B + r"ova" + _E, low):
         kind = "ova"
