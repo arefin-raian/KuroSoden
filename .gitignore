@@ -69,3 +69,6 @@ _subs_probe/
 history [claude].txt
 history*[claude]*.txt
 .claude/
+
+# One-off backfill/rollback snapshots (scripts/backfill_idless_request.py)
+*.franchise_data.bak.json
