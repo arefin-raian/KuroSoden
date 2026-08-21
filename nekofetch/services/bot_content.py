@@ -1159,6 +1159,18 @@ class BotContentService:
             merged["banner_url"] = entry.banner_url
         if entry.cover_url:
             merged["poster_url"] = entry.cover_url
+        # Per-entry RATING: season 2 has its own AniList score (8.2 vs S1's 8.0),
+        # not the franchise-level value. FranchiseEntry.score is 0-10 — the same
+        # scale base_meta["score"] carries (str(search.score)) — so the caption's
+        # rating slot stays format-consistent.
+        if getattr(entry, "score", None) is not None:
+            merged["score"] = str(entry.score)
+        # Per-entry GENRES when the walk entry actually carries them (usually
+        # identical across a franchise, so this is a no-op for most titles); the
+        # franchise-level list is the fallback otherwise.
+        entry_genres = getattr(entry, "genres", None)
+        if entry_genres:
+            merged["genres"] = list(entry_genres)
         # Per-episode runtime + episode count drive the movie-vs-season card
         # choice and the DURATION field (a single-episode entry shows runtime,
         # a multi-episode one shows episode count).

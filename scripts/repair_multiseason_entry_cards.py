@@ -144,6 +144,94 @@ def _summary(fields: dict) -> dict:
     }
 
 
+def _indent(text: str | None, pad: str = "          ") -> str:
+    """Indent a (possibly multi-line) caption for readable dry-run printing."""
+    if not text:
+        return pad + "(empty)"
+    return "\n".join(pad + ln for ln in str(text).splitlines())
+
+
+async def _build_caption_context(container, doc: str, title_hint: str | None):
+    """Assemble the SAME inputs BotContentService uses to build a season card,
+    once, so every entry's corrected caption is produced by the real builder
+    (identical template/style) rather than hand-rolled text. Returns
+    ``(svc, meta, franchise, identities, packs)`` or ``None`` on any failure."""
+    try:
+        from nekofetch.services.bot_content import BotContentService
+        svc = BotContentService(container)
+        # Bounded: on the VPS the franchise walk is a fast offline cache read
+        # (anilist.json is prefetched there); if the cache is absent it falls back
+        # to a live BFS walk — cap it so a missing cache degrades to thumbnail-only
+        # instead of hanging the repair.
+        async def _load():
+            packs = await svc._load_packs(doc)
+            meta = await svc._gather_metadata(doc, title_hint=title_hint)
+            franchise = await svc._walk_franchise(doc, meta)
+            identities = svc._tv_entry_identities(franchise.get("tv", []))
+            return svc, meta, franchise, identities, packs
+        return await asyncio.wait_for(_load(), timeout=180)
+    except asyncio.TimeoutError:
+        print("  (caption context timed out — franchise walk unavailable here; "
+              "captions will be left untouched. Run on the VPS where the metadata "
+              "cache exists.)")
+        return None
+    except Exception as exc:  # noqa: BLE001 — caption repair is best-effort
+        print(f"  (caption context unavailable: {type(exc).__name__}: {str(exc)[:120]})")
+        return None
+
+
+def _rebuild_entry_caption(ctx, aid: int) -> str | None:
+    """The corrected caption for entry ``aid`` via the real BotContentService
+    builder (per-entry rating now flows through _entry_meta). ``None`` if the
+    entry isn't in the walk or the build fails — caller then leaves the caption
+    untouched (thumbnail-only), never posts a hand-made one."""
+    if ctx is None:
+        return None
+    svc, meta, franchise, identities, packs = ctx
+    all_entries = list(franchise.get("tv", [])) + list(franchise.get("extras", []))
+    entry = next((e for e in all_entries
+                  if getattr(e, "anilist_id", None) == aid), None)
+    if entry is None:
+        return None
+    try:
+        i = franchise.get("tv", []).index(entry) + 1 if entry in franchise.get("tv", []) else 1
+        season, season_part = identities.get(
+            aid, (i, getattr(entry, "season_part", None)))
+        season_packs = svc._packs_for_tv_entry(packs, season, entry,
+                                                season_part=season_part)
+        entry_meta = svc._entry_meta(meta, entry)
+        caption, _img = svc._build_season_card(
+            entry_meta, season, season_packs, season_part=season_part)
+        return caption or None
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (caption rebuild failed for [{aid}]: {type(exc).__name__}: {str(exc)[:120]})")
+        return None
+
+
+async def _current_caption(container, doc: str, aid: int) -> str | None:
+    """The caption stored for this live season/movie card (for the dry-run diff)."""
+    from sqlalchemy import select
+    from nekofetch.infrastructure.database.postgres.models import (
+        BotContentPost, DistributionBot,
+    )
+    from nekofetch.infrastructure.database.postgres.session import session_scope
+    async with session_scope(container.pg_sessionmaker) as s:
+        bot = (await s.execute(
+            select(DistributionBot).where(
+                DistributionBot.anime_doc_id == doc,
+                DistributionBot.enabled.is_(True),
+            ).order_by(DistributionBot.id.desc()))).scalars().first()
+        if bot is None:
+            return None
+        post = (await s.execute(
+            select(BotContentPost).where(
+                BotContentPost.bot_id == bot.id,
+                BotContentPost.anilist_id == aid,
+                BotContentPost.post_type.in_(("season_card", "movie_card")),
+            ).order_by(BotContentPost.order))).scalars().first()
+        return post.caption if post else None
+
+
 async def main(args) -> None:
     from nekofetch.core.config import get_env
     from nekofetch.core.container import Container
@@ -175,8 +263,11 @@ async def main(args) -> None:
             raise RuntimeError("no franchise entries recorded on this request")
         print(f"Entries  : {len(entries)}  (mode={'APPLY' if args.apply else 'DRY RUN'})\n")
 
-        # Plan: for each entry with a saved card, compute corrected per-entry
-        # fields and compare against what's stored.
+        # Caption context (one AniList walk, reused for every entry's caption).
+        cap_ctx = await _build_caption_context(container, doc, franchise.get("english"))
+
+        # Plan: for each entry with a saved card, compute the corrected per-entry
+        # thumbnail fields AND the corrected caption, and compare against live.
         plans: list[dict] = []
         for e in entries:
             aid = e.get("anilist_id")
@@ -193,15 +284,35 @@ async def main(args) -> None:
             fresh = await gather_thumbnail_fields(
                 container, title, doc, prefer_anilist_synopsis=True, anilist_id=aid)
             merged = {**stored, **fresh}
-            changed = render_fields(stored) != render_fields(merged)
+            thumb_changed = render_fields(stored) != render_fields(merged)
+            # Caption: rebuild via the real builder; only override when it differs
+            # from what's live (keeps the edit surgical). None → leave live as-is.
+            new_caption = _rebuild_entry_caption(cap_ctx, aid)
+            cur_caption = await _current_caption(container, doc, aid)
+            caption_changed = bool(
+                new_caption and new_caption.strip() != (cur_caption or "").strip())
+            changed = thumb_changed or caption_changed
             old, new = _summary(stored), _summary(merged)
             flag = "CHANGED" if changed else "unchanged"
             print(f"  · [{aid}] S{e.get('season_number')} {title!r} — {flag}")
             for key in ("romaji", "native", "score", "meta"):
                 if old[key] != new[key]:
-                    print(f"        {key:6}: {old[key]!r}  ->  {new[key]!r}")
+                    print(f"        thumb {key:>6}: {old[key]!r}  ->  {new[key]!r}")
+            if caption_changed:
+                print("        caption: WILL UPDATE (inline keyboard/buttons preserved "
+                      "— read from the live message and re-passed unchanged)")
+                print("        --- CURRENT caption ---")
+                print(_indent(cur_caption))
+                print("        --- NEW caption ---")
+                print(_indent(new_caption))
+            elif new_caption is None:
+                print("        caption: could not rebuild — will LEAVE the live caption "
+                      "untouched (thumbnail only)")
             if changed:
-                plans.append({"aid": aid, "title": title, "merged": merged})
+                plans.append({
+                    "aid": aid, "title": title, "merged": merged,
+                    "caption": new_caption if caption_changed else None,
+                })
 
         if not plans:
             print("\nNothing to repair — every saved card already matches its "
@@ -236,9 +347,11 @@ async def main(args) -> None:
                     continue
                 await persist_thumbnail_source(container, doc, aid, merged,
                                                image_path=image_path)
-                ok = await svc.refresh_published_thumbnail(doc, aid, str(image_path))
+                ok = await svc.refresh_published_thumbnail(
+                    doc, aid, str(image_path), caption_override=p.get("caption"))
+                tail = " + caption" if p.get("caption") else ""
                 print(f"  [{aid}] {p['title']!r}: "
-                      + ("live card refreshed" if ok else
+                      + (f"live card refreshed (thumbnail{tail})" if ok else
                          "persisted, but NO live card found to refresh"))
         finally:
             await renderer.close()
@@ -258,9 +371,14 @@ if __name__ == "__main__":
     ap.add_argument("--code", help="unambiguous request code, e.g. REQ-1094")
     ap.add_argument("--apply", action="store_true",
                     help="re-render + edit the live cards; without it the script is read-only")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="explicit read-only mode (the default); forces dry run even with --apply")
     ap.add_argument("--yes", action="store_true",
                     help="skip the confirmation prompt (only with --apply)")
     args = ap.parse_args()
+    # Dry run is the default; --dry-run is an explicit, override-everything guard.
+    if args.dry_run:
+        args.apply = False
     try:
         asyncio.run(main(args))
     except (LookupError, RuntimeError) as exc:

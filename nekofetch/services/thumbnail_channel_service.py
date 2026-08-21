@@ -268,8 +268,14 @@ class ThumbnailChannelService:
 
     async def refresh_published_thumbnail(
         self, anime_doc_id: str, anilist_id: int, image_path: str,
+        *, caption_override: str | None = None,
     ) -> bool:
-        """Replace one live distribution-card image and its restore snapshot."""
+        """Replace one live distribution-card image and its restore snapshot.
+
+        ``caption_override`` (HTML) replaces the card's caption in the SAME edit —
+        used by the multi-season repair to correct a season card whose rating was
+        baked from franchise-level data. The live inline keyboard is still read
+        and re-passed, so the quality buttons survive."""
         from pathlib import Path
         from nekofetch.infrastructure.database.postgres.models import (
             BotContentPost, ChannelContentBackup, ChannelLayout, DistributionBot,
@@ -329,6 +335,10 @@ class ThumbnailChannelService:
                     src = getattr(live, "text", None)
                 caption = getattr(src, "html", None) or (str(src) if src else None) or caption
                 markup = getattr(live, "reply_markup", None)
+            # A caller (the multi-season repair) can supply a corrected caption;
+            # it wins over the live text, while the live keyboard is preserved.
+            if caption_override:
+                caption = caption_override
             if not caption:
                 log.warning("thumbcc.published_refresh.no_caption",
                             anime=anime_doc_id, anilist_id=anilist_id)
@@ -374,6 +384,8 @@ class ThumbnailChannelService:
                     post.image_url = str(image_path)
                     post.image_cached_url = durable
                     post.tg_message_id = message_id
+                    if caption_override:
+                        post.caption = caption_override
                 row = (await session.execute(
                     select(ChannelContentBackup).where(
                         ChannelContentBackup.scope == "distribution",
@@ -387,6 +399,8 @@ class ThumbnailChannelService:
                         if (card.get("anilist_id") == anilist_id and
                                 card.get("kind") in ("season_card", "movie_card")):
                             card["image_url"] = durable
+                            if caption_override:
+                                card["caption"] = caption_override
                             changed = True
                     if changed:
                         row.cards = cards
