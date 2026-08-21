@@ -168,6 +168,48 @@ def test_is_moviesmod_title():
     assert is_meaningful_track_name("Hindi - MoviesMod") is True
 
 
+# ── VegaMovies: the SAME stripping generalized to a second release brand ───────
+
+def test_is_release_brand_title_covers_vegamovies():
+    # The MoviesMod matcher now covers the whole banned-brand set, so VegaMovies
+    # (and its dotted domain variant) are rejected exactly like MoviesMod.
+    assert is_moviesmod_title("VegaMovies") is True
+    assert is_moviesmod_title("VegaMovies.co.ru") is True
+    assert is_moviesmod_title("Tamil - VegaMovies") is True
+    assert is_moviesmod_title("vegamovies") is True
+    # Unrelated titles still pass through untouched.
+    assert is_moviesmod_title("English") is False
+    assert is_moviesmod_title("Signs & Songs") is False
+
+
+def test_strip_removes_vegamovies_credit_line():
+    ass = _ass([
+        "A real subtitle line.",
+        "Follow us on VegaMovies.co.ru for more!",
+        "Another genuine dialogue line.",
+    ])
+    out, removed = strip_moviesmod_lines(ass)
+    assert removed == 1
+    assert "VegaMovies" not in out
+    assert "A real subtitle line." in out
+    assert "Another genuine dialogue line." in out
+    assert out.count("Dialogue:") == 2
+
+
+def test_strip_removes_both_brands_in_one_pass():
+    ass = _ass([
+        "Genuine line one.",
+        "Downloaded from MoviesMod.org",
+        "Visit VEGAMOVIES now",
+        "Genuine line two.",
+    ])
+    out, removed = strip_moviesmod_lines(ass)
+    assert removed == 2
+    assert "MoviesMod" not in out and "VEGAMOVIES" not in out.upper().replace(
+        "GENUINE LINE ONE.", "").replace("GENUINE LINE TWO.", "")
+    assert out.count("Dialogue:") == 2
+
+
 # ── End-to-end title resolution through the remux argv ────────────────────────
 
 class _FakeProc:

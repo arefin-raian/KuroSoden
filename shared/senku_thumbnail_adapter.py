@@ -391,9 +391,13 @@ class SenkuThumbnailAdapter:
             )
             # Distribution entry cards describe THAT season → AniList per-entry
             # synopsis (TMDB fallback). Without this flag the render baked the
-            # franchise-level TMDB overview onto every season card.
+            # franchise-level TMDB overview onto every season card. Passing the
+            # entry's own anilist_id also routes romaji/native/score/year/runtime
+            # to THIS installment's node (season 2 ≠ season 1) instead of the
+            # franchise root ``search`` blob.
             fields = await gather_thumbnail_fields(
-                self._c, title, anime_doc_id, prefer_anilist_synopsis=True)
+                self._c, title, anime_doc_id, prefer_anilist_synopsis=True,
+                anilist_id=entry.anilist_id)
             source_fields = {
                 **fields,
                 "title": title,

@@ -1065,7 +1065,9 @@ class DownloadWorker:
         from kurosoden.bots.levi.handlers.progress_monitor import _load_msg_ref
         from nekofetch.services import naming_confirm as nc
         from nekofetch.services.franchise_flow import FranchiseFlowService
-        from nekofetch.services.torrent_mapping import build_torrent_mapping
+        from nekofetch.services.torrent_mapping import (
+            build_torrent_mapping, fetch_episode_titles_for_franchise,
+        )
         from nekofetch.ui.torrent_screens import format_torrent_mapping
 
         franchise = req.franchise_data or {}
@@ -1107,7 +1109,16 @@ class DownloadWorker:
         if len(mapping.entries) <= 1 and not any(e.season_part for e in mapping.entries):
             return None
 
-        tmapping = build_torrent_mapping(ordered_files, mapping)
+        # Episode titles from Jikan (best-effort) so the DDL mapping uses the SAME
+        # MAL-title-match cascade tier as the torrent path — a season absent from
+        # bare filenames still resolves instead of collapsing onto S1.
+        ep_titles: dict = {}
+        try:
+            ep_titles = await fetch_episode_titles_for_franchise(mapping)
+        except Exception:  # noqa: BLE001 — titles are an optional cascade tier
+            log.debug("ddl.franchise_map.jikan_titles_failed", job_id=job_id)
+
+        tmapping = build_torrent_mapping(ordered_files, mapping, episode_titles=ep_titles)
 
         enc_heights = [h for h in self._c.config.processing.encode_heights if h > 0]
         _acq = getattr(self._c.config, "acquisition", None)
@@ -1133,7 +1144,7 @@ class DownloadWorker:
                 job_id, mapping_dict=tmapping.to_dict(), ordered_files=ordered_files,
                 franchise=franchise, encode_heights=enc_heights,
                 fallbacks_cfg=fallbacks, card_text=card_text,
-                chat_id=chat_id, msg_id=msg_id,
+                chat_id=chat_id, msg_id=msg_id, episode_titles=ep_titles,
             )
         finally:
             await self._set_confirm_hold(job_id, False)

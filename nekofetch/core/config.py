@@ -335,6 +335,30 @@ class WatermarkConfig(BaseModel):
     fast: bool = True
 
 
+class ThumbnailStyleConfig(BaseModel):
+    """Tunable look of the rendered franchise thumbnail card (``thumbnail/index.html``).
+
+    Every field maps to a numeric ``{{STYLE_*}}`` token substituted into the
+    template at render time, so the owner can retune the card's shadows/sizes live
+    from Senku settings (persisted to the DB, applied without a code change). The
+    defaults deliberately LOWER the shadow strengths from the original template —
+    the owner found them too dark. Opacities are 0–1; sizes are px/rem.
+    """
+    # Legibility text-shadow behind rating / brand / score text (``.thumb-shadow``).
+    shadow_opacity: float = 0.55          # was 0.85 — softened
+    shadow_blur_px: int = 6
+    # Ambient top gradient darkness over the backdrop (0–1). The three template
+    # stops (from/via/to) are derived from this one knob, keeping their ratio.
+    overlay_darkness: float = 0.65        # was 0.80 — softened
+    # Drop/box shadow alphas on the logo, poster, and the AniList score ring.
+    logo_shadow_opacity: float = 0.45     # was 0.60
+    poster_shadow_opacity: float = 0.40   # was 0.50
+    ring_shadow_opacity: float = 0.55     # was 0.70
+    # A couple of high-value size knobs.
+    synopsis_px: int = 16                 # synopsis paragraph font size
+    logo_height_rem: float = 4.5          # title-logo height
+
+
 class BrandingConfig(BaseModel):
     enabled: bool = True
     channel_name: str = "Anime Weebs"
@@ -765,6 +789,7 @@ class AppConfig(BaseModel):
     metadata: MetadataConfig = Field(default_factory=MetadataConfig)
     thumbnail: ThumbnailConfig = Field(default_factory=ThumbnailConfig)
     watermark: WatermarkConfig = Field(default_factory=WatermarkConfig)
+    thumbnail_style: ThumbnailStyleConfig = Field(default_factory=ThumbnailStyleConfig)
     branding: BrandingConfig = Field(default_factory=BrandingConfig)
     distribution: DistributionConfig = Field(default_factory=DistributionConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)

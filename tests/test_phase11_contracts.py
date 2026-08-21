@@ -95,6 +95,12 @@ def test_new_phase11_callbacks_stay_within_telegram_limit():
 
 def test_thumbnail_logo_slot_is_slightly_larger_and_wider():
     template = (Path(__file__).resolve().parents[1] / "thumbnail" / "index.html").read_text()
-    assert 'h-[4.5rem] w-auto max-w-[820px]' in template
+    # The logo HEIGHT is now an owner-tunable {{STYLE_LOGO_HEIGHT}} token; resolve
+    # the style tokens (defaults) before asserting the effective dimensions.
+    import nekofetch.services.thumbnail_service as ts
+    ts.set_thumbnail_style_provider(None)
+    for token, value in ts._style_tokens().items():
+        template = template.replace(token, value)
+    assert 'h-[4.5rem] w-auto max-w-[820px]' in template   # default logo slot
     assert 'w-[12vw] h-[40vh]' in template  # poster remains unchanged
     assert 'max-w-[520px]' in template       # synopsis remains unchanged

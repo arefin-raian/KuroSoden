@@ -12,7 +12,18 @@ class NotificationService:
 
     @property
     def _client(self):
-        return getattr(self._c, "admin_client", None)
+        """The bot that sends requester-facing DMs.
+
+        MUST be a crew bot the user actually talks to — the requester made their
+        request through Lelouch, so notifications ("published", "removed",
+        "requeued", …) come from Lelouch. Using ``admin_client`` here was the bug
+        that leaked DMs from the internal NekoFetch admin bot (which the owner
+        should never hear from). Falls back to ``admin_client`` only if the
+        pipeline/Lelouch client isn't up yet (e.g. early startup / standalone).
+        """
+        mgr = getattr(self._c, "pipeline_manager", None)
+        lelouch = getattr(mgr, "lelouch", None) if mgr is not None else None
+        return lelouch or getattr(self._c, "admin_client", None)
 
     async def _send(self, user_id: int, text: str) -> None:
         if not self._client:

@@ -40,10 +40,6 @@ STATE_CHANGE_MAIN = "gojo:await_new_main_channel"
 STATE_UPDATES_REVIEW = "gojo:await_updates_review"
 STATE_UPDATES_EDIT = "gojo:await_updates_edit"
 STATE_CHANGE_INDEX = "gojo:await_new_index_channel"
-# Index slot-management free-text steps. Each stashes the target slot's sort_order.
-STATE_IDX_SLOT_CAPTION = "gojo:await_idx_slot_caption"
-STATE_IDX_SLOT_IMAGE = "gojo:await_idx_slot_image"
-STATE_IDX_SLOT_BUTTONS = "gojo:await_idx_slot_buttons"
 STATE_RECOVERY_CHANNEL = "gojo:await_recovery_channel"
 
 # Every command Gojo registers. The FSM free-text consumer MUST exclude all of
@@ -55,6 +51,7 @@ STATE_RECOVERY_CHANNEL = "gojo:await_recovery_channel"
 GOJO_RESERVED = [
     "start", "tasks", "publish", "recover", "schedule", "updates",
     "bancheck", "stats", "settings", "help", "cancel", "footer", "backup",
+    "editpost",
 ]
 
 
@@ -121,38 +118,9 @@ async def render_updates_review(edit_target: Message, rows: list[dict]) -> None:
 
 
 # ── Index management markup ───────────────────────────────────────────────────
-# A slot's callbacks carry its ``sort_order`` (stable) rather than a list index,
-# so a concurrent shift can't retarget the wrong post.
-
-def _index_slots_markup(slots: list[dict]):
-    """One button per index slot, tagged by kind, then a Change-Index / Home row.
-
-    ``letter`` slots show their label, ``reserved`` an empty-slot marker, and
-    ``repurposed`` a lock so the operator sees which posts auto-indexing leaves
-    alone. Tapping a slot opens its action panel."""
-    icon = {"letter": "🔤", "reserved": "▫️", "repurposed": "🔒"}
-    btn_rows = []
-    for s in slots:
-        tag = s["label"] or ("Reserved" if s["kind"] == "reserved" else "Repurposed")
-        btn_rows.append([(
-            f"{icon.get(s['kind'], '•')} #{s['order']} · {tag}",
-            cb("gojo", "idx_slot", str(s["order"])),
-        )])
-    btn_rows.append([(V.BTN_CHANGE_INDEX, cb("gojo", "change_index"))])
-    btn_rows.append([(V.BTN_HOME, cb("gojo", "home"))])
-    return keyboard(*btn_rows)
-
-
-def _index_slot_actions_markup(order: int):
-    """Edit-text / replace-image / edit-buttons + repurpose toggle for one slot."""
-    return keyboard(
-        [(V.BTN_IDX_EDIT_TEXT, cb("gojo", "idx_edit", "caption", str(order)))],
-        [(V.BTN_IDX_EDIT_IMAGE, cb("gojo", "idx_edit", "image", str(order)))],
-        [(V.BTN_IDX_EDIT_BUTTONS, cb("gojo", "idx_edit", "buttons", str(order)))],
-        [(V.BTN_IDX_MARK_REPURPOSED, cb("gojo", "idx_repurpose", str(order), "on")),
-         (V.BTN_IDX_MARK_RESERVED, cb("gojo", "idx_repurpose", str(order), "off"))],
-        [(V.BTN_IDX_BACK, cb("gojo", "index")), (V.BTN_HOME, cb("gojo", "home"))],
-    )
+# The per-slot index editor (list slots → edit text/image/buttons/repurpose)
+# moved to handlers/post_editor.py's letter-grid editor, which also re-snapshots
+# the index backup after every edit (the old slot editor didn't → restore bug).
 
 
 async def _recovery_admin_ids(container: Container, requester_id: int | None = None) -> list[int]:
@@ -801,70 +769,9 @@ def register(client: Client, container: Container) -> None:
         await _arm_prompt(q.from_user.id, STATE_CHANGE_INDEX, q.message,
                           V.CHANGE_INDEX_PROMPT)
 
-    # ── Index management — list slots, edit text/image/buttons ────────────────
-    async def _render_index_slots(edit_target: Message) -> None:
-        from nekofetch.services.index_channel_service import IndexChannelService
-
-        slots = await IndexChannelService(container).list_slots()
-        await edit_target.edit_text(
-            V.index_slots_body(slots), parse_mode=ParseMode.HTML,
-            reply_markup=_index_slots_markup(slots),
-        )
-
-    @client.on_callback_query(filters.regex(r"^gojo\|index$"))
-    async def _cb_index(_: Client, q: CallbackQuery) -> None:
-        await q.answer()
-        from nekofetch.services.index_channel_service import IndexChannelService
-
-        slots = await IndexChannelService(container).list_slots()
-        note = await q.message.reply(V.INDEX_INTRO, parse_mode=ParseMode.HTML)
-        await note.edit_text(
-            V.index_slots_body(slots), parse_mode=ParseMode.HTML,
-            reply_markup=_index_slots_markup(slots),
-        )
-
-    @client.on_callback_query(filters.regex(r"^gojo\|idx_slot\|"))
-    async def _cb_idx_slot(_: Client, q: CallbackQuery) -> None:
-        await q.answer()
-        try:
-            order = int(q.data.rsplit("|", 1)[1])
-        except (ValueError, IndexError):
-            return
-        await q.message.edit_text(
-            V.index_slot_detail(order), parse_mode=ParseMode.HTML,
-            reply_markup=_index_slot_actions_markup(order),
-        )
-
-    @client.on_callback_query(filters.regex(r"^gojo\|idx_edit\|"))
-    async def _cb_idx_edit(_: Client, q: CallbackQuery) -> None:
-        # gojo|idx_edit|<what>|<order>  where what ∈ caption|image|buttons
-        parts = q.data.split("|")
-        if len(parts) < 4:
-            await q.answer()
-            return
-        what, order = parts[2], parts[3]
-        state = {"caption": STATE_IDX_SLOT_CAPTION, "image": STATE_IDX_SLOT_IMAGE,
-                 "buttons": STATE_IDX_SLOT_BUTTONS}.get(what)
-        if state is None:
-            await q.answer()
-            return
-        await q.answer()
-        await fsm.set(q.from_user.id, state, slot_order=int(order))
-        await q.message.reply(V.index_edit_prompt(what), parse_mode=ParseMode.HTML)
-
-    @client.on_callback_query(filters.regex(r"^gojo\|idx_repurpose\|"))
-    async def _cb_idx_repurpose(_: Client, q: CallbackQuery) -> None:
-        # gojo|idx_repurpose|<order>|<on|off>
-        parts = q.data.split("|")
-        if len(parts) < 4:
-            await q.answer()
-            return
-        order, flag = int(parts[2]), parts[3] == "on"
-        from nekofetch.services.index_channel_service import IndexChannelService
-
-        ok = await IndexChannelService(container).mark_slot_repurposed(order, flag)
-        await q.answer("Updated." if ok else "Slot not found.", show_alert=not ok)
-        await _render_index_slots(q.message)
+    # ── Index management moved to handlers/post_editor.py (letter-grid editor
+    #    with backup re-sync). The old ``gojo|index`` / ``idx_slot`` / ``idx_edit``
+    #    / ``idx_repurpose`` handlers were removed here.
 
     # ── Update check — detect-only sweep + edit-before-submit ─────────────────
     _updates_review_markup = updates_review_markup
@@ -1290,36 +1197,6 @@ def register(client: Client, container: Container) -> None:
             except Exception:  # noqa: BLE001
                 pass
             await _restore_index_to_channel(client, container, message, new_id)
-        elif state == STATE_IDX_SLOT_CAPTION:
-            from kurosoden.shared.settings_ui import parse_user_markup
-            from nekofetch.services.index_channel_service import IndexChannelService
-
-            order = int(data.get("slot_order", -1))
-            html_cap = parse_user_markup(message)
-            await fsm.clear(message.from_user.id)
-            ok = await IndexChannelService(container).edit_slot_caption(order, html_cap)
-            await message.reply(V.index_edit_result(ok, "caption"), parse_mode=ParseMode.HTML)
-        elif state == STATE_IDX_SLOT_IMAGE:
-            from nekofetch.services.index_channel_service import IndexChannelService
-
-            order = int(data.get("slot_order", -1))
-            image = _extract_image_ref(message)
-            await fsm.clear(message.from_user.id)
-            if not image:
-                await message.reply(V.index_image_bad, parse_mode=ParseMode.HTML)
-                return
-            ok = await IndexChannelService(container).replace_slot_image(order, image)
-            await message.reply(V.index_edit_result(ok, "image"), parse_mode=ParseMode.HTML)
-        elif state == STATE_IDX_SLOT_BUTTONS:
-            from nekofetch.services.index_channel_service import IndexChannelService
-
-            order = int(data.get("slot_order", -1))
-            buttons = _parse_button_lines(message.text or "")
-            await fsm.clear(message.from_user.id)
-            ok = await IndexChannelService(container).set_slot_buttons(order, buttons)
-            await message.reply(
-                V.index_buttons_result(ok, len(buttons)), parse_mode=ParseMode.HTML,
-            )
 
     @client.on_message(filters.command("cancel"))
     async def _cancel(_: Client, message: Message) -> None:
@@ -1739,43 +1616,6 @@ async def _restore_index_to_channel(
         V.restore_done(stats.restored, stats.total, stats.failed),
         parse_mode=ParseMode.HTML,
     )
-
-
-def _extract_image_ref(message: Message) -> str | None:
-    """Pull an image reference from an admin's message for a slot-image swap.
-
-    Accepts a sent photo/document (uses its Telegram ``file_id``) or a plain URL
-    typed as text. Returns ``None`` when neither is present so the caller can
-    reprompt.
-    """
-    if message.photo:
-        return message.photo.file_id
-    doc = getattr(message, "document", None)
-    if doc is not None and (getattr(doc, "mime_type", "") or "").startswith("image/"):
-        return doc.file_id
-    text = (message.text or "").strip()
-    if text.startswith("http://") or text.startswith("https://"):
-        return text
-    return None
-
-
-def _parse_button_lines(raw: str) -> list[tuple[str, str]]:
-    """Parse ``Text | https://url`` lines into ``[(text, url), …]`` (one per row).
-
-    Blank lines and lines without a ``|`` separator or a valid http(s) URL are
-    skipped, so a stray line can't create a dead button. An empty result clears
-    the slot's buttons.
-    """
-    out: list[tuple[str, str]] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or "|" not in line:
-            continue
-        text, _, url = line.partition("|")
-        text, url = text.strip(), url.strip()
-        if text and (url.startswith("http://") or url.startswith("https://")):
-            out.append((text, url))
-    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -463,6 +463,107 @@ class RequestService:
         )
         return {"title": title, "files": removed_files, "packs": removed_packs}
 
+    async def reset_source(self, code: str) -> dict:
+        """TOTAL reset for a 'Change source' — stop everything, wipe everything
+        created since the source was picked, keep the request so a fresh source can
+        be chosen from a clean slate.
+
+        Unlike :meth:`abandon` (a soft reset that leaves the channel/publish rows
+        and the stale ``source_ref``), this:
+          1. Signals a running worker to STOP FIRST (both ``:source_abort`` and
+             ``:cancel`` flags) so a mid-watermark/-encode/-upload job bails at its
+             next checkpoint BEFORE we delete its files — this is what prevents the
+             "No such file or directory" mid-loop race the owner saw. Also latches
+             the Levi card (``:finalized``) so its refresh loop can't repaint over
+             the picker the caller re-renders.
+          2. Deletes storage packs (channel messages + rows), MediaFiles + local
+             files, DownloadJobs (via :meth:`_purge_request_rows`), AND the
+             per-anime channel/publish rows (main/index/distribution + backups, via
+             :meth:`_purge_channel_rows`) so nothing published survives.
+          3. Clears ``source_ref`` + the DDL/torrent franchise mapping and resets
+             the request to PENDING — "as if the source was never picked". The
+             request row + its owner/stage assignment are kept.
+
+        Returns ``{title, files, packs}``. Destructive + irreversible; the caller
+        (the owner's 'Change source' tap) is the confirmation.
+        """
+        from nekofetch.services.download_service import _safe_folder
+        from sqlalchemy import select
+
+        title = code
+        job_ids: list[int] = []
+        summary = {"files": 0, "packs": 0}
+        work_folder: str | None = None
+        anime_doc_id: str | None = None
+
+        # 1a. Resolve the job ids up front so we can signal the worker to stop
+        #     BEFORE we start deleting its rows/files.
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            req = await RequestRepository(session).get_by_code(code)
+            if req is None:
+                raise NotFound(code)
+            title = req.anime_title or code
+            anime_doc_id = req.anime_doc_id
+            work_folder = _safe_folder(req)
+            from nekofetch.infrastructure.database.postgres.models import DownloadJob
+            job_ids = (await session.execute(
+                select(DownloadJob.id).where(DownloadJob.request_id == req.id)
+            )).scalars().all()
+
+        # 1b. Signal-to-stop + latch the card. Do this FIRST: the heavy stages poll
+        #     ``source_abort`` per file, so the running encode unwinds within one
+        #     file instead of chewing through the rest of the series.
+        #     ``request_source_abort`` also tears down any in-flight naming/caption
+        #     confirm gate for the job, so a dead attempt can't surface its card late.
+        from nekofetch.services.download_service import DownloadWorker
+        worker = DownloadWorker(self._c)
+        for jid in job_ids:
+            try:
+                await worker.request_source_abort(jid)
+            except Exception:  # noqa: BLE001 — signalling is best-effort
+                pass
+            if self._c.redis:
+                for suffix, ttl in (("cancel", 600), ("finalized", 6 * 60 * 60)):
+                    try:
+                        await self._c.redis.set(f"nf:job:{jid}:{suffix}", "1", ex=ttl)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        # 2 + 3. Full teardown, then reset the request in place.
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            req = await RequestRepository(session).get_by_code(code)
+            if req is None:
+                raise NotFound(code)
+            summary = await self._purge_request_rows(session, req)
+            job_ids = summary["job_ids"] or job_ids
+            if anime_doc_id:
+                # Realistically none exist yet at the download stage, but if a tier
+                # was already published this clears the main/index/distribution rows
+                # + backups so nothing stale survives the reset.
+                await self._purge_channel_rows(session, anime_doc_id, [code])
+            # "As if the source was never picked": drop the source-native ref and
+            # the DDL/torrent franchise mapping; keep the request + its assignment.
+            req.source_ref = None
+            if req.franchise_data:
+                data = dict(req.franchise_data)
+                for k in ("_torrent_mapping", "redo_relink"):
+                    data.pop(k, None)
+                req.franchise_data = data or None
+            req.status = RequestStatus.PENDING
+            req.episodes = None
+            await session.flush()
+
+        await self._prune_work_dir(work_folder)
+        await self._clear_distribution_cache([code])
+        await self._clear_job_flags(code, job_ids)
+
+        from nekofetch.services.log_channel_service import LogChannelService
+        await LogChannelService(self._c).event(
+            "admin", "source_reset", code=code, anime=title,
+            files=summary["files"], packs=summary["packs"],
+        )
+        return {"title": title, "files": summary["files"], "packs": summary["packs"]}
+
     async def _purge_pack_messages(self, pack) -> None:
         """Delete a storage pack's channel messages (header, files, end sticker).
         Best-effort — a missing message or disabled channel must not abort abandon."""

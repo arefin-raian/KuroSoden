@@ -423,6 +423,7 @@ class NamingConfirm:
         self, job_id: int, *, mapping_dict: dict, ordered_files: list[dict],
         franchise: dict, encode_heights: list[int], fallbacks_cfg: dict,
         card_text: str, chat_id: int | None, msg_id: int | None = None,
+        episode_titles: dict | None = None,
     ) -> dict | None:
         """DDL franchise-mapping confirm (kind ``"ddlmap"``): show the mapping card
         with per-entry present/to-encode qualities, block until the admin taps
@@ -467,6 +468,10 @@ class NamingConfirm:
                 "mapping": mapping_dict, "ordered_files": ordered_files,
                 "franchise": franchise, "encode_heights": encode_heights,
                 "fallbacks_cfg": fallbacks_cfg,
+                # Kept so a manual "Fix seasons" re-run keeps the SAME MAL-title
+                # cascade tier the auto build used (JSON stringifies the int
+                # anilist_id keys; the re-run coerces them back).
+                "episode_titles": episode_titles or {},
             }),
             label="ddlmap.data", ex=_CONFIRM_TIMEOUT_S + 60)
         await _arm(redis, chat_id, state, job_id=job_id, kind=kind)

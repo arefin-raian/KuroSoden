@@ -163,6 +163,11 @@ class PublishingService:
                         break
             except Exception:  # noqa: BLE001 — override is optional
                 pass
+            # Job ids drive the mid-upload abort checkpoint below: a 'Change source'
+            # reset sets ``nf:job:<id>:source_abort``/``:cancel`` and we must stop
+            # shipping packs promptly so the teardown doesn't race an in-flight
+            # upload into orphaned channel messages.
+            abort_job_ids = [j.id for j in jobs] if jobs else []
             # Extract the AniList entry ID from franchise_data so storage packs
             # track which specific entry (season/movie/OVA) the files belong to.
             # ``anilist_id`` is stored as a STRING at the request-creation sites
@@ -186,6 +191,7 @@ class PublishingService:
 
         uploaded_paths, cleanup_paths = await self._upload_packs(
             anime_doc_id, title, snapshot, on_progress=on_progress,
+            abort_check=self._make_abort_check(abort_job_ids),
         )
 
         # Delete every file that was CONFIRMED uploaded — individually, so a
@@ -627,8 +633,28 @@ class PublishingService:
             skipped=(not completed),
         )
 
+    def _make_abort_check(self, job_ids: list[int]):
+        """Build an async predicate: True once any of ``job_ids`` is flagged for a
+        source-abort/cancel. Lets a long pack upload bail mid-run when the owner
+        hits 'Change source', so the reset teardown doesn't race live uploads into
+        orphaned channel messages. Fail-open: a Redis blip never aborts a good run."""
+        async def _check() -> bool:
+            redis = getattr(self._c, "redis", None)
+            if redis is None or not job_ids:
+                return False
+            try:
+                keys = []
+                for jid in job_ids:
+                    keys.append(f"nf:job:{jid}:source_abort")
+                    keys.append(f"nf:job:{jid}:cancel")
+                vals = await redis.mget(keys)
+                return any(bool(v) for v in vals)
+            except Exception:  # noqa: BLE001 — fail open
+                return False
+        return _check
+
     async def _upload_packs(self, anime_doc_id: str, title: str, files: list[dict],
-                            *, on_progress=None) -> set[str]:
+                            *, on_progress=None, abort_check=None) -> set[str]:
         """Group published files by (season, resolution, audio, entry_id) and upload each as a pack.
 
         Returns ``(uploaded_paths, cleanup_paths)``: the first set contains only
@@ -684,7 +710,7 @@ class PublishingService:
         # franchise walk. Each pack (S1/S2/S3/OVA) gets ITS OWN cover — AniList
         # has per-installment covers TMDB frequently lacks, and it matches the
         # franchise structure exactly. Falls back to the shared TMDB poster.jpg.
-        entry_posters = await self._anilist_entry_posters(anime_doc_id, files)
+        entry_posters = await self._anilist_entry_posters(anime_doc_id, files, title)
         # Shorter title candidates (English/native/synonyms) the caption builder
         # falls back to when the full title overflows the 38-char line. Resolved
         # once from the prefetched AniList cache; empty when absent.
@@ -693,6 +719,12 @@ class PublishingService:
         uploaded_paths: set[str] = set()
         cleanup_paths: set[str] = set()
         for (season, season_part, resolution, audio, entry_id), items in ordered_groups:
+            # 'Change source' reset landed mid-upload — stop shipping packs so the
+            # teardown that's clearing this request's rows/messages doesn't race us.
+            if abort_check is not None and await abort_check():
+                _log.info("publish.storage.upload_aborted",
+                          anime=anime_doc_id, uploaded=len(uploaded_paths))
+                break
             if not resolution or audio is None:
                 continue
             items.sort(key=lambda x: (x["episode"] or 0))
@@ -765,6 +797,15 @@ class PublishingService:
                     (p for i in items
                      if (p := Path(i["path"]).with_name(POSTER_THUMB_NAME)).exists()),
                     None,
+                )
+                # Surface the fall-through: with the resilient walk fallback in
+                # place, reaching the shared TMDB poster means EVERY tier missed a
+                # cover for this pack — worth a WARNING (it used to be silent, so a
+                # whole-franchise cover miss looked like normal operation).
+                _log.warning(
+                    "publish.pack_poster.shared_tmdb_fallback",
+                    anime=anime_doc_id, season=season, season_part=season_part,
+                    entry_id=entry_id, has_shared=bool(poster),
                 )
 
             # ── Resume guard: skip a pack already fully in the channel ──
@@ -900,7 +941,7 @@ class PublishingService:
         return out
 
     async def _anilist_entry_posters(
-        self, anime_doc_id: str, files: list[dict],
+        self, anime_doc_id: str, files: list[dict], title: str | None = None,
     ) -> dict:
         """Map each franchise installment to its AniList cover URL.
 
@@ -911,8 +952,10 @@ class PublishingService:
 
         keyed by BOTH the entry's AniList id (matches a pack's ``entry_id``) and
         its chronological season index (fallback when a pack has no entry_id).
-        Empty dict when the cache is absent — the caller then uses the shared
-        TMDB poster."""
+        When the cache carries no franchise walk (e.g. a title accepted without an
+        AniList id ever resolving), it falls back to a LIVE *resilient* walk by
+        title (AniList → Kaggle → Jikan → Kitsu) so each season still resolves its
+        OWN cover instead of collapsing every pack onto the shared TMDB poster."""
         from nekofetch.core.logging import get_logger
         _log = get_logger(__name__)
         out: dict = {}
@@ -921,9 +964,13 @@ class PublishingService:
 
             blob = await load_cached(self._c, anime_doc_id, "anilist",
                                      anime_doc_id=anime_doc_id)
-            if not blob:
+            walk = (blob or {}).get("franchise") or {}
+            if not walk:
+                # Nothing cached → resolve the franchise live via the resilient
+                # chain so a title stored id-less still gets per-season covers.
+                walk = await self._resilient_franchise_walk(title)
+            if not walk:
                 return out
-            walk = blob.get("franchise") or {}
             # walk_franchise_full serializes to {id: FranchiseEntry-dict}; the
             # values carry anilist_id + cover_url + start_date (for ordering).
             entries = list(walk.values()) if isinstance(walk, dict) else list(walk or [])
@@ -979,6 +1026,35 @@ class PublishingService:
             _log.debug("publish.anilist_posters.failed",
                        anime=anime_doc_id, error=str(exc))
         return out
+
+    async def _resilient_franchise_walk(self, title: str | None) -> dict:
+        """Live franchise walk via the resilient chain, serialized like the cache.
+
+        Used when the prefetched ``anilist.json`` carried no franchise walk (a
+        title accepted without an AniList id resolving). ``container.anilist`` is
+        the resilient client, so ``search``/``walk_franchise_full`` cascade
+        AniList → Kaggle → Jikan → Kitsu; a null root id is fine as long as SOME
+        tier resolves the title. Returns the ``{id: {...}}`` serialized shape
+        (via ``_jsonable``) so the caller's existing map-builder is unchanged, or
+        an empty dict when nothing resolves."""
+        ani = getattr(self._c, "anilist", None)
+        if ani is None or not title:
+            return {}
+        try:
+            media = await ani.search(title)
+            mid = getattr(media, "id", None) if media else None
+            if not mid:
+                return {}
+            live = await ani.walk_franchise_full(int(mid))
+            if not live:
+                return {}
+            from nekofetch.services.metadata_prefetch import _jsonable
+            return _jsonable(live) or {}
+        except Exception as exc:  # noqa: BLE001 — best-effort; caller degrades
+            from nekofetch.core.logging import get_logger
+            get_logger(__name__).debug("publish.resilient_walk.failed",
+                                       title=title, error=str(exc))
+            return {}
 
     async def _pack_poster(
         self, entry_posters: dict, entry_id, season, dest_dir,

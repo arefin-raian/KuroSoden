@@ -35,7 +35,9 @@ from nekofetch.core.exceptions import NotFound
 from nekofetch.core.logging import get_logger
 from nekofetch.domain.enums import AudioType
 from nekofetch.sources._archive import extract_archive
-from nekofetch.sources._torrent import group_variants, order_episodes
+from nekofetch.sources._torrent import (
+    group_variants, order_episodes, parse_release_meta,
+)
 from nekofetch.sources.base import (
     AnimeDetails,
     AnimeSource,
@@ -263,32 +265,44 @@ class DdlSource(AnimeSource):
                 continue
             downloaded.append({
                 "arc_name": arc_name, "path": archive_path,
-                "dir": cache / digest, "season_hint": arc.get("season"),
+                # Season hint from the explicit archive field OR the archive NAME
+                # ("...S02...zip"). DDL episode filenames are often bare
+                # ("Episode 01.mkv"), so the archive name is the only season
+                # signal — matching the owner's "season from filename OR archive
+                # name" rule and the torrent path's per-file season detection.
+                "dir": cache / digest, "season_hint": _archive_season_hint(arc, arc_name),
             })
 
-        # ── Phase 2: extract every downloaded archive (per-file progress) ──
+        # ── Phase 2: extract every downloaded archive (CUMULATIVE progress) ──
+        # A multi-archive release (e.g. one archive per season) used to show the
+        # LAST archive's local count — "4 / 4" for a 12-file, 3-archive pack —
+        # because every archive emitted its own 0..N frames. Offset each frame by
+        # the running pooled count so "File X / Y" climbs 0 → grand-total and the
+        # final frame reads the TRUE extracted total (12 / 12).
         pooled: list[dict] = []
         for pos, item in enumerate(downloaded, start=1):
             arc_name = item["arc_name"]
-            # Track the real per-file counts the extractor reports so the FINAL
-            # "extract_done" frame shows the true episode total (e.g. 24/24) — not
-            # a hardcoded 1/1, which used to render every season as "File 1/1".
+            base = len(pooled)  # files already extracted from earlier archives
+            # Track the real per-file counts the extractor reports so the archive's
+            # closing frame uses the true count, not a hardcoded 1/1.
             last_count = {"done": 0, "total": 0}
 
             async def _on_file(done, total, name="", an=arc_name, i=pos,
-                               _c=last_count):
+                               _c=last_count, _base=base):
                 _c["done"], _c["total"] = int(done or 0), int(total or 0)
-                await _emit("extract", an, i, done, total)
+                # Cumulative across archives (offset by prior archives' files).
+                await _emit("extract", an, i, _base + _c["done"], _base + _c["total"])
 
             try:
-                await _emit("extract", arc_name, pos, 0, 0)
+                await _emit("extract", arc_name, pos, base, base)
                 videos = await extract_archive(
                     item["path"], item["dir"], on_file=_on_file,
                 )
                 # Prefer the extracted video count; fall back to the last poller
-                # frame. Both beat the old hardcoded (1, 1).
-                final_total = len(videos) or last_count["total"] or 1
-                await _emit("extract_done", arc_name, pos, final_total, final_total)
+                # frame. Both beat the old hardcoded (1, 1). Still cumulative.
+                arc_total = len(videos) or last_count["total"] or 1
+                await _emit("extract", arc_name, pos,
+                            base + arc_total, base + arc_total)
             except Exception as exc:  # noqa: BLE001
                 log.warning("ddl.archive.failed", archive=arc_name, error=str(exc))
                 await _emit("failed", f"{arc_name}: {exc}", pos)
@@ -304,12 +318,39 @@ class DdlSource(AnimeSource):
 
         if not pooled:
             return []
+        # FINAL frame: the true cumulative extracted total (e.g. 12 / 12), emitted
+        # once after every archive so the completed card never shows a single
+        # archive's local count.
+        _grand = len(pooled)
+        _last_arc = downloaded[-1]["arc_name"] if downloaded else ""
+        await _emit("extract_done", _last_arc, len(downloaded), _grand, _grand)
 
         # Keep EVERY quality (no prefer_resolution collapse) and group per real
         # (season, episode) so a multi-quality pack becomes ONE episode with a
         # sibling file per tier — get_variants expands them, the worker downloads
         # each, and EncodeStage fills only genuinely-missing tiers.
         ordered = order_episodes(pooled)
+        # Apply the per-archive season hint to files whose OWN name didn't state a
+        # season (bare "Episode 01.mkv"). Done BEFORE group_variants so its
+        # (season, episode) keys don't merge S2E1 into S1E1 as a phantom "quality"
+        # of season 1 — the exact way DDL's mapping used to collapse onto S1.
+        _hinted = False
+        for e in ordered:
+            hint = e.get("_season_hint")
+            if hint is not None and not e.get("season_explicit"):
+                e["season"], e["season_explicit"] = int(hint), True
+                _hinted = True
+        if _hinted:
+            # Re-order numbered episodes by the corrected (season, episode); keep
+            # movies/extras after, preserving their relative order.
+            _num = [e for e in ordered
+                    if e.get("kind") == "episode" and e.get("episode") is not None]
+            _other = [e for e in ordered
+                      if not (e.get("kind") == "episode" and e.get("episode") is not None)]
+            _num.sort(key=lambda e: (e["season"], e["episode"]))
+            ordered = _num + _other
+            for _seq, e in enumerate(ordered, start=1):
+                e["seq"] = _seq
         groups = group_variants(ordered)
         episodes: list[Episode] = []
         for g in groups:
@@ -439,6 +480,22 @@ def _parse_ref(ref: str) -> dict:
         return json.loads(ref)
     except (TypeError, json.JSONDecodeError):
         return {}
+
+
+def _archive_season_hint(arc: dict, arc_name: str) -> int | None:
+    """Season for a downloaded archive: the explicit field, else parsed from the
+    archive NAME ("A.Show.S02.1080p.zip" → 2). ``None`` when neither states one —
+    the per-file cascade then decides. Only an EXPLICIT season in the name counts
+    (``parse_release_meta`` defaults to 1), so a name without a season token
+    doesn't force S1 onto files that belong elsewhere."""
+    explicit = arc.get("season")
+    if explicit is not None:
+        try:
+            return int(explicit)
+        except (TypeError, ValueError):
+            return None
+    meta = parse_release_meta(arc_name or "")
+    return int(meta["season"]) if meta.get("season_explicit") else None
 
 
 def _ext_of(url: str) -> str:

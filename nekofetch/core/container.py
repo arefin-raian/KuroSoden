@@ -206,6 +206,16 @@ class Container:
 
         await SettingsService(self).apply_overrides()
 
+        # Let the container-less thumbnail renderer read the LIVE, override-applied
+        # card styling (Senku settings → thumbnail_style) without per-call plumbing.
+        try:
+            from nekofetch.services.thumbnail_service import (
+                set_thumbnail_style_provider,
+            )
+            set_thumbnail_style_provider(lambda: self.config.thumbnail_style)
+        except Exception:  # noqa: BLE001 — styling is best-effort, never block startup
+            pass
+
         # Activate only authorized sources listed in config.
         self.sources.activate(
             self.config.sources.enabled,

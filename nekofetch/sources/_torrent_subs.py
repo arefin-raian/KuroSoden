@@ -699,23 +699,26 @@ def detect_subtitle_language(ass_text: str) -> str:
     return _DETECT_LANG_NAMES.get(code) or _DETECT_LANG_NAMES.get(code.split("-")[0], "")
 
 
-# ── MoviesMod release-site stripping (DDL only) ───────────────────────────────
-# MoviesMod DDL packs stamp their site into two places: standalone credit cues
-# ("Downloaded from MoviesMod.org") inside the subtitle body, and audio/subtitle
-# track TITLES ("Hindi - MoviesMod"). Both are stripped for DDL sources only
-# (torrents keep their fansub cues + titles verbatim).
-_MOVIESMOD_TOKEN = "moviesmod"
+# ── Release-site line stripping (DDL only) ────────────────────────────────────
+# DDL packs stamp their site into two places: standalone credit cues ("Downloaded
+# from MoviesMod.org", "Follow us on VegaMovies.co.ru") inside the subtitle body,
+# and audio/subtitle track TITLES ("Hindi - MoviesMod", "VegaMovies"). Both are
+# stripped for DDL sources only (torrents keep their fansub cues + titles
+# verbatim). The banned-brand token set lives in ``_branding`` so the title
+# matcher (``is_release_brand_title``) and this line stripper share one list.
+from nekofetch.sources._branding import _RELEASE_BRAND_TOKENS
 
 
-def strip_moviesmod_lines(ass_text: str) -> tuple[str, int]:
-    """Remove every ``Dialogue:``/``Comment:`` event whose visible text mentions
-    the MoviesMod site, returning ``(new_text, removed_count)``.
+def strip_release_brand_lines(ass_text: str) -> tuple[str, int]:
+    """Remove every ``Dialogue:``/``Comment:`` event whose visible text mentions a
+    banned release site (MoviesMod, VegaMovies, …), returning ``(new_text,
+    removed_count)``.
 
-    The owner's rule: a cue that reads "Downloaded from MoviesMod.org" is dropped
-    ENTIRELY (not just the URL token) — a legitimate line never contains the site
-    name. Non-event lines (headers, styles) are untouched. Matching is
-    case-insensitive on the event TEXT field only, so a style named after the
-    site couldn't cause a false strip of real dialogue.
+    The owner's rule: a cue that reads "Downloaded from MoviesMod.org" or
+    "VegaMovies.co.ru" is dropped ENTIRELY (not just the URL token) — a legitimate
+    line never contains a release-site name. Non-event lines (headers, styles) are
+    untouched. Matching is case-insensitive on the event TEXT field only, so a
+    style named after a site couldn't cause a false strip of real dialogue.
     """
     text = ass_text.replace("\r\n", "\n").replace("\r", "\n")
     out: list[str] = []
@@ -725,11 +728,16 @@ def strip_moviesmod_lines(ass_text: str) -> tuple[str, int]:
         if s.startswith("Dialogue:") or s.startswith("Comment:"):
             fields = ln.split(",", 9)
             body = fields[9] if len(fields) >= 10 else ln
-            if _MOVIESMOD_TOKEN in body.lower():
+            low = body.lower()
+            if any(tok in low for tok in _RELEASE_BRAND_TOKENS):
                 removed += 1
                 continue
         out.append(ln)
     return "\n".join(out), removed
+
+
+# Back-compat alias: the historical name. Now strips the whole brand-token set.
+strip_moviesmod_lines = strip_release_brand_lines
 
 
 async def brand_torrent_subtitles(

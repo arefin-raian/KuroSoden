@@ -52,6 +52,36 @@ def _msg_key(job_id: int) -> str:
     return f"nf:job:{job_id}:progressmsg"
 
 
+def _finalized_key(job_id: int) -> str:
+    return f"nf:job:{job_id}:finalized"
+
+
+async def _mark_finalized(container: Container, job_id: int) -> None:
+    """Latch a job's card as terminally painted so the refresh loop stops.
+
+    The cancel/delete path (``finalize_cancelled_card``) runs DIRECTLY, out of
+    band from the job's still-running ``_refresh_loop`` task. Without a latch, an
+    in-flight loop tick that fetched a non-terminal view just before the row was
+    deleted would repaint a live frame OVER the "Cancelled" card — the reported
+    ~0.1s flash-then-revert. Setting this BEFORE painting, and having the loop
+    check it at tick-top and immediately before every edit, closes that window.
+    """
+    if container.redis:
+        try:
+            await container.redis.set(_finalized_key(job_id), "1", ex=_MAX_LIFETIME)
+        except Exception:  # noqa: BLE001 — best-effort latch
+            log.debug("levi.progress.finalize_latch_blip", job_id=job_id)
+
+
+async def _is_finalized(container: Container, job_id: int) -> bool:
+    if not container.redis:
+        return False
+    try:
+        return bool(await container.redis.get(_finalized_key(job_id)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _store_msg_ref(container: Container, job_id: int, chat_id: int, msg_id: int) -> None:
     if container.redis:
         try:
@@ -92,6 +122,9 @@ async def finalize_cancelled_card(
     """
     from kurosoden.shared import levi_voice as V
 
+    # Latch BEFORE painting so the job's own refresh loop can't repaint a live
+    # frame over the "Cancelled" card (the flash-then-revert race).
+    await _mark_finalized(container, job_id)
     ref = await _load_msg_ref(container, job_id)
     mgr = getattr(container, "pipeline_manager", None)
     levi = getattr(mgr, "levi", None) if mgr is not None else None
@@ -279,6 +312,11 @@ async def _refresh_loop(client: Client, container: Container, job_id: int,
     while time.monotonic() < deadline:
         await asyncio.sleep(_REFRESH_CADENCE)
 
+        # A terminal paint (cancel/delete) may have run out of band since the last
+        # tick — if so, stand down permanently so we never repaint over it.
+        if await _is_finalized(container, job_id):
+            return
+
         # While the naming/caption confirm cards own this message, stand down so
         # we never repaint the live card over a confirm prompt. When the hold
         # lifts, force one repaint (drop last_text) so the card returns to live.
@@ -323,6 +361,10 @@ async def _refresh_loop(client: Client, container: Container, job_id: int,
         # or uploading is still running.
         text = _render_live(job_id, view)
         if text != last_text:
+            # Final re-check: a cancel/delete may have painted the terminal card
+            # during the awaits above (view was fetched non-terminal). Don't clobber it.
+            if await _is_finalized(container, job_id):
+                return
             try:
                 await client.edit_message_text(
                     chat_id, msg_id, text, parse_mode=ParseMode.HTML,
@@ -499,43 +541,55 @@ def register(client: Client, container: Container) -> None:
         if not await _guard(q, Permission.QUEUE_DOWNLOADS):
             return
         job_id = int(q.data.split("|")[2])
-        from nekofetch.services.download_service import DownloadWorker
-        await DownloadWorker(container).request_source_abort(job_id)
+        # Resolve the request code BEFORE the reset deletes the job row.
         view = await _job_view(container, job_id) or {}
         code = view.get("code")
-        if q.message is not None and code:
+        title = view.get("title", code)
+        if not code:
+            await q.answer("That task is already gone.", show_alert=True)
+            return
+        await q.answer("Stopping and clearing everything…", show_alert=True)
+        # TOTAL reset: stop the worker at any stage, delete every pack/message/file/
+        # job/channel row created since the source was picked, wipe local work +
+        # Redis, and clear the source so it's a clean slate. Destructive by design —
+        # the owner's tap is the confirmation.
+        from nekofetch.services.request_service import RequestService
+        try:
+            await RequestService(container).reset_source(code)
+        except Exception as exc:  # noqa: BLE001 — still re-present the picker below
+            log.warning("levi.progress.reset_source_failed", code=code, error=str(exc))
+        # Re-present the ORIGINAL 4-button route picker in place (Telegram / Website
+        # / Torrent / DDL) via the hook Levi's task handler exposed — same card the
+        # request started from, so the owner continues from a genuine clean slate.
+        picker = getattr(container, "levi_source_picker", None)
+        rendered = False
+        if picker is not None and q.message is not None:
+            try:
+                await picker(q.message.chat.id, code, q.message)
+                rendered = True
+            except Exception as exc:  # noqa: BLE001
+                log.warning("levi.progress.reset_picker_failed", code=code, error=str(exc))
+        if not rendered and q.message is not None:
+            # Fallback inline picker if the hook wasn't wired (defensive).
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "🌐 Website sources",
-                    callback_data=cb("levi", "website", code),
-                ),
-                 InlineKeyboardButton(
-                    "✈️ Telegram manual",
-                    callback_data=cb("levi", "telegram", code),
-                )],
-                [InlineKeyboardButton(
-                    "🧲 Torrent",
-                    callback_data=cb("staff", "rsource", code, "torrent"),
-                ),
-                 InlineKeyboardButton(
-                    "🔗 Direct Link (DDL)",
-                    callback_data=cb("staff", "rsource", code, "ddl"),
-                )],
+                [InlineKeyboardButton("🌐 Website sources",
+                                      callback_data=cb("levi", "website", code)),
+                 InlineKeyboardButton("✈️ Telegram manual",
+                                      callback_data=cb("levi", "telegram", code))],
+                [InlineKeyboardButton("🧲 Torrent",
+                                      callback_data=cb("staff", "rsource", code, "torrent")),
+                 InlineKeyboardButton("🔗 Direct Link (DDL)",
+                                      callback_data=cb("staff", "rsource", code, "ddl"))],
             ])
             try:
                 await q.message.edit_text(
-                    (
-                        "⚔️ <b>Source attempt stopped.</b>\n\n"
-                        f"<b>{view.get('title', code)}</b>\n"
-                        f"<code>{code}</code>\n\n"
-                        "<i>Pick another route. The request stays alive.</i>"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb,
+                    ("⚔️ <b>Reset complete — pick a route.</b>\n\n"
+                     f"<b>{title}</b>\n<code>{code}</code>\n\n"
+                     "<i>Everything from the last source was cleared.</i>"),
+                    parse_mode=ParseMode.HTML, reply_markup=kb,
                 )
             except Exception:  # noqa: BLE001
                 pass
-        await q.answer("Source stopped. Pick another route.", show_alert=True)
 
     @client.on_callback_query(filters.regex(r"^levi\|dlretry\|"))
     async def _dl_retry(_: Client, q: CallbackQuery) -> None:

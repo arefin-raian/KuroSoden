@@ -60,6 +60,60 @@ _GENRE_CHAR_BUDGET = 42
 _GENRE_MAX_PILLS = 5
 
 
+# ── Owner-tunable card styling ────────────────────────────────────────────────
+# The renderer is container-less (constructed as ``ThumbnailRenderService()`` at
+# many call sites), so it can't read ``container.config`` directly. The container
+# installs a provider at startup that returns the LIVE ``ThumbnailStyleConfig``
+# (which SettingsService keeps in sync with DB overrides), so a Senku settings
+# edit is reflected on the very next render with no per-call-site plumbing.
+_STYLE_PROVIDER: "Any | None" = None
+
+
+def set_thumbnail_style_provider(provider) -> None:
+    """Install a ``() -> ThumbnailStyleConfig`` provider (called once by the
+    container at startup). Passing ``None`` clears it (tests / standalone)."""
+    global _STYLE_PROVIDER
+    _STYLE_PROVIDER = provider
+
+
+def _resolve_style():
+    """The current thumbnail style: the provider's live config, else defaults."""
+    from nekofetch.core.config import ThumbnailStyleConfig
+    if _STYLE_PROVIDER is not None:
+        try:
+            style = _STYLE_PROVIDER()
+            if style is not None:
+                return style
+        except Exception as exc:  # noqa: BLE001 — never fail a render on style lookup
+            log.debug("thumbnail.style_provider_failed", error=str(exc))
+    return ThumbnailStyleConfig()
+
+
+def _style_tokens() -> dict[str, str]:
+    """Numeric ``{{STYLE_*}}`` substitutions for ``thumbnail/index.html``.
+
+    All values are plain numbers embedded into existing CSS / Tailwind arbitrary
+    values, so the template stays valid after substitution. The three overlay
+    stops are derived from one ``overlay_darkness`` knob, preserving the template's
+    original 0.80/0.30/0.10 ratio."""
+    st = _resolve_style()
+    op = float(st.shadow_opacity)
+    d = float(st.overlay_darkness)
+    return {
+        "{{STYLE_SHADOW_BLUR}}": str(int(st.shadow_blur_px)),
+        "{{STYLE_SHADOW_OPACITY}}": f"{round(op, 3)}",
+        "{{STYLE_SHADOW_OPACITY2}}": f"{round(op * 0.7, 3)}",
+        "{{STYLE_OVERLAY_FROM}}": str(int(round(d * 100))),
+        "{{STYLE_OVERLAY_VIA}}": str(int(round(d * 100 * 0.375))),
+        "{{STYLE_OVERLAY_TO}}": str(int(round(d * 100 * 0.125))),
+        "{{STYLE_LOGO_ALPHA}}": f"{round(float(st.logo_shadow_opacity), 3)}",
+        "{{STYLE_POSTER_ALPHA}}": f"{round(float(st.poster_shadow_opacity), 3)}",
+        "{{STYLE_RING_ALPHA}}": f"{round(float(st.ring_shadow_opacity), 3)}",
+        "{{STYLE_SYNOPSIS_PX}}": str(int(st.synopsis_px)),
+        "{{STYLE_LOGO_HEIGHT}}": f"{round(float(st.logo_height_rem), 3)}",
+    }
+
+
 def _truncate(text: str, max_chars: int) -> str:
     """Truncate text and append ``…`` if too long."""
     text = (text or "").strip()
@@ -189,7 +243,8 @@ def _flag_url(country: str | None) -> str:
 
 async def gather_thumbnail_fields(container: Any, title: str,
                                   anime_doc_id: str | None = None,
-                                  *, prefer_anilist_synopsis: bool = False) -> dict:
+                                  *, prefer_anilist_synopsis: bool = False,
+                                  anilist_id: int | None = None) -> dict:
     """Enrich a title into the display fields ``render_thumbnail`` consumes.
 
     Pulls facts from TMDB (overview, native title, studio, rating, country,
@@ -203,6 +258,17 @@ async def gather_thumbnail_fields(container: Any, title: str,
     synopsis), while the main-channel-post render leaves it ``False`` (the
     franchise-level TMDB overview). Either way the other source is the fallback.
     Rating stays TMDB on every surface (series-level).
+
+    ``anilist_id`` targets a SPECIFIC franchise installment (distribution entry
+    cards for season 2+): its romaji/native/score/synopsis/episodes/year/runtime
+    are read from that entry's node in the cached franchise walk
+    (``anilist.json["franchise"][anilist_id]``) — the same per-entry source the
+    main-channel post averages — instead of the franchise ROOT ``search`` blob
+    (which is season 1). On a cache miss it falls back to a live *resilient* fetch
+    by id (``container.anilist._fetch_full`` → AniList/Kaggle/Jikan/Kitsu), so a
+    title stored without a franchise walk still gets per-entry data. Only the
+    content rating (TV-14) stays series-level from TMDB; year + runtime come from
+    the entry's AniList node.
 
     The user-picked logo/poster/backdrop are NOT set here (the caller owns those);
     this fills everything else. Returns a kwargs dict ready to splat into
@@ -256,6 +322,7 @@ async def gather_thumbnail_fields(container: Any, title: str,
     # ── AniList: prefetch cache first, live search only on a miss ──
     anilist_media = None
     anilist_cached: dict | None = None
+    anilist_franchise: dict | None = None
     if anime_doc_id:
         try:
             from nekofetch.services.metadata_prefetch import load_cached
@@ -264,6 +331,10 @@ async def gather_thumbnail_fields(container: Any, title: str,
                                       anime_doc_id=anime_doc_id)
             if ablob:
                 anilist_cached = ablob.get("search") or None
+                # Per-entry data (season 2+ cards) lives in the franchise walk.
+                fr = ablob.get("franchise")
+                if isinstance(fr, dict):
+                    anilist_franchise = fr
         except Exception as exc:  # noqa: BLE001 — cache miss → live below
             log.debug("thumbfields.anilist_cache.failed", error=str(exc))
     if anilist_cached is None:
@@ -291,6 +362,56 @@ async def gather_thumbnail_fields(container: Any, title: str,
             # AnilistMedia.score is 0-10; the ring wants 0-100.
             anilist_score = round(_score * 10)
         anilist_synopsis = _a("synopsis") or ""
+
+    # ── Per-entry override (distribution entry cards for season 2+) ──
+    # Season 2's romaji/native/score/synopsis/year/runtime must come from ITS OWN
+    # AniList node, not the franchise root ``search`` blob (season 1). Read the
+    # cached franchise walk node first (offline); on a miss fall back to a live
+    # *resilient* fetch by id so a title stored without a walk still resolves from
+    # whatever tier (AniList → Kaggle → Jikan → Kitsu) carries it.
+    entry_year: str | None = None
+    entry_runtime: str | None = None
+    if anilist_id is not None:
+        node: dict | None = None
+        if anilist_franchise:
+            node = (anilist_franchise.get(str(anilist_id))
+                    or anilist_franchise.get(anilist_id))
+        if node is None:
+            try:
+                ani = getattr(container, "anilist", None)
+                media = await ani._fetch_full(int(anilist_id)) if ani else None
+            except Exception as exc:  # noqa: BLE001 — live per-entry is best-effort
+                media = None
+                log.debug("thumbfields.entry.live_failed",
+                          anilist_id=anilist_id, error=str(exc))
+            if media is not None:
+                node = {
+                    "titles": list(getattr(media, "titles", None) or []),
+                    "score": getattr(media, "score", None),
+                    "synopsis": getattr(media, "synopsis", None),
+                    "duration": getattr(media, "duration", None),
+                    "start_date": (getattr(media, "start_date", None)
+                                   or ({"year": media.year}
+                                       if getattr(media, "year", None) else None)),
+                }
+        if node:
+            _et = node.get("titles") or []
+            if len(_et) >= 2 and _et[1]:
+                romaji_title = _et[1]
+            if len(_et) >= 3 and _et[2]:
+                native_title = _et[2]
+            _es = node.get("score")
+            if _es is not None:
+                # Node/media score is 0-10; the ring wants 0-100.
+                anilist_score = round(float(_es) * 10)
+            if node.get("synopsis"):
+                anilist_synopsis = node["synopsis"]
+            _sd = node.get("start_date") or {}
+            if _sd.get("year"):
+                entry_year = str(_sd["year"])
+            if node.get("duration"):
+                # AniList duration is minutes/episode; match TMDB's "24m" label.
+                entry_runtime = f"{int(node['duration'])}m"
 
     # Route the baked synopsis by surface: distribution entry cards prefer the
     # per-title AniList synopsis; the main-channel post prefers the franchise-
@@ -347,6 +468,14 @@ async def gather_thumbnail_fields(container: Any, title: str,
                 language = language_label(langs)
         except Exception as exc:  # noqa: BLE001
             log.debug("thumbfields.language.failed", error=str(exc))
+
+    # For a per-entry card, YEAR + RUNTIME come from the entry's AniList node;
+    # only the content rating (TV-14) stays series-level from TMDB. Falls back to
+    # the TMDB value per-field when the node didn't carry it.
+    if anilist_id is not None:
+        meta_bits = [b for b in (entry_year or _t("year"),
+                                 _t("certification"),
+                                 entry_runtime or _t("runtime")) if b]
 
     return {
         "native_title": native_title,
@@ -606,6 +735,9 @@ class ThumbnailRenderService:
             "{{POSTER_IMAGE}}": poster_path,
             "{{FLAG_IMAGE}}": flag_path,
         }
+        # Owner-tunable shadow/size styling (Senku settings → thumbnail_style),
+        # resolved live so an edit shows on the next render.
+        tokens.update(_style_tokens())
         html = _load_template()
         for token, value in tokens.items():
             html = html.replace(token, value)

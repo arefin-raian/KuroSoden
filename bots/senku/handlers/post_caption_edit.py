@@ -20,11 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import html
-import io
 
 from pyrogram import Client, filters
-from pyrogram.enums import ChatType, ParseMode
-from pyrogram.types import CallbackQuery, InputMediaPhoto, Message
+from pyrogram.enums import ChatType
+from pyrogram.types import CallbackQuery, Message
 from sqlalchemy import select
 
 from nekofetch.bots.channel_reply import arm as arm_reply
@@ -40,6 +39,7 @@ from nekofetch.infrastructure.database.postgres.session import session_scope
 from nekofetch.ui.components import cb
 from nekofetch.ui.screens import card, message_ref, send_screen
 from nekofetch.services.bot_render import build_audio_keyboard
+from kurosoden.shared import post_edit_ops
 from kurosoden.shared import senku_voice as V
 from kurosoden.shared.access_gate import is_staff
 
@@ -218,27 +218,13 @@ async def _edit_caption(
 
     # Telegram is the live source of truth. Persist the DB copy only after this
     # succeeds; otherwise a failed live edit would make restores silently ship a
-    # caption that subscribers never saw.
-    try:
-        live = await client.get_messages(chat_id, tg_message_id)
-        # CRITICAL: editMessageCaption/Text DROP the inline keyboard unless it is
-        # re-supplied. A caption edit must keep the post's quality buttons — hand
-        # the live markup straight back (None when the post had none).
-        keep_markup = getattr(live, "reply_markup", None)
-        if any(getattr(live, kind, None)
-               for kind in ("photo", "video", "animation", "document")):
-            await client.edit_message_caption(
-                chat_id, tg_message_id, new_caption, parse_mode=ParseMode.HTML,
-                reply_markup=keep_markup,
-            )
-        else:
-            await client.edit_message_text(
-                chat_id, tg_message_id, new_caption, parse_mode=ParseMode.HTML,
-                reply_markup=keep_markup,
-            )
-    except Exception as exc:  # noqa: BLE001 — keep durable data unchanged
-        log.warning("senku.caption.live_edit_failed", chat=chat_id,
-                    mid=tg_message_id, error=str(exc))
+    # caption that subscribers never saw. The shared primitive preserves the
+    # post's inline keyboard (editMessageCaption/Text would otherwise drop it).
+    ok, _msg = await post_edit_ops.live_edit_caption(
+        client, chat_id, tg_message_id, new_caption,
+        text_limit=_TEXT_LIMIT, log_event_prefix="senku.caption",
+    )
+    if not ok:
         return False, "Telegram rejected the live edit; the database was left unchanged."
 
     if bot_id is None:
@@ -298,12 +284,15 @@ async def _edit_buttons(
 
     try:
         markup = build_audio_keyboard(button_data, container.config.post_format)
-        await client.edit_message_reply_markup(
-            chat_id, tg_message_id, reply_markup=markup,
-        )
-    except Exception as exc:  # noqa: BLE001 — keep durable data unchanged
-        log.warning("senku.buttons.live_edit_failed", chat=chat_id,
+    except Exception as exc:  # noqa: BLE001 — malformed button_data must not crash
+        log.warning("senku.buttons.build_failed", chat=chat_id,
                     mid=tg_message_id, error=str(exc))
+        return False, "I couldn't build those buttons; the database was left unchanged."
+    ok, _msg = await post_edit_ops.live_edit_buttons(
+        client, chat_id, tg_message_id, markup,
+        log_event_prefix="senku.buttons",
+    )
+    if not ok:
         return False, "Telegram rejected the live button edit; the database was left unchanged."
 
     if bot_id is None:
@@ -360,38 +349,15 @@ async def _edit_media(
             if bot is not None:
                 anime_doc_id = bot.anime_doc_id
 
-    # Preserve caption + buttons from the live message; editMessageMedia clears
-    # the keyboard unless we hand it back.
-    try:
-        live = await client.get_messages(chat_id, tg_message_id)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("senku.image.fetch_failed", chat=chat_id,
-                    mid=tg_message_id, error=str(exc))
-        return False, "I couldn't read that post to replace its image."
-    if not any(getattr(live, kind, None)
-               for kind in ("photo", "video", "animation", "document")):
-        return False, ("That post has no image to replace — edit its caption or "
-                       "buttons instead.")
-    # CRITICAL: ``live.caption`` is the PLAIN text; the styling lives in
-    # caption_entities. Re-supplying the plain text with parse_mode=HTML strips
-    # all formatting (the reported "caption became regular text" bug). Use the
-    # ``.html`` accessor, which reconstructs the HTML from the entities so the
-    # bold/links/spoilers survive the media swap.
-    cap_src = getattr(live, "caption", None)
-    caption = getattr(cap_src, "html", None) or (str(cap_src) if cap_src else None)
-    markup = getattr(live, "reply_markup", None)
-
-    try:
-        stream = io.BytesIO(image_bytes)
-        stream.name = "image.jpg"  # pyrogram needs a filename hint on a stream
-        media = InputMediaPhoto(stream, caption=caption, parse_mode=ParseMode.HTML)
-        await client.edit_message_media(
-            chat_id, tg_message_id, media, reply_markup=markup,
-        )
-    except Exception as exc:  # noqa: BLE001 — keep durable data unchanged
-        log.warning("senku.image.live_edit_failed", chat=chat_id,
-                    mid=tg_message_id, error=str(exc))
-        return False, "Telegram rejected the live image edit; the database was left unchanged."
+    # Preserve caption (via .html) + buttons across the swap — the shared
+    # primitive reconstructs the styled caption and re-hands the keyboard that
+    # editMessageMedia would otherwise drop.
+    ok, msg = await post_edit_ops.live_edit_media(
+        client, chat_id, tg_message_id, image_bytes,
+        log_event_prefix="senku.image",
+    )
+    if not ok:
+        return False, msg
 
     if bot_id is None:
         log.info("senku.image.edited", chat=chat_id, mid=tg_message_id, durable=False)

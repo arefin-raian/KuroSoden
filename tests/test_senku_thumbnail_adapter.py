@@ -362,7 +362,7 @@ async def test_render_entry_prefers_anilist_synopsis(adapter, monkeypatch, tmp_p
 
     import nekofetch.services.thumbnail_service as ts
 
-    async def spy_gather(container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False):
+    async def spy_gather(container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False, anilist_id=None):
         captured["prefer"] = prefer_anilist_synopsis
         return {}
     monkeypatch.setattr(ts, "gather_thumbnail_fields", spy_gather)
@@ -394,7 +394,7 @@ async def test_render_main_uses_tmdb_synopsis_avg_ring_and_persists_minus1(
     captured: dict = {}
     import nekofetch.services.thumbnail_service as ts
 
-    async def spy_gather(container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False):
+    async def spy_gather(container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False, anilist_id=None):
         captured["prefer"] = prefer_anilist_synopsis
         return {"anilist_score": 70}  # per-entry value that must be OVERRIDDEN
 

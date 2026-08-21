@@ -111,7 +111,19 @@ def _rebuild_ddl_mapping(data: dict, overrides: dict[int, int]):
         anime_doc_id="", root_title="",
         entries=[e.franchise_entry for e in prev.entries],
     )
-    return build_torrent_mapping(ordered, franchise, season_overrides=overrides or None)
+    # JSON stringified the int anilist_id keys when the working set was stashed —
+    # coerce them back so build_torrent_mapping's title-match tier keeps working
+    # on the manual re-run exactly as it did on the auto build.
+    raw_titles = data.get("episode_titles") or {}
+    ep_titles: dict[int, list] = {}
+    for k, v in raw_titles.items():
+        try:
+            ep_titles[int(k)] = v
+        except (TypeError, ValueError):
+            continue
+    return build_torrent_mapping(
+        ordered, franchise, episode_titles=ep_titles or None,
+        season_overrides=overrides or None)
 
 
 def _render_ddl_card(data: dict, mapping) -> str:

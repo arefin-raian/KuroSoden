@@ -28,9 +28,10 @@
     }
 
     /* Subtle text shadow so ratings / branding stay legible over a busy
-       backdrop — enough to be visible, not a heavy glow. */
+       backdrop — strengths are owner-tunable via {{STYLE_*}} tokens (Senku
+       settings → thumbnail_style). */
     .thumb-shadow {
-      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.85), 0 0 2px rgba(0, 0, 0, 0.6);
+      text-shadow: 0 2px {{STYLE_SHADOW_BLUR}}px rgba(0, 0, 0, {{STYLE_SHADOW_OPACITY}}), 0 0 2px rgba(0, 0, 0, {{STYLE_SHADOW_OPACITY2}});
     }
   </style>
 </head>
@@ -42,7 +43,7 @@
   <div class="custom-bg-frame relative w-screen h-screen pt-20 px-25 pb-12 flex flex-col justify-between">
 
     <!-- HIGH LEGIBILITY AMBIENT GRADIENT BLEND LAYER -->
-    <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-black/30 to-black/10 z-10 pointer-events-none">
+    <div class="absolute inset-0 bg-gradient-to-t from-black/{{STYLE_OVERLAY_FROM}} via-black/{{STYLE_OVERLAY_VIA}} to-black/{{STYLE_OVERLAY_TO}} z-10 pointer-events-none">
     </div>
 
     <!-- 1. TOP BRANDING INDICATOR BLOCK -->
@@ -58,7 +59,7 @@
       <!-- 2. GIGANTIC MOVIE TITLE LOGO IMAGE INTERCHANGE -->
       <!-- 🚀 SWAPPED TEXT BANNERS OUT FOR logo.png IMAGE REFERENCED VERBATIM -->
       <div class="ml-1 mb-2">
-        <img src="logo.png" alt="{{TITLE}}" class="h-[4.5rem] w-auto max-w-[820px] object-contain filter drop-shadow-[0_4px_20px_rgba(0,0,0,0.6)]" />
+        <img src="logo.png" alt="{{TITLE}}" class="h-[{{STYLE_LOGO_HEIGHT}}rem] w-auto max-w-[820px] object-contain filter drop-shadow-[0_4px_20px_rgba(0,0,0,{{STYLE_LOGO_ALPHA}})]" />
       </div>
 
       <!-- 3. COMPACT MAIN DETAILS AND POSTER ROW -->
@@ -67,7 +68,7 @@
         <!-- POSTER ART THUMBNAIL (SMALL FIXED SIZE SCALE) -->
         <div class="flex-shrink-0">
           <div
-            class="w-[12vw] h-[40vh] rounded-md border border-white/20 shadow-[0_12px_24px_rgba(0,0,0,0.5)] flex items-end justify-center pb-4 relative overflow-hidden"
+            class="w-[12vw] h-[40vh] rounded-md border border-white/20 shadow-[0_12px_24px_rgba(0,0,0,{{STYLE_POSTER_ALPHA}})] flex items-end justify-center pb-4 relative overflow-hidden"
             style="background: url('poster.webp') no-repeat center center/cover;">
 
             <div class="absolute inset-0 z-0"></div>
@@ -93,7 +94,7 @@
 
 
             <p
-              class="text-[16px] leading-[1.65] text-zinc-200 font-normal max-w-[520px] drop-shadow-[0_2px_8px_rgba(0,0,0,0.5)]">
+              class="text-[{{STYLE_SYNOPSIS_PX}}px] leading-[1.65] text-zinc-200 font-normal max-w-[520px] drop-shadow-[0_2px_8px_rgba(0,0,0,0.5)]">
               {{SYNOPSIS}}
             </p>
 
@@ -153,7 +154,7 @@
       <div class="flex flex-col items-center gap-2">
         <!-- 🚀 SVG DONUT CHART WITH PERFECT 82% TRACK FILL AND TRANSPARENT CENTER -->
         <div class="relative w-[96px] h-[96px] flex items-center justify-center">
-          <svg class="w-full h-full -rotate-90 drop-shadow-[0_2px_6px_rgba(0,0,0,0.7)]" viewBox="0 0 100 100">
+          <svg class="w-full h-full -rotate-90 drop-shadow-[0_2px_6px_rgba(0,0,0,{{STYLE_RING_ALPHA}})]" viewBox="0 0 100 100">
             <!-- Inactive track background layer -->
             <circle cx="50" cy="50" r="42" stroke="rgba(255, 255, 255, 0.4)" stroke-width="12" fill="transparent" />
             <!-- Active white progress track layer (82% of 2 * PI * 42 = ~216.4) -->

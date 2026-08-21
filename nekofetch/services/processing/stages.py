@@ -475,6 +475,16 @@ async def _sub_tracks(ffprobe: str, path: Path) -> list[dict]:
     return tracks
 
 
+def _fully_text_branded(subs: list[dict]) -> bool:
+    """True when subtitle branding fully covered this file — i.e. it HAS subs and
+    EVERY track is a brandable TEXT sub (ASS/SRT/VTT/…) that carries our channel
+    cue. Any image sub (PGS/VobSub) or no subs at all → only partial coverage, so
+    the file still needs the visible burn. Shared by the per-file skip decision
+    and the series-wide burn pre-pass so they can never disagree."""
+    from nekofetch.sources._torrent_subs import is_text_sub
+    return bool(subs) and all(is_text_sub(t.get("codec", "")) for t in subs)
+
+
 async def _probe_duration_ms(ffprobe: str, path: Path) -> int | None:
     """Media duration in ms (for subtitle branding-window placement), or None."""
     import json
@@ -1215,6 +1225,27 @@ class WatermarkStage(Stage):
         max_h = max((_res_h(f) for f in on_disk), default=0)
         targets = [f for f in on_disk if _res_h(f) == max_h and max_h > 0] or on_disk
         n = len(targets)
+
+        # ── Series-wide burn decision (auto mode) ────────────────────────────
+        # A season must look consistent: if ANY target still needs a hard burn
+        # (an image sub like PGS, or no subs at all → branding didn't cover it),
+        # burn EVERY target — even ones whose subs are fully text-branded — so the
+        # whole series carries the same visible mark. Probe each file's subs ONCE
+        # here and reuse the result in the loop (same probe count as before, just
+        # moved up), so a single fully-branded episode can't leave the season split.
+        sub_probe: dict[str, list] = {}
+        series_needs_burn = False
+        if mode == "auto" and ffprobe:
+            for f in targets:
+                if not f.local_path:
+                    continue
+                subs = await _sub_tracks(ffprobe, Path(f.local_path))
+                sub_probe[f.local_path] = subs
+                if not _fully_text_branded(subs):
+                    series_needs_burn = True
+            log.info("watermark.series_policy", job_id=ctx.job_id,
+                     files=n, series_needs_burn=series_needs_burn)
+
         await _push_stage_progress(self.c, ctx, "Watermarking", 0.0, file_index=0, file_total=n)
         for i, f in enumerate(targets):
             if await source_abort_requested(self.c, ctx.job_id):
@@ -1222,6 +1253,15 @@ class WatermarkStage(Stage):
             if not f.local_path:
                 continue
             src = Path(f.local_path)
+            # A concurrent teardown (Change Source / cancel) can delete the work
+            # files mid-loop. The snapshot at the top of the stage is stale by now,
+            # so re-check existence right before use — a vanished source is a
+            # teardown, not an encode failure, so skip it quietly (this is the
+            # "No such file or directory" spam the owner saw when a reset raced the
+            # still-running loop).
+            if not src.exists():
+                log.info("watermark.source_gone", file=src.name, job_id=ctx.job_id)
+                continue
             # ── "auto" mode: skip the watermark ONLY when subtitle branding
             #    fully covered this file — i.e. EVERY subtitle track is a
             #    brandable TEXT track (ASS/SRT/VTT/…) that carries our channel
@@ -1230,11 +1270,13 @@ class WatermarkStage(Stage):
             #    still needs the visible burn. (Previously used any(), which
             #    skipped the burn as soon as a single text sub existed, leaving
             #    files with mixed text+PGS subs unbranded on the image tracks.)
+            #    Series override: when ANY sibling needs a burn, burn this one too.
             if mode == "auto" and ffprobe:
-                subs = await _sub_tracks(ffprobe, src)
-                fully_branded = bool(subs) and all(
-                    is_text_sub(t.get("codec", "")) for t in subs)
-                if fully_branded:
+                subs = sub_probe.get(f.local_path)
+                if subs is None:
+                    subs = await _sub_tracks(ffprobe, src)
+                fully_branded = _fully_text_branded(subs)
+                if fully_branded and not series_needs_burn:
                     log.info("watermark.auto_skip", file=src.name,
                              reason="all_subs_text_branded",
                              sub_tracks=len(subs))
@@ -1242,8 +1284,10 @@ class WatermarkStage(Stage):
                         f"watermark: skipped {src.name} (auto — all subs branded)")
                     continue
                 n_text = sum(1 for t in subs if is_text_sub(t.get("codec", "")))
-                log.info("watermark.auto_burn", file=src.name,
-                         reason="partial_or_no_text_subtitle",
+                reason = ("series_consistency"
+                          if fully_branded and series_needs_burn
+                          else "partial_or_no_text_subtitle")
+                log.info("watermark.auto_burn", file=src.name, reason=reason,
                          sub_tracks=len(subs), text_subs=n_text)
             # Tag the card with THIS file's identity + "file i of n" as we start
             # it, so the watermark pass walks episode-by-episode like downloads.

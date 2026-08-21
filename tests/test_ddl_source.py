@@ -164,6 +164,99 @@ async def test_registry_activates_and_resolves_ddl() -> None:
     assert isinstance(registry.resolve("ddl"), DdlSource)
 
 
+async def test_extract_count_is_cumulative_across_archives(tmp_path: Path, monkeypatch) -> None:
+    # Bug B: a multi-archive release used to end on the LAST archive's local count
+    # ("4 / 4" for a 12-file, 3-archive pack). The final extract_done frame must
+    # report the TRUE cumulative total (12 / 12).
+    def _season_zip(name: str, season: int) -> Path:
+        return _make_zip(
+            tmp_path / name,
+            [f"Show S0{season}E0{ep} 1080p.mkv" for ep in range(1, 5)],  # 4 eps each
+        )
+
+    zips = {
+        "https://example.test/s1.zip": _season_zip("s1.zip", 1),
+        "https://example.test/s2.zip": _season_zip("s2.zip", 2),
+        "https://example.test/s3.zip": _season_zip("s3.zip", 3),
+    }
+    src = DdlSource()
+    monkeypatch.setattr(
+        "nekofetch.sources.ddl.get_env",
+        lambda: SimpleNamespace(storage_path=tmp_path),
+    )
+
+    async def fake_fetch(url: str, dest: Path, **kwargs) -> Path:
+        shutil.copy(zips[url], dest)
+        return dest
+
+    monkeypatch.setattr(src, "_fetch_archive", fake_fetch)
+    # Avoid the real HEAD request; give each archive a stable resolved name.
+    async def fake_head(url):
+        return None, url.rsplit("/", 1)[-1]
+    monkeypatch.setattr(src, "_head_meta", fake_head)
+
+    frames: list[dict] = []
+
+    async def on_progress(info: dict) -> None:
+        frames.append(info)
+
+    ref = json.dumps({
+        "archives": [{"url": u, "season": None} for u in zips],
+        "title": "Show",
+    })
+    episodes = await src.get_episodes(ref, on_progress=on_progress)
+
+    # 12 files extracted across 3 archives.
+    done_frames = [f for f in frames if f["stage"] == "extract_done"]
+    assert done_frames, "expected a final extract_done frame"
+    last = done_frames[-1]
+    assert (last["done"], last["total"]) == (12, 12), done_frames
+    # Progress climbed cumulatively rather than resetting per archive: some frame
+    # reported more than a single archive's 4 files.
+    assert max(f.get("done", 0) for f in frames if f["stage"] == "extract") > 4
+
+
+async def test_archive_name_season_hint_splits_seasons(tmp_path: Path, monkeypatch) -> None:
+    # Bug C: DDL episode filenames are often bare ("Episode 01.mkv") with the
+    # season only in the ARCHIVE name. The hint must split S1/S2 instead of
+    # collapsing every file onto season 1.
+    s1 = _make_zip(tmp_path / "s1.zip", ["Episode 01.mkv", "Episode 02.mkv"])
+    s2 = _make_zip(tmp_path / "s2.zip", ["Episode 01.mkv", "Episode 02.mkv"])
+    zips = {
+        "https://example.test/Show.S01.1080p.zip": s1,
+        "https://example.test/Show.S02.1080p.zip": s2,
+    }
+    src = DdlSource()
+    monkeypatch.setattr(
+        "nekofetch.sources.ddl.get_env",
+        lambda: SimpleNamespace(storage_path=tmp_path),
+    )
+
+    async def fake_fetch(url: str, dest: Path, **kwargs) -> Path:
+        shutil.copy(zips[url], dest)
+        return dest
+
+    monkeypatch.setattr(src, "_fetch_archive", fake_fetch)
+
+    async def fake_head(url):
+        # The archive NAME (with S01/S02) is what carries the season signal.
+        return None, url.rsplit("/", 1)[-1]
+    monkeypatch.setattr(src, "_head_meta", fake_head)
+
+    ref = json.dumps({
+        # Explicit archive season is null — the hint must come from the name.
+        "archives": [{"url": u, "season": None} for u in zips],
+        "title": "Show",
+    })
+    episodes = await src.get_episodes(ref)
+
+    seasons = {e.season for e in episodes}
+    assert seasons == {1, 2}, [(e.season, e.number) for e in episodes]
+    # Two distinct episodes per season (E1/E2 in each) — not merged as duplicate
+    # "qualities" of one season-1 episode.
+    assert len(episodes) == 4
+
+
 def test_multi_audio_pack_matches_subbed_dubbed_requests() -> None:
     # The real DDL failure: MoviesMod packs are "Hindi.Japanese.English" → tagged
     # AudioType.MULTI, but the worker only ever asks for DUBBED/SUBBED. The exact

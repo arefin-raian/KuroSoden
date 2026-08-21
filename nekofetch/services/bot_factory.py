@@ -422,8 +422,51 @@ class BotFactory:
         # Sort qualities by resolution.
         _QORDER = {"360p": 0, "480p": 1, "540p": 2, "720p": 3, "1080p": 4, "2160p": 5}
         quality_list = sorted(quals, key=lambda q: _QORDER.get(q, 99)) if quals else []
+        # ── Romaji fallback (so the decorated channel title isn't bare) ──
+        # Some requests are stored with a NULL franchise_data.romaji (e.g. a
+        # torrent accepted without an AniList id resolving), which collapses
+        # ``format_channel_title`` to the bare English name and then trips
+        # Telegram's CHAT_NOT_MODIFIED on the wizard rename. Backfill romaji from
+        # the resilient metadata chain (AniList → Kaggle → Jikan → Kitsu) exactly
+        # like the main-channel post does (main_channel_service._enrich_facts_
+        # fallback). Cache-first (offline) then a single live search, keyed by the
+        # English title so a missing anilist_id doesn't matter.
+        if not romaji and english:
+            romaji = await self._resolve_romaji_fallback(anime_doc_id, english)
         return {"english": english, "romaji": romaji, "audios": audios,
                 "languages": languages, "qualities": quality_list}
+
+    async def _resolve_romaji_fallback(self, anime_doc_id: str, english: str) -> str:
+        """Best-effort romaji when ``franchise_data`` didn't carry it.
+
+        Tries the prefetched ``anilist.json["search"]`` first (no network), then a
+        live *resilient* ``container.anilist.search`` (which cascades AniList →
+        Kaggle → Jikan → Kitsu). Returns ``""`` on every miss — a bare title is
+        still better than raising inside channel creation.
+        """
+        # 1) Prefetch cache — offline, keyed by the same doc-id the folder uses.
+        try:
+            from nekofetch.services.metadata_prefetch import load_cached
+            blob = await load_cached(self._c, anime_doc_id, "anilist",
+                                     anime_doc_id=anime_doc_id)
+            cached = (blob or {}).get("search") or {}
+            rom = (cached.get("romaji") or "").strip()
+            if rom:
+                return rom
+        except Exception as exc:  # noqa: BLE001 — cache miss → live below
+            log.debug("botfactory.romaji_cache.failed", anime=anime_doc_id,
+                      error=str(exc))
+        # 2) Live resilient search by title.
+        try:
+            anilist = getattr(self._c, "anilist", None)
+            media = await anilist.search(english) if anilist else None
+            rom = (getattr(media, "romaji", None) or "").strip() if media else ""
+            if rom:
+                return rom
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            log.debug("botfactory.romaji_live.failed", anime=anime_doc_id,
+                      error=str(exc))
+        return ""
 
     # ── AniXWeebs branding block ────────────────────────────────────────────────
     # The owner's exact about/description text. Telegram enforces:

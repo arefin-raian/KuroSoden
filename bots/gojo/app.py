@@ -32,6 +32,7 @@ GOJO_COMMANDS = [
     BotCommand("schedule", "Schedule a post for later"),
     BotCommand("updates", "Sweep the catalog for new franchise entries"),
     BotCommand("bancheck", "Probe every channel for bans"),
+    BotCommand("editpost", "Edit a published main or index post"),
     BotCommand("settings", "Configure the publisher bot"),
     BotCommand("help", "How publishing works"),
 ]
@@ -71,7 +72,7 @@ def _home_rows(container: Container, obj) -> list[list[tuple[str, str]]]:
          ("📡 Change Main", cb("gojo", "change_main"))],
         [("🔎 Check Updates", cb("gojo", "check_updates")),
          ("🩺 Ban Check", cb("gojo", "check_banned"))],
-        [("🗂 Index", cb("gojo", "index")),
+        [("📝 Edit Post", cb("gojo", "pe")),
          ("🆕 Change Index", cb("gojo", "change_index"))],
         [("📊 Stats", cb("gojo", "stats")),
          ("✏️ Edit Footer", cb("gojo", "edit_footer"))],
@@ -79,8 +80,12 @@ def _home_rows(container: Container, obj) -> list[list[tuple[str, str]]]:
          ("❓ Help", cb("gojo", "help"))],
     ]
     if not is_owner(container, obj):
-        # Drop only the owner-only Settings *button*, keeping its row-mate (Help).
-        rows = [[btn for btn in row if "settings" not in btn[1]] for row in rows]
+        # Drop only the owner-only buttons (Settings + Edit Post), keeping any
+        # row-mate. ``gojo|pe`` is the post editor's namespace; ``settings`` is
+        # matched as a substring the way it always has been.
+        owner_only = ("settings", "gojo|pe")
+        rows = [[btn for btn in row
+                 if not any(k in btn[1] for k in owner_only)] for row in rows]
         rows = [row for row in rows if row]
     return rows
 
@@ -141,6 +146,16 @@ def build_gojo(container: Container, token: str) -> Client:
                 Screen(caption=_HOME_CAPTION, image=pick_artwork(bot),
                        keyboard=_kb(*_home_rows(container, q))),
                 old_msg=q.message)
+            await q.answer()
+            return
+
+        # ¬¬ Post editor ¬¬
+        # ``gojo|pe|…`` is owned by handlers/post_editor.py (registered before
+        # this catch-all), so this branch is only a safety net if that handler
+        # is ever unregistered — open the editor's surface picker.
+        if action == "pe":
+            from kurosoden.bots.gojo.handlers.post_editor import open_editor_home
+            await open_editor_home(client, container, q)
             await q.answer()
             return
 

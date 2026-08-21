@@ -67,16 +67,35 @@ def is_meaningful_track_name(name: str | None) -> bool:
     return t.lower() not in _GENERIC_AUDIO_NAMES
 
 
-def is_moviesmod_title(name: str | None) -> bool:
-    """True when a track TITLE is a MoviesMod release-site watermark.
+# Release-site brands stamped into DDL packs. Matched case-insensitively as a
+# SUBSTRING so dotted / suffixed variants are all caught by one token:
+#   "moviesmod"  → "MoviesMod.org", "Hindi - MoviesMod"
+#   "vegamovies" → "VegaMovies", "VegaMovies.co.ru", "Tamil VegaMovies"
+# Single source of truth for BOTH the title matcher (below) and the subtitle-cue
+# stripper (``_torrent_subs.strip_release_brand_lines``). Add a new banned site
+# here and every strip site — audio/subtitle track titles AND standalone credit
+# cues — picks it up with no other change.
+_RELEASE_BRAND_TOKENS = ("moviesmod", "vegamovies")
 
-    DDL packs from MoviesMod stamp the release site into audio/subtitle track
-    titles (e.g. ``"MoviesMod.org"`` or ``"Hindi - MoviesMod"``). That carries no
-    legitimate stream meaning, so a DDL caller treats such a title as unusable and
-    falls back to the (detected/tagged) language instead. Compared case-
-    insensitively. Torrent callers don't apply this (see ``strip_domain``).
+
+def is_release_brand_title(name: str | None) -> bool:
+    """True when a track TITLE is a release-site watermark (MoviesMod, VegaMovies…).
+
+    DDL packs stamp the release site into audio/subtitle track titles
+    (e.g. ``"MoviesMod.org"``, ``"Hindi - VegaMovies"``, ``"VegaMovies.co.ru"``).
+    That carries no legitimate stream meaning, so a DDL caller treats such a title
+    as unusable and falls back to the (detected/tagged) language instead. Compared
+    case-insensitively as a substring against :data:`_RELEASE_BRAND_TOKENS`.
+    Torrent callers don't apply this (see ``strip_domain``).
     """
-    return "moviesmod" in (name or "").lower()
+    low = (name or "").lower()
+    return any(tok in low for tok in _RELEASE_BRAND_TOKENS)
+
+
+# Back-compat alias: the historical name used at ~8 call sites. It now covers the
+# whole brand-token set (MoviesMod + VegaMovies + any future addition), not just
+# MoviesMod — kept so those imports don't need to churn.
+is_moviesmod_title = is_release_brand_title
 
 
 def brand_audio_title(name: str | None, ordinal: int,

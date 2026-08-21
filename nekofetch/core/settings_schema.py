@@ -174,6 +174,26 @@ _CARD_GUIDE_EXTRA = {
 
 
 FIELD_DOCS: dict[str, FieldDoc] = {
+    # ── thumbnail_style (franchise card shadows + sizes) ──────────────────────
+    "thumbnail_style.shadow_opacity": FieldDoc(
+        desc="Darkness of the text shadow behind rating/brand/score text (0–1). Lower = lighter.",
+        example="0.55"),
+    "thumbnail_style.shadow_blur_px": FieldDoc(
+        desc="Blur radius of that text shadow, in pixels.", example="6"),
+    "thumbnail_style.overlay_darkness": FieldDoc(
+        desc="How much the backdrop is darkened for legibility (0–1). Lower = brighter art.",
+        example="0.65"),
+    "thumbnail_style.logo_shadow_opacity": FieldDoc(
+        desc="Drop-shadow strength under the title logo (0–1).", example="0.45"),
+    "thumbnail_style.poster_shadow_opacity": FieldDoc(
+        desc="Shadow strength around the poster thumbnail (0–1).", example="0.4"),
+    "thumbnail_style.ring_shadow_opacity": FieldDoc(
+        desc="Shadow strength under the AniList score ring (0–1).", example="0.55"),
+    "thumbnail_style.synopsis_px": FieldDoc(
+        desc="Font size of the synopsis paragraph, in pixels.", example="16"),
+    "thumbnail_style.logo_height_rem": FieldDoc(
+        desc="Height of the title logo, in rem.", example="4.5"),
+
     # ── features (master switches) ────────────────────────────────────────────
     "features.request_system": FieldDoc(
         desc="Master switch for user anime requests. Off = nobody can submit new requests."),
@@ -768,7 +788,7 @@ FIELD_DOCS: dict[str, FieldDoc] = {
 OWNER_ONLY_SECTIONS = frozenset({
     "security", "sources", "access", "shortlink",
     "storage_channel", "log_channel", "main_channel", "index_channel",
-    "thumbnail_channel", "bot", "post_format",
+    "thumbnail_channel", "bot", "post_format", "thumbnail_style",
 })
 
 

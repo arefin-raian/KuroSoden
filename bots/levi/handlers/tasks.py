@@ -807,3 +807,14 @@ def register(client: Client, container: Container) -> None:
             f"{V.ICON} <b>Sent to owner.</b>\n\nThe request is still alive.",
             parse_mode=ParseMode.HTML,
         )
+
+    # Expose the source picker on the container so other handlers (e.g. the live
+    # download card's "Change source" reset) can re-present the ORIGINAL 4-button
+    # route card in place — ``_render_source_picker`` is nested here, so a hook is
+    # the only way to reach it without importing this module's internals.
+    async def _source_picker_hook(
+        chat_id: int, code: str, old_msg: Message | None = None,
+    ) -> None:
+        await _render_source_picker(chat_id, code, old_msg=old_msg)
+
+    container.levi_source_picker = _source_picker_hook  # type: ignore[attr-defined]

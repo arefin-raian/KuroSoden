@@ -45,12 +45,13 @@ def register_all(client: Client, container: Container) -> None:
     # the app.py `senku|` fallback so every `senku|set|…` tap lands here.
     register_settings(
         client, container, "senku",
-        ["post_format", "bot"],
+        ["post_format", "bot", "thumbnail_style"],
         title="Senku — Distribution Settings",
         blurb=(
             "Everything about how your channel posts <b>look</b> — the info, "
-            "season and movie cards, the watch guide, the quality buttons, and "
-            "the footer. Change any of it and see a live preview before you save."
+            "season and movie cards, the watch guide, the quality buttons, the "
+            "footer, and the franchise thumbnail card's shadows &amp; sizes. "
+            "Change any of it and see a live preview before you save."
         ),
         owner_only=True,
     )

@@ -156,13 +156,63 @@ class BackupService:
 
         svc = MainChannelService(self._c)
         facts = await svc.gather_facts(anime_doc_id)
+        # Facts-derived values are the FALLBACK. The live post is the source of
+        # truth: it reflects the publish AND every later edit (caption, buttons,
+        # image, thumbnail regen, redo refresh). Re-deriving from facts here would
+        # silently revert an operator's edit on the next full /backup — the exact
+        # "restore ships the faulty one" bug. So prefer the live message and only
+        # fall back to facts when it can't be read (id-only client / post gone).
         caption = svc._caption(facts)
         markup = await svc._buttons(facts)
         source_url = facts.backdrop_url or facts.poster_url or ""
+        live_photo_bytes: bytes | None = None
 
-        # Mirror the photo onto independent hosts so it survives the ban.
+        client = getattr(self._c, "admin_client", None)
+        live_chat_id = post.main_channel_id or self.cfg.channel_id
+        if client is not None and hasattr(client, "get_messages"):
+            try:
+                live = await client.get_messages(live_chat_id, post.main_message_id)
+                src = getattr(live, "caption", None)
+                if src is None:
+                    src = getattr(live, "text", None)
+                # ``.html`` reconstructs styling from entities; plain text would
+                # flatten bold/links/spoilers in the backup.
+                live_caption = getattr(src, "html", None) or (str(src) if src else None)
+                if live_caption:
+                    caption = live_caption
+                # Only ADOPT a live keyboard when one is actually present. A None
+                # here usually means the read didn't populate markup, not that the
+                # post is button-less (main posts always carry Index/Download), so
+                # we keep the facts-derived buttons rather than wrongly clearing.
+                live_markup = getattr(live, "reply_markup", None)
+                if live_markup is not None:
+                    markup = live_markup
+                # Mirror the live PHOTO's own bytes so a custom "replace image"
+                # (which stores no facts URL) survives a full backup + restore.
+                if any(getattr(live, kind, None)
+                       for kind in ("photo", "video", "animation", "document")):
+                    try:
+                        raw = await client.download_media(live, in_memory=True)
+                        live_photo_bytes = (bytes(raw.getbuffer())
+                                            if hasattr(raw, "getbuffer") else bytes(raw))
+                    except Exception as exc:  # noqa: BLE001 — fall back to source_url
+                        log.debug("backup.one.live_photo_failed",
+                                  anime=anime_doc_id, error=str(exc))
+            except Exception as exc:  # noqa: BLE001 — keep facts fallback
+                log.debug("backup.one.live_read_failed",
+                          anime=anime_doc_id, error=str(exc))
+
+        # Mirror the photo onto independent hosts so it survives the ban. Prefer
+        # the live post's own bytes; else mirror the facts-derived remote URL.
         catbox_url = telegraph_url = imgbb_url = None
-        if source_url:
+        if live_photo_bytes is not None:
+            from kurosoden.shared.image_backup import backup_bytes
+
+            mirrored = await backup_bytes(self._c, live_photo_bytes, mime="image/jpeg")
+            catbox_url = mirrored.catbox_url
+            telegraph_url = mirrored.telegraph_url
+            imgbb_url = mirrored.imgbb_url
+        elif source_url:
             from kurosoden.shared.image_backup import backup_image
 
             mirrored = await backup_image(self._c, source_url)
@@ -376,6 +426,29 @@ class BackupService:
             if row is None:
                 return False
             row.caption = caption
+        return True
+
+    async def update_main_buttons(
+        self, anime_doc_id: str, markup: "InlineKeyboardMarkup | None",
+    ) -> bool:
+        """Refresh only the stored buttons of a main-post backup.
+
+        The Gojo post editor lets the operator rewrite a main post's Index/
+        Download buttons. Without persisting here, a later full ``/backup``
+        (``backup_one`` re-derives buttons from ``_buttons(facts)``) or a
+        ban-restore would revive the OLD buttons. Serialized with the same
+        ``_markup_to_rows`` shape ``backup_one`` uses, so ``restore_to_channel``'s
+        ``_rows_to_markup`` reads it back verbatim. Caption/media left untouched.
+        """
+        async with session_scope(self._c.pg_sessionmaker) as session:
+            row = (await session.execute(
+                select(PublishedPostBackup).where(
+                    PublishedPostBackup.anime_doc_id == anime_doc_id
+                )
+            )).scalar_one_or_none()
+            if row is None:
+                return False
+            row.button_data = _markup_to_rows(markup)
         return True
 
     async def record_distribution_channel(

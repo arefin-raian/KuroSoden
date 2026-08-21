@@ -18,11 +18,15 @@ def register_all(client: Client, container: Container) -> None:
     from nekofetch.bots.middleware import install_auth_middleware
     from kurosoden.bots.gojo.handlers.tasks import register as register_tasks
     from kurosoden.bots.gojo.handlers.schedule import register as register_schedule
+    from kurosoden.bots.gojo.handlers.post_editor import register as register_post_editor
     from kurosoden.shared.settings_ui import register_settings
 
     install_auth_middleware(client, container, staff_only_bot="gojo")
     register_tasks(client, container)
     register_schedule(client, container)
+    # Registered before app.py's ``^gojo\|`` catch-all (attached after
+    # register_all) so ``gojo|pe|…`` taps land here, not the menu fallback.
+    register_post_editor(client, container)
 
     register_settings(
         client,

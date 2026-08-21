@@ -78,7 +78,10 @@ _GOJO_STAFF = [
     _c("schedule", "Schedule a post for later"),
     _c("help", "How publishing works"),
 ]
-_GOJO_OWNER = _GOJO_STAFF + [_c("settings", "Configure the publisher (owner)")]
+_GOJO_OWNER = _GOJO_STAFF + [
+    _c("editpost", "Edit a published main or index post (owner)"),
+    _c("settings", "Configure the publisher (owner)"),
+]
 
 # bot → (user, staff, owner) command tiers. ``user`` empty for the staff-only bots.
 _TIERS: dict[str, tuple[list, list, list]] = {

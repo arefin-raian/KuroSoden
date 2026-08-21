@@ -125,7 +125,7 @@ async def test_refresh_metadata_rerenders_and_pushes_on_change(
         calls["rendered"] += 1
         return Path("/tmp/fake_thumb.webp")
 
-    async def _fake_gather(self, container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False):
+    async def _fake_gather(self, container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False, anilist_id=None):
         return {"synopsis": "s", "meta_label": "2024", "studio": "MADHOUSE",
                 "tmdb_rating": 8.2, "anilist_score": 82, "genres": ["Drama"],
                 "native_title": "", "romaji_title": "", "country": "JP",
@@ -214,7 +214,7 @@ async def test_refresh_metadata_quality_only_does_not_rerender(
         calls["rendered"] += 1
         return Path("/tmp/x.webp")
 
-    async def _fake_gather(self, container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False):
+    async def _fake_gather(self, container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False, anilist_id=None):
         return {"anilist_score": 75, "language": "Japanese"}
 
     async def _fake_persist(*a, **k):
@@ -268,7 +268,7 @@ async def test_refresh_metadata_renames_channel_on_title_change(
         renders.append(1)
         return Path("/tmp/x.webp")
 
-    async def _fake_gather(self, container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False):
+    async def _fake_gather(self, container, title, anime_doc_id=None, *, prefer_anilist_synopsis=False, anilist_id=None):
         return {"anilist_score": 75, "language": "Japanese"}
 
     async def _fake_persist(*a, **k):

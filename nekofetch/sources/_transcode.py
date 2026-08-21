@@ -148,6 +148,45 @@ def _encoder_available(ffmpeg: str, encoder: str) -> bool:
         return False
 
 
+# Runtime probe cache, keyed by (ffmpeg, encoder). ``_encoder_available`` only
+# proves an encoder is COMPILED IN — not that its device/runtime actually loads.
+# A GPU-less VPS with an nvenc-enabled ffmpeg build reports h264_nvenc available,
+# yet every real encode dies with "Cannot load libcuda.so.1". We probe ONCE per
+# process and cache the verdict so the watermark ladder skips a dead hardware
+# encoder up front instead of re-attempting (and re-failing) it on every file.
+_HW_PROBE_CACHE: dict[tuple[str, str], bool] = {}
+
+
+async def _hw_encoder_usable(ffmpeg: str, encoder: str, venc: list[str]) -> bool:
+    """Can this hardware encoder actually INITIALISE on this box (not just be
+    compiled in)? Runs a tiny 1-frame null encode with the SAME encoder flags the
+    real command uses, against a synthetic source, so a missing GPU/driver (e.g.
+    CUDA/``libcuda.so.1``) makes the encoder drop to the software fallback — once,
+    cached — rather than spamming a per-file failure. Cached per (ffmpeg, encoder).
+    """
+    key = (ffmpeg, encoder)
+    if key in _HW_PROBE_CACHE:
+        return _HW_PROBE_CACHE[key]
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=1",
+           "-frames:v", "1", *venc, "-f", "null", "-"]
+
+    def _run() -> bool:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            return r.returncode == 0
+        except Exception:  # noqa: BLE001 — any probe error → treat as unusable
+            return False
+
+    ok = await asyncio.to_thread(_run)
+    _HW_PROBE_CACHE[key] = ok
+    if not ok:
+        log.warning("encode.hw_encoder_unusable", encoder=encoder,
+                    hint="compiled in but device/runtime probe failed; "
+                         "using software fallback")
+    return ok
+
+
 # H.264 hardware encoders, fastest/most-common first. A watermark burn is a full
 # re-encode of the whole file; on a box with any of these, it runs many times
 # faster than software x264/x265 — and a corner mark's quality is dominated by
@@ -289,32 +328,40 @@ async def build_watermark_encode_args(
     # Fast path.
     if is_10bit:
         for enc in _HW_HEVC_ENCODERS:          # 1. hardware HEVC (keeps 10-bit)
-            if await _avail(enc):
-                venc = ["-c:v", enc, "-pix_fmt", "p010le"]
-                if enc == "hevc_nvenc":
-                    venc += ["-preset", "p4", "-rc", "constqp", "-qp", q]
-                elif enc == "hevc_qsv":
-                    venc += ["-global_quality", q]
-                else:  # hevc_vaapi
-                    venc += ["-qp", q]
-                ladder.append((enc, _cmd(enc, venc, "format=p010le")))
-                break
+            if not await _avail(enc):
+                continue
+            venc = ["-c:v", enc, "-pix_fmt", "p010le"]
+            if enc == "hevc_nvenc":
+                venc += ["-preset", "p4", "-rc", "constqp", "-qp", q]
+            elif enc == "hevc_qsv":
+                venc += ["-global_quality", q]
+            else:  # hevc_vaapi
+                venc += ["-qp", q]
+            # Compiled in ≠ usable: probe the device/runtime ONCE. A GPU-less box
+            # skips straight to software instead of failing this encoder per file.
+            if not await _hw_encoder_usable(ffmpeg, enc, venc):
+                continue
+            ladder.append((enc, _cmd(enc, venc, "format=p010le")))
+            break
         if await _avail("libx265"):            # 2. software x265 10-bit
             ladder.append(("libx265", _cmd("libx265", _x265_10(), "")))
         # 3. libx264 8-bit downconvert (universal last resort)
         ladder.append(("libx264", _cmd("libx264", _x264_8(), "format=yuv420p")))
     else:
         for enc in _HW_H264_ENCODERS:          # 8-bit: fastest H.264 hardware
-            if await _avail(enc):
-                venc = ["-c:v", enc, "-pix_fmt", "yuv420p"]
-                if enc in ("h264_nvenc", "h264_amf"):
-                    venc += ["-preset", "p4", "-cq", q]
-                elif enc == "h264_qsv":
-                    venc += ["-global_quality", q]
-                else:  # h264_vaapi
-                    venc += ["-qp", q]
-                ladder.append((enc, _cmd(enc, venc, "format=yuv420p")))
-                break
+            if not await _avail(enc):
+                continue
+            venc = ["-c:v", enc, "-pix_fmt", "yuv420p"]
+            if enc in ("h264_nvenc", "h264_amf"):
+                venc += ["-preset", "p4", "-cq", q]
+            elif enc == "h264_qsv":
+                venc += ["-global_quality", q]
+            else:  # h264_vaapi
+                venc += ["-qp", q]
+            if not await _hw_encoder_usable(ffmpeg, enc, venc):
+                continue
+            ladder.append((enc, _cmd(enc, venc, "format=yuv420p")))
+            break
         ladder.append(("libx264", _cmd("libx264", _x264_8(), "format=yuv420p")))
 
     return ladder
