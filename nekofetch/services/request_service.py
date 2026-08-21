@@ -553,7 +553,7 @@ class RequestService:
             req.episodes = None
             await session.flush()
 
-        await self._prune_work_dir(work_folder)
+        await self._prune_work_dir(work_folder, code)
         await self._clear_distribution_cache([code])
         await self._clear_job_flags(code, job_ids)
 
@@ -727,22 +727,28 @@ class RequestService:
         except Exception:  # noqa: BLE001 — assignment table optional/absent
             pass
 
-    async def _prune_work_dir(self, folder: str | None) -> None:
-        """Best-effort rmtree of a request's on-disk work folder.
+    async def _prune_work_dir(self, folder: str | None, code: str | None = None) -> None:
+        """Best-effort rmtree of a request's on-disk work dirs.
 
-        Takes the folder NAME directly (computed by the caller while the Request
-        row still exists) — by the time this runs the row is already deleted, so
-        re-deriving the folder from a DB lookup would find nothing and leak the
-        directory. ``metadata/`` is a sibling of ``work/`` and is never touched."""
-        if not folder:
-            return
-        try:
-            import shutil
-            work_dir = self._c.env.storage_path / "work" / folder
-            if work_dir.exists():
-                shutil.rmtree(work_dir, ignore_errors=True)
-        except Exception:  # noqa: BLE001
-            pass
+        Removes BOTH ``work/<folder>`` (processed outputs, keyed by the
+        anime_doc_id the caller computed) AND ``work/<code>`` (DDL keeps its
+        archive + extracted-MKV cache under ``work/<code>/.ddl`` — keyed by request
+        CODE, a DIFFERENT directory — so a folder-only sweep leaked the raw
+        downloads). Both are request-specific; ``metadata/`` is a sibling of
+        ``work/`` and is never touched.
+
+        Takes the names directly (computed by the caller while the Request row
+        still exists) — by the time this runs the row may be deleted, so
+        re-deriving from a DB lookup would find nothing and leak the directory."""
+        import shutil
+        root = self._c.env.storage_path / "work"
+        for name in {n for n in (folder, code) if n}:
+            try:
+                work_dir = root / str(name)
+                if work_dir.exists():
+                    shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _clear_job_flags(self, code: str, job_ids: list[int]) -> None:
         if not self._c.redis:
@@ -824,7 +830,7 @@ class RequestService:
         # auto-advance — BEFORE _clear_job_flags wipes the card's stored msg-ref.
         await self._signal_and_finalize_cards(job_ids, title, code)
 
-        await self._prune_work_dir(work_folder)
+        await self._prune_work_dir(work_folder, code)
         await self._clear_job_flags(code, job_ids)
 
         # Notify the original requester (resolve their telegram id from the DB user).
@@ -904,7 +910,7 @@ class RequestService:
         # card (→ 'cancelled' + auto-advance) before the flags/refs are wiped.
         await self._signal_and_finalize_cards(job_ids, title, code)
 
-        await self._prune_work_dir(work_folder)
+        await self._prune_work_dir(work_folder, code)
         await self._clear_job_flags(code, job_ids)
 
         # Re-assign the download stage for the new ticket (fresh offer/duty).
@@ -988,8 +994,8 @@ class RequestService:
                     await session.delete(req)
             await session.flush()
 
-        for folder in work_folders:
-            await self._prune_work_dir(folder)
+        for folder, code in zip(work_folders, codes):
+            await self._prune_work_dir(folder, code)
         for code in codes:
             await self._clear_job_flags(code, job_ids)
 

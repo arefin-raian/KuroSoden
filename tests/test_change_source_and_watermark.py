@@ -192,6 +192,54 @@ def _reset_container(sessionmaker, tmp_path, redis, admin):
 
 
 @aio
+async def test_prune_work_dir_removes_both_output_and_ddl_cache(tmp_path):
+    # DDL extracts archives + MKVs into work/<code>/.ddl (keyed by CODE), while
+    # processed outputs live in work/<anime_doc_id>. A cleanup that swept only the
+    # doc-id folder leaked the raw DDL files. _prune_work_dir must remove BOTH.
+    from nekofetch.services.request_service import RequestService
+
+    work = tmp_path / "work"
+    out_dir = work / "132405"                       # outputs (anime_doc_id)
+    ddl_mkv = work / "REQ-1094" / ".ddl" / "abc123" / "Episode 01.mkv"  # DDL cache (code)
+    out_dir.mkdir(parents=True)
+    (out_dir / "watermarked.mkv").write_bytes(b"x")
+    ddl_mkv.parent.mkdir(parents=True)
+    ddl_mkv.write_bytes(b"x" * 10)
+    # metadata/ is a sibling that must NEVER be touched.
+    meta = tmp_path / "metadata" / "132405"
+    meta.mkdir(parents=True)
+    (meta / "anilist.json").write_bytes(b"{}")
+
+    container = _reset_container(None, tmp_path, _FakeRedis(), _FakeClient())
+    await RequestService(container)._prune_work_dir("132405", "REQ-1094")
+
+    assert not out_dir.exists(), "output folder should be removed"
+    assert not (work / "REQ-1094").exists(), "DDL cache (work/<code>) should be removed"
+    assert meta.exists() and (meta / "anilist.json").exists(), "metadata must survive"
+
+
+def test_cleanup_local_files_targets_ddl_cache(tmp_path):
+    # The post-upload sweep must also delete the code-keyed DDL cache.
+    from nekofetch.services.publishing_service import PublishingService
+
+    work = tmp_path / "work"
+    ddl = work / "REQ-1094" / ".ddl" / "d1"
+    ddl.mkdir(parents=True)
+    (ddl / "Episode 01.mkv").write_bytes(b"x")
+    out = work / "132405"
+    out.mkdir(parents=True)
+    (out / "ep1.mkv").write_bytes(b"x")
+
+    container = SimpleNamespace(env=SimpleNamespace(storage_path=tmp_path))
+    snapshot = [{"path": str(out / "ep1.mkv")}]
+    PublishingService(container)._cleanup_local_files(
+        snapshot, code="REQ-1094", title="My Dress-Up Darling")
+
+    assert not (work / "REQ-1094").exists(), "DDL cache must be swept after upload"
+    assert not out.exists(), "output folder must be swept after upload"
+
+
+@aio
 async def test_reset_source_full_teardown(session, sessionmaker, tmp_path, monkeypatch):
     from nekofetch.services.request_service import RequestService
 

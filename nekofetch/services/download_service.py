@@ -1475,17 +1475,22 @@ class DownloadWorker:
         # one. The prefetched metadata lives under a separate ``meta/`` tree and is
         # left untouched, so re-sourcing costs no extra provider calls.
         await self._teardown_naming_confirm(job_id)
-        if folder:
+        # Purge BOTH the output folder (work/<anime_doc_id>) AND the DDL cache
+        # (work/<code>/.ddl — the downloaded archives + extracted MKVs, keyed by
+        # request CODE, which a folder-only sweep would leak).
+        _work = Path(self._c.env.storage_path) / "work"
+        _purge_dirs = {d for d in (_work / folder if folder else None,
+                                   _work / str(code) if code else None) if d}
+        for _d in _purge_dirs:
             import shutil
-            work_dir = Path(self._c.env.storage_path) / "work" / folder
             try:
-                if work_dir.exists():
-                    await asyncio.to_thread(shutil.rmtree, work_dir, ignore_errors=True)
+                if _d.exists():
+                    await asyncio.to_thread(shutil.rmtree, _d, ignore_errors=True)
                     log.info("download.source_aborted.purged_local",
-                             job_id=job_id, folder=folder)
+                             job_id=job_id, path=str(_d))
             except Exception as exc:  # noqa: BLE001 — purge is best-effort
                 log.debug("download.source_aborted.purge_failed",
-                          job_id=job_id, folder=folder, error=str(exc))
+                          job_id=job_id, path=str(_d), error=str(exc))
         log.info("download.source_aborted", job_id=job_id)
         from nekofetch.services.log_channel_service import LogChannelService
         await LogChannelService(self._c).event(

@@ -291,6 +291,11 @@ class PublishingService:
         storage = Path(self._c.env.storage_path)
         if code:
             targets.add(storage / "work" / "_manual" / code)
+            # DDL keeps its downloaded archives + extracted MKVs under
+            # work/<code>/.ddl (keyed by request CODE, not the anime_doc_id the
+            # work outputs use) — sweep the whole per-code dir here or the raw
+            # files leak after a successful upload.
+            targets.add(storage / "work" / str(code))
         if title:
             targets.add(storage / "library" / _slug(title))
 
