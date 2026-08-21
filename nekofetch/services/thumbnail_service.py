@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import html as html_module
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,18 @@ _THUMBNAIL_WIDTH = 1366
 _THUMBNAIL_HEIGHT = 641
 _THUMBNAIL_SCALE = 3   # device_scale_factor — increase for higher export resolution
 _SYNOPSIS_MAX_CHARS = 300
+
+# Whitelist of REAL HTML tag names AniList (and other providers) embed in a
+# description. ``_strip_html`` removes only these — an ``<i>``/``</i>``/``<br>``/
+# ``<a href=…>`` — so a genuine angle-bracketed word in prose (``<Wakana>``, an
+# ``<AI>`` label) is never mistaken for markup and deleted. Case-insensitive; the
+# ``\b`` + closing ``>`` mean ``<3`` and ``<Wakana Gojo>`` don't match.
+_HTML_TAG_RE = re.compile(
+    r"</?(?:a|abbr|b|blockquote|br|center|cite|code|del|div|dl|dt|dd|em|figure|"
+    r"figcaption|h[1-6]|hr|i|img|ins|kbd|li|mark|ol|p|pre|q|s|samp|small|span|"
+    r"strike|strong|sub|sup|table|tbody|td|th|thead|tr|u|ul|var|wbr)\b[^>]*>",
+    re.IGNORECASE,
+)
 
 # The SVG score ring: r=42 → circumference = 2·π·42 ≈ 263.89. dashoffset is the
 # UNfilled remainder, so offset = C · (1 - pct/100).
@@ -112,6 +125,28 @@ def _style_tokens() -> dict[str, str]:
         "{{STYLE_SYNOPSIS_PX}}": str(int(st.synopsis_px)),
         "{{STYLE_LOGO_HEIGHT}}": f"{round(float(st.logo_height_rem), 3)}",
     }
+
+
+def _strip_html(text: str | None) -> str:
+    """Flatten AniList-style HTML to plain text for the rendered card.
+
+    AniList ships synopses AS AUTHORED (``asHtml:false``), which includes literal
+    ``<br>``/``<i>``/``<b>``/``<a …>`` tags WHEN the author used them (S2's
+    description italicises the Japanese title; S1's is plain). The card renders
+    from an HTML template with the value HTML-ESCAPED, so an unstripped tag shows
+    as literal ``<i>``/``<br>`` inside the image.
+
+    Only REAL HTML tags are removed — matched by a whitelist of known tag names —
+    so genuine prose that happens to sit in angle brackets (e.g. ``<Wakana>``, an
+    ``<AI>`` label, a ``<3``) is PRESERVED, never mistaken for markup. Explicit
+    breaks become spaces; entities are unescaped last (``&amp;`` → ``&``). Mirrors
+    ``bot_content._clean_synopsis``."""
+    if not text:
+        return ""
+    text = re.sub(r"(?i)<br\s*/?>", " ", text)
+    text = _HTML_TAG_RE.sub("", text)
+    text = html_module.unescape(text)
+    return " ".join(text.split())
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -480,7 +515,9 @@ async def gather_thumbnail_fields(container: Any, title: str,
     return {
         "native_title": native_title,
         "romaji_title": romaji_title,
-        "synopsis": synopsis,
+        # Flatten AniList's <i>/<br> HTML so the persisted + rendered synopsis is
+        # plain text (the render escapes it, so raw tags would show literally).
+        "synopsis": _strip_html(synopsis),
         "meta_label": " | ".join(meta_bits),
         "language": language,
         "genres": genres,
@@ -724,7 +761,7 @@ class ThumbnailRenderService:
             "{{ROMAJI_TITLE}}": esc(romaji_title or title),
             "{{META_LABEL}}": esc(meta_label),
             "{{LANGUAGE}}": esc(language),
-            "{{SYNOPSIS}}": esc(_truncate(synopsis, _SYNOPSIS_MAX_CHARS)),
+            "{{SYNOPSIS}}": esc(_truncate(_strip_html(synopsis), _SYNOPSIS_MAX_CHARS)),
             "{{STUDIO}}": esc(studio or "—"),
             "{{TMDB_RATING}}": esc(rating_text),
             "{{ANILIST_SCORE}}": score_text,

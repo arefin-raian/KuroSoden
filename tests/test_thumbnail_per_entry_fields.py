@@ -94,6 +94,63 @@ async def test_root_render_still_uses_the_search_blob(_patched_cache):
     assert fields["meta_label"] == "2022 | TV-14 | 24m"
 
 
+def test_strip_html_flattens_anilist_markup():
+    # AniList synopses ship <i>/<br>/<b> + entities; the card render HTML-ESCAPES
+    # the value, so an unstripped tag renders as the literal text "<i>"/"<br>" in
+    # the image (the reported season-2 thumbnail bug).
+    raw = "A <i>delinquent</i> who sews.<br><br>Then <b>Marin</b> appears &amp; more."
+    out = ts._strip_html(raw)
+    assert "<" not in out and ">" not in out
+    assert "&amp;" not in out and "&" in out
+    assert "delinquent" in out and "Marin" in out
+
+
+def test_strip_html_removes_only_real_tags_not_bracketed_prose():
+    # Only WHITELISTED HTML tag names are stripped, so genuine angle-bracketed
+    # prose survives — the owner's concern that "<Wakana Gojo>" must not be
+    # deleted like an HTML tag. Void tags (<br>) are still handled (a paired-only
+    # rule would leave them as literal text).
+    assert ts._strip_html("The second season of <i>Sono Bisque Doll</i>.") \
+        == "The second season of Sono Bisque Doll."
+    assert ts._strip_html("Line one.<br><br>Line two.") == "Line one. Line two."
+    assert ts._strip_html('See <a href="https://x">here</a> now.') == "See here now."
+    # Preserved: real prose that merely uses angle brackets.
+    assert ts._strip_html("A boy named <Wakana Gojo> sews.") \
+        == "A boy named <Wakana Gojo> sews."
+    assert ts._strip_html("If x < 3 and y > 1 then win.") == "If x < 3 and y > 1 then win."
+    assert ts._strip_html("I love this <3 so much.") == "I love this <3 so much."
+    assert ts._strip_html("The <AI> takes over.") == "The <AI> takes over."
+
+
+@pytest.mark.asyncio
+async def test_gathered_synopsis_is_tag_free(monkeypatch):
+    # End-to-end: a per-entry node whose synopsis carries HTML yields a clean,
+    # tag-free synopsis in the fields the renderer/persistence consume.
+    import nekofetch.services.metadata_prefetch as mp
+
+    node = {**_S2_NODE, "synopsis": "S2 <i>italic</i> desc.<br>Second line."}
+
+    async def fake_load_cached(container, code, kind, *, anime_doc_id=None):
+        if kind == "tmdb":
+            return _TMDB
+        if kind == "anilist":
+            return {"search": _ROOT_SEARCH, "franchise": {"154768": node}}
+        return None
+
+    async def fake_jikan(container, code, *, anime_doc_id=None):
+        return None
+
+    monkeypatch.setattr(mp, "load_cached", fake_load_cached)
+    monkeypatch.setattr(mp, "load_cached_jikan", fake_jikan)
+
+    fields = await ts.gather_thumbnail_fields(
+        _container(), "Show", "132405",
+        prefer_anilist_synopsis=True, anilist_id=154768,
+    )
+    assert "<" not in fields["synopsis"] and ">" not in fields["synopsis"]
+    assert "italic" in fields["synopsis"] and "Second line." in fields["synopsis"]
+
+
 @pytest.mark.asyncio
 async def test_missing_node_falls_back_to_live_resilient_fetch(monkeypatch):
     # When the entry's node isn't cached, the resilient client resolves it by id

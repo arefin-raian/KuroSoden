@@ -136,9 +136,17 @@ def _is_season_entry(entry) -> bool:
     return entry_is_season(entry)
 
 # AniList synopses (fetched asHtml:false) still embed literal HTML — <br>, <i>,
-# <b>, and a trailing "<source>" fragment. Strip ALL tags before truncating so a
-# mid-tag slice can't leave a dangling "<" that Pyrogram re-escapes to "&lt;".
-_HTML_TAG_RE = re.compile(r"<[^>]*>")
+# <b>, and a trailing "<source>" fragment. Strip only REAL HTML tags (whitelist
+# of known tag names) before truncating, so a mid-tag slice can't leave a
+# dangling "<" that Pyrogram re-escapes to "&lt;" — while a genuine angle-bracketed
+# word in the prose (e.g. "<Wakana>", an "<AI>" label) is preserved, not deleted.
+# Mirrors thumbnail_service._HTML_TAG_RE so the caption and the card agree.
+_HTML_TAG_RE = re.compile(
+    r"</?(?:a|abbr|b|blockquote|br|center|cite|code|del|div|dl|dt|dd|em|figure|"
+    r"figcaption|h[1-6]|hr|i|img|ins|kbd|li|mark|ol|p|pre|q|s|samp|small|span|"
+    r"strike|strong|sub|sup|table|tbody|td|th|thead|tr|u|ul|var|wbr)\b[^>]*>",
+    re.IGNORECASE,
+)
 
 
 def _clean_synopsis(text: str | None, *, limit: int = 350) -> str:
