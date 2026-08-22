@@ -84,13 +84,16 @@ def install_auth_middleware(
     # Group -1 runs before feature handlers (group 0+).
     @client.on_message(group=-1)
     async def _msg_mw(_: Client, message: Message) -> None:
-        if message.from_user and await _rate_limited(message.from_user.id):
+        message.nf_user = await _resolve(message.from_user)  # type: ignore[attr-defined]
+        # Staff are exempt from the rate limit (it's anti-spam for open
+        # request-bot users, not for operators working the pipeline).
+        if (message.from_user and not _is_staff(message.nf_user)
+                and await _rate_limited(message.from_user.id)):
             await message.reply(
                 bq(container.localizer.get("rate_limited")),
                 parse_mode=ParseMode.HTML,
             )
             await message.stop_propagation()
-        message.nf_user = await _resolve(message.from_user)  # type: ignore[attr-defined]
         # Gate ONLY real humans in a private chat. Channel posts, service
         # messages, and anonymous-admin posts have no ``from_user`` — gating
         # them would send the "Staff Access Only" card straight into the channel
@@ -103,10 +106,16 @@ def install_auth_middleware(
 
     @client.on_callback_query(group=-1)
     async def _cb_mw(_: Client, query: CallbackQuery) -> None:
-        if query.from_user and await _rate_limited(query.from_user.id):
-            await query.answer(bq(container.localizer.get("rate_limited")), show_alert=True)
-            await query.stop_propagation()
         query.nf_user = await _resolve(query.from_user)  # type: ignore[attr-defined]
+        # Staff are NEVER rate-limited — the limit is anti-spam for open
+        # request-bot users, and it was firing on rapid, legitimate asset-pick
+        # taps (the 1/2/3/4 buttons). A callback popup renders PLAIN text, so the
+        # message must NOT be wrapped in <blockquote>/HTML (that showed the raw
+        # tags in the toast).
+        if (query.from_user and not _is_staff(query.nf_user)
+                and await _rate_limited(query.from_user.id)):
+            await query.answer(container.localizer.get("rate_limited"), show_alert=True)
+            await query.stop_propagation()
         if staff_only_bot and not _is_staff(query.nf_user):
             # Only render the full gate card in a private chat; never edit a
             # channel/group message into it. Elsewhere a private alert to the
