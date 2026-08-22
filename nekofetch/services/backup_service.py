@@ -339,6 +339,7 @@ class BackupService:
                     sent = await client.send_message(
                         new_channel_id, b.caption or "",
                         reply_markup=markup, parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
                     )
                 stats.restored += 1
             except Exception as exc:  # noqa: BLE001
@@ -934,6 +935,7 @@ class BackupService:
                     sent = await client.send_message(
                         new_chat_id, caption,
                         reply_markup=markup, parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
                     )
                 aid = card.get("anilist_id")
                 if aid is not None:
@@ -1071,6 +1073,7 @@ class BackupService:
                 else:
                     sent = await client.send_message(
                         new_channel_id, caption, parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
                     )
 
                 if card.get("kind") == "index_poster":

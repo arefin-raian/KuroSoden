@@ -71,9 +71,11 @@ async def live_edit_caption(
                 reply_markup=keep_markup,
             )
         else:
+            # A text post (e.g. the watch guide) carries quality hyperlinks —
+            # suppress the link preview so no t.me thumbnail card appears on edit.
             await client.edit_message_text(
                 chat_id, tg_message_id, new_caption, parse_mode=ParseMode.HTML,
-                reply_markup=keep_markup,
+                reply_markup=keep_markup, disable_web_page_preview=True,
             )
     except Exception as exc:  # noqa: BLE001 — keep the caller's durable data unchanged
         log.warning(f"{log_event_prefix}.live_edit_failed", chat=chat_id,

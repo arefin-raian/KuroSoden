@@ -674,7 +674,7 @@ class SenkuPublisher:
                 else:
                     msg = await client.send_message(
                         chat_id, caption, reply_markup=markup,
-                        parse_mode=ParseMode.HTML,
+                        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
                     )
             except Exception as exc:  # noqa: BLE001 — a partial update still ships
                 log.warning("senku.update.card_failed",
@@ -746,6 +746,7 @@ class SenkuPublisher:
             else:
                 fmsg = await client.send_message(
                     chat_id, caption, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
                 )
             footer_mid = fmsg.id
             new_layout.append({"kind": "footer", "tg_message_id": fmsg.id,

@@ -62,7 +62,8 @@ class _FakeClient:
                                       "markup": reply_markup}))
         return _FakeMsg(self._next_id)
 
-    async def send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
+    async def send_message(self, chat_id, text, reply_markup=None, parse_mode=None,
+                           disable_web_page_preview=None):
         self._next_id += 1
         self.events.append(("message", {"caption": text, "markup": reply_markup}))
         return _FakeMsg(self._next_id)

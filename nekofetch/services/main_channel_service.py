@@ -661,6 +661,7 @@ class MainChannelService:
                         await client.edit_message_text(
                             self.cfg.channel_id, existing_id, caption,
                             reply_markup=markup, parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
                         )
                     message_id = existing_id
                 except Exception as exc:
@@ -694,6 +695,7 @@ class MainChannelService:
                     sent = await client.send_message(
                         self.cfg.channel_id, caption, reply_markup=markup,
                         parse_mode=ParseMode.HTML, disable_notification=silent,
+                        disable_web_page_preview=True,
                     )
                 message_id = sent.id
         except Exception as exc:  # noqa: BLE001
@@ -891,6 +893,7 @@ class MainChannelService:
                 ),
                 reply_to_message_id=post.main_message_id,
                 parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
             )
             return True
         except Exception as exc:  # noqa: BLE001 — announcement must not fail publish
@@ -920,6 +923,7 @@ class MainChannelService:
                 t(M.BAN_RECOVERY_REPLY, title=title, channel_link=channel_link),
                 reply_to_message_id=post.main_message_id,
                 parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
             )
             return True
         except Exception as exc:  # noqa: BLE001

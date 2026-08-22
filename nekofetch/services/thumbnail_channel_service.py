@@ -139,6 +139,9 @@ class ThumbnailChannelService:
     # ── low-level message helpers ───────────────────────────────────────────
 
     async def _send(self, text: str, **kw):
+        # Watch-guide / entry-card text carries quality deep-links — never let a
+        # t.me preview card render. Callers may still override via kw.
+        kw.setdefault("disable_web_page_preview", True)
         for attempt in range(3):
             try:
                 return await self._client.send_message(
@@ -157,6 +160,7 @@ class ThumbnailChannelService:
                 await self._client.edit_message_text(
                     self.cfg.channel_id, mid, _truncate_html(text, MESSAGE_LIMIT),
                     parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+                    disable_web_page_preview=True,
                 )
                 return
             except FloodWait as fw:
