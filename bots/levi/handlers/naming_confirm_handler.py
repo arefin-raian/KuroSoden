@@ -155,6 +155,37 @@ def register(client: Client, container: Container) -> None:
             return
         job_id, kind = int(parts[2]), parts[3]
         redis = container.redis
+
+        # DDL mapping (ddlmap) is a PARKED gate now, not a block-poll: the worker
+        # already returned. Proceed = accept the current (auto or Fix-corrected)
+        # mapping and RESUME the job (re-enqueue; code-keyed cache is reused).
+        if kind == "ddlmap":
+            mapping_dict = None
+            if redis is not None:
+                import json as _json
+                raw = await safe_redis_get(redis, ddlmap_data_key(job_id),
+                                           label="ddlmap.proceed_read")
+                try:
+                    mapping_dict = (_json.loads(raw).get("mapping") if raw else None)
+                except Exception:  # noqa: BLE001
+                    mapping_dict = None
+                await _disarm_reply(redis, q.message.chat.id)
+            from nekofetch.services.naming_confirm import resume_parked_ddl_mapping
+            resumed = await resume_parked_ddl_mapping(container, job_id, mapping_dict)
+            try:
+                await q.message.edit_text(
+                    (q.message.text.html if q.message.text else "")
+                    + ("\n\n<i>✅ Confirmed — resuming.</i>" if resumed
+                       else "\n\n<i>This mapping is no longer awaiting confirmation.</i>"),
+                    parse_mode=ParseMode.HTML)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await q.answer("Resuming." if resumed else "Already handled.")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
         if redis is not None:
             await _release(redis, job_id, kind, _USE_DEFAULT)
             await _disarm_reply(redis, q.message.chat.id)

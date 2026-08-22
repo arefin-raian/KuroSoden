@@ -113,29 +113,13 @@ async def _commit_and_release(container, sess, mapping_dict: dict) -> None:
     kind = rel.get("kind")
     redis = container.redis
     if kind == "ddlmap":
-        # Write the corrected mapping into the worker's stash, then release the
-        # gate with the "use it" sentinel — the worker reads mapping back from
-        # ddlmap_data and proceeds. (Mirrors the text Fix flow's commit path.)
-        import json as _json
-        from nekofetch.services.naming_confirm import (
-            ddlmap_data_key, value_key, await_key, _USE_DEFAULT,
-        )
-        from nekofetch.core.redis_safe import (
-            safe_redis_get, safe_redis_set, safe_redis_delete,
-        )
+        # The DDL mapping gate PARKS the job (status PAUSED) — the worker has
+        # already returned, so there's no block-poll to release. Saving the editor
+        # RESUMES it: persist the rebuilt mapping onto the request + re-enqueue
+        # (code-keyed, so the DDL cache is reused and nothing re-downloads).
+        from nekofetch.services.naming_confirm import resume_parked_ddl_mapping
         job_id = int(rel["job_id"])
-        raw = await safe_redis_get(redis, ddlmap_data_key(job_id),
-                                   label="mapedit.ddl.read")
-        data = _json.loads(raw) if raw else dict(sess.working_set)
-        data["mapping"] = mapping_dict
-        await safe_redis_set(redis, ddlmap_data_key(job_id), _json.dumps(data),
-                             label="mapedit.ddl.write", ex=15 * 60)
-        # Release: value first, THEN clear await flag (worker never sees an empty
-        # value) — identical ordering to naming_confirm_handler._release.
-        await safe_redis_set(redis, value_key(job_id, "ddlmap"), _USE_DEFAULT,
-                             label="mapedit.ddl.release_value", ex=15 * 60)
-        await safe_redis_delete(redis, await_key(job_id, "ddlmap"),
-                                label="mapedit.ddl.release")
+        await resume_parked_ddl_mapping(container, job_id, mapping_dict)
     elif kind == "torrent":
         # Write the rebuilt mapping back into the admin's FSM working set so the
         # torrent card's existing "Confirm" stays the SINGLE enqueue point (its

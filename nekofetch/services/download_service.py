@@ -65,6 +65,30 @@ _DISK_BUFFER_BYTES = 1_000_000_000  # 1 GB safety margin
 # quality at a time).
 _READY_RELEASE_SOURCES = frozenset({"ddl"})
 
+# Below this overall confidence a DDL mapping is treated as uncertain → gated for
+# the owner's confirmation instead of auto-proceeding to upload.
+_MAPPING_CONFIDENCE_MIN = 0.75
+
+
+def _mapping_uncertain(tmapping, ordered_files: list[dict]) -> bool:
+    """Whether a built ``TorrentMapping`` is uncertain enough to require the owner's
+    confirmation before processing + uploading (vs auto-proceeding).
+
+    Uncertain when it has missing-episode gaps, any unmatched files, an overall
+    confidence below the floor, or any file numbered only by last-resort file order
+    (the positional detector declined — we're guessing). A clean, complete, fully
+    numbered mapping is confident → no card, straight through."""
+    try:
+        if tmapping.has_gaps or tmapping.unmatched:
+            return True
+        if (tmapping.overall_confidence or 0.0) < _MAPPING_CONFIDENCE_MIN:
+            return True
+    except Exception:  # noqa: BLE001 — never let the gate check crash the pipeline
+        return True
+    if any((f or {}).get("episode_source") == "order" for f in (ordered_files or [])):
+        return True
+    return False
+
 
 def _is_torrent_ref(ref: str) -> bool:
     """True when a ``source_ref`` is a nyaa/torrent descriptor (magnet, torrent
@@ -242,12 +266,21 @@ class DownloadWorker:
                     pass
             try:
                 confirmed_map = await self._ddl_franchise_map(job_id, req, episodes)
-                if confirmed_map:
-                    fr = dict(req.franchise_data or {})
-                    fr["_torrent_mapping"] = confirmed_map
-                    req.franchise_data = fr
             except Exception as exc:  # noqa: BLE001 — mapping is best-effort
                 log.info("ddl.franchise_map.skipped", job_id=job_id, error=str(exc))
+                confirmed_map = None
+            # Uncertain mapping → the gate PARKED the job (status PAUSED) awaiting
+            # the owner's confirmation. Do NOT proceed to process/upload: a later
+            # Proceed / editor Save re-enqueues the job (code-keyed resume reuses
+            # the cached download). This is the owner's "never upload unconfirmed".
+            from nekofetch.services.naming_confirm import PARKED as _PARKED
+            if confirmed_map is _PARKED:
+                log.info("ddl.franchise_map.parked", job_id=job_id)
+                return
+            if confirmed_map:
+                fr = dict(req.franchise_data or {})
+                fr["_torrent_mapping"] = confirmed_map
+                req.franchise_data = fr
 
         # Strip extras (NCOP, NCED, etc.) when the franchise data tells us how
         # many main episodes to expect and no explicit episode list was given.
@@ -1072,6 +1105,13 @@ class DownloadWorker:
 
         franchise = req.franchise_data or {}
 
+        # RESUME after a park: the owner already confirmed (Proceed / editor Save
+        # wrote the mapping + this flag onto the request), so reuse it and DON'T
+        # re-show the card — otherwise the re-enqueued job would park forever.
+        if franchise.get("_ddlmap_confirmed"):
+            log.info("ddl.franchise_map.resumed", job_id=job_id)
+            return franchise.get("_torrent_mapping")
+
         # Build ``ordered_files`` from the resolved episodes: one row per LOGICAL
         # episode carrying that episode's quality tiers (the sibling files a DDL
         # release ships). This is exactly the shape build_torrent_mapping wants.
@@ -1119,6 +1159,14 @@ class DownloadWorker:
             log.debug("ddl.franchise_map.jikan_titles_failed", job_id=job_id)
 
         tmapping = build_torrent_mapping(ordered_files, mapping, episode_titles=ep_titles)
+
+        # Auto-proceed when the mapping is CONFIDENT and COMPLETE — no gaps, nothing
+        # unmatched, good confidence, and no episode numbered only by last-resort
+        # file order. Only an UNCERTAIN mapping is gated (the owner's "confirm only
+        # when uncertain"); a confident one flows straight through with no card.
+        if not _mapping_uncertain(tmapping, ordered_files):
+            log.info("ddl.franchise_map.auto_confident", job_id=job_id)
+            return tmapping.to_dict()
 
         enc_heights = [h for h in self._c.config.processing.encode_heights if h > 0]
         _acq = getattr(self._c.config, "acquisition", None)

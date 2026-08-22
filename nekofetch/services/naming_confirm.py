@@ -64,6 +64,12 @@ _CANCEL_KEY = "nf:job:{job_id}:cancel"
 
 _USE_DEFAULT = "__use__"          # sentinel the handler writes for the "Use it" tap
 
+# Distinct outcome for the mapping gate: the mapping was uncertain, the card was
+# posted, and the job was PARKED (status PAUSED) awaiting the owner's confirmation.
+# The caller must NOT proceed to upload — a later Proceed / editor Save re-enqueues
+# the job (code-keyed resume reuses the already-downloaded DDL cache).
+PARKED = object()
+
 
 def await_key(job_id: int, kind: str) -> str:
     return _AWAIT_KEY.format(job_id=job_id, kind=kind)
@@ -84,6 +90,43 @@ def ddlmap_data_key(job_id: int) -> str:
     accumulated overrides. The worker reads the (possibly-corrected) ``mapping``
     from here after the admin taps Proceed."""
     return f"nf:job:{job_id}:ddlmap_data"
+
+
+async def resume_parked_ddl_mapping(container, job_id: int,
+                                    mapping_dict: dict | None) -> bool:
+    """Resume a job PARKED at the DDL mapping gate (Proceed tapped, or the web
+    editor Saved). Persist the confirmed mapping onto the REQUEST (survives the
+    fresh job) + set the ``_ddlmap_confirmed`` flag so the resumed run skips the
+    gate, then re-enqueue — code-keyed, so the DDL cache is reused and nothing
+    re-downloads. Returns True when a re-enqueue happened.
+
+    Only acts on a PAUSED job, so a stray tap on a still-running (rare) or already
+    finished job can't double-enqueue."""
+    from nekofetch.domain.enums import JobStatus
+    from nekofetch.infrastructure.database.postgres.models import DownloadJob
+    from nekofetch.infrastructure.database.postgres.session import session_scope
+    from nekofetch.infrastructure.repositories.request_repo import RequestRepository
+
+    code = None
+    async with session_scope(container.pg_sessionmaker) as session:
+        job = await session.get(DownloadJob, job_id)
+        if job is None or job.status != JobStatus.PAUSED:
+            return False
+        req = await RequestRepository(session).get(job.request_id)
+        if req is None:
+            return False
+        fr = dict(req.franchise_data or {})
+        if mapping_dict:
+            fr["_torrent_mapping"] = mapping_dict
+        fr["_ddlmap_confirmed"] = True
+        req.franchise_data = fr
+        code = req.code
+    if not code:
+        return False
+    from nekofetch.services.queue_service import QueueService
+    await QueueService(container).enqueue(code)
+    log.info("naming_confirm.ddlmap.resumed", job=job_id, code=code)
+    return True
 
 
 # ── filename parsing (inverse of templates.render_filename) ───────────────────
@@ -450,8 +493,11 @@ class NamingConfirm:
         redis = self._c.redis
         levi = self._levi()
         if redis is None or levi is None or chat_id is None:
-            await self._mark_confirmed(job_id, kind)
-            return mapping_dict
+            # Can't show a confirm card (degraded system) — do NOT auto-upload an
+            # uncertain mapping. Park it so the owner can requeue when the surface
+            # is back (resume then re-shows the card). Never upload unconfirmed.
+            await self._park_job(job_id)
+            return PARKED
         if await self._abandoned(job_id):
             log.info("naming_confirm.ddlmap.aborted_preshow", job=job_id)
             return None
@@ -522,58 +568,43 @@ class NamingConfirm:
                 sent = await levi.send_message(
                     chat_id, card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
                 card_id = sent.id
-            except Exception as exc:  # noqa: BLE001 — can't show card → use default
+            except Exception as exc:  # noqa: BLE001 — can't show card → PARK, don't upload
                 log.warning("ddlmap.card_failed", job=job_id, error=str(exc))
                 await self._cleanup(job_id, kind, chat_id)
-                await self._mark_confirmed(job_id, kind)
-                return mapping_dict
+                await self._park_job(job_id)
+                return PARKED
         await safe_redis_set(
             redis, f"nf:job:{job_id}:{kind}_card", f"{chat_id}:{card_id}",
             label="ddlmap.cardref", ex=_CONFIRM_TIMEOUT_S + 60)
 
-        loops = int(_CONFIRM_TIMEOUT_S / _POLL_INTERVAL_S)
-        cancelled = False
-        for _ in range(loops):
-            await asyncio.sleep(_POLL_INTERVAL_S)
-            if await self._abandoned(job_id):
-                log.info("naming_confirm.ddlmap.aborted", job=job_id)
-                cancelled = True
-                break
-            still = await safe_redis_get(redis, await_key(job_id, kind),
-                                         label="ddlmap.poll")
-            if not still:
-                # Released. "__use__" = Proceed; anything else (a Cancel sentinel)
-                # means bail to the auto mapping.
-                val = await safe_redis_get(redis, value_key(job_id, kind),
-                                           label="ddlmap.readval")
-                if val and val != _USE_DEFAULT:
-                    cancelled = True
-                break
-        else:
-            log.info("naming_confirm.ddlmap.timeout", job=job_id)
-            # Annotate the card so the timeout is visible, not a silent revert —
-            # the owner reported "I was never shown any mapping prompt", which the
-            # invisible auto-proceed made worse. Mirrors confirm()'s behaviour.
-            if card_id is not None:
-                try:
-                    await levi.edit_message_text(
-                        chat_id, card_id,
-                        card_text + "\n\n<i>No response — proceeding with the "
-                        "auto mapping.</i>",
-                        parse_mode=ParseMode.HTML)
-                except Exception:  # noqa: BLE001
-                    pass
+        # PARK (no block-poll): the mapping was uncertain, so we do NOT proceed to
+        # upload on our own. Pause the job + drop live progress so the worker frees
+        # up and the parked job leaves ACTIVE TASKS. The card stays (Edit mapping /
+        # Proceed / Fix seasons); a later tap re-enqueues the job (code-keyed
+        # resume reuses the cached download), and on resume _ddl_franchise_map sees
+        # the confirmed mapping and skips re-parking. This is the owner's
+        # "park & let me resume — never auto-upload without my confirm".
+        await self._park_job(job_id)
+        return PARKED
 
-        # Read the (possibly Fix-corrected) mapping back before cleanup wipes it.
-        confirmed = mapping_dict
+    async def _park_job(self, job_id: int) -> None:
+        """Set the job PAUSED (awaiting mapping confirmation) and drop its live
+        progress snapshot so it leaves ACTIVE TASKS — mirrors the coverage gate."""
+        from nekofetch.domain.enums import JobStatus
+        from nekofetch.infrastructure.database.postgres.models import DownloadJob
+        from nekofetch.infrastructure.database.postgres.session import session_scope
         try:
-            raw = await safe_redis_get(redis, ddlmap_data_key(job_id),
-                                       label="ddlmap.final_read")
-            if raw:
-                confirmed = json.loads(raw).get("mapping") or mapping_dict
-        except Exception:  # noqa: BLE001 — fall back to the auto mapping
-            pass
-
-        await self._cleanup(job_id, kind, chat_id)
-        await self._mark_confirmed(job_id, kind)
-        return None if cancelled else confirmed
+            async with session_scope(self._c.pg_sessionmaker) as session:
+                job = await session.get(DownloadJob, job_id)
+                if job is not None:
+                    job.status = JobStatus.PAUSED
+                    rs = dict(job.resume_state or {})
+                    rs["awaiting_mapping_confirm"] = True
+                    job.resume_state = rs
+        except Exception as exc:  # noqa: BLE001 — never strand the job on a park error
+            log.warning("naming_confirm.ddlmap.park_failed", job=job_id, error=str(exc))
+        if self._c.progress:
+            try:
+                await self._c.progress.delete(job_id)
+            except Exception:  # noqa: BLE001
+                pass

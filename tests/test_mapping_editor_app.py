@@ -129,10 +129,24 @@ def test_get_requires_valid_initdata(client_and_container):
             if s["kind"] == "episode"} == {1, 2}
 
 
-def test_post_save_ddl_releases_gate(client_and_container):
+def test_post_save_ddl_resumes_parked_job(client_and_container, monkeypatch):
     client, container = client_and_container
     token = _seed(container, {"kind": "ddlmap", "job_id": 7})
-    # Move everything into S1 in a custom order; exclude nothing.
+    # Capture the resume call (real resume needs a DB; here we assert it's invoked
+    # with the rebuilt mapping — all four files moved into S1).
+    calls = {}
+    import nekofetch.web.app as appmod
+
+    async def _fake_resume(cont, job_id, mapping_dict):
+        calls["job_id"] = job_id
+        calls["mapping"] = mapping_dict
+        return True
+
+    monkeypatch.setattr(appmod, "resume_parked_ddl_mapping", _fake_resume, raising=False)
+    # app.py imports it lazily inside _commit_and_release; patch the source too.
+    import nekofetch.services.naming_confirm as ncmod
+    monkeypatch.setattr(ncmod, "resume_parked_ddl_mapping", _fake_resume)
+
     layout = {"files": [
         {"index": 3, "season": 1, "position": 1},
         {"index": 0, "season": 1, "position": 2},
@@ -143,20 +157,13 @@ def test_post_save_ddl_releases_gate(client_and_container):
                     json={"init_data": _sign(1), "layout": layout})
     assert r.status_code == 200 and r.json()["ok"] is True
 
-    # The DDL gate was released: value set to the "use it" sentinel, await flag
-    # cleared, and the rebuilt mapping written into ddlmap_data.
-    from nekofetch.services.naming_confirm import (
-        value_key, await_key, ddlmap_data_key, _USE_DEFAULT,
-    )
-    d = container.redis.d
-    assert d.get(value_key(7, "ddlmap")) == _USE_DEFAULT
-    assert await_key(7, "ddlmap") not in d
-    saved = json.loads(d[ddlmap_data_key(7)])
-    m = TorrentMapping.from_dict(saved["mapping"])
+    # The parked job was resumed with the rebuilt mapping (four files in S1).
+    assert calls["job_id"] == 7
+    m = TorrentMapping.from_dict(calls["mapping"])
     s1 = next(e for e in m.entries if e.franchise_entry.season_number == 1)
-    assert s1.actual == 4          # all four files landed in S1 per the layout
+    assert s1.actual == 4
     # Session consumed.
-    assert not any(k.startswith("nf:mapedit:") for k in d)
+    assert not any(k.startswith("nf:mapedit:") for k in container.redis.d)
 
 
 def test_post_rejects_bad_initdata(client_and_container):
