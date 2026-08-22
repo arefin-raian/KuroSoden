@@ -283,6 +283,7 @@ def build_torrent_mapping(
     *,
     episode_titles: dict[int, list[dict]] | None = None,
     season_overrides: dict[int, int] | None = None,
+    episode_overrides: dict[int, int] | None = None,
     junk_indices: set[int] | None = None,
 ) -> TorrentMapping:
     """Map torrent files to franchise entries.
@@ -319,6 +320,17 @@ def build_torrent_mapping(
     ordered_files = _apply_season_resolution(
         ordered_files, franchise, episode_titles, season_overrides,
     )
+
+    # Manual episode order (the web mapping editor's drag-to-reorder): an explicit
+    # file_index → episode-number map that WINS over the filename-parsed number, so
+    # the admin's chosen position is authoritative. Applied after the season
+    # cascade so it also fixes an episode the cascade couldn't derive.
+    if episode_overrides:
+        ordered_files = [
+            {**f, "episode": episode_overrides[f["index"]]}
+            if f.get("index") in episode_overrides else f
+            for f in ordered_files
+        ]
 
     # Admin-marked junk: force these files out of the episode stream so they are
     # never assigned an episode slot and instead surface as unmatched.
