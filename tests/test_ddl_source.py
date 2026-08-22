@@ -22,7 +22,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from nekofetch.sources._archive import extract_archive
-from nekofetch.sources.ddl import DdlSource, _archive_name, _name_from_disposition
+from nekofetch.sources.ddl import (
+    DdlSource,
+    _archive_name,
+    _name_from_disposition,
+    _name_from_url_query,
+)
 from nekofetch.sources.registry import build_default_registry
 
 
@@ -50,6 +55,39 @@ def test_archive_name_from_shortener_url_is_the_tail() -> None:
     assert _archive_name(
         "https://worker.dev/abc/A.Couple.Of.Cuckoos.S01.1080p.zip"
     ) == "A.Couple.Of.Cuckoos.S01.1080p.zip"
+
+
+def test_name_from_url_query_reads_presigned_disposition() -> None:
+    # The exact bug the owner reported: a Cloudflare R2 presigned URL whose PATH
+    # is a meaningless hash, with the real archive name in the
+    # `response-content-disposition` query param. We must surface the real name.
+    r2 = (
+        "https://0928bfbd88f58368ae60eaea541b7ff0.r2.cloudflarestorage.com/"
+        "1i522nj2/db1e6e2a5c861ab6f8eb78120a1529c99f4ffa7f"
+        "?response-content-disposition=attachment%3B%20filename%3D%22"
+        "Clevatess.S01.1080p.x265.10bit.WEB-DL.Multi.Audio.ESub-Vegamovies.co.rs.zip%22"
+        "&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-SignedHeaders=host"
+    )
+    assert _name_from_url_query(r2) == (
+        "Clevatess.S01.1080p.x265.10bit.WEB-DL.Multi.Audio.ESub-Vegamovies.co.rs.zip"
+    )
+    # The path basename alone (old behavior) would have shown just the hash.
+    assert _archive_name(r2) == "db1e6e2a5c861ab6f8eb78120a1529c99f4ffa7f"
+
+    # RFC 5987 extended form in the query is honored too.
+    assert _name_from_url_query(
+        "https://s3.example.com/x/hash?response-content-disposition="
+        "attachment%3B%20filename%2A%3DUTF-8%27%27Show.S02.zip"
+    ) == "Show.S02.zip"
+
+    # A bare filename= param (some hosts) also works.
+    assert _name_from_url_query(
+        "https://dl.example.com/get?id=99&filename=Bocchi.the.Rock.S01.720p.zip"
+    ) == "Bocchi.the.Rock.S01.720p.zip"
+
+    # No name in the query → None (caller falls back to the path basename).
+    assert _name_from_url_query("https://worker.dev/abc/Real.Name.S01.zip") is None
+    assert _name_from_url_query("https://flyn.im/9pYDxXE") is None
 
 
 def _make_zip(path: Path, names: list[str]) -> Path:

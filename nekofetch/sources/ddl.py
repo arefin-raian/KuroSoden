@@ -25,7 +25,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import aiofiles
 import httpx
@@ -178,9 +178,11 @@ class DdlSource(AnimeSource):
         """Resolve ``(content_length, filename)`` in a single redirect-following
         HEAD. The client has ``follow_redirects=True``, so ``r.url`` is the FINAL
         URL after a shortener 302 (``flyn.im/9pYDxXE`` → ``…/A.Couple.Of.Cuckoos
-        .S01…zip``); the real name comes from ``Content-Disposition`` first, else
-        the final URL's basename — never the shortener tail. Size falls back to a
-        ranged GET; name falls back to ``None`` (caller keeps its own default)."""
+        .S01…zip``). Name priority: ``Content-Disposition`` header → the name in
+        the URL query (``response-content-disposition`` on presigned R2/S3/GCS
+        links) → the final URL's path basename — never the shortener tail or a
+        presigned hash. Size falls back to a ranged GET; name falls back to
+        ``None`` (caller keeps its own default)."""
         size = 0
         name: str | None = None
         try:
@@ -189,6 +191,12 @@ class DdlSource(AnimeSource):
             if cl and cl.isdigit():
                 size = int(cl)
             name = _name_from_disposition(r.headers.get("content-disposition"))
+            if not name:
+                # Presigned R2/S3/GCS links carry the real name in the query
+                # (response-content-disposition); a HEAD signed for GET 403s, so
+                # the header is often absent. Read it from the URL before the
+                # path basename (which is just the meaningless hash).
+                name = _name_from_url_query(str(r.url)) or _name_from_url_query(url)
             if not name:
                 # Final URL after redirects — its path holds the real archive name.
                 final = _archive_name(str(r.url))
@@ -203,6 +211,9 @@ class DdlSource(AnimeSource):
                     if not name:
                         name = _name_from_disposition(
                             resp.headers.get("content-disposition"))
+                        if not name:
+                            name = (_name_from_url_query(str(resp.url))
+                                    or _name_from_url_query(url))
                         if not name:
                             final = _archive_name(str(resp.url))
                             name = final if final != "archive.zip" else None
@@ -248,7 +259,7 @@ class DdlSource(AnimeSource):
             # redirect-following HEAD, so the card shows "A.Couple.Of.Cuckoos
             # .S01…zip" from the first tick — not the shortener tail "9pYDxXE".
             size_hint, resolved_name = await self._head_meta(url)
-            arc_name = resolved_name or _archive_name(url)
+            arc_name = resolved_name or _name_from_url_query(url) or _archive_name(url)
             digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
             archive_path = cache / f"{digest}{_ext_of(url)}"
 
@@ -538,3 +549,36 @@ def _name_from_disposition(disposition: str | None) -> str | None:
     # Guard against a path/traversal sneaking in via the header.
     name = name.replace("\\", "/").rstrip("/").split("/")[-1]
     return name or None
+
+
+def _name_from_url_query(url: str) -> str | None:
+    """Filename embedded in a URL's QUERY STRING, if any.
+
+    Presigned object-store links (Cloudflare R2 / AWS S3 / Google GCS) put a
+    meaningless hash in the PATH and carry the REAL name in a
+    ``response-content-disposition`` query param — a full Content-Disposition
+    value, e.g. ``…?response-content-disposition=attachment%3B%20filename%3D%22
+    Clevatess.S01…zip%22`` — or, less often, a bare ``filename=`` param. HEAD
+    usually can't surface it (the URL is signed for GET, so a HEAD 403s), and the
+    path basename is just the hash, so we read the name straight from the link:
+    no network, works for ANY link shape. Returns None when the query has no name."""
+    try:
+        params = parse_qs(urlparse(url).query)  # values arrive URL-decoded
+    except Exception:  # noqa: BLE001
+        return None
+    lower = {k.lower(): v for k, v in params.items()}
+    # A full Content-Disposition value lives here on presigned S3/R2/GCS links.
+    for key in ("response-content-disposition", "content-disposition"):
+        vals = lower.get(key)
+        if vals:
+            name = _name_from_disposition(vals[0])
+            if name:
+                return name
+    # A bare filename-ish param.
+    for key in ("filename", "file_name", "name", "fn"):
+        vals = lower.get(key)
+        if vals and vals[0].strip():
+            cand = unquote(vals[0].strip()).replace("\\", "/").rstrip("/").split("/")[-1]
+            if cand:
+                return cand
+    return None
