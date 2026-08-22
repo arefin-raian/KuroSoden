@@ -38,12 +38,13 @@ async def fetch_logos(client: "TmdbClient", tmdb_id: int, media_type: str) -> li
     ``{"url": str, "file_path": str, "language": str | None, "width": int,
         "height": int, "vote_average": float, "vote_count": int}``
 
-    English-tagged logos come first, then language-neutral, then others.
+    Language priority (owner spec): English → Japanese → language-neutral. Any
+    OTHER language is dropped so the picker only offers EN / JP / textless art.
     """
     try:
         imgs = await client._get(
             f"/{media_type}/{tmdb_id}/images",
-            include_image_language="en,null",
+            include_image_language="en,ja,null",
         )
     except Exception as exc:
         log.warning("tmdb.logos.failed", id=tmdb_id, error=str(exc))
@@ -53,16 +54,16 @@ async def fetch_logos(client: "TmdbClient", tmdb_id: int, media_type: str) -> li
     if not logos:
         return []
 
-    # Logos are ENGLISH-ONLY by spec (the title art overlaid on the thumbnail
-    # must read in English). Fall back to language-neutral art only when TMDB
-    # has no English logo at all, so the picker is never empty.
-    english = [l for l in logos if (l.get("iso_639_1") or "") == "en"]
-    logos = english or [l for l in logos if not l.get("iso_639_1")]
+    # Keep EN / JA / neutral only, tiered English → Japanese → neutral.
+    logos = [l for l in logos if (l.get("iso_639_1") or "") in ("en", "ja", "")]
     if not logos:
         return []
 
+    _tier = {"en": 0, "ja": 1, "": 2}
+
     def sort_key(l: dict) -> tuple:
-        return (-l.get("vote_count", 0), -_quality_key(l)[2])
+        lang = l.get("iso_639_1") or ""
+        return (_tier.get(lang, 3), -l.get("vote_count", 0), -_quality_key(l)[2])
 
     logos.sort(key=sort_key)
 
@@ -83,14 +84,14 @@ async def fetch_logos(client: "TmdbClient", tmdb_id: int, media_type: str) -> li
 async def fetch_posters_ranked(
     client: "TmdbClient", tmdb_id: int, media_type: str,
 ) -> list[dict]:
-    """Fetch ranked poster images from TMDB (English first, then neutral).
+    """Fetch ranked poster images from TMDB (English → Japanese → neutral).
 
     Returns same format as ``fetch_logos`` but with ``w500`` sized URLs.
     """
     try:
         imgs = await client._get(
             f"/{media_type}/{tmdb_id}/images",
-            include_image_language="en,null",
+            include_image_language="en,ja,null",
         )
     except Exception as exc:
         log.warning("tmdb.posters.failed", id=tmdb_id, error=str(exc))
@@ -100,18 +101,19 @@ async def fetch_posters_ranked(
     if not posters:
         return []
 
-    # Posters by spec: English first, then language-neutral. Drop any other
-    # language so the picker only offers EN + textless art.
+    # Posters by spec: English → Japanese → language-neutral. Drop any other
+    # language so the picker only offers EN / JP / textless art.
     posters = [
-        p for p in posters if (p.get("iso_639_1") or "") in ("en", "")
+        p for p in posters if (p.get("iso_639_1") or "") in ("en", "ja", "")
     ]
     if not posters:
         return []
 
+    _tier = {"en": 0, "ja": 1, "": 2}
+
     def sort_key(p: dict) -> tuple:
         lang = p.get("iso_639_1") or ""
-        tier = 0 if lang == "en" else 1  # English first, then neutral
-        return (tier, -p.get("vote_count", 0), -_quality_key(p)[2])
+        return (_tier.get(lang, 3), -p.get("vote_count", 0), -_quality_key(p)[2])
 
     posters.sort(key=sort_key)
 
