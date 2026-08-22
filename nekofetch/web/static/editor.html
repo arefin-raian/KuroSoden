@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Franchise Mapping</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root{
+    --bg: var(--tg-theme-bg-color, #0f1115);
+    --card: var(--tg-theme-secondary-bg-color, #171a21);
+    --text: var(--tg-theme-text-color, #e9edf2);
+    --hint: var(--tg-theme-hint-color, #8b95a3);
+    --accent: var(--tg-theme-button-color, #5b8cff);
+    --accent-text: var(--tg-theme-button-text-color, #ffffff);
+    --danger:#ff5c72; --line: color-mix(in srgb, var(--text) 12%, transparent);
+    --radius:14px;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;background:var(--bg);color:var(--text);
+    font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
+    padding-bottom:96px}
+  header{position:sticky;top:0;z-index:5;background:linear-gradient(var(--bg),color-mix(in srgb,var(--bg) 70%,transparent));
+    backdrop-filter:blur(8px);padding:16px 16px 10px}
+  h1{font-size:17px;font-weight:700;margin:0}
+  .sub{color:var(--hint);font-size:12.5px;margin-top:3px}
+  .wrap{padding:6px 12px 12px}
+  .season{margin:14px 0 6px;display:flex;align-items:center;gap:8px}
+  .season h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--hint);
+    font-weight:700;margin:0}
+  .season .count{font-size:11px;color:var(--hint);background:var(--card);
+    padding:2px 8px;border-radius:20px}
+  ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:7px}
+  li{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--line);
+    border-radius:var(--radius);padding:10px 12px;transition:transform .12s ease,opacity .12s ease,border-color .12s}
+  li.dragging{opacity:.55;border-color:var(--accent);transform:scale(1.01)}
+  li.over{border-color:var(--accent)}
+  .grip{cursor:grab;color:var(--hint);font-size:18px;line-height:1;touch-action:none;
+    padding:2px 2px;user-select:none;flex:0 0 auto}
+  .grip:active{cursor:grabbing}
+  .num{flex:0 0 auto;min-width:34px;height:26px;border-radius:8px;background:var(--accent);
+    color:var(--accent-text);font-weight:700;font-size:12.5px;display:flex;align-items:center;
+    justify-content:center;padding:0 6px}
+  .meta{flex:1 1 auto;min-width:0}
+  .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600;font-size:13.5px}
+  .eptitle{color:var(--hint);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tags{color:var(--hint);font-size:11px;margin-top:1px}
+  .move,.del{flex:0 0 auto;border:0;background:transparent;color:var(--hint);font-size:15px;
+    padding:6px;border-radius:8px;cursor:pointer}
+  .del:active{color:var(--danger)}
+  .seasonpick{flex:0 0 auto;background:transparent;color:var(--text);border:1px solid var(--line);
+    border-radius:8px;padding:5px 6px;font-size:12px}
+  .excluded li{opacity:.7}
+  .excluded .num{background:color-mix(in srgb,var(--danger) 80%,#000);}
+  .restore{color:var(--accent);background:transparent;border:0;font-size:13px;cursor:pointer;padding:6px}
+  .empty{color:var(--hint);font-size:12.5px;padding:8px 2px}
+  footer{position:fixed;left:0;right:0;bottom:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));
+    background:linear-gradient(transparent,var(--bg) 30%)}
+  button.save{width:100%;border:0;border-radius:12px;background:var(--accent);color:var(--accent-text);
+    font-weight:700;font-size:15px;padding:14px;cursor:pointer}
+  button.save[disabled]{opacity:.5}
+  .toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:var(--card);
+    border:1px solid var(--line);color:var(--text);padding:9px 14px;border-radius:20px;font-size:13px;
+    opacity:0;transition:opacity .2s;pointer-events:none}
+  .toast.show{opacity:1}
+  .loading{padding:40px 16px;text-align:center;color:var(--hint)}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Franchise Mapping</h1>
+  <div class="sub">Drag ⠿ to reorder within a season · pick a season · 🗑 excludes a file</div>
+</header>
+<div class="wrap" id="root"><div class="loading">Loading…</div></div>
+<footer><button class="save" id="save" disabled>Save mapping</button></footer>
+<div class="toast" id="toast"></div>
+<script>
+"use strict";
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { try { tg.ready(); tg.expand(); } catch(e){} }
+
+const TOKEN = location.pathname.split("/").pop();
+const INIT = (tg && tg.initData) || "";
+const state = { title:"", seasons:[], files:[], excluded:new Set() };
+let dragId = null;
+
+function toast(msg){ const t=document.getElementById("toast"); t.textContent=msg;
+  t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),1800); }
+
+async function api(method, body){
+  const r = await fetch(`/api/map/${TOKEN}`, {
+    method, headers:{"Content-Type":"application/json","X-Init-Data":INIT},
+    body: body?JSON.stringify(body):undefined });
+  if(!r.ok){ throw new Error((await r.json().catch(()=>({}))).detail || r.status); }
+  return r.json();
+}
+
+function seasonOptions(current){
+  const nums = state.seasons.map(s=>s.season_number).filter(n=>n!=null);
+  const set = [...new Set(nums.length?nums:[1])].sort((a,b)=>a-b);
+  if(!set.includes(current)) set.push(current);
+  return set.sort((a,b)=>a-b).map(n=>
+    `<option value="${n}" ${n===current?"selected":""}>S${String(n).padStart(2,"0")}</option>`).join("");
+}
+
+// Included files grouped by season, ordered by their in-array position.
+function render(){
+  const root = document.getElementById("root");
+  document.getElementById("title").textContent = state.title || "Franchise Mapping";
+  const bySeason = new Map();
+  state.files.forEach(f=>{ if(state.excluded.has(f.index)) return;
+    if(!bySeason.has(f.season)) bySeason.set(f.season, []);
+    bySeason.get(f.season).push(f); });
+  const seasonKeys = [...bySeason.keys()].sort((a,b)=>a-b);
+  let html = "";
+  for(const s of seasonKeys){
+    const list = bySeason.get(s);
+    html += `<div class="season"><h2>Season ${String(s).padStart(2,"0")}</h2>
+      <span class="count">${list.length} ep</span></div><ul data-season="${s}">`;
+    list.forEach((f,i)=>{ html += row(f, i+1); });
+    html += `</ul>`;
+  }
+  // Excluded section.
+  const ex = state.files.filter(f=>state.excluded.has(f.index));
+  html += `<div class="season"><h2>Excluded — not an episode</h2>
+    <span class="count">${ex.length}</span></div>`;
+  if(ex.length){ html += `<ul class="excluded">`; ex.forEach(f=>{ html += exRow(f); }); html += `</ul>`; }
+  else html += `<div class="empty">Nothing excluded. 🗑 on a file moves it here.</div>`;
+  root.innerHTML = html;
+  wire();
+  document.getElementById("save").disabled = false;
+}
+
+function esc(s){ return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function row(f, pos){
+  const tags = (f.resolutions&&f.resolutions.length)? f.resolutions.join(" · ") : "";
+  return `<li draggable="true" data-index="${f.index}">
+    <span class="grip" aria-label="drag">⠿</span>
+    <span class="num">#${pos}</span>
+    <div class="meta">
+      <div class="name">${esc(f.name)}</div>
+      ${f.ep_title?`<div class="eptitle">${esc(f.ep_title)}</div>`:""}
+      ${tags?`<div class="tags">${esc(tags)}</div>`:""}
+    </div>
+    <select class="seasonpick" data-index="${f.index}">${seasonOptions(f.season)}</select>
+    <button class="del" data-index="${f.index}" title="Exclude">🗑</button>
+  </li>`;
+}
+function exRow(f){
+  return `<li data-index="${f.index}">
+    <span class="num">✕</span>
+    <div class="meta"><div class="name">${esc(f.name)}</div></div>
+    <button class="restore" data-index="${f.index}">Restore</button>
+  </li>`;
+}
+
+function wire(){
+  document.querySelectorAll(".del").forEach(b=>b.onclick=()=>{
+    state.excluded.add(+b.dataset.index); haptic(); render(); });
+  document.querySelectorAll(".restore").forEach(b=>b.onclick=()=>{
+    state.excluded.delete(+b.dataset.index); haptic(); render(); });
+  document.querySelectorAll(".seasonpick").forEach(sel=>sel.onchange=()=>{
+    const f = state.files.find(x=>x.index===+sel.dataset.index);
+    if(f){ f.season = +sel.value; haptic(); render(); } });
+  // Native HTML5 drag-and-drop for reordering within a season list.
+  document.querySelectorAll('li[draggable="true"]').forEach(li=>{
+    li.addEventListener("dragstart",e=>{ dragId=+li.dataset.index; li.classList.add("dragging");
+      e.dataTransfer.effectAllowed="move"; });
+    li.addEventListener("dragend",()=>{ li.classList.remove("dragging");
+      document.querySelectorAll("li.over").forEach(x=>x.classList.remove("over")); });
+    li.addEventListener("dragover",e=>{ e.preventDefault(); li.classList.add("over"); });
+    li.addEventListener("dragleave",()=>li.classList.remove("over"));
+    li.addEventListener("drop",e=>{ e.preventDefault(); li.classList.remove("over");
+      onDrop(+li.dataset.index); });
+  });
+}
+
+// Reorder: move dragged file to the target's position, adopting the target's
+// season (so dragging across season lists reassigns season too).
+function onDrop(targetIdx){
+  if(dragId==null || dragId===targetIdx) return;
+  const from = state.files.findIndex(f=>f.index===dragId);
+  const to = state.files.findIndex(f=>f.index===targetIdx);
+  if(from<0||to<0) return;
+  const [moved] = state.files.splice(from,1);
+  moved.season = state.files[to>from?to-1:to].season; // adopt target's season
+  const insertAt = state.files.findIndex(f=>f.index===targetIdx);
+  state.files.splice(insertAt,0,moved);
+  haptic(); render();
+}
+function haptic(){ try{ tg && tg.HapticFeedback && tg.HapticFeedback.selectionChanged(); }catch(e){} }
+
+// Build the layout the API expects: per-file {index, season, position}, where
+// position is the 1-based order within the file's season (array order), plus the
+// excluded index list.
+function buildLayout(){
+  const perSeason = {};
+  const files = [];
+  for(const f of state.files){
+    if(state.excluded.has(f.index)) continue;
+    perSeason[f.season] = (perSeason[f.season]||0) + 1;
+    files.push({index:f.index, season:f.season, position:perSeason[f.season]});
+  }
+  return { files, excluded:[...state.excluded] };
+}
+
+async function save(){
+  const btn = document.getElementById("save"); btn.disabled=true; btn.textContent="Saving…";
+  try{
+    await api("POST", { init_data:INIT, layout:buildLayout() });
+    toast("Saved ✓");
+    if(tg){ try{ tg.HapticFeedback.notificationOccurred("success"); }catch(e){}
+      setTimeout(()=>tg.close(), 700); }
+  }catch(err){ toast("Save failed: "+err.message); btn.disabled=false; btn.textContent="Save mapping"; }
+}
+
+async function load(){
+  try{
+    const data = await api("GET");
+    state.title = data.title; state.seasons = data.seasons||[];
+    state.files = (data.files||[]).map(f=>({...f, season:f.season||1}));
+    // Pre-exclude files the mapper already treats as non-episodes (kind!=episode).
+    state.files.forEach(f=>{ if(f.kind && f.kind!=="episode") state.excluded.add(f.index); });
+    render();
+  }catch(err){
+    document.getElementById("root").innerHTML =
+      `<div class="loading">Couldn't load this mapping.<br><small>${esc(err.message)}</small></div>`;
+  }
+}
+document.getElementById("save").onclick = save;
+load();
+</script>
+</body>
+</html>

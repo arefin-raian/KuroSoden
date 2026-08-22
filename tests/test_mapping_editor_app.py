@@ -159,3 +159,20 @@ def test_post_rejects_bad_initdata(client_and_container):
     r = client.post(f"/api/map/{token}",
                     json={"init_data": _sign(1, token="999:WRONG"), "layout": {}})
     assert r.status_code == 401
+
+
+def test_editor_page_is_served(client_and_container):
+    client, _container = client_and_container
+    r = client.get("/map/whatever-token")
+    assert r.status_code == 200
+    html = r.text
+    # Key hooks the editor JS relies on + the Telegram Web App SDK.
+    assert "telegram-web-app.js" in html
+    assert 'id="save"' in html and 'id="root"' in html
+    assert "/api/map/" in html            # it fetches the payload
+    assert "buildLayout" in html          # the layout serializer exists
+
+
+def test_healthz(client_and_container):
+    client, _container = client_and_container
+    assert client.get("/healthz").json() == {"ok": True}
