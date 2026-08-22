@@ -51,6 +51,16 @@ log = get_logger(__name__)
 STATE_NAME = "redo:await_name"
 STATE_FRANCHISE = "redo:franchise"
 
+# Commands that must NEVER be swallowed as a redo search title. Mirrors the
+# request/batch reserved lists (so their own handlers keep working) and adds
+# "cancel" — the abort command below. Without this, the group-3 text intake
+# treated "/cancel" / "/redo" as a title and searched AniList for it (the owner's
+# "it's searching for commands even" bug).
+_REDO_RESERVED = [
+    "start", "help", "myrequests", "admin", "settings",
+    "batch", "cleardatabase", "redo", "cancel",
+]
+
 
 def _esc_q(text: str) -> str:
     return html.escape(text or "", quote=False)
@@ -119,25 +129,57 @@ def register(client: Client, container: Container) -> None:
         await q.answer()
         await _prompt(q.message.chat.id, q.from_user.id, old_msg=q.message)
 
-    # ── Callback: cancel the redo ─────────────────────────────────────────
+    # ── Cancel the redo (shared by the button + /cancel command) ──────────
+    async def _cancel_redo(user_id: int, chat_id: int, *, old_msg: Message | None) -> None:
+        """Clear the redo FSM and show the cancelled card."""
+        await fsm.clear(user_id)
+        await send_screen(
+            client, chat_id,
+            Screen(caption=V.REDO_CANCELLED, image=pick_artwork("lelouch")),
+            old_msg=old_msg,
+        )
+
     @client.on_callback_query(filters.regex(r"^redo\|cancel"))
     async def _redo_cancel(_: Client, q: CallbackQuery) -> None:
         if not _is_owner(q, container):
             await q.answer(V.OWNER_ONLY, show_alert=True)
             return
-        await fsm.clear(q.from_user.id)
         await q.answer()
-        await send_screen(
-            client, q.message.chat.id,
-            Screen(caption=V.REDO_CANCELLED, image=pick_artwork("lelouch")),
-            old_msg=q.message,
-        )
+        await _cancel_redo(q.from_user.id, q.message.chat.id, old_msg=q.message)
+
+    # ── /cancel command — abort an in-progress /redo ──────────────────────
+    # Scoped to the redo FSM (namespace "lelouch_redo"): it only acts when the
+    # owner is actually mid-/redo, so it's inert for everyone else and never
+    # steps on the request/batch flows (which own their inline Cancel buttons).
+    # This is what the owner reached for ("/cancel to stop asking for a value")
+    # and it previously did nothing — the text intake ate it as a search title.
+    @client.on_message(filters.command("cancel") & filters.private)
+    async def _redo_cancel_cmd(_: Client, message: Message) -> None:
+        if not message.from_user or not _is_owner(message, container):
+            return
+        state, data = await fsm.get(message.from_user.id)
+        if not state:
+            return  # not mid-redo → nothing to cancel; stay silent
+        # Evolve the original prompt card in place when we still have its ref;
+        # otherwise a fresh cancelled card. Drop the "/cancel" text for tidiness.
+        prompt = (message_ref(client,
+                              data.get("prompt_chat_id") or message.chat.id,
+                              data.get("prompt_msg_id"))
+                  if data.get("prompt_msg_id") else None)
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001 — best-effort tidy
+            pass
+        await _cancel_redo(message.from_user.id, message.chat.id, old_msg=prompt)
 
     # ── Text handler — AniList search (NO dedup guard) ────────────────────
     # group=3 so it runs independently of the request (group 0) and batch
     # (group 2) text handlers; it only acts when the owner is mid-/redo (FSM),
     # so it's inert for everyone else.
-    @client.on_message(filters.text & filters.private, group=3)
+    @client.on_message(
+        filters.text & filters.private & ~filters.command(_REDO_RESERVED),
+        group=3,
+    )
     async def _text(_: Client, message: Message) -> None:
         if not message.from_user:
             return
@@ -146,6 +188,10 @@ def register(client: Client, container: Container) -> None:
             if not _is_owner(message, container):
                 return
             query = message.text.strip()
+            # Defence-in-depth: never treat ANY slash-command as a search title,
+            # even one not in _REDO_RESERVED — let its own handler deal with it.
+            if query.startswith("/"):
+                return
             # One card, always updated: drop the owner's typed title, then evolve
             # the existing "Order a redo" prompt card into the confirm card in
             # place — no separate "searching…" card, nothing orphaned.

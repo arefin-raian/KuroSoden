@@ -68,7 +68,7 @@ STATE_BATCH_CONFIRM = "lelouch_batch:confirm"  # final approval card, ready to c
 _FR_PAGE = 5
 
 # Commands the batch text handler must never swallow.
-_RESERVED = ["start", "help", "myrequests", "admin", "settings", "batch", "cleardatabase"]
+_RESERVED = ["start", "help", "myrequests", "admin", "settings", "batch", "cleardatabase", "cancel"]
 
 BOT = "lelouch"
 
