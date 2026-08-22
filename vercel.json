@@ -5,7 +5,7 @@
     "nekofetch/web/vercel_entry.py": {
       "maxDuration": 30,
       "memory": 512,
-      "excludeFiles": "{.venv/**,tests/**,test_*.py,**/test_*.py,**/*.test.py,data/**,images/**,thumbnail/**,tools/**,playground/**,Leech-main/**,migrations/**,docs/**,scripts/**,resources/**,_subs_probe/**,#issue/**,**/*.png,**/*.jpg,**/*.jpeg,**/*.pdf,**/*.svg,**/*.ipynb,**/__pycache__/**}"
+      "excludeFiles": "{tests/**,**/test_*.py,images/**,thumbnail/**,tools/**,Leech-main/**,playground/**,docs/**,resources/**,**/*.png,**/*.jpg,**/*.pdf,**/*.ipynb}"
     }
   }
 }
