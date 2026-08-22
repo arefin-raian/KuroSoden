@@ -9,3 +9,8 @@
 fastapi>=0.117.0
 redis>=5.0.0
 structlog>=24.1.0
+# Required, not optional: `from fastapi import Request` imports starlette.formparsers,
+# which does an UNGUARDED `import python_multipart`. pip does NOT auto-install it
+# (it's a fastapi extra), so without this the function crashes on every request
+# with FUNCTION_INVOCATION_FAILED. (ujson/orjson ARE optional — guarded by fastapi.)
+python-multipart>=0.0.9
