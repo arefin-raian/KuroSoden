@@ -81,7 +81,8 @@ def _esc(text: str) -> str:
     return _html.escape(text or "", quote=False)
 
 
-def _torrent_map_kb(L, code: str, map_url: str, *, with_fix: bool = True) -> InlineKeyboardMarkup:
+def _torrent_map_kb(L, code: str, map_url: str, *, with_fix: bool = True,
+                    edit_button: "InlineKeyboardButton | None" = None) -> InlineKeyboardMarkup:
     """Mapping card keyboard — a single, STABLE button set.
 
     The old card had four overlapping buttons (Full Mapping / Details / Toggle /
@@ -90,6 +91,7 @@ def _torrent_map_kb(L, code: str, map_url: str, *, with_fix: bool = True) -> Inl
     original card (the owner's "Fix Seasons → Back drops the buttons" bug). This
     renders the SAME rows on every paint, keyed only by ``code``:
 
+      • 🎬 Edit mapping (WebApp) — the visual editor, when configured (top row).
       • Full Mapping  — the structured read-only view (Telegraph page when we have
         a URL, else an inline callback so the button NEVER collapses into a bare
         caption hyperlink).
@@ -98,9 +100,13 @@ def _torrent_map_kb(L, code: str, map_url: str, *, with_fix: bool = True) -> Inl
       • Confirm / Back.
 
     ``with_fix`` is accepted for backward-compat but ignored (the keyboard no
-    longer branches on it).
+    longer branches on it). ``edit_button`` (a WebApp button) is added as the top
+    row when the mapping editor is configured; the text/button Edit hub stays as
+    the fallback.
     """
     rows: list[list[InlineKeyboardButton]] = []
+    if edit_button is not None:
+        rows.append([edit_button])
     if map_url:
         rows.append([InlineKeyboardButton(L(M.TORRENT_MAP_BTN_FULL), url=map_url)])
     else:
@@ -1398,7 +1404,27 @@ def register(client: Client, container: Container) -> None:
 
         text = L(M.TORRENT_MAP_CONFIRM, title=L(M.TORRENT_MAP_TITLE),
                  mapping=summary)
-        kb = _torrent_map_kb(L, code, map_url or "")
+        # Visual mapping editor (WebApp) as the top button when configured. Its
+        # Save writes the rebuilt mapping back into THIS user's FSM working set,
+        # so the card's existing Confirm stays the single enqueue point. The
+        # text/button Edit hub remains as the fallback (and when the editor is off).
+        _edit_btn = None
+        try:
+            from nekofetch.web.editor_button import mapping_editor_button
+            _edit_btn = await mapping_editor_button(
+                container,
+                working_set={
+                    "mapping": tmapping.to_dict(),
+                    "ordered_files": ordered_files,
+                    "episode_titles": {str(k): v for k, v in ep_titles.items()},
+                    "title": title,
+                },
+                release={"kind": "torrent", "code": code,
+                         "user_id": user_id, "bot": "admin"},
+            )
+        except Exception:  # noqa: BLE001 — editor is optional
+            _edit_btn = None
+        kb = _torrent_map_kb(L, code, map_url or "", edit_button=_edit_btn)
         await show(client, msg, text, kb)
 
     async def _torrent_enqueue(

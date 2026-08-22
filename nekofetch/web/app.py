@@ -101,17 +101,14 @@ async def _commit_and_release(container, sess, mapping_dict: dict) -> None:
         await safe_redis_delete(redis, await_key(job_id, "ddlmap"),
                                 label="mapedit.ddl.release")
     elif kind == "torrent":
-        # Persist onto the request + enqueue — the torrent card's Confirm path.
-        from nekofetch.services.request_service import RequestService
-        from nekofetch.services.queue_service import QueueService
-        code = rel["code"]
-        rs = RequestService(container)
-        req = await rs.get(code)
-        fr = dict(getattr(req, "franchise_data", None) or {})
-        fr["_torrent_mapping"] = mapping_dict
-        await rs.update_franchise_data(code, fr)
-        if rel.get("enqueue", True):
-            await QueueService(container).enqueue(code)
+        # Write the rebuilt mapping back into the admin's FSM working set so the
+        # torrent card's existing "Confirm" stays the SINGLE enqueue point (its
+        # _torrent_map_confirm reads data["torrent_mapping"] from the FSM). We do
+        # NOT enqueue here — that would double-enqueue against Confirm.
+        from nekofetch.bots.fsm import FSM
+        user_id = int(rel["user_id"])
+        await FSM(redis, bot=rel.get("bot", "admin")).update(
+            user_id, torrent_mapping=mapping_dict)
     else:
         raise ValueError(f"unknown release kind: {kind!r}")
 

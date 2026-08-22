@@ -128,10 +128,41 @@ async def _run() -> None:
         except NotImplementedError:  # Windows
             pass
 
+    editor_server = None
+    editor_task = None
     try:
         await manager.start()
+        # Mapping-editor web server (Telegram Mini App) — only when a public HTTPS
+        # base URL is configured. Runs on the SAME event loop as the bots via a
+        # uvicorn Server task, so it shares Redis/Postgres and stops with them.
+        if getattr(container.env, "mapping_editor_base_url", ""):
+            try:
+                import uvicorn
+
+                from nekofetch.web.app import build_app
+
+                cfg = uvicorn.Config(
+                    build_app(container), host="0.0.0.0",
+                    port=int(container.env.mapping_editor_port),
+                    log_level="warning", access_log=False,
+                )
+                editor_server = uvicorn.Server(cfg)
+                editor_server.install_signal_handlers = lambda: None  # we own signals
+                editor_task = asyncio.create_task(editor_server.serve())
+                log.info("mapping_editor.serving",
+                         port=int(container.env.mapping_editor_port),
+                         base_url=container.env.mapping_editor_base_url)
+            except Exception as exc:  # noqa: BLE001 — editor is optional; never block bots
+                log.warning("mapping_editor.start_failed", error=str(exc))
         await stop.wait()
     finally:
+        if editor_server is not None:
+            editor_server.should_exit = True
+            if editor_task is not None:
+                try:
+                    await asyncio.wait_for(editor_task, timeout=5)
+                except Exception:  # noqa: BLE001 — best-effort shutdown
+                    editor_task.cancel()
         await manager.stop()
         await container.shutdown()
 

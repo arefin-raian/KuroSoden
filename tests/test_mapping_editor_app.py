@@ -176,3 +176,34 @@ def test_editor_page_is_served(client_and_container):
 def test_healthz(client_and_container):
     client, _container = client_and_container
     assert client.get("/healthz").json() == {"ok": True}
+
+
+def test_post_save_torrent_writes_fsm_not_enqueue(client_and_container):
+    client, container = client_and_container
+    # Seed the admin FSM working set (as _show_torrent_mapping would) + a session.
+    import json as _json
+    from nekofetch.core.constants import REDIS_FSM
+    from nekofetch.web.mapping_session import MappingSession, _session_key
+    uid = 6161189904
+    fsm_key = REDIS_FSM.format(bot="admin", user_id=uid)
+    container.redis.d[fsm_key] = _json.dumps({
+        "state": "staff:torrent_map",
+        "data": {"code": "REQ-T1", "torrent_mapping": {"stale": True}},
+    })
+    token = "tok-torrent"
+    container.redis.d[_session_key(token)] = MappingSession(
+        token=token, working_set=_working_set(),
+        release={"kind": "torrent", "code": "REQ-T1", "user_id": uid, "bot": "admin"},
+    ).to_json()
+
+    layout = {"files": [{"index": i, "season": 1, "position": i + 1}
+                        for i in range(4)], "excluded": []}
+    r = client.post(f"/api/map/{token}", json={"init_data": _sign(uid), "layout": layout})
+    assert r.status_code == 200
+
+    # The admin FSM's torrent_mapping was updated in place; no DownloadJob path
+    # was taken (pg_sessionmaker is None — enqueue would have crashed).
+    fsm_data = _json.loads(container.redis.d[fsm_key])["data"]
+    assert fsm_data["torrent_mapping"] != {"stale": True}
+    m = TorrentMapping.from_dict(fsm_data["torrent_mapping"])
+    assert sum(e.actual for e in m.entries) >= 1

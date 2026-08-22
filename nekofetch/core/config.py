@@ -109,6 +109,14 @@ class EnvSettings(BaseSettings):
     # FLOOD_WAIT / connection resets under many parallel streams.
     upload_concurrency: int = Field(0, alias="UPLOAD_CONCURRENCY")
 
+    # ── Mapping editor (Telegram Mini App) ──────────────────────────────────────
+    # The franchise-mapping editor is served over HTTP and opened as a Mini App
+    # from the mapping card. Enabled only when a PUBLIC HTTPS base URL is set (a
+    # Mini App requires https + the domain registered with BotFather). When empty,
+    # the bots fall back to the legacy text-command "Fix seasons" flow.
+    mapping_editor_base_url: str = Field("", alias="MAPPING_EDITOR_BASE_URL")
+    mapping_editor_port: int = Field(8100, alias="MAPPING_EDITOR_PORT")
+
     @field_validator("storage_path", mode="before")
     @classmethod
     def _coerce_storage_path(cls, v: Any) -> Path:

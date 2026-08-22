@@ -479,10 +479,32 @@ class NamingConfirm:
         from pyrogram.enums import ParseMode
         from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-        kb = InlineKeyboardMarkup([[
+        # Visual mapping editor (Telegram Mini App) — a top-row "Edit mapping"
+        # WebApp button when configured; the text "Fix seasons" flow stays as the
+        # fallback (and when the editor is off). The editor's Save commits the
+        # mapping + releases this same gate, so Proceed still works either way.
+        rows: list[list[InlineKeyboardButton]] = []
+        try:
+            from nekofetch.web.editor_button import mapping_editor_button
+            _edit_btn = await mapping_editor_button(
+                self._c,
+                working_set={
+                    "mapping": mapping_dict, "ordered_files": ordered_files,
+                    "episode_titles": episode_titles or {},
+                    "encode_heights": encode_heights, "fallbacks_cfg": fallbacks_cfg,
+                    "title": (franchise or {}).get("english") or (franchise or {}).get("title") or "",
+                },
+                release={"kind": "ddlmap", "job_id": job_id},
+            )
+        except Exception:  # noqa: BLE001 — editor is optional
+            _edit_btn = None
+        if _edit_btn is not None:
+            rows.append([_edit_btn])
+        rows.append([
             InlineKeyboardButton("✅ Proceed", callback_data=cb("levi", "nmuse", job_id, kind)),
             InlineKeyboardButton("🔧 Fix seasons", callback_data=cb("levi", "ddlfix", job_id)),
-        ]])
+        ])
+        kb = InlineKeyboardMarkup(rows)
         card_id = None
         if msg_id is not None:
             try:
