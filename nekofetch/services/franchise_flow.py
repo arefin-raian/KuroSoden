@@ -21,10 +21,13 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
 from nekofetch.domain.enums import ContentKind
+
+if TYPE_CHECKING:  # type-only: keeps the heavy container graph out of runtime imports
+    from nekofetch.core.container import Container
 
 log = get_logger(__name__)
 

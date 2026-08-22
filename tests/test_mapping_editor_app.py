@@ -49,7 +49,11 @@ def _container():
     return SimpleNamespace(
         redis=_Redis(),
         env=SimpleNamespace(downloader_bot_token=_TOKEN, admin_bot_token="222:ADM"),
-        pg_sessionmaker=None,
+        # Truthy sentinel → the DB-backed STAFF branch runs (and hits the stubbed
+        # AuthService below). The commit paths never touch it. Env whitelist is
+        # empty here, so these tests exercise the DB path; the env-whitelist path
+        # is covered by test_env_whitelist_authorizes_without_db.
+        pg_sessionmaker=object(),
     )
 
 
@@ -178,6 +182,35 @@ def test_healthz(client_and_container):
     assert client.get("/healthz").json() == {"ok": True}
 
 
+def test_env_whitelist_authorizes_without_db(monkeypatch):
+    """The Vercel deployment mode: no database (pg_sessionmaker=None), auth by the
+    env owner/admin whitelist alone. AuthService must NOT be consulted."""
+    import nekofetch.services.auth_service as auth_mod
+
+    class _Boom:
+        def __init__(self, _c):
+            raise AssertionError("AuthService must not be constructed on the env path")
+
+    monkeypatch.setattr(auth_mod, "AuthService", _Boom)
+
+    uid = 424242
+    container = SimpleNamespace(
+        redis=_Redis(),
+        env=SimpleNamespace(downloader_bot_token=_TOKEN, admin_bot_token="222:ADM",
+                            admin_ids=[uid], owner_id=0),
+        pg_sessionmaker=None,          # no DB — the Vercel case
+    )
+    token = _seed(container, {"kind": "ddlmap", "job_id": 7})
+    client = TestClient(webapp.build_app(container))
+
+    # In the whitelist → authorized without touching AuthService.
+    r = client.get(f"/api/map/{token}", headers={"X-Init-Data": _sign(uid)})
+    assert r.status_code == 200
+    # NOT in the whitelist + no DB → 401.
+    r2 = client.get(f"/api/map/{token}", headers={"X-Init-Data": _sign(999999)})
+    assert r2.status_code == 401
+
+
 def test_post_save_torrent_writes_fsm_not_enqueue(client_and_container):
     client, container = client_and_container
     # Seed the admin FSM working set (as _show_torrent_mapping would) + a session.
@@ -201,8 +234,9 @@ def test_post_save_torrent_writes_fsm_not_enqueue(client_and_container):
     r = client.post(f"/api/map/{token}", json={"init_data": _sign(uid), "layout": layout})
     assert r.status_code == 200
 
-    # The admin FSM's torrent_mapping was updated in place; no DownloadJob path
-    # was taken (pg_sessionmaker is None — enqueue would have crashed).
+    # The admin FSM's torrent_mapping was updated in place; the torrent commit
+    # path uses FSM/redis only and never enqueues (Confirm stays the single
+    # enqueue point), so pg_sessionmaker is irrelevant to it.
     fsm_data = _json.loads(container.redis.d[fsm_key])["data"]
     assert fsm_data["torrent_mapping"] != {"stale": True}
     m = TorrentMapping.from_dict(fsm_data["torrent_mapping"])

@@ -1,0 +1,11 @@
+# Minimal dependency set for the Vercel deployment of the mapping editor.
+#
+# Vercel installs ONLY this (via `installCommand` in vercel.json), NOT the bots'
+# full pyproject/requirements — the editor's request path imports just these plus
+# the Python stdlib. Do NOT add Pyrogram / SQLAlchemy / Pillow / etc. here: the
+# whole point is a tiny, fast serverless bundle. The heavy modules that would
+# need them are never imported on Vercel (their `Container` type-import is
+# TYPE_CHECKING-guarded).
+fastapi>=0.117.0
+redis>=5.0.0
+structlog>=24.1.0

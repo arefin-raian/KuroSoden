@@ -31,7 +31,18 @@ dependencies = [
     "playwright>=1.44.0",
     "pillow>=10.0.0",
     "uvloop>=0.19.0 ; sys_platform != 'win32'",
+    # Mapping-editor Mini App server (used by the bots when MAPPING_EDITOR_BASE_URL
+    # is set, and the app Vercel serves). Vercel installs its own minimal subset
+    # from requirements-vercel.txt via installCommand — not this full list.
+    "fastapi>=0.117.0",
+    "uvicorn[standard]>=0.30.0",
 ]
+
+[tool.vercel]
+# Explicit ASGI entrypoint for the Vercel deployment of the mapping editor, so
+# Vercel loads THIS app rather than the bots' root main.py (also a detected
+# entrypoint name). Deps come from requirements-vercel.txt (see vercel.json).
+entrypoint = "nekofetch.web.vercel_entry:app"
 
 [project.optional-dependencies]
 dev = [

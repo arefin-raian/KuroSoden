@@ -45,9 +45,40 @@ def _staff_bot_tokens(container) -> list[str]:
     return [t for t in tokens if t]
 
 
+def _env_principal_ids(container) -> set[int]:
+    """Owner + admin Telegram ids from env — the whitelist that ALWAYS wins.
+
+    Mirrors :class:`AuthService` (whose docstring states "the .env admin whitelist
+    always wins"). Consulting it here lets the editor authorize the owner/admins
+    WITHOUT a database — the deployment mode used on Vercel, where the function is
+    intentionally DB-less (``pg_sessionmaker is None``) to stay a tiny bundle."""
+    env = container.env
+    ids: set[int] = set()
+    for aid in (getattr(env, "admin_ids", None) or []):
+        try:
+            ids.add(int(aid))
+        except (TypeError, ValueError):
+            continue
+    try:
+        owner = int(getattr(env, "owner_id", 0) or 0)
+    except (TypeError, ValueError):
+        owner = 0
+    if owner:
+        ids.add(owner)
+    return ids
+
+
 async def _authenticate(container, init_data: str) -> dict:
     """Validate initData against any staff bot token → return the user dict, or
-    raise MiniAppAuthError. Then require the user to be staff (role check)."""
+    raise MiniAppAuthError. Then require the user to be staff.
+
+    Staff gate, in order:
+      1. The env owner/admin whitelist always wins — no DB round-trip (and the
+         only path available on the DB-less Vercel deployment).
+      2. DB-backed STAFF check via :class:`AuthService`, consulted ONLY when a
+         database is wired (``pg_sessionmaker`` present) — i.e. the full bot
+         deployment, where DB-stored STAFF (not just env admins) may use it.
+    """
     user = None
     last_err: Exception | None = None
     for token in _staff_bot_tokens(container):
@@ -59,16 +90,21 @@ async def _authenticate(container, init_data: str) -> dict:
     if user is None:
         raise MiniAppAuthError(str(last_err) or "no bot token matched")
 
-    # Staff gate: resolve the Telegram id and require STAFF/ADMIN.
-    from nekofetch.services.auth_service import AuthService
-    from nekofetch.domain.enums import Role
-    nf_user = await AuthService(container).resolve_user(int(user["id"]))
-    try:
-        if Role(getattr(nf_user, "role", None)) not in (Role.STAFF, Role.ADMIN):
-            raise MiniAppAuthError("not staff")
-    except ValueError:
-        raise MiniAppAuthError("unknown role")
-    return user
+    tid = int(user["id"])
+    # 1) Env whitelist — authoritative, DB-free.
+    if tid in _env_principal_ids(container):
+        return user
+    # 2) DB-backed STAFF, only when a database is actually configured.
+    if getattr(container, "pg_sessionmaker", None) is not None:
+        from nekofetch.services.auth_service import AuthService
+        from nekofetch.domain.enums import Role
+        nf_user = await AuthService(container).resolve_user(tid)
+        try:
+            if Role(getattr(nf_user, "role", None)) in (Role.STAFF, Role.ADMIN):
+                return user
+        except ValueError:
+            pass
+    raise MiniAppAuthError("not staff")
 
 
 async def _commit_and_release(container, sess, mapping_dict: dict) -> None:

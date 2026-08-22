@@ -31,8 +31,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+from typing import TYPE_CHECKING
 
-from nekofetch.core.container import Container
 from nekofetch.core.logging import get_logger
 from nekofetch.core.redis_safe import (
     safe_redis_delete,
@@ -40,6 +40,9 @@ from nekofetch.core.redis_safe import (
     safe_redis_mget,
     safe_redis_set,
 )
+
+if TYPE_CHECKING:  # type-only: keeps the heavy container graph out of runtime imports
+    from nekofetch.core.container import Container
 
 log = get_logger(__name__)
 

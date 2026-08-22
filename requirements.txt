@@ -30,3 +30,9 @@ beautifulsoup4>=4.12.0
 # Arabic/…; langdetect handles Latin scripts) instead of the @AniXWeebs placeholder.
 langdetect>=1.0.9
 
+# Mapping-editor Mini App server (served by the bots when MAPPING_EDITOR_BASE_URL
+# is set). The Vercel deployment installs its own minimal subset — see
+# requirements-vercel.txt — and does NOT use this file.
+fastapi>=0.117.0
+uvicorn[standard]>=0.30.0
+
