@@ -124,7 +124,9 @@ def test_get_requires_valid_initdata(client_and_container):
     assert r.status_code == 200
     body = r.json()
     assert len(body["files"]) == 4
-    assert {s["season_number"] for s in body["seasons"]} == {1, 2}
+    # Payload now exposes a section per franchise entry (seasons here).
+    assert {s["season_number"] for s in body["sections"]
+            if s["kind"] == "episode"} == {1, 2}
 
 
 def test_post_save_ddl_releases_gate(client_and_container):

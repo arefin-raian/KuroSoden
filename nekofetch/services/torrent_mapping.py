@@ -284,6 +284,7 @@ def build_torrent_mapping(
     episode_titles: dict[int, list[dict]] | None = None,
     season_overrides: dict[int, int] | None = None,
     episode_overrides: dict[int, int] | None = None,
+    kind_overrides: dict[int, str] | None = None,
     junk_indices: set[int] | None = None,
 ) -> TorrentMapping:
     """Map torrent files to franchise entries.
@@ -307,12 +308,19 @@ def build_torrent_mapping(
     land in ``unmatched`` (the "doesn't belong here" bucket) instead of being
     assigned an episode slot (the "Season 1 Trailer 1 became E01" fix).
 
+    ``kind_overrides`` maps ``file_index → kind`` (``"episode"`` / ``"special"`` /
+    ``"movie"`` / ``"ova"``) — the visual editor's section assignment. It lets the
+    admin RESCUE a file the parser mis-classified (e.g. force a "special"-looking
+    file back into a season as ``episode``) or PLACE an ambiguous file onto a
+    Special/Movie entry. Wins over the parsed kind; applied before grouping.
+
     Before grouping, every file's season (and episode, for flat absolute-numbered
     releases) is run through the season-mapping cascade so a franchise with several
     seasons is no longer collapsed onto S1 by ``parse_release_meta``'s default.
     """
     episode_titles = episode_titles or {}
     junk_indices = junk_indices or set()
+    kind_overrides = kind_overrides or {}
 
     # ── season-mapping cascade (auto → MAL titles → absolute → manual) ──────────
     # Rewrite each file's season/episode from the resolver before the historic
@@ -329,6 +337,17 @@ def build_torrent_mapping(
         ordered_files = [
             {**f, "episode": episode_overrides[f["index"]]}
             if f.get("index") in episode_overrides else f
+            for f in ordered_files
+        ]
+
+    # Manual kind (the web editor's section assignment): force a file into
+    # ``episode`` (rescue a mis-classified file into a season) or ``special`` /
+    # ``movie`` / ``ova`` (place it on that franchise entry). Applied after the
+    # episode override, before junk — junk still wins (an excluded file stays out).
+    if kind_overrides:
+        ordered_files = [
+            {**f, "kind": kind_overrides[f["index"]]}
+            if f.get("index") in kind_overrides else f
             for f in ordered_files
         ]
 

@@ -7,69 +7,90 @@
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root{
-    --bg: var(--tg-theme-bg-color, #0f1115);
-    --card: var(--tg-theme-secondary-bg-color, #171a21);
-    --text: var(--tg-theme-text-color, #e9edf2);
-    --hint: var(--tg-theme-hint-color, #8b95a3);
-    --accent: var(--tg-theme-button-color, #5b8cff);
+    --bg: var(--tg-theme-bg-color, #0e1013);
+    --card: var(--tg-theme-secondary-bg-color, #16191f);
+    --card-2: color-mix(in srgb, var(--card) 80%, var(--text) 5%);
+    --text: var(--tg-theme-text-color, #eef1f5);
+    --hint: var(--tg-theme-hint-color, #8a94a2);
+    --accent: var(--tg-theme-button-color, #4b8dff);
     --accent-text: var(--tg-theme-button-text-color, #ffffff);
-    --danger:#ff5c72; --line: color-mix(in srgb, var(--text) 12%, transparent);
-    --radius:14px;
+    --danger:#ff5468; --warn:#f5a524;
+    --line: color-mix(in srgb, var(--text) 10%, transparent);
+    --radius:16px;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html,body{margin:0;background:var(--bg);color:var(--text);
     font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
-    padding-bottom:96px}
-  header{position:sticky;top:0;z-index:5;background:linear-gradient(var(--bg),color-mix(in srgb,var(--bg) 70%,transparent));
-    backdrop-filter:blur(8px);padding:16px 16px 10px}
-  h1{font-size:17px;font-weight:700;margin:0}
-  .sub{color:var(--hint);font-size:12.5px;margin-top:3px}
-  .wrap{padding:6px 12px 12px}
-  .season{margin:14px 0 6px;display:flex;align-items:center;gap:8px}
-  .season h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--hint);
-    font-weight:700;margin:0}
-  .season .count{font-size:11px;color:var(--hint);background:var(--card);
-    padding:2px 8px;border-radius:20px}
-  ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:7px}
-  li{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--line);
-    border-radius:var(--radius);padding:10px 12px;transition:transform .12s ease,opacity .12s ease,border-color .12s}
-  li.dragging{opacity:.55;border-color:var(--accent);transform:scale(1.01)}
-  li.over{border-color:var(--accent)}
-  .grip{cursor:grab;color:var(--hint);font-size:18px;line-height:1;touch-action:none;
-    padding:2px 2px;user-select:none;flex:0 0 auto}
-  .grip:active{cursor:grabbing}
-  .num{flex:0 0 auto;min-width:34px;height:26px;border-radius:8px;background:var(--accent);
-    color:var(--accent-text);font-weight:700;font-size:12.5px;display:flex;align-items:center;
-    justify-content:center;padding:0 6px}
+    padding-bottom:100px;overscroll-behavior:none}
+  header{position:sticky;top:0;z-index:5;
+    background:linear-gradient(var(--bg),color-mix(in srgb,var(--bg) 60%,transparent));
+    backdrop-filter:blur(10px);padding:18px 18px 12px}
+  h1{font-size:18px;font-weight:700;margin:0;letter-spacing:-.01em}
+  .sub{color:var(--hint);font-size:12.5px;margin-top:4px}
+  .wrap{padding:4px 12px 12px}
+  .section{margin:18px 4px 8px;display:flex;align-items:center;gap:8px}
+  .section h2{font-size:11.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--hint);
+    font-weight:700;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .section .count{font-size:11px;color:var(--hint);background:var(--card);
+    padding:2px 9px;border-radius:20px;flex:0 0 auto}
+  .section.unsure h2{color:var(--warn)}
+  ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px;min-height:6px}
+  li{display:flex;align-items:center;gap:9px;background:var(--card);border:1px solid var(--line);
+    border-radius:var(--radius);padding:9px 10px 9px 6px;
+    transition:transform .16s cubic-bezier(.2,.7,.3,1),box-shadow .16s,border-color .16s,opacity .16s;
+    touch-action:pan-y}
+  li.dragging{opacity:.97;border-color:var(--accent);
+    box-shadow:0 12px 34px -10px rgba(0,0,0,.6);transform:scale(1.02);z-index:10;position:relative}
+  .unsure li{border-color:color-mix(in srgb,var(--warn) 45%,var(--line))}
+  .grip{display:flex;align-items:center;justify-content:center;color:var(--hint);
+    width:24px;height:36px;flex:0 0 auto;cursor:grab;touch-action:none;border-radius:8px}
+  .grip:active{cursor:grabbing;background:color-mix(in srgb,var(--text) 8%,transparent)}
+  .grip svg{width:16px;height:16px;opacity:.7}
+  .num{flex:0 0 auto;min-width:28px;height:28px;border-radius:9px;
+    background:color-mix(in srgb,var(--accent) 16%,transparent);
+    color:var(--accent);font-weight:700;font-size:12.5px;display:flex;align-items:center;
+    justify-content:center;padding:0 7px}
+  .unsure .num{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
   .meta{flex:1 1 auto;min-width:0}
   .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600;font-size:13.5px}
-  .eptitle{color:var(--hint);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .tags{color:var(--hint);font-size:11px;margin-top:1px}
-  .move,.del{flex:0 0 auto;border:0;background:transparent;color:var(--hint);font-size:15px;
-    padding:6px;border-radius:8px;cursor:pointer}
-  .del:active{color:var(--danger)}
-  .seasonpick{flex:0 0 auto;background:transparent;color:var(--text);border:1px solid var(--line);
-    border-radius:8px;padding:5px 6px;font-size:12px}
-  .excluded li{opacity:.7}
-  .excluded .num{background:color-mix(in srgb,var(--danger) 80%,#000);}
-  .restore{color:var(--accent);background:transparent;border:0;font-size:13px;cursor:pointer;padding:6px}
-  .empty{color:var(--hint);font-size:12.5px;padding:8px 2px}
+  .eptitle{color:var(--hint);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+  .tags{color:var(--hint);font-size:10.5px;margin-top:2px;letter-spacing:.02em}
+  .arrows{display:flex;flex-direction:column;gap:2px;flex:0 0 auto}
+  .arrows button{border:0;background:transparent;color:var(--hint);width:28px;height:17px;
+    display:flex;align-items:center;justify-content:center;cursor:pointer;border-radius:6px;padding:0}
+  .arrows button:active{background:color-mix(in srgb,var(--text) 10%,transparent);color:var(--text)}
+  .arrows button[disabled]{opacity:.22;pointer-events:none}
+  .arrows svg{width:15px;height:15px}
+  .pick{flex:0 0 auto;background:var(--card-2);color:var(--text);border:1px solid var(--line);
+    border-radius:9px;padding:7px 6px;font-size:12px;font-weight:600;max-width:104px;
+    -webkit-appearance:none;appearance:none;text-align:center}
+  .iconbtn{flex:0 0 auto;border:0;background:transparent;color:var(--hint);width:32px;height:32px;
+    display:flex;align-items:center;justify-content:center;border-radius:9px;cursor:pointer}
+  .iconbtn svg{width:17px;height:17px}
+  .del:active{color:var(--danger);background:color-mix(in srgb,var(--danger) 14%,transparent)}
+  .restore:active{color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent)}
+  .excluded li{opacity:.6}
+  .excluded .num{background:color-mix(in srgb,var(--danger) 18%,transparent);color:var(--danger)}
+  .empty{color:var(--hint);font-size:12px;padding:9px 12px;border:1px dashed var(--line);
+    border-radius:var(--radius);opacity:.7}
   footer{position:fixed;left:0;right:0;bottom:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));
-    background:linear-gradient(transparent,var(--bg) 30%)}
-  button.save{width:100%;border:0;border-radius:12px;background:var(--accent);color:var(--accent-text);
-    font-weight:700;font-size:15px;padding:14px;cursor:pointer}
-  button.save[disabled]{opacity:.5}
-  .toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:var(--card);
-    border:1px solid var(--line);color:var(--text);padding:9px 14px;border-radius:20px;font-size:13px;
-    opacity:0;transition:opacity .2s;pointer-events:none}
-  .toast.show{opacity:1}
-  .loading{padding:40px 16px;text-align:center;color:var(--hint)}
+    background:linear-gradient(transparent,var(--bg) 34%)}
+  button.save{width:100%;border:0;border-radius:14px;background:var(--accent);color:var(--accent-text);
+    font-weight:700;font-size:15px;padding:15px;cursor:pointer;letter-spacing:.01em;
+    box-shadow:0 6px 20px -6px color-mix(in srgb,var(--accent) 60%,transparent);transition:opacity .15s}
+  button.save[disabled]{opacity:.5;box-shadow:none}
+  .toast{position:fixed;left:50%;bottom:88px;transform:translateX(-50%) translateY(6px);
+    background:var(--card);border:1px solid var(--line);color:var(--text);padding:10px 16px;
+    border-radius:22px;font-size:13px;opacity:0;transition:opacity .2s,transform .2s;
+    pointer-events:none;box-shadow:0 8px 24px -8px rgba(0,0,0,.5);max-width:80%;text-align:center}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .loading{padding:48px 16px;text-align:center;color:var(--hint)}
 </style>
 </head>
 <body>
 <header>
   <h1 id="title">Franchise Mapping</h1>
-  <div class="sub">Drag ⠿ to reorder within a season · pick a season · 🗑 excludes a file</div>
+  <div class="sub">Assign each file to a section · drag or use arrows to reorder · remove non-episodes</div>
 </header>
 <div class="wrap" id="root"><div class="loading">Loading…</div></div>
 <footer><button class="save" id="save" disabled>Save mapping</button></footer>
@@ -81,11 +102,23 @@ if (tg) { try { tg.ready(); tg.expand(); } catch(e){} }
 
 const TOKEN = location.pathname.split("/").pop();
 const INIT = (tg && tg.initData) || "";
-const state = { title:"", seasons:[], files:[], excluded:new Set() };
-let dragId = null;
+const UNSURE = "__unsure__";
+const state = { title:"", sections:[], files:[] };  // files: {..., section_id|null, excluded}
 
-function toast(msg){ const t=document.getElementById("toast"); t.textContent=msg;
-  t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),1800); }
+const SVG = {
+  grip:'<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>',
+  up:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg>',
+  down:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>',
+  del:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13"/></svg>',
+  restore:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 4v4h4"/></svg>',
+};
+
+function toast(m){ const t=document.getElementById("toast"); t.textContent=m;
+  t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),1900); }
+function haptic(k){ try{ if(!tg||!tg.HapticFeedback) return;
+  if(k==="impact") tg.HapticFeedback.impactOccurred("light"); else tg.HapticFeedback.selectionChanged();
+}catch(e){} }
+function esc(s){ return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
 async function api(method, body){
   const r = await fetch(`/api/map/${TOKEN}`, {
@@ -95,133 +128,189 @@ async function api(method, body){
   return r.json();
 }
 
-function seasonOptions(current){
-  const nums = state.seasons.map(s=>s.season_number).filter(n=>n!=null);
-  const set = [...new Set(nums.length?nums:[1])].sort((a,b)=>a-b);
-  if(!set.includes(current)) set.push(current);
-  return set.sort((a,b)=>a-b).map(n=>
-    `<option value="${n}" ${n===current?"selected":""}>S${String(n).padStart(2,"0")}</option>`).join("");
+function sectionById(id){ return state.sections.find(s=>s.section_id===id) || null; }
+function filesIn(id){ // included files currently assigned to section id (array order)
+  return state.files.filter(f=>!f.excluded && f.section_id===id);
 }
 
-// Included files grouped by season, ordered by their in-array position.
+function pickOptions(current){
+  const opts = state.sections.map(s=>
+    `<option value="${s.section_id}" ${s.section_id===current?"selected":""}>${esc(s.label)}</option>`);
+  opts.push(`<option value="${UNSURE}" ${current==null?"selected":""}>Unsure</option>`);
+  return opts.join("");
+}
+
 function render(){
   const root = document.getElementById("root");
   document.getElementById("title").textContent = state.title || "Franchise Mapping";
-  const bySeason = new Map();
-  state.files.forEach(f=>{ if(state.excluded.has(f.index)) return;
-    if(!bySeason.has(f.season)) bySeason.set(f.season, []);
-    bySeason.get(f.season).push(f); });
-  const seasonKeys = [...bySeason.keys()].sort((a,b)=>a-b);
   let html = "";
-  for(const s of seasonKeys){
-    const list = bySeason.get(s);
-    html += `<div class="season"><h2>Season ${String(s).padStart(2,"0")}</h2>
-      <span class="count">${list.length} ep</span></div><ul data-season="${s}">`;
-    list.forEach((f,i)=>{ html += row(f, i+1); });
+  // A box per franchise entry — shown even when empty.
+  for(const s of state.sections){
+    const list = filesIn(s.section_id);
+    html += `<div class="section"><h2>${esc(s.label)}</h2>
+      <span class="count">${list.length}${s.expected?` / ${s.expected}`:""}</span></div>`;
+    html += `<ul data-section="${s.section_id}">`;
+    if(list.length) list.forEach((f,i)=>{ html += row(f,i+1,i===0,i===list.length-1); });
+    else html += `<div class="empty">Empty — drag files here or use each file's picker.</div>`;
     html += `</ul>`;
   }
-  // Excluded section.
-  const ex = state.files.filter(f=>state.excluded.has(f.index));
-  html += `<div class="season"><h2>Excluded — not an episode</h2>
-    <span class="count">${ex.length}</span></div>`;
+  // Unsure bucket (only when it has files).
+  const unsure = state.files.filter(f=>!f.excluded && f.section_id==null);
+  if(unsure.length){
+    html += `<div class="section unsure"><h2>Unsure — assign these</h2>
+      <span class="count">${unsure.length}</span></div><ul data-section="${UNSURE}">`;
+    unsure.forEach((f,i)=>{ html += row(f,i+1,true,true); });
+    html += `</ul>`;
+  }
+  // Excluded.
+  const ex = state.files.filter(f=>f.excluded);
+  html += `<div class="section"><h2>Excluded — not an episode</h2><span class="count">${ex.length}</span></div>`;
   if(ex.length){ html += `<ul class="excluded">`; ex.forEach(f=>{ html += exRow(f); }); html += `</ul>`; }
-  else html += `<div class="empty">Nothing excluded. 🗑 on a file moves it here.</div>`;
+  else html += `<div class="empty">Nothing excluded.</div>`;
   root.innerHTML = html;
   wire();
   document.getElementById("save").disabled = false;
 }
 
-function esc(s){ return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-
-function row(f, pos){
+function row(f,pos,isFirst,isLast){
   const tags = (f.resolutions&&f.resolutions.length)? f.resolutions.join(" · ") : "";
-  return `<li draggable="true" data-index="${f.index}">
-    <span class="grip" aria-label="drag">⠿</span>
-    <span class="num">#${pos}</span>
+  return `<li data-index="${f.index}">
+    <span class="grip" data-index="${f.index}" aria-label="Drag">${SVG.grip}</span>
+    <span class="num">${pos}</span>
     <div class="meta">
       <div class="name">${esc(f.name)}</div>
       ${f.ep_title?`<div class="eptitle">${esc(f.ep_title)}</div>`:""}
       ${tags?`<div class="tags">${esc(tags)}</div>`:""}
     </div>
-    <select class="seasonpick" data-index="${f.index}">${seasonOptions(f.season)}</select>
-    <button class="del" data-index="${f.index}" title="Exclude">🗑</button>
+    <div class="arrows">
+      <button class="mv" data-index="${f.index}" data-dir="-1" ${isFirst?"disabled":""} aria-label="Up">${SVG.up}</button>
+      <button class="mv" data-index="${f.index}" data-dir="1" ${isLast?"disabled":""} aria-label="Down">${SVG.down}</button>
+    </div>
+    <select class="pick" data-index="${f.index}">${pickOptions(f.section_id)}</select>
+    <button class="iconbtn del" data-index="${f.index}" aria-label="Exclude">${SVG.del}</button>
   </li>`;
 }
 function exRow(f){
   return `<li data-index="${f.index}">
-    <span class="num">✕</span>
+    <span class="num">×</span>
     <div class="meta"><div class="name">${esc(f.name)}</div></div>
-    <button class="restore" data-index="${f.index}">Restore</button>
+    <button class="iconbtn restore" data-index="${f.index}" aria-label="Restore">${SVG.restore}</button>
   </li>`;
 }
 
 function wire(){
   document.querySelectorAll(".del").forEach(b=>b.onclick=()=>{
-    state.excluded.add(+b.dataset.index); haptic(); render(); });
+    const f=byIndex(+b.dataset.index); if(f){ f.excluded=true; haptic("impact"); render(); } });
   document.querySelectorAll(".restore").forEach(b=>b.onclick=()=>{
-    state.excluded.delete(+b.dataset.index); haptic(); render(); });
-  document.querySelectorAll(".seasonpick").forEach(sel=>sel.onchange=()=>{
-    const f = state.files.find(x=>x.index===+sel.dataset.index);
-    if(f){ f.season = +sel.value; haptic(); render(); } });
-  // Native HTML5 drag-and-drop for reordering within a season list.
-  document.querySelectorAll('li[draggable="true"]').forEach(li=>{
-    li.addEventListener("dragstart",e=>{ dragId=+li.dataset.index; li.classList.add("dragging");
-      e.dataTransfer.effectAllowed="move"; });
-    li.addEventListener("dragend",()=>{ li.classList.remove("dragging");
-      document.querySelectorAll("li.over").forEach(x=>x.classList.remove("over")); });
-    li.addEventListener("dragover",e=>{ e.preventDefault(); li.classList.add("over"); });
-    li.addEventListener("dragleave",()=>li.classList.remove("over"));
-    li.addEventListener("drop",e=>{ e.preventDefault(); li.classList.remove("over");
-      onDrop(+li.dataset.index); });
-  });
+    const f=byIndex(+b.dataset.index); if(f){ f.excluded=false; haptic("impact"); render(); } });
+  document.querySelectorAll(".mv").forEach(b=>b.onclick=()=>move(+b.dataset.index,+b.dataset.dir));
+  document.querySelectorAll(".pick").forEach(sel=>sel.onchange=()=>{
+    const f=byIndex(+sel.dataset.index);
+    if(f){ f.section_id = sel.value===UNSURE ? null : sel.value; haptic("select"); render(); } });
+  document.querySelectorAll(".grip").forEach(g=>g.addEventListener("pointerdown", startDrag));
+}
+function byIndex(i){ return state.files.find(f=>f.index===i); }
+
+// Swap with the adjacent sibling in the SAME section (array order).
+function move(index, dir){
+  const f = byIndex(index); if(!f) return;
+  const sibs = state.files.filter(x=>!x.excluded && x.section_id===f.section_id);
+  const p = sibs.indexOf(f); const other = sibs[p+dir];
+  if(!other) return;
+  const ai = state.files.indexOf(f), bi = state.files.indexOf(other);
+  [state.files[ai], state.files[bi]] = [state.files[bi], state.files[ai]];
+  haptic("select"); render();
 }
 
-// Reorder: move dragged file to the target's position, adopting the target's
-// season (so dragging across season lists reassigns season too).
-function onDrop(targetIdx){
-  if(dragId==null || dragId===targetIdx) return;
-  const from = state.files.findIndex(f=>f.index===dragId);
-  const to = state.files.findIndex(f=>f.index===targetIdx);
-  if(from<0||to<0) return;
-  const [moved] = state.files.splice(from,1);
-  moved.season = state.files[to>from?to-1:to].season; // adopt target's season
-  const insertAt = state.files.findIndex(f=>f.index===targetIdx);
-  state.files.splice(insertAt,0,moved);
-  haptic(); render();
+// ── Pointer-events drag (works on touch, unlike native HTML5 drag) ──────────
+let drag = null;
+function startDrag(e){
+  const li = e.target.closest("li"); if(!li) return;
+  e.preventDefault();
+  drag = { index:+li.dataset.index, li, startY:e.clientY, moved:false };
+  li.setPointerCapture && li.setPointerCapture(e.pointerId);
+  document.addEventListener("pointermove", onDrag);
+  document.addEventListener("pointerup", endDrag, {once:true});
+  document.addEventListener("pointercancel", endDrag, {once:true});
 }
-function haptic(){ try{ tg && tg.HapticFeedback && tg.HapticFeedback.selectionChanged(); }catch(e){} }
-
-// Build the layout the API expects: per-file {index, season, position}, where
-// position is the 1-based order within the file's season (array order), plus the
-// excluded index list.
-function buildLayout(){
-  const perSeason = {};
-  const files = [];
-  for(const f of state.files){
-    if(state.excluded.has(f.index)) continue;
-    perSeason[f.season] = (perSeason[f.season]||0) + 1;
-    files.push({index:f.index, season:f.season, position:perSeason[f.season]});
+function onDrag(e){
+  if(!drag) return;
+  if(!drag.moved){
+    if(Math.abs(e.clientY - drag.startY) < 6) return;
+    drag.moved = true; drag.li.classList.add("dragging"); haptic("impact");
   }
-  return { files, excluded:[...state.excluded] };
+  const el = document.elementFromPoint(e.clientX, e.clientY);
+  const overUl = el && el.closest && el.closest("ul[data-section]");
+  const overLi = el && el.closest && el.closest("li[data-index]");
+  if(overUl && overUl.classList.contains("excluded")) return; // don't drag into excluded
+  const dragF = byIndex(drag.index); if(!dragF) return;
+  // Determine the target section (the list under the finger).
+  const targetSection = overUl ? overUl.dataset.section : null;
+  if(targetSection != null){
+    dragF.section_id = (targetSection===UNSURE) ? null : targetSection;
+  }
+  // Reorder relative to the row under the finger, when it's a different file.
+  if(overLi && +overLi.dataset.index !== drag.index){
+    const overF = byIndex(+overLi.dataset.index);
+    if(overF && !overF.excluded){
+      dragF.section_id = overF.section_id;
+      const from = state.files.indexOf(dragF); state.files.splice(from,1);
+      const to = state.files.indexOf(overF);
+      const rect = overLi.getBoundingClientRect();
+      const after = e.clientY > rect.top + rect.height/2;
+      state.files.splice(after?to+1:to, 0, dragF);
+    }
+  }
+  render();
+  const fresh = document.querySelector(`li[data-index="${drag.index}"]`);
+  if(fresh){ drag.li = fresh; fresh.classList.add("dragging"); }
+}
+function endDrag(){
+  document.removeEventListener("pointermove", onDrag);
+  if(drag && drag.li) drag.li.classList.remove("dragging");
+  const moved = drag && drag.moved; drag = null;
+  if(moved){ haptic("select"); render(); }
+}
+
+// Layout for the API: each included+assigned file → {index, kind, season, position}
+// (position = 1-based order within its section). Unsure files are omitted (stay
+// unmatched); excluded files go in the excluded list.
+function buildLayout(){
+  const perSection = {}; const files = [];
+  for(const f of state.files){
+    if(f.excluded || f.section_id==null) continue;
+    const sec = sectionById(f.section_id); if(!sec) continue;
+    perSection[f.section_id] = (perSection[f.section_id]||0) + 1;
+    files.push({index:f.index, kind:sec.kind, season:sec.season_number,
+                position:perSection[f.section_id]});
+  }
+  return { files, excluded: state.files.filter(f=>f.excluded).map(f=>f.index) };
 }
 
 async function save(){
+  const unsure = state.files.filter(f=>!f.excluded && f.section_id==null).length;
+  if(unsure){ toast(`Assign the ${unsure} unsure file${unsure>1?"s":""} first (or exclude them)`); return; }
   const btn = document.getElementById("save"); btn.disabled=true; btn.textContent="Saving…";
   try{
     await api("POST", { init_data:INIT, layout:buildLayout() });
-    toast("Saved ✓");
+    toast("Saved");
     if(tg){ try{ tg.HapticFeedback.notificationOccurred("success"); }catch(e){}
-      setTimeout(()=>tg.close(), 700); }
+      setTimeout(()=>tg.close(), 650); }
   }catch(err){ toast("Save failed: "+err.message); btn.disabled=false; btn.textContent="Save mapping"; }
 }
 
 async function load(){
   try{
     const data = await api("GET");
-    state.title = data.title; state.seasons = data.seasons||[];
-    state.files = (data.files||[]).map(f=>({...f, season:f.season||1}));
-    // Pre-exclude files the mapper already treats as non-episodes (kind!=episode).
-    state.files.forEach(f=>{ if(f.kind && f.kind!=="episode") state.excluded.add(f.index); });
+    state.title = data.title; state.sections = data.sections || [];
+    state.files = (data.files||[]).map(f=>({
+      index:f.index, name:f.name, ep_title:f.ep_title||"", resolutions:f.resolutions||[],
+      section_id: (f.section_id!=null ? f.section_id : null),
+      // Genuine junk (trailers/NC/previews → kind "extra") starts excluded;
+      // everything else keeps its section, or lands in Unsure for the owner to
+      // confirm. Specials stay assignable (never auto-excluded).
+      excluded: f.kind==="extra",
+    }));
     render();
   }catch(err){
     document.getElementById("root").innerHTML =

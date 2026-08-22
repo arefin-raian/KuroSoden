@@ -90,34 +90,42 @@ async def delete_session(redis, token: str) -> None:
 
 def layout_to_overrides(
     layout: dict,
-) -> tuple[dict[int, int], dict[int, int], set[int]]:
-    """Editor layout → ``(season_overrides, episode_overrides, junk_indices)``.
+) -> tuple[dict[int, int], dict[int, int], dict[int, str], set[int]]:
+    """Editor layout → ``(season_overrides, episode_overrides, kind_overrides, junk)``.
 
-    ``layout`` = ``{"files": [{"index": int, "season": int, "position": int}, …],
-    "excluded": [int, …]}``. ``position`` is the 1-based order the admin dragged
-    the file into WITHIN its season; it becomes the episode number so drag order
-    is authoritative. Excluded files become junk (dropped from the episode
-    stream). Robust to missing/duplicate positions: within each season the
-    included files are ordered by their given ``position`` (stable) and
-    RE-NUMBERED 1..N so gaps/dupes never produce colliding episode numbers."""
+    ``layout`` = ``{"files": [{"index", "kind", "season", "position"}, …],
+    "excluded": [int, …]}``. Each included file carries the SECTION the admin put
+    it in: ``kind`` is ``"episode"`` (a season section) or ``"special"``/
+    ``"movie"``/``"ova"`` (a non-season entry). For episode files, ``position`` is
+    the 1-based drag order within the season → becomes the episode number (so drag
+    order is authoritative), re-numbered 1..N per season so gaps/dupes never
+    collide. Non-episode files carry only their forced ``kind``. Excluded files
+    become junk. Files left in the "Unsure" bucket are simply absent from both
+    lists → no override → they stay unmatched. ``kind`` defaults to ``"episode"``
+    for backward-compat with the old season-only layout schema."""
     excluded = {int(i) for i in (layout.get("excluded") or [])}
     files = [f for f in (layout.get("files") or [])
              if int(f.get("index")) not in excluded]
 
-    # Group included files by season, order by the admin's drag position.
-    by_season: dict[int, list[dict]] = {}
-    for f in files:
-        by_season.setdefault(int(f.get("season", 1)), []).append(f)
-
     season_overrides: dict[int, int] = {}
     episode_overrides: dict[int, int] = {}
+    kind_overrides: dict[int, str] = {}
+
+    by_season: dict[int, list[dict]] = {}
+    for f in files:
+        idx = int(f["index"])
+        kind = (f.get("kind") or "episode").lower()
+        kind_overrides[idx] = kind
+        if kind == "episode":
+            by_season.setdefault(int(f.get("season", 1)), []).append(f)
+
     for season, group in by_season.items():
         group.sort(key=lambda f: (int(f.get("position", 0)), int(f.get("index", 0))))
         for ep, f in enumerate(group, start=1):
             idx = int(f["index"])
             season_overrides[idx] = season
             episode_overrides[idx] = ep
-    return season_overrides, episode_overrides, excluded
+    return season_overrides, episode_overrides, kind_overrides, excluded
 
 
 def apply_layout(working_set: dict, layout: dict) -> dict:
@@ -148,28 +156,36 @@ def apply_layout(working_set: dict, layout: dict) -> dict:
         except (TypeError, ValueError):
             continue
 
-    season_ov, episode_ov, junk = layout_to_overrides(layout)
+    season_ov, episode_ov, kind_ov, junk = layout_to_overrides(layout)
     mapping = build_torrent_mapping(
         ordered, franchise,
         episode_titles=ep_titles or None,
         season_overrides=season_ov or None,
         episode_overrides=episode_ov or None,
+        kind_overrides=kind_ov or None,
         junk_indices=junk or None,
     )
     return mapping.to_dict()
 
 
 def build_editor_payload(sess: MappingSession) -> dict:
-    """The JSON the editor page consumes: per-file rows (with episode titles +
-    current season/order) grouped for display, plus the franchise's season list.
+    """The JSON the editor page consumes.
+
+    Shape:
+      * ``sections`` — ONE per franchise entry (every season AND every special/
+        movie/OVA), shown even when empty, each with a stable ``section_id``, a
+        human ``label``, its target ``kind`` (``"episode"`` for seasons, else the
+        entry kind) and ``season_number`` so the editor can POST the assignment.
+      * ``files`` — every file with its current ``section_id`` (the entry it
+        mapped to, or ``null`` when it's ambiguous/unmatched → the editor's
+        "Unsure" bucket) and an ``ambiguous`` flag.
 
     Read-only shape derived from the working set; the editor renders it and POSTs
     back a :func:`layout_to_overrides`-shaped layout."""
     ws = sess.working_set
     ordered = ws.get("ordered_files") or []
-    # Episode titles keyed by anilist_id → flatten to a per-(season,number) lookup
-    # is overkill for the picker; the editor just needs the file's own name +
-    # current season/episode. Titles are surfaced best-effort by episode number.
+    mapping = ws.get("mapping") or {}
+
     title_by_num: dict[int, str] = {}
     for _aid, eps in (ws.get("episode_titles") or {}).items():
         for e in eps or []:
@@ -178,32 +194,56 @@ def build_editor_payload(sess: MappingSession) -> dict:
             except (TypeError, ValueError):
                 continue
 
+    # One section per franchise entry (seasons + specials/movies/OVAs), even empty.
+    sections: list[dict] = []
+    file_section: dict[int, str] = {}       # file_index → section_id it mapped to
+    for i, e in enumerate(mapping.get("entries", [])):
+        sid = f"e{i}"
+        kind = e.get("kind")
+        if kind == "season":
+            sn = e.get("season_number") or 1
+            part = e.get("season_part")
+            label = f"Season {int(sn):02d}" + (f" · Part {part}" if part else "")
+            target_kind, season_number = "episode", int(sn)
+        else:
+            label = (kind or "extra").title()
+            if e.get("title"):
+                label += f" · {str(e['title'])[:34]}"
+            target_kind, season_number = (kind or "extra"), int(e.get("season_number") or 0)
+        sections.append({
+            "section_id": sid, "label": label, "kind": target_kind,
+            "season_number": season_number, "season_part": e.get("season_part"),
+            "expected": e.get("episodes"),
+        })
+        for f in e.get("files", []):
+            file_section[int(f["file_index"])] = sid
+
+    unmatched_idx = {int(f["file_index"]) for f in mapping.get("unmatched", [])}
+    src_by_idx = {int(f.get("index")): f for f in ordered}
+
     files = []
     for f in ordered:
         idx = int(f.get("index"))
         num = f.get("episode")
+        of = src_by_idx.get(idx, {})
+        # "Unsure": unmatched, unnumbered, or numbered only by last-resort file
+        # order (episode_source == "order") — surface these for the owner to
+        # confirm/assign rather than silently trusting a guess.
+        ambiguous = (idx in unmatched_idx or num is None
+                     or of.get("episode_source") == "order")
         files.append({
             "index": idx,
             "name": f.get("name") or "",
-            "season": int(f.get("season", 1) or 1),
+            "kind": f.get("kind", "episode"),
             "episode": num,
             "ep_title": title_by_num.get(int(num)) if num else "",
-            "kind": f.get("kind", "episode"),
-            "resolutions": f.get("resolutions") or [],
+            "resolutions": f.get("resolutions")
+                or ([f["resolution"]] if f.get("resolution") else []),
+            "section_id": None if ambiguous else file_section.get(idx),
+            "ambiguous": ambiguous,
         })
-
-    # Season list from the stored mapping (season entries + their expected counts).
-    seasons: list[dict] = []
-    for e in (ws.get("mapping") or {}).get("entries", []):
-        if e.get("kind") == "season":
-            seasons.append({
-                "season_number": e.get("season_number"),
-                "season_part": e.get("season_part"),
-                "expected": e.get("episodes"),
-                "title": e.get("title") or "",
-            })
     return {
         "title": ws.get("title") or (sess.release.get("code") or "Mapping"),
+        "sections": sections,
         "files": files,
-        "seasons": seasons,
     }
