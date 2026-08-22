@@ -509,6 +509,44 @@ class DistributionCache:
             ex=_DEFAULT_TTL, label="dist_cache.tmdb_assets.set",
         )
 
+    async def get_gallery_url(self, code: str, asset_type: str) -> str | None:
+        """The Telegraph gallery URL for a franchise-root asset type, if built.
+
+        TMDB assets are franchise-level (no per-season split), so every entry
+        shares one gallery — this reuses the base series' page instead of creating
+        a new Telegraph page per entry. Stored in the SAME root-scoped blob as the
+        assets (under a ``__gallery__`` sub-key) so it retires with them."""
+        raw = await safe_redis_get(
+            self._redis, _K_TMDB_ASSETS.format(code=code),
+            label="dist_cache.gallery.get",
+        )
+        if not raw:
+            return None
+        try:
+            url = (json.loads(raw).get("__gallery__") or {}).get(asset_type)
+            return url if isinstance(url, str) and url else None
+        except (TypeError, ValueError):
+            return None
+
+    async def set_gallery_url(self, code: str, asset_type: str, url: str) -> None:
+        raw = await safe_redis_get(
+            self._redis, _K_TMDB_ASSETS.format(code=code),
+            label="dist_cache.gallery.read_modify_write",
+        )
+        try:
+            values = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            values = {}
+        galleries = values.get("__gallery__")
+        if not isinstance(galleries, dict):
+            galleries = {}
+        galleries[asset_type] = url
+        values["__gallery__"] = galleries
+        await safe_redis_set(
+            self._redis, _K_TMDB_ASSETS.format(code=code), json.dumps(values),
+            ex=_DEFAULT_TTL, label="dist_cache.gallery.set",
+        )
+
     async def all_done(self, code: str) -> bool:
         """True when every cached entry has a rendered thumbnail (or none exist)."""
         entries = await self.get_entries(code)

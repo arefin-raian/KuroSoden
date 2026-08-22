@@ -76,12 +76,26 @@ async def test_adapter_reuses_gallery_for_two_entries(monkeypatch):
         return "anilist:root"
 
     monkeypatch.setattr(adapter, "_root_doc_id", fake_root_doc_id)
+
+    # Count Telegraph gallery-page builds — must be ONE across both entries
+    # (franchise galleries are reused, not re-created per season).
+    gallery_calls: list = []
+
+    async def fake_gallery_url(asset_type, title, assets_):
+        gallery_calls.append((asset_type, title))
+        return "https://telegra.ph/root-logos"
+
+    monkeypatch.setattr(adapter, "gallery_url", fake_gallery_url)
+
     first_entry = EntryData(index=10, label="Season 1", title="Root", tmdb_id=10)
     second_entry = EntryData(index=11, label="Season 2", title="Root 2", tmdb_id=11)
-    first, _gallery, _rows = await adapter.asset_step("REQ-1", first_entry, "logo")
-    second, _gallery, _rows = await adapter.asset_step("REQ-1", second_entry, "logo")
+    first, gallery1, _rows = await adapter.asset_step("REQ-1", first_entry, "logo")
+    second, gallery2, _rows = await adapter.asset_step("REQ-1", second_entry, "logo")
     assert first == second == assets
     assert len(calls) == 1
+    # The gallery page is built once and reused (same URL, one build call).
+    assert gallery1 == gallery2 == "https://telegra.ph/root-logos"
+    assert len(gallery_calls) == 1
 
 
 def test_new_phase11_callbacks_stay_within_telegram_limit():

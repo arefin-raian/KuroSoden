@@ -297,8 +297,26 @@ class SenkuThumbnailAdapter:
                                          anime_doc_id=doc_id)
         if not assets:
             return [], None, []
-        title = entry.title or entry.label
-        gallery = await self.gallery_url(asset_type, title, assets)
+        # TMDB assets are franchise-level (no per-season split), so every entry
+        # shares ONE gallery. Reuse the franchise-root gallery page instead of
+        # creating a new Telegraph page per entry (which produced a fresh
+        # "<Title> 2nd Season — Logos" page for each season). Keyed by the root
+        # doc-id + asset type; created once, then reused.
+        gallery: str | None = None
+        cache_type = "backdrop" if asset_type in ("bg", "backdrop") else asset_type
+        if doc_id:
+            try:
+                gallery = await self.cache.get_gallery_url(str(doc_id), cache_type)
+            except Exception as exc:  # noqa: BLE001 — cache miss → build below
+                log.debug("senku.thumb.gallery_cache_failed", error=str(exc))
+        if not gallery:
+            title = entry.title or entry.label
+            gallery = await self.gallery_url(asset_type, title, assets)
+            if gallery and doc_id:
+                try:
+                    await self.cache.set_gallery_url(str(doc_id), cache_type, gallery)
+                except Exception as exc:  # noqa: BLE001 — non-fatal
+                    log.debug("senku.thumb.gallery_cache_set_failed", error=str(exc))
         rows = self.numbered_button_rows(code, entry.index, asset_type, len(assets))
         return assets, gallery, rows
 
