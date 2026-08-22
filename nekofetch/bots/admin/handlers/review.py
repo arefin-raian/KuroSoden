@@ -952,25 +952,44 @@ def register(client: Client, container: Container) -> None:
 
         import re as _re
         from urllib.parse import parse_qs, unquote, urlparse
-        hash_m = _re.search(r"btih:([0-9a-fA-F]{40}|[0-9a-zA-Z]{32})", text)
-        info_hash = hash_m.group(1) if hash_m else ""
-
-        # Classify audio from the magnet's own display name (dn=…) — the release
-        # name carries "Dual Audio"/"Multi" even when the request title doesn't.
-        # Fall back to the request title if the magnet has no dn.
-        try:
-            _dn = (parse_qs(urlparse(text).query).get("dn") or [""])[0]
-            _release_name = unquote(_dn).strip()
-        except Exception:
-            _release_name = ""
         from nekofetch.sources.nyaa import classify_audio as _classify_audio
-        _audio_cls = _classify_audio(_release_name or title)
-        magnet_ref = json.dumps({
-            "magnet": text, "info_hash": info_hash, "title": title,
-            "release_name": _release_name,
-            "dual_audio": _audio_cls["dual_audio"],
-            "audio": _audio_cls["audio"],
-        })
+
+        # A single reply may carry MULTIPLE magnets (e.g. one per season),
+        # whitespace/newline-separated — ingest ALL of them. A magnet URI is a
+        # single whitespace-free token, so split() cleanly separates them.
+        _magnets = [t for t in text.split() if t.startswith("magnet:")] or [text]
+        _rank = {"single": 0, "dual": 1, "multi": 2}
+        sources: list[dict] = []
+        _best_audio = "single"
+        _first_release = ""
+        for _m in _magnets:
+            _hm = _re.search(r"btih:([0-9a-fA-F]{40}|[0-9a-zA-Z]{32})", _m)
+            _ih = _hm.group(1) if _hm else ""
+            try:
+                _dn = (parse_qs(urlparse(_m).query).get("dn") or [""])[0]
+                _rn = unquote(_dn).strip()
+            except Exception:
+                _rn = ""
+            _ac = _classify_audio(_rn or title)
+            if _rank.get(_ac["audio"], 0) > _rank.get(_best_audio, 0):
+                _best_audio = _ac["audio"]
+            if _rn and not _first_release:
+                _first_release = _rn
+            sources.append({"magnet": _m, "info_hash": _ih, "release_name": _rn})
+
+        def _build_ref(audio_kind: str) -> str:
+            return json.dumps({
+                "sources": sources, "title": title,
+                "release_name": _first_release,
+                "dual_audio": audio_kind in ("dual", "multi"),
+                "audio": audio_kind, "audio_kind": audio_kind,
+                # Back-compat flat fields (first magnet) for any consumer reading a
+                # single-source ref before get_episodes normalizes ``sources``.
+                "magnet": _magnets[0],
+                "info_hash": sources[0]["info_hash"] if sources else "",
+            })
+
+        magnet_ref = _build_ref(_best_audio)
 
         # Consume the awaited-reply flow now that the duplicate guard has let
         # this magnet through — clears the per-user FSM and disarms the
@@ -1008,36 +1027,40 @@ def register(client: Client, container: Container) -> None:
         # same card in place once resolution finishes.
         ack = await _ack(L(M.TORRENT_MAGNET_ACK), _back_kb)
 
-        # Try to resolve magnet metadata for mapping.
+        # Try to resolve magnet metadata for mapping. Resolve EVERY magnet and
+        # merge their files (each tagged with its own magnet/hash) so a
+        # multi-season provide (S1 magnet + S2 magnet) maps ALL seasons, not just
+        # the first — the reported "S2 shows 0/12" bug.
         from nekofetch.sources._torrent import order_episodes, torrent_files
 
         try:
             from nekofetch.sources.nyaa import NyaaSource
 
             ns = NyaaSource()
-            raw = await ns._resolve_magnet(text)
-            await ns.close()
-            _name, files = torrent_files(raw)
-            ordered = order_episodes(files)
+            merged_files: list[dict] = []
+            name_blob: list[str] = []
+            try:
+                for _src in sources:
+                    raw = await ns._resolve_magnet(_src["magnet"])
+                    _name, _files = torrent_files(raw)
+                    name_blob.append(_name or "")
+                    for _f in _files:
+                        _f["magnet"] = _src["magnet"]
+                        _f["info_hash"] = _src["info_hash"]
+                        name_blob.append(str(_f.get("path") or _f.get("name") or ""))
+                    merged_files.extend(_files)
+            finally:
+                await ns.close()
+            if not merged_files:
+                raise RuntimeError("no files resolved from the provided magnet(s)")
+            ordered = order_episodes(merged_files)
 
-            # The resolved torrent name + its file names are an ADDITIONAL audio
-            # signal (they carry "Dual Audio" even when dn=/title don't). Combine
-            # them with the dn= verdict and keep the STRONGEST — multi > dual >
-            # single — so a "Dual Audio" dn is never downgraded by a BDRip whose
-            # internal files only mention the codec, and vice-versa.
-            _blob = " ".join(
-                [_name or ""] + [str(f.get("path") or f.get("name") or "") for f in files]
-            )
-            _rc = _classify_audio(_blob or _release_name or title)
-            _rank = {"single": 0, "dual": 1, "multi": 2}
-            _best = max(_audio_cls["audio"], _rc["audio"],
-                        key=lambda a: _rank.get(a, 0))
-            magnet_ref = json.dumps({
-                "magnet": text, "info_hash": info_hash, "title": title,
-                "release_name": _release_name,
-                "dual_audio": _best in ("dual", "multi"),
-                "audio": _best, "audio_kind": _best,
-            })
+            # Resolved names are an ADDITIONAL audio signal (they carry "Dual
+            # Audio"/"Multi" even when dn=/title don't); keep the STRONGEST verdict
+            # across the dn= classification and the file names.
+            _rc = _classify_audio(" ".join(name_blob) or _first_release or title)
+            _best = max(_best_audio, _rc["audio"], key=lambda a: _rank.get(a, 0))
+            magnet_ref = _build_ref(_best)
 
             await _show_torrent_mapping(
                 ack, user_id, code, magnet_ref, ordered, title,

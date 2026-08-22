@@ -304,20 +304,51 @@ class NyaaSource(AnimeSource):
         )
 
     async def get_episodes(self, source_ref: str) -> list[Episode]:
-        """Download the .torrent, parse its file list, order EP1..EPN."""
+        """Download the .torrent(s), parse the file list(s), order EP1..EPN.
+
+        Supports MULTIPLE torrents in one request (``sources``: a list of
+        {magnet|torrent_url|torrent_path, info_hash} — e.g. a season-1 magnet + a
+        season-2 magnet). Each source's files are tagged with THEIR magnet/hash so
+        the per-file download addresses the right torrent, then all files are
+        merged and ordered together so the franchise mapping sees every season.
+        Falls back to the legacy single-source fields when ``sources`` is absent."""
         r = json.loads(source_ref)
-        try:
-            if r.get("torrent_path"):
-                raw = Path(r["torrent_path"]).read_bytes()
-            elif r.get("magnet"):
-                raw = await self._resolve_magnet(r["magnet"])
-            else:
-                resp = await self.http.get(r["torrent_url"])
-                resp.raise_for_status()
-                raw = resp.content
-            _name, files = torrent_files(raw)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("nyaa.torrent.parse_failed", error=str(exc))
+        sources = r.get("sources")
+        if not sources:
+            one = {k: r[k] for k in
+                   ("magnet", "torrent_url", "torrent_path", "info_hash", "release_name")
+                   if r.get(k)}
+            sources = [one] if one else []
+
+        files: list[dict] = []
+        for src in sources:
+            try:
+                if src.get("torrent_path"):
+                    raw = Path(src["torrent_path"]).read_bytes()
+                elif src.get("magnet"):
+                    raw = await self._resolve_magnet(src["magnet"])
+                else:
+                    resp = await self.http.get(src["torrent_url"])
+                    resp.raise_for_status()
+                    raw = resp.content
+                _name, src_files = torrent_files(raw)
+            except Exception as exc:  # noqa: BLE001 — skip a bad source, keep the rest
+                log.warning("nyaa.torrent.parse_failed",
+                            src=src.get("info_hash") or src.get("magnet") or "?",
+                            error=str(exc))
+                continue
+            # Tag each file with its OWN torrent locator (file_index/path are only
+            # meaningful within the torrent they came from).
+            for f in src_files:
+                if src.get("magnet"):
+                    f["magnet"] = src["magnet"]
+                if src.get("torrent_url"):
+                    f["torrent_url"] = src["torrent_url"]
+                if src.get("torrent_path"):
+                    f["torrent_path"] = src["torrent_path"]
+                f["info_hash"] = src.get("info_hash", "")
+            files.extend(src_files)
+        if not files:
             return []
 
         # Keep EVERY resolution (no 1080p-only collapse) and group the release's
@@ -329,14 +360,15 @@ class NyaaSource(AnimeSource):
         ordered = order_episodes(files)
         groups = group_variants(ordered)
         episodes: list[Episode] = []
-        ep_ref_base = {}
-        if r.get("torrent_url"):
-            ep_ref_base["torrent_url"] = r["torrent_url"]
-        if r.get("magnet"):
-            ep_ref_base["magnet"] = r["magnet"]
-        if r.get("torrent_path"):
-            ep_ref_base["torrent_path"] = r["torrent_path"]
-        ep_ref_base["info_hash"] = r.get("info_hash", "")
+        # ep_ref_base carries only NON-locator fields (audio/title/release); the
+        # torrent locator is set PER EPISODE below from its own files, so a
+        # multi-torrent request routes each episode to the right magnet.
+        ep_ref_base: dict = {}
+        # Legacy single-source locator, used as the fallback when a file wasn't
+        # tagged (single-torrent path — files carry no per-file magnet).
+        legacy_locator = {k: r[k] for k in
+                          ("magnet", "torrent_url", "torrent_path") if r.get(k)}
+        legacy_locator["info_hash"] = r.get("info_hash", "")
 
         # Robustly derive audio. Signals, most-authoritative first:
         #   1. An explicit upstream kind the caller already resolved and stored on
@@ -355,7 +387,7 @@ class NyaaSource(AnimeSource):
         release_name = r.get("release_name") or r.get("dn") or ""
         file_blob = " ".join(f.get("name", "") for f in files[:40])
         cls = classify_audio(
-            f"{r.get('title', '')} {release_name} {_name} {file_blob}")
+            f"{r.get('title', '')} {release_name} {file_blob}")
         audio_kind = cls["audio"]  # 'dual' | 'multi' | 'single'
         # Upstream verdict overrides a fresh 'single' miss (never downgrades a
         # freshly-detected multi/dual).
@@ -373,10 +405,20 @@ class NyaaSource(AnimeSource):
             label = {"movie": "Movie", "ova": "OVA", "special": "Special",
                      "extra": "Extra"}.get(g["kind"], f"Ep. {g['number']}")
             primary = g["files"][0]
+            # This episode's torrent locator: the primary file's own magnet/hash
+            # (multi-torrent) or the request's single-source fallback (legacy).
+            locator = {k: primary[k] for k in
+                       ("magnet", "torrent_url", "torrent_path") if primary.get(k)}
+            if primary.get("info_hash"):
+                locator["info_hash"] = primary["info_hash"]
+            if not locator.get("magnet") and not locator.get("torrent_url") \
+                    and not locator.get("torrent_path"):
+                locator = dict(legacy_locator)
             episodes.append(
                 Episode(
                     source_ref=json.dumps({
                         **ep_ref_base,
+                        **locator,
                         # Per-resolution files for this episode; get_variants emits
                         # one VideoVariant per entry so every tier downloads.
                         "files": g["files"],
@@ -433,6 +475,10 @@ class NyaaSource(AnimeSource):
                 "name": f.get("name"),
                 "length": f.get("length"),
                 "resolution": f.get("resolution"),
+                # A file carries its OWN torrent locator on multi-torrent releases;
+                # let it win over ``base`` so download addresses the right torrent.
+                **({"magnet": f["magnet"]} if f.get("magnet") else {}),
+                **({"info_hash": f["info_hash"]} if f.get("info_hash") else {}),
             }
             variants.append(
                 VideoVariant(

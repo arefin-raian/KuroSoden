@@ -464,6 +464,11 @@ def group_variants(ordered: list[dict]) -> list[dict]:
             "name": e["name"],
             "length": e.get("length"),
             "resolution": e.get("resolution"),
+            # Per-file source attribution for multi-torrent releases (each magnet
+            # is a distinct torrent, so file_index/path are only meaningful WITH
+            # the magnet they came from). Absent for single-torrent releases.
+            **({"magnet": e["magnet"]} if e.get("magnet") else {}),
+            **({"info_hash": e["info_hash"]} if e.get("info_hash") else {}),
         })
     for g in groups.values():
         g["files"].sort(
