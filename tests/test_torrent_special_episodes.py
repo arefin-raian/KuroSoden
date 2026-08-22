@@ -116,3 +116,67 @@ def test_fractional_special_ordered_after_main_episodes():
     assert [e["kind"] for e in o] == ["episode", "episode", "special"]
     assert o[-1]["episode"] == 13
     assert o[-1]["fractional"] is True
+
+
+# ── order_episodes: positional (incrementing-column) episode detection ─────────
+# The owner's rule: the episode number is the numeric token that climbs +1,+1
+# across the pack; the constant prefix and non-incrementing right-side codes are
+# NOT episodes. analyze_pack finds that column; order_episodes must use it so
+# unusual styles the per-file regex misses still number correctly. Same code path
+# serves torrent AND DDL (both call order_episodes).
+
+def _mains(names):
+    return [e for e in order_episodes(_files(names)) if e["kind"] == "episode"]
+
+
+def test_clean_sxxexx_pack_numbers_by_column():
+    o = _mains([f"Clevatess.S01E{n:02d}.1080p.WEB-DL.mkv" for n in range(1, 7)])
+    assert [e["episode"] for e in o] == [1, 2, 3, 4, 5, 6]
+    assert all(e["season"] == 1 for e in o)
+
+
+def test_leading_number_dot_title_style_now_detected():
+    # "01. Title" — the per-file regex misses this entirely (no e/ep/episode/dash
+    # anchor), so before wiring analyze_pack it fell through to no-number → gaps.
+    # The incrementing column recovers 1..N.
+    o = _mains(["01. The Beginning.mkv", "02. The Journey.mkv", "03. The End.mkv"])
+    assert [e["episode"] for e in o] == [1, 2, 3]
+    assert all(e.get("episode_source") == "column" for e in o)
+
+
+def test_varying_right_side_does_not_derail_episode_column():
+    # Right side (title / bracket codes) changes but does NOT increment +1; the
+    # episode column is the one that does. Detection must pick the episode column.
+    o = _mains([
+        "Attack on Titan S01 - 01 [A1B2].mkv",
+        "Attack on Titan S01 - 02 [Z9Q7].mkv",
+        "Attack on Titan S01 - 03 [K3M4].mkv",
+    ])
+    assert [e["episode"] for e in o] == [1, 2, 3]
+    assert all(e["season"] == 1 for e in o)
+
+
+def test_space_separated_season_episode_styles():
+    for names in (
+        ["Show S01 01.mkv", "Show S01 02.mkv", "Show S01 03.mkv"],
+        ["Show S01 EP01.mkv", "Show S01 EP02.mkv", "Show S01 EP03.mkv"],
+    ):
+        o = _mains(names)
+        assert [e["episode"] for e in o] == [1, 2, 3], names
+        assert all(e["season"] == 1 for e in o), names
+
+
+def test_genuine_gap_is_preserved_not_renumbered():
+    # 1,2,3,4,6,7 (EP5 missing) is unique but NOT contiguous → the column detector
+    # declines (ambiguous), the per-file regex keeps the true numbers, and the gap
+    # at 5 survives so the mapping layer can flag it missing.
+    o = _mains([f"Show.S01E{n:02d}.mkv" for n in (1, 2, 3, 4, 6, 7)])
+    assert [e["episode"] for e in o] == [1, 2, 3, 4, 6, 7]
+
+
+def test_unparseable_names_fall_back_to_file_order():
+    # No detectable number anywhere → last-resort file order numbers 1..N so the
+    # pack still maps instead of collapsing to all-None.
+    o = _mains(["aaa.mkv", "bbb.mkv", "ccc.mkv"])
+    assert [e["episode"] for e in o] == [1, 2, 3]
+    assert all(e.get("episode_source") == "order" for e in o)

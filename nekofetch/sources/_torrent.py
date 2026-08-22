@@ -173,6 +173,43 @@ def _natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
+def _apply_positional_episodes(main: list[dict]) -> None:
+    """Assign episode numbers to the main-episode files, IN PLACE, preferring the
+    positional "incrementing column" over the per-file regex.
+
+    The owner's rule: in a real pack the filename format is constant and only the
+    episode number climbs +1,+1,+1 — the constant prefix (``Attack on Titan S01``)
+    and any code/title on the right do NOT increment. ``analyze_pack`` finds that
+    column even when a per-file regex would grab a wrong number or miss an unusual
+    style (``01. Title``, ``S01 01``, ``S01 EP01``, ``- 01 [Dual]``). Precedence:
+
+      1. ``analyze_pack`` aligned-column numbers, when that detection is confident
+         (a ``template`` was built and the result is non-ambiguous) — authoritative.
+      2. otherwise the per-file ``parse_release_meta`` number already on each dict.
+      3. last resort — if NOTHING got a number either way, number the files 1..N by
+         natural filename order (the owner's "worst case, use the file order").
+
+    Never invents a number for a genuinely unnumbered lone file; only fills when
+    the whole main set is otherwise numberless.
+    """
+    if not main:
+        return
+    pa = analyze_pack([e["name"] for e in main])
+    # (1) Confident aligned column → its per-position numbers are the episodes.
+    if pa.template and not pa.ambiguous and pa.episode_numbers:
+        for e, num in zip(main, pa.episode_numbers, strict=False):
+            if num is not None:
+                e["episode"] = num
+                e["episode_source"] = "column"
+    # (3) Total miss (regex + column both empty) → fall back to file order.
+    if all(e.get("episode") is None for e in main):
+        for pos, e in enumerate(
+            sorted(main, key=lambda x: _natural_key(x["name"])), start=1
+        ):
+            e["episode"] = pos
+            e["episode_source"] = "order"
+
+
 # --------------------------------------------------------------------------- #
 # pack pattern analysis (secondary validation of episode order)
 # --------------------------------------------------------------------------- #
@@ -380,6 +417,11 @@ def order_episodes(files: list[dict], *, prefer_resolution: int | None = None) -
     main = [e for e in enriched if e["kind"] == "episode"]
     movies = [e for e in enriched if e["kind"] == "movie"]
     extras = [e for e in enriched if e["kind"] in ("special", "ova", "extra")]
+
+    # Episode numbers via the positional incrementing-column detector (falls back
+    # to the per-file regex, then file order). Done BEFORE zero-based resolution
+    # and the (season, episode) sort so both operate on the reliable numbers.
+    _apply_positional_episodes(main)
 
     # Resolve episode-00 numbering: a release that runs 00..N is zero-based (00 is
     # episode 1) and must be shifted +1 so it maps onto the franchise's 1..N slots.
