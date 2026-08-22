@@ -222,8 +222,10 @@ class MainChannelService:
         # Genres / studio-tag / title from the PREFETCHED AniList search blob.
         # The main channel NEVER hits a source scraper (kaa.lt) at publish — that
         # was the 404 — so enrichment is gone. Genres + studio come from the
-        # cached AniList media; the overview is overridden by TMDB below (TMDB's
-        # franchise-level synopsis is preferred for the main post per spec).
+        # cached AniList media; the overview is TMDB's (resolved below) — the
+        # AniList synopsis is captured ONLY as a last resort so it can never
+        # pre-empt TMDB (main-post overview = TMDB, franchise-level, per spec).
+        anilist_overview_fb = ""
         try:
             from nekofetch.services.metadata_prefetch import load_cached
 
@@ -237,8 +239,7 @@ class MainChannelService:
                 studio = search.get("studio")
                 if studio:
                     facts.tag = studio.replace(" ", "")
-                if not facts.overview or facts.overview == "—":
-                    facts.overview = search.get("synopsis") or facts.overview
+                anilist_overview_fb = (search.get("synopsis") or "").strip()
                 # Capture english/romaji for the title header built at the end
                 # (kept out of facts.title so the plain title still drives the
                 # TMDB search below — the HTML header would break that lookup).
@@ -393,6 +394,12 @@ class MainChannelService:
             except Exception as exc:  # noqa: BLE001
                 log.debug("mainchannel.tmdb.failed", title=facts.title, error=str(exc))
 
+        # Last resort ONLY: if TMDB (cached + live) yielded no overview, fall back
+        # to the AniList synopsis so the post isn't blank. TMDB is the source for
+        # the main post per spec; this never runs when TMDB has an overview.
+        if (not facts.overview or facts.overview == "—") and anilist_overview_fb:
+            facts.overview = anilist_overview_fb
+
         # Collapse hard line breaks so the overview reads as one clean paragraph
         # (TMDB/AniList synopses arrive with ragged newlines that look broken in
         # the <blockquote>).
@@ -425,8 +432,12 @@ class MainChannelService:
         need_studio = (not facts.tag) or facts.tag == default_tag
         need_title = (not facts._english) or facts._english == anime_doc_id
         need_romaji = not facts._romaji
-        need_overview = (not facts.overview) or facts.overview == "—"
-        if not any((need_genres, need_studio, need_title, need_romaji, need_overview)):
+        # NOTE: overview is deliberately NOT backfilled here. The main-post overview
+        # is TMDB's franchise-level synopsis (resolved in gather_facts AFTER this
+        # call); backfilling the AniList base-series synopsis here would pre-empt
+        # TMDB (the exact bug the owner flagged). The AniList synopsis is only a
+        # last resort applied after TMDB, in gather_facts.
+        if not any((need_genres, need_studio, need_title, need_romaji)):
             return
 
         # ── (1) franchise_data — already persisted, no network ──
@@ -464,12 +475,9 @@ class MainChannelService:
         if need_romaji and rom:
             facts._romaji = rom
             need_romaji = False
-        if need_overview and fd.get("synopsis"):
-            facts.overview = fd["synopsis"]
-            need_overview = False
 
-        # ── (2) live AniList for whatever franchise_data lacked (studio/synopsis) ──
-        if not any((need_genres, need_studio, need_title, need_romaji, need_overview)):
+        # ── (2) live AniList for whatever franchise_data lacked (studio) ──
+        if not any((need_genres, need_studio, need_title, need_romaji)):
             return
         try:
             from nekofetch.core.parsing import clean_anilist_id
@@ -490,8 +498,6 @@ class MainChannelService:
                     facts._english = media.english
                 if need_romaji and getattr(media, "romaji", None):
                     facts._romaji = media.romaji
-                if need_overview and getattr(media, "synopsis", None):
-                    facts.overview = media.synopsis
         except Exception as exc:  # noqa: BLE001 — live fallback is best-effort
             log.debug("mainchannel.fallback.live_failed",
                       anime=anime_doc_id, error=str(exc))

@@ -71,7 +71,10 @@ async def test_live_fallback_fills_all_defaults():
     assert facts.tag == "CloverWorks"                       # not the "#anime" default
     assert facts._english == "The Elusive Samurai"
     assert facts._romaji == "Nige Jouzu no Wakagimi"
-    assert "flees" in facts.overview
+    # overview is NOT filled by the enrich fallback — the main-post overview is
+    # TMDB's franchise-level synopsis (resolved in gather_facts); the AniList
+    # synopsis is only a last resort applied AFTER TMDB, never here.
+    assert "flees" not in (facts.overview or "")
 
 
 async def test_fallback_never_overwrites_a_good_cached_value():
